@@ -10,7 +10,7 @@ members = [".", "migration"]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json"] }
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "fs", "time", "signal"] }
 sea-orm = { version = "2.0.0-rc.7", features = [
     "sqlx-sqlite",
     "sqlx-postgres",
@@ -23,6 +23,7 @@ migration = { path = "migration" }
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
 
+#[derive(Clone, Debug)]
 pub struct PortalClient {
     base_url: String,
     storage_dir: PathBuf,

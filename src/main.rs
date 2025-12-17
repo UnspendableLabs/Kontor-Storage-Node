@@ -1,15 +1,20 @@
 mod cli;
 mod clients;
 mod config;
+mod daemon;
 mod database;
+mod entities;
+mod tasks;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::io::{self, Write};
+use tokio::signal;
 
 use cli::{Cli, Commands};
 use clients::PortalClient;
 use config::Config;
+use daemon::spawn_portal_daemon;
 use database::DBClient;
 
 #[tokio::main]
@@ -25,14 +30,34 @@ async fn run(cli: Cli, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "Database URL: {}", config.database_url)?;
     writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
 
+    std::fs::create_dir_all(&config.storage_dir).with_context(|| {
+        format!(
+            "failed to create storage directory {}",
+            config.storage_dir.display()
+        )
+    })?;
+
     let db = DBClient::new(&config.database_url).await?;
-    let _conn = db.connection();
+    let conn = db.connection().clone();
     let client = PortalClient::new(&config.portal_url, &config.storage_dir);
+    let lock_path = config.storage_dir.join(".portal-daemon.lock");
 
     match cli.command {
         Commands::Ping => {
             let body = client.ping().await?;
             writeln!(writer, "{body}")?;
+        }
+        Commands::Run => {
+            let handle =
+                spawn_portal_daemon(client, conn, config.portal_polling_interval, lock_path);
+
+            writeln!(
+                writer,
+                "Portal sync daemon running every {}s",
+                config.portal_polling_interval.as_secs()
+            )?;
+            signal::ctrl_c().await?;
+            handle.abort();
         }
     }
 
@@ -60,6 +85,7 @@ mod tests {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
+            portal_polling_interval_secs: 5,
             command: Commands::Ping,
         };
 
@@ -99,6 +125,7 @@ mod tests {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
+            portal_polling_interval_secs: 5,
             command: Commands::Ping,
         };
 
