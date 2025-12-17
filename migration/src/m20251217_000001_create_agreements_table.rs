@@ -2,7 +2,7 @@ use sea_orm_migration::{
     prelude::{
         DbErr, DeriveIden, DeriveMigrationName, Expr, Index, MigrationTrait, SchemaManager, Table,
     },
-    schema::{big_integer, json, string_len, timestamp_with_time_zone},
+    schema::{big_integer, boolean, json, string_len, timestamp_with_time_zone},
     sea_orm::{self, JsonValue},
 };
 
@@ -29,6 +29,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(JsonValue::Array(Vec::new())),
                     )
+                    .col(boolean(Agreements::Downloaded).not_null().default(false))
                     .col(string_len(Agreements::TransactionId, 64))
                     .col(json(Agreements::Curation))
                     .col(
@@ -108,6 +109,7 @@ enum Agreements {
     MimeType,
     OriginalSize,
     Nodes,
+    Downloaded,
     TransactionId,
     Curation,
     Status,

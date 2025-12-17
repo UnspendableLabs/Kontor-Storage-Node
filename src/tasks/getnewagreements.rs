@@ -82,6 +82,7 @@ fn agreement_to_active_model(
         mime_type: Set(agreement.mime_type.clone()),
         original_size: Set(original_size),
         nodes: Set(nodes_json),
+        downloaded: Set(false),
         transaction_id: Set(agreement.transaction_id.clone()),
         curation: Set(agreement.curation.clone()),
         status: Set(agreement.status.clone()),
@@ -210,6 +211,7 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(555),
             nodes: Set(json!(["NODE-existing"])),
+            downloaded: Set(false),
             transaction_id: Set(Some("TX-existing".into())),
             curation: Set(json!({"curated": true})),
             status: Set("ready".into()),
@@ -240,6 +242,10 @@ mod tests {
         assert!(inserted.transaction_id.is_none());
         assert_eq!(inserted.curation, json!({"notes": "ok"}));
         assert_eq!(inserted.status, "ready");
+        assert!(
+            !inserted.downloaded,
+            "new agreements should start as not downloaded"
+        );
         assert_eq!(
             inserted.created_at,
             DateTime::parse_from_rfc3339(&new_agreement.created_at).unwrap()
@@ -272,6 +278,7 @@ mod tests {
             mime_type: Set(agreement.mime_type.clone()),
             original_size: Set(agreement.original_size as i64),
             nodes: Set(json!(agreement.nodes)),
+            downloaded: Set(false),
             transaction_id: Set(agreement.transaction_id.clone()),
             curation: Set(agreement.curation.clone()),
             status: Set(agreement.status.clone()),

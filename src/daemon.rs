@@ -1,4 +1,5 @@
 use crate::clients::PortalClient;
+use crate::tasks::downloadagreements::download_ready_agreement_files;
 use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
@@ -11,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 /// Starts the portal synchronization daemon that periodically fetches agreements
-/// ready to be signed and stores the new ones locally.
+/// ready to be signed, stores the new ones locally, and downloads their files.
 pub fn spawn_portal_daemon(
     portal_client: PortalClient,
     database: DatabaseConnection,
@@ -39,12 +40,18 @@ async fn run_portal_daemon(
     sync_ready_agreements(&portal_client, &database)
         .await
         .context("initial agreements sync failed")?;
+    download_ready_agreement_files(&portal_client, &database)
+        .await
+        .context("initial agreement download failed")?;
 
     let mut ticker = time::interval(interval);
     loop {
         ticker.tick().await;
         if let Err(err) = sync_ready_agreements(&portal_client, &database).await {
             eprintln!("failed to sync agreements: {err:#}");
+        }
+        if let Err(err) = download_ready_agreement_files(&portal_client, &database).await {
+            eprintln!("failed to download agreement files: {err:#}");
         }
     }
 }
@@ -213,6 +220,7 @@ mod tests {
                 "created_at": "2024-01-15T10:30:00Z"
             }]
         });
+        let download_url = format!("{}/files/contract.pdf", mock_server.uri());
 
         Mock::given(method("GET"))
             .and(path("/agreements"))
@@ -221,12 +229,27 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/agreements/AGREEMENT-test/download"))
+            .and(query_param("no_redirect", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/files/contract.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
         let database = setup_in_memory_db().await;
         let lock_path = unique_path("lock_loop");
         let storage_dir = unique_path("storage_loop");
 
         let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), storage_dir),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
@@ -244,6 +267,14 @@ mod tests {
 
         let stored = Agreements::find().count(&database).await.unwrap();
         assert_eq!(stored, 1, "agreement should be inserted exactly once");
+
+        let agreement = Agreements::find().one(&database).await.unwrap().unwrap();
+        assert!(
+            agreement.downloaded,
+            "download task should mark agreements as downloaded"
+        );
+        let contents = fs::read_to_string(storage_dir.join("contract.pdf")).unwrap();
+        assert_eq!(contents, "file-body");
 
         assert!(
             !lock_path.exists(),
