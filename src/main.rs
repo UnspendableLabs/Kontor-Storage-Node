@@ -8,7 +8,11 @@ mod tasks;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use sea_orm::DatabaseConnection;
+use std::future::Future;
 use std::io::{self, Write};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::signal;
 
 use cli::{Cli, Commands};
@@ -24,7 +28,15 @@ async fn main() -> Result<()> {
     run(cli, &mut stdout).await
 }
 
-async fn run(cli: Cli, mut writer: impl Write) -> Result<()> {
+async fn run(cli: Cli, writer: impl Write) -> Result<()> {
+    run_with_shutdown(cli, writer, signal::ctrl_c()).await
+}
+
+async fn run_with_shutdown(
+    cli: Cli,
+    mut writer: impl Write,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<()> {
     let config = Config::from(&cli);
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
@@ -48,28 +60,61 @@ async fn run(cli: Cli, mut writer: impl Write) -> Result<()> {
             writeln!(writer, "{body}")?;
         }
         Commands::Run => {
-            let handle =
-                spawn_portal_daemon(client, conn, config.portal_polling_interval, lock_path);
-
-            writeln!(
-                writer,
-                "Portal sync daemon running every {}s",
-                config.portal_polling_interval.as_secs()
-            )?;
-            signal::ctrl_c().await?;
-            handle.abort();
+            run_daemon_command(
+                &mut writer,
+                client,
+                conn,
+                config.portal_polling_interval,
+                lock_path,
+                shutdown,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
+async fn run_daemon_command(
+    mut writer: impl Write,
+    client: PortalClient,
+    conn: DatabaseConnection,
+    interval: Duration,
+    lock_path: PathBuf,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<()> {
+    let handle = spawn_portal_daemon(client, conn, interval, lock_path);
+
+    writeln!(
+        writer,
+        "Portal sync daemon running every {}s",
+        interval.as_secs()
+    )?;
+
+    let shutdown_result = shutdown.await;
+    handle.abort();
+    let _ = handle.await;
+
+    shutdown_result?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
-    use wiremock::matchers::{method, path};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{sleep, Duration};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_storage_dir(prefix: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("kontor_main_{prefix}_{id}"))
+    }
 
     #[tokio::test]
     async fn run_writes_ping_output() {
@@ -136,5 +181,105 @@ mod tests {
             err.to_string().contains("Portal ping failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_starts_daemon_and_aborts_on_shutdown() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("daemon");
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_dir.clone()),
+            portal_polling_interval_secs: 1,
+            command: Commands::Run,
+        };
+
+        let shutdown = async {
+            sleep(Duration::from_millis(50)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            output.contains("Portal sync daemon running every"),
+            "expected daemon startup message in output: {output}"
+        );
+
+        let lock_path = storage_dir.join(".portal-daemon.lock");
+        assert!(
+            !lock_path.exists(),
+            "lock file should be cleaned up after shutdown"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            !requests.is_empty(),
+            "daemon should poll the portal at least once"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_propagates_shutdown_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("shutdown_error");
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_dir.clone()),
+            portal_polling_interval_secs: 1,
+            command: Commands::Run,
+        };
+
+        let shutdown = async { Err(io::Error::other("ctrlc failure")) };
+
+        let mut buffer = Vec::new();
+        let err = run_with_shutdown(cli, &mut buffer, shutdown)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("ctrlc failure"),
+            "expected shutdown error to be propagated, got {err}"
+        );
+
+        let lock_path = storage_dir.join(".portal-daemon.lock");
+        assert!(
+            !lock_path.exists(),
+            "lock file should be cleaned even when shutdown fails"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
     }
 }

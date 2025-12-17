@@ -116,6 +116,7 @@ async fn connect(database_url: &str) -> Result<DatabaseConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm_migration::SchemaManager;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -204,6 +205,29 @@ mod tests {
         client.connection().ping().await?;
 
         fs::remove_file(&db_path).ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrations_apply_and_revert_in_memory() -> Result<()> {
+        let db_url = "sqlite::memory:";
+        let conn = connect(db_url).await?;
+        let schema = SchemaManager::new(&conn);
+
+        migration::Migrator::up(&conn, None).await?;
+        assert!(
+            schema.has_table("agreements").await?,
+            "expected agreements table to exist after running migrations"
+        );
+
+        let steps = migration::Migrator::migrations().len() as u32;
+        migration::Migrator::down(&conn, Some(steps)).await?;
+
+        assert!(
+            !schema.has_table("agreements").await?,
+            "expected agreements table to be dropped after rolling back migrations"
+        );
 
         Ok(())
     }
