@@ -15,3 +15,26 @@ impl From<&Cli> for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Commands};
+
+    #[test]
+    fn config_from_cli_clones_fields() {
+        let mut cli = Cli {
+            portal_url: "https://portal.example/api".to_string(),
+            database_url: "sqlite://localhost/mydb".to_string(),
+            command: Commands::Ping,
+        };
+
+        let config = Config::from(&cli);
+
+        cli.portal_url.push_str("/extra");
+        cli.database_url.push_str("?mode=ro");
+
+        assert_eq!(config.portal_url, "https://portal.example/api");
+        assert_eq!(config.database_url, "sqlite://localhost/mydb");
+    }
+}

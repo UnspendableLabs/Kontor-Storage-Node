@@ -1,6 +1,7 @@
-use sea_orm_migration::{cli, prelude::MigratorTrait};
+use migration::Migrator;
+use sea_orm_migration::cli;
 
 #[tokio::main]
 async fn main() {
-    cli::run_cli(migration::Migrator).await;
+    cli::run_cli(Migrator).await;
 }

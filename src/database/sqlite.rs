@@ -54,3 +54,133 @@ fn ensure_sqlite_file_exists(file_path: &str) -> Result<bool> {
 
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join("database_sqlite")
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        test_root().join(format!("kontor_storage_node_{name}_{id}"))
+    }
+
+    fn cleanup_path(path: &Path) {
+        if path.is_file() {
+            fs::remove_file(path).ok();
+        } else if path.is_dir() {
+            fs::remove_dir_all(path).ok();
+        }
+
+        if let Some(parent) = path.parent() {
+            if parent.ends_with("database_sqlite") {
+                fs::remove_dir_all(parent).ok();
+            }
+        }
+    }
+
+    #[test]
+    fn is_sqlite_url_and_extract_sqlite_file_path() {
+        assert!(is_sqlite_url("sqlite://tmp/test.db"));
+        assert!(!is_sqlite_url("postgres://tmp/test.db"));
+
+        assert_eq!(
+            extract_sqlite_file_path("sqlite:///tmp/test.db"),
+            Some("/tmp/test.db".to_string())
+        );
+        assert_eq!(
+            extract_sqlite_file_path("sqlite:relative/test.db"),
+            Some("relative/test.db".to_string())
+        );
+        assert_eq!(extract_sqlite_file_path("postgres:///tmp/test.db"), None);
+    }
+
+    #[test]
+    fn prepare_sqlite_returns_false_for_non_sqlite_url() {
+        assert!(!prepare_sqlite("postgres://db").unwrap());
+    }
+
+    #[test]
+    fn prepare_sqlite_memory_url_returns_true() {
+        assert!(prepare_sqlite("sqlite::memory:").unwrap());
+    }
+
+    #[test]
+    fn ensure_sqlite_file_exists_returns_true_when_file_is_present() {
+        let path = unique_temp_path("existing_file").with_extension("sqlite");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::File::create(&path).unwrap();
+
+        assert!(ensure_sqlite_file_exists(path.to_str().unwrap()).unwrap());
+        cleanup_path(&path);
+    }
+
+    #[test]
+    fn prepare_sqlite_creates_file_and_signals_migrations() {
+        let db_path = unique_temp_path("create_and_signal").join("db.sqlite");
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        if let Some(parent) = db_path.parent() {
+            fs::remove_dir_all(parent).ok();
+        }
+
+        assert!(prepare_sqlite(&db_url).unwrap());
+        assert!(db_path.exists());
+        assert!(!prepare_sqlite(&db_url).unwrap());
+
+        cleanup_path(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn ensure_sqlite_file_exists_errors_when_parent_is_file() {
+        let parent_file = unique_temp_path("parent_file");
+        if let Some(parent) = parent_file.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&parent_file, b"not a directory").unwrap();
+        let target = parent_file.join("child").with_extension("sqlite");
+
+        let err = ensure_sqlite_file_exists(target.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to create directory"),
+            "unexpected error: {err}"
+        );
+
+        cleanup_path(&parent_file);
+    }
+
+    #[test]
+    fn ensure_sqlite_file_exists_errors_when_parent_is_read_only() {
+        let dir_path = unique_temp_path("parent_read_only");
+        if let Some(parent) = dir_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::create_dir_all(&dir_path).unwrap();
+        let file_path = dir_path.join("db.sqlite");
+        fs::set_permissions(&dir_path, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = ensure_sqlite_file_exists(file_path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to create SQLite database file"),
+            "unexpected error: {err}"
+        );
+
+        fs::set_permissions(&dir_path, fs::Permissions::from_mode(0o755)).ok();
+        cleanup_path(&dir_path);
+    }
+}
