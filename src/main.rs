@@ -23,10 +23,11 @@ async fn run(cli: Cli, mut writer: impl Write) -> Result<()> {
     let config = Config::from(&cli);
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
+    writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
 
     let db = DBClient::new(&config.database_url).await?;
     let _conn = db.connection();
-    let client = PortalClient::new(&config.portal_url);
+    let client = PortalClient::new(&config.portal_url, &config.storage_dir);
 
     match cli.command {
         Commands::Ping => {
@@ -41,6 +42,7 @@ async fn run(cli: Cli, mut writer: impl Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -57,6 +59,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/storage")),
             command: Commands::Ping,
         };
 
@@ -71,6 +74,10 @@ mod tests {
         assert!(
             output.contains("Database URL:"),
             "expected database url line in output"
+        );
+        assert!(
+            output.contains("Storage dir:"),
+            "expected storage dir line in output"
         );
         assert!(
             output.contains("pong"),
@@ -91,6 +98,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/storage")),
             command: Commands::Ping,
         };
 

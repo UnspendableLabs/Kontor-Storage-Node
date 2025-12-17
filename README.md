@@ -30,6 +30,7 @@ The node can be configured via command-line arguments or environment variables:
 |--------|---------------------|---------|-------------|
 | `--portal-url` | `PORTAL_API_URL` | `http://localhost:8080` | Portal API base URL |
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
+| `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
 
 ### Database
 

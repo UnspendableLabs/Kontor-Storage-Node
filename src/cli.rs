@@ -1,5 +1,6 @@
 use crate::database;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
@@ -15,6 +16,10 @@ pub struct Cli {
         default_value_t = database::default_database_url()
     )]
     pub database_url: String,
+
+    /// Directory used to store downloaded files (default: app data dir/files)
+    #[arg(long, env = "STORAGE_DIR")]
+    pub storage_dir: Option<PathBuf>,
 
     /// Command to run
     #[command(subcommand)]

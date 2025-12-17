@@ -10,6 +10,7 @@ use super::{migration, sqlite};
 
 const DEFAULT_DB_DIR: &str = "Kontor-Storage-Node";
 const DEFAULT_DB_FILE: &str = "storage.db";
+const DEFAULT_FILES_DIR: &str = "files";
 
 #[cfg(test)]
 thread_local! {
@@ -71,13 +72,29 @@ impl DBClient {
 /// Returns a SQLite database URL under the user's data directory.
 #[must_use]
 pub fn default_database_url() -> String {
-    if let Some(data_dir) = data_dir() {
-        let db_path = data_dir.join(DEFAULT_DB_DIR).join(DEFAULT_DB_FILE);
+    if let Some(app_dir) = default_app_dir() {
+        let db_path = app_dir.join(DEFAULT_DB_FILE);
         return format!("sqlite://{}", db_path.display());
     }
 
     // Safe fallback if the platform does not expose a data directory.
     "sqlite::memory:".to_string()
+}
+
+/// Returns the default application data directory (e.g. `~/.local/share/Kontor-Storage-Node`).
+#[must_use]
+pub fn default_app_dir() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(DEFAULT_DB_DIR))
+}
+
+/// Returns the default directory used to store downloaded files.
+#[must_use]
+pub fn default_storage_dir() -> PathBuf {
+    if let Some(app_dir) = default_app_dir() {
+        app_dir.join(DEFAULT_FILES_DIR)
+    } else {
+        PathBuf::from(DEFAULT_FILES_DIR)
+    }
 }
 
 /// Establishes a database connection using SeaORM.
@@ -128,6 +145,23 @@ mod tests {
             url.contains(&expected_prefix.display().to_string()),
             "expected database url to contain {} but got {url}",
             expected_prefix.display()
+        );
+    }
+
+    #[test]
+    fn default_storage_dir_uses_app_dir_override() {
+        let dir = test_root().join("storage_dir_override");
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage_dir = with_data_dir_override(Some(dir.clone()), default_storage_dir);
+        let expected = dir.join(DEFAULT_DB_DIR).join(DEFAULT_FILES_DIR);
+
+        assert_eq!(
+            storage_dir,
+            expected,
+            "expected storage dir to be {} but got {}",
+            expected.display(),
+            storage_dir.display()
         );
     }
 
