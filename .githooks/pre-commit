@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Install by pointing git to this directory: `git config core.hooksPath .githooks`
+set -euo pipefail
+
+run() {
+  echo "==> $*"
+  "$@"
+}
+
+run cargo fmt --all -- --check
+run cargo clippy --all-targets --all-features -- -D warnings
+run cargo test
