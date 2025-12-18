@@ -83,12 +83,6 @@ mod tests {
         } else if path.is_dir() {
             fs::remove_dir_all(path).ok();
         }
-
-        if let Some(parent) = path.parent() {
-            if parent.ends_with("database_sqlite") {
-                fs::remove_dir_all(parent).ok();
-            }
-        }
     }
 
     #[test]

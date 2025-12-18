@@ -45,7 +45,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -74,6 +74,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -105,7 +106,7 @@ mod tests {
         agreement.insert(&database).await.unwrap();
 
         download_ready_agreement_files(
-            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
         )
         .await
@@ -131,7 +132,7 @@ mod tests {
         let storage_dir = unique_storage_dir("empty");
 
         download_ready_agreement_files(
-            &PortalClient::new("http://localhost:1", storage_dir),
+            &PortalClient::new("http://localhost:1", "secret", storage_dir),
             &database,
         )
         .await

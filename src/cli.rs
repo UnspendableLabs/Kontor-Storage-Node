@@ -9,6 +9,10 @@ pub struct Cli {
     #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
     pub portal_url: String,
 
+    /// Portal API key used for Bearer authentication
+    #[arg(long, env = "PORTAL_API_KEY")]
+    pub portal_api_key: String,
+
     /// Database connection string (default: local SQLite file)
     #[arg(
         long,

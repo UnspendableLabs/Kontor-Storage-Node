@@ -51,7 +51,11 @@ async fn run_with_shutdown(
 
     let db = DBClient::new(&config.database_url).await?;
     let conn = db.connection().clone();
-    let client = PortalClient::new(&config.portal_url, &config.storage_dir);
+    let client = PortalClient::new(
+        &config.portal_url,
+        &config.portal_api_key,
+        &config.storage_dir,
+    );
     let lock_path = config.storage_dir.join(".portal-daemon.lock");
 
     match cli.command {
@@ -106,7 +110,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{sleep, Duration};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -122,12 +126,14 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
             .mount(&mock_server)
             .await;
 
         let cli = Cli {
             portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
@@ -162,12 +168,14 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
             .mount(&mock_server)
             .await;
 
         let cli = Cli {
             portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
@@ -190,6 +198,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/agreements"))
             .and(query_param("status", "ready"))
+            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -202,6 +211,7 @@ mod tests {
         let storage_dir = unique_storage_dir("daemon");
         let cli = Cli {
             portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
@@ -256,6 +266,7 @@ mod tests {
         let storage_dir = unique_storage_dir("shutdown_error");
         let cli = Cli {
             portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
