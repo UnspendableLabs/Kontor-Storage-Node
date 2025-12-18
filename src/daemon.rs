@@ -170,7 +170,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(500))
@@ -224,7 +224,7 @@ mod tests {
         let download_url = format!("{}/files/contract.pdf", mock_server.uri());
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
@@ -232,7 +232,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/agreements/AGREEMENT-test/download"))
+            .and(path("/api/agreements/AGREEMENT-test/download"))
             .and(query_param("no_redirect", "true"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

@@ -157,7 +157,7 @@ mod tests {
     async fn returns_ok_when_no_ready_agreements() {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -188,7 +188,7 @@ mod tests {
         let new_agreement = sample_agreement("AGREEMENT-new");
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -260,7 +260,7 @@ mod tests {
         let agreement = sample_agreement("AGREEMENT-existing");
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

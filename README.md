@@ -29,8 +29,18 @@ The node can be configured via command-line arguments or environment variables:
 | Option | Environment Variable | Default | Description |
 |--------|---------------------|---------|-------------|
 | `--portal-url` | `PORTAL_API_URL` | `http://localhost:8080` | Portal API base URL |
+| `--portal-api-key` | `PORTAL_API_KEY` | _required_ | Portal API key used for Bearer authentication |
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
+
+You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
+
+```
+PORTAL_API_URL=https://portal.example.com/api
+PORTAL_API_KEY=super-secret
+DATABASE_URL=sqlite:///tmp/kontor.db
+STORAGE_DIR=/tmp/kontor-files
+```
 
 ### Database
 

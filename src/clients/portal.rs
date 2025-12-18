@@ -45,7 +45,7 @@ impl PortalClient {
     /// Fetch agreements that are ready for signing.
     pub async fn get_agreements_to_sign(&self) -> Result<AgreementsPage> {
         let url = format!(
-            "{}/agreements?status=ready",
+            "{}/api/agreements?status=ready",
             self.base_url.trim_end_matches('/')
         );
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
@@ -72,7 +72,7 @@ impl PortalClient {
         utxo: &str,
     ) -> Result<JoinAgreementResponse> {
         let url = format!(
-            "{}/agreements/{agreement_id}/join",
+            "{}/api/agreements/{agreement_id}/join",
             self.base_url.trim_end_matches('/')
         );
         let payload = JoinAgreementRequest {
@@ -136,7 +136,7 @@ impl PortalClient {
 
     async fn fetch_download_url(&self, agreement_id: &str) -> Result<String> {
         let url = format!(
-            "{}/agreements/{agreement_id}/download?no_redirect=true",
+            "{}/api/agreements/{agreement_id}/download?no_redirect=true",
             self.base_url.trim_end_matches('/')
         );
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
@@ -320,7 +320,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -358,7 +358,7 @@ mod tests {
         let agreement_id = "AGREEMENT-join";
 
         Mock::given(method("POST"))
-            .and(path(format!("/agreements/{agreement_id}/join")))
+            .and(path(format!("/api/agreements/{agreement_id}/join")))
             .and(header("authorization", "Bearer secret"))
             .and(body_json(json!({ "utxo": "txid:1" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -386,7 +386,7 @@ mod tests {
         let download_url = format!("{}{}", mock_server.uri(), download_url_path);
 
         Mock::given(method("GET"))
-            .and(path(format!("/agreements/{agreement_id}/download")))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

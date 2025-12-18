@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "dotenvy",
  "migration",
  "reqwest",
  "sea-orm",

@@ -72,7 +72,7 @@ mod tests {
         let download_url = format!("{}{}", mock_server.uri(), download_path);
 
         Mock::given(method("GET"))
-            .and(path(format!("/agreements/{agreement_id}/download")))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

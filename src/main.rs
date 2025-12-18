@@ -23,9 +23,18 @@ use database::DBClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_local_env()?;
     let cli = Cli::parse();
     let mut stdout = io::stdout();
     run(cli, &mut stdout).await
+}
+
+fn load_local_env() -> Result<()> {
+    match dotenvy::from_filename(".env.local") {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).context("failed to load .env.local"),
+    }
 }
 
 async fn run(cli: Cli, writer: impl Write) -> Result<()> {
@@ -196,7 +205,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -252,7 +261,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/agreements"))
+            .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
