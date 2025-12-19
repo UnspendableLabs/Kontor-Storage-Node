@@ -42,10 +42,10 @@ impl PortalClient {
         }
     }
 
-    /// Fetch agreements that are marked as ready.
+    /// Fetch agreements that are marked as new.
     pub async fn get_new_agreements(&self) -> Result<AgreementsPage> {
         let url = format!(
-            "{}/api/agreements?status=ready",
+            "{}/api/agreements?status=new",
             self.base_url.trim_end_matches('/')
         );
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
@@ -316,12 +316,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_new_agreements_requests_ready_status() {
+    async fn get_new_agreements_requests_new_status() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
+            .and(query_param("status", "new"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,

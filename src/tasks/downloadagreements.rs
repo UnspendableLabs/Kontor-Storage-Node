@@ -3,13 +3,12 @@ use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 
-/// Download agreement files that are ready and not yet stored locally.
+/// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
     let pending = Agreements::find()
-        .filter(agreements::Column::Status.eq("ready"))
         .filter(agreements::Column::Downloaded.eq(false))
         .all(database)
         .await

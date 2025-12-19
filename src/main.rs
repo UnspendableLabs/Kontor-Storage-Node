@@ -206,7 +206,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
+            .and(query_param("status", "new"))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
@@ -262,7 +262,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
+            .and(query_param("status", "new"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
