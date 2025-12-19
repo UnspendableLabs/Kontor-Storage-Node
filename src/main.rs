@@ -46,10 +46,14 @@ async fn run_with_shutdown(
     mut writer: impl Write,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let config = Config::from(&cli);
+    let config = Config::from_cli(&cli)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
     writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
+    match config.storage_capacity {
+        Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
+        None => writeln!(writer, "Storage capacity: unlimited")?,
+    }
 
     std::fs::create_dir_all(&config.storage_dir).with_context(|| {
         format!(
@@ -79,6 +83,7 @@ async fn run_with_shutdown(
                 conn,
                 config.portal_polling_interval,
                 lock_path,
+                config.storage_capacity,
                 shutdown,
             )
             .await?;
@@ -94,9 +99,10 @@ async fn run_daemon_command(
     conn: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
+    storage_capacity: Option<u64>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let handle = spawn_portal_daemon(client, conn, interval, lock_path);
+    let handle = spawn_portal_daemon(client, conn, interval, lock_path, storage_capacity);
 
     writeln!(
         writer,
@@ -146,6 +152,7 @@ mod tests {
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
+            storage_capacity: None,
             command: Commands::Ping,
         };
 
@@ -164,6 +171,10 @@ mod tests {
         assert!(
             output.contains("Storage dir:"),
             "expected storage dir line in output"
+        );
+        assert!(
+            output.contains("Storage capacity:"),
+            "expected storage capacity line in output"
         );
         assert!(
             output.contains("pong"),
@@ -188,6 +199,7 @@ mod tests {
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
+            storage_capacity: None,
             command: Commands::Ping,
         };
 
@@ -224,6 +236,7 @@ mod tests {
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
+            storage_capacity: Some("1GB".into()),
             command: Commands::Run,
         };
 
@@ -279,6 +292,7 @@ mod tests {
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
+            storage_capacity: None,
             command: Commands::Run,
         };
 

@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long, env = "PORTAL_POOLING_INTERVAL", default_value_t = 30)]
     pub portal_polling_interval_secs: u64,
 
+    /// Maximum allowed storage for downloaded files (supports M/G/T suffix)
+    #[arg(long, env = "STORAGE_CAPACITY")]
+    pub storage_capacity: Option<String>,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

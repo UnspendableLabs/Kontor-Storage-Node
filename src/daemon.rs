@@ -18,9 +18,18 @@ pub fn spawn_portal_daemon(
     database: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
+    storage_capacity: Option<u64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run_portal_daemon(portal_client, database, interval, lock_path).await {
+        if let Err(err) = run_portal_daemon(
+            portal_client,
+            database,
+            interval,
+            lock_path,
+            storage_capacity,
+        )
+        .await
+        {
             eprintln!("portal daemon stopped with error: {err:#}");
         }
     })
@@ -31,6 +40,7 @@ async fn run_portal_daemon(
     database: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
+    storage_capacity: Option<u64>,
 ) -> Result<()> {
     // Ensure only a single daemon instance runs at a time.
     let _lock =
@@ -40,7 +50,7 @@ async fn run_portal_daemon(
     sync_ready_agreements(&portal_client, &database)
         .await
         .context("initial agreements sync failed")?;
-    download_agreements(&portal_client, &database)
+    download_agreements(&portal_client, &database, storage_capacity)
         .await
         .context("initial agreement download failed")?;
 
@@ -50,7 +60,7 @@ async fn run_portal_daemon(
         if let Err(err) = sync_ready_agreements(&portal_client, &database).await {
             eprintln!("failed to sync agreements: {err:#}");
         }
-        if let Err(err) = download_agreements(&portal_client, &database).await {
+        if let Err(err) = download_agreements(&portal_client, &database, storage_capacity).await {
             eprintln!("failed to download agreement files: {err:#}");
         }
     }
@@ -186,6 +196,7 @@ mod tests {
             database,
             Duration::from_millis(5),
             lock_path.clone(),
+            None,
         )
         .await
         .unwrap_err();
@@ -257,6 +268,7 @@ mod tests {
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
+            None,
         );
 
         time::sleep(Duration::from_millis(50)).await;

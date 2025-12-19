@@ -32,6 +32,8 @@ The node can be configured via command-line arguments or environment variables:
 | `--portal-api-key` | `PORTAL_API_KEY` | _required_ | Portal API key used for Bearer authentication |
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
+| `--storage-capacity` | `STORAGE_CAPACITY` | _unlimited_ | Max storage for downloads (bytes, supports M/G/T suffix) |
+| `--portal-polling-interval-secs` | `PORTAL_POOLING_INTERVAL` | `30` | Interval in seconds between portal polling runs |
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
 
@@ -40,7 +42,11 @@ PORTAL_API_URL=https://portal.example.com/api
 PORTAL_API_KEY=super-secret
 DATABASE_URL=sqlite:///tmp/kontor.db
 STORAGE_DIR=/tmp/kontor-files
+STORAGE_CAPACITY=10GB
+PORTAL_POOLING_INTERVAL=45
 ```
+
+When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space.
 
 ### Database
 
