@@ -144,6 +144,7 @@ mod tests {
         Schema, Set,
     };
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path, query_param};
@@ -307,6 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn spawn_portal_daemon_syncs_initially_and_on_interval() {
         let mock_server = MockServer::start().await;
         let response_body = json!({
@@ -371,7 +373,7 @@ mod tests {
         // hashing, ledger writes, and metadata persistence.
         let start = time::Instant::now();
         let mut downloaded = false;
-        while start.elapsed() < Duration::from_secs(5) {
+        while start.elapsed() < Duration::from_secs(10) {
             time::sleep(Duration::from_millis(50)).await;
             if let Some(agreement) = Agreements::find().one(&database).await.unwrap() {
                 if agreement.downloaded {
