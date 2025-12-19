@@ -358,6 +358,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let lock_path = unique_path("lock_loop");
         let storage_dir = unique_path("storage_loop");
+        fs::remove_file(&lock_path).ok();
         fs::remove_dir_all(&storage_dir).ok();
 
         let handle = spawn_portal_daemon(

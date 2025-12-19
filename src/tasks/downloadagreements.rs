@@ -182,6 +182,13 @@ async fn process_downloaded_file(
         .map_err(PostProcessError::Prepare)?;
     let storage_root = saved_path
         .parent()
+        .and_then(|parent| {
+            if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(parent)
+            }
+        })
         .ok_or_else(|| {
             anyhow!(
                 "downloaded file path {} does not have a parent directory",
@@ -288,12 +295,13 @@ fn ledger_path(storage_root: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::entities::prelude::{Agreements, FileMetadata};
+    use halo2curves::pasta::Fq;
     use sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
     };
     use serde_json::json;
     use std::fs as stdfs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
     use wiremock::matchers::{header, method, path, query_param};
@@ -1033,6 +1041,70 @@ mod tests {
         assert!(
             !stored.downloaded,
             "agreement should remain unprepared when ledger fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_downloaded_file_errors_when_path_missing_parent() {
+        let database = setup_in_memory_db().await;
+        let txn = database.begin().await.unwrap();
+        let agreement = agreements::Model {
+            agreement_id: "AGREEMENT-no-parent".into(),
+            user_id: "user_1".into(),
+            file_id: "FILE-no-parent".into(),
+            filename: "file.pdf".into(),
+            mime_type: "application/pdf".into(),
+            original_size: 10,
+            nodes: json!(["NODE-1"]),
+            downloaded: false,
+            transaction_id: None,
+            curation: json!({}),
+            status: "ready".into(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
+        };
+
+        let result =
+            process_downloaded_file(Path::new("orphaned_file"), b"file-body", &agreement, &txn)
+                .await;
+
+        assert!(
+            matches!(result, Err(PostProcessError::Prepare(_))),
+            "expected missing parent path to be reported as prepare error"
+        );
+
+        txn.rollback().await.unwrap();
+
+        let metadata_rows = FileMetadata::find().count(&database).await.unwrap();
+        assert_eq!(
+            metadata_rows, 0,
+            "metadata should not be persisted on prepare errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_file_metadata_rejects_overflow_sizes() {
+        let database = setup_in_memory_db().await;
+        let metadata = CryptoFileMetadata {
+            root: Fq::one(),
+            file_id: "FILE-overflow".into(),
+            padded_len: usize::MAX,
+            original_size: usize::MAX,
+            filename: "huge.bin".into(),
+        };
+
+        let err = persist_file_metadata(&database, "AGREEMENT-overflow", &metadata)
+            .await
+            .expect_err("overflowing metadata should return an error");
+
+        assert!(
+            err.to_string().contains("exceeds i64"),
+            "error should mention i64 overflow"
+        );
+
+        let metadata_rows = FileMetadata::find().count(&database).await.unwrap();
+        assert_eq!(
+            metadata_rows, 0,
+            "overflowing metadata should not be stored"
         );
     }
 }
