@@ -14,6 +14,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     pub portal_polling_interval: Duration,
     pub storage_capacity: Option<u64>,
+    pub storage_max_files: Option<u64>,
 }
 
 impl Config {
@@ -30,6 +31,7 @@ impl Config {
             storage_dir: cli.storage_dir.clone().unwrap_or_else(default_storage_dir),
             portal_polling_interval: Duration::from_secs(cli.portal_polling_interval_secs),
             storage_capacity,
+            storage_max_files: cli.storage_max_files,
         })
     }
 }
@@ -71,6 +73,7 @@ mod tests {
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 42,
             storage_capacity: Some("15GB".into()),
+            storage_max_files: Some(10),
             command: Commands::Ping,
         };
 
@@ -81,6 +84,7 @@ mod tests {
         cli.database_url.push_str("?mode=ro");
         cli.storage_dir = Some(PathBuf::from("/other"));
         cli.storage_capacity = Some("20GB".into());
+        cli.storage_max_files = Some(20);
 
         assert_eq!(config.portal_url, "https://portal.example/api");
         assert_eq!(config.portal_api_key, "secret");
@@ -88,6 +92,7 @@ mod tests {
         assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
         assert_eq!(config.portal_polling_interval, Duration::from_secs(42));
         assert_eq!(config.storage_capacity, Some(15_000_000_000));
+        assert_eq!(config.storage_max_files, Some(10));
     }
 
     #[test]

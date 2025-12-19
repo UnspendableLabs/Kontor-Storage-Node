@@ -1,8 +1,9 @@
 use crate::clients::PortalClient;
+use crate::entities::{agreements, prelude::Agreements};
 use crate::tasks::downloadagreements::download_agreements;
 use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -11,6 +12,12 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageLimits {
+    pub capacity: Option<u64>,
+    pub max_files: Option<u64>,
+}
+
 /// Starts the portal synchronization daemon that periodically fetches agreements
 /// ready to be signed, stores the new ones locally, and downloads their files.
 pub fn spawn_portal_daemon(
@@ -18,17 +25,11 @@ pub fn spawn_portal_daemon(
     database: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
-    storage_capacity: Option<u64>,
+    storage_limits: StorageLimits,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run_portal_daemon(
-            portal_client,
-            database,
-            interval,
-            lock_path,
-            storage_capacity,
-        )
-        .await
+        if let Err(err) =
+            run_portal_daemon(portal_client, database, interval, lock_path, storage_limits).await
         {
             eprintln!("portal daemon stopped with error: {err:#}");
         }
@@ -40,30 +41,57 @@ async fn run_portal_daemon(
     database: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
-    storage_capacity: Option<u64>,
+    storage_limits: StorageLimits,
 ) -> Result<()> {
     // Ensure only a single daemon instance runs at a time.
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
 
     // Run immediately, then on each tick.
-    sync_ready_agreements(&portal_client, &database)
+    sync_portal_once(&portal_client, &database, storage_limits)
         .await
-        .context("initial agreements sync failed")?;
-    download_agreements(&portal_client, &database, storage_capacity)
-        .await
-        .context("initial agreement download failed")?;
+        .context("initial portal sync failed")?;
 
     let mut ticker = time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = sync_ready_agreements(&portal_client, &database).await {
-            eprintln!("failed to sync agreements: {err:#}");
-        }
-        if let Err(err) = download_agreements(&portal_client, &database, storage_capacity).await {
-            eprintln!("failed to download agreement files: {err:#}");
+        if let Err(err) = sync_portal_once(&portal_client, &database, storage_limits).await {
+            eprintln!("portal sync failed: {err:#}");
         }
     }
+}
+
+async fn sync_portal_once(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_limits: StorageLimits,
+) -> Result<()> {
+    if let Some(max_files) = storage_limits.max_files {
+        let downloaded = downloaded_files_count(database).await?;
+        if downloaded >= max_files {
+            println!(
+                "Max stored files limit ({max_files}) reached; skipping agreement fetch and downloads"
+            );
+            return Ok(());
+        }
+    }
+
+    sync_ready_agreements(portal_client, database)
+        .await
+        .context("fetching new agreements failed")?;
+    download_agreements(portal_client, database, storage_limits)
+        .await
+        .context("downloading agreements failed")?;
+
+    Ok(())
+}
+
+async fn downloaded_files_count(database: &DatabaseConnection) -> Result<u64> {
+    let count = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .count(database)
+        .await?;
+    Ok(count)
 }
 
 /// Simple filesystem-based lock to prevent multiple daemon instances.
@@ -107,9 +135,12 @@ impl Drop for LockFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
+    use chrono::DateTime;
     use sea_orm::{
-        ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
+        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
+        Schema, Set,
     };
     use serde_json::json;
     use std::fs;
@@ -196,18 +227,77 @@ mod tests {
             database,
             Duration::from_millis(5),
             lock_path.clone(),
-            None,
+            StorageLimits::default(),
         )
         .await
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("initial agreements sync failed"),
+            error.to_string().contains("initial portal sync failed"),
             "initial sync errors should be surfaced"
         );
         assert!(
             !lock_path.exists(),
             "lock file should be removed even when an error occurs"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_portal_calls_when_max_files_reached() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "new"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let lock_path = unique_path("lock_max_files");
+        let storage_dir = unique_path("storage_max_files");
+        fs::remove_dir_all(&storage_dir).ok();
+
+        let already_downloaded = agreements::ActiveModel {
+            agreement_id: Set("AGREEMENT-downloaded".into()),
+            user_id: Set("user_1".into()),
+            file_id: Set("FILE-downloaded".into()),
+            filename: Set("downloaded.pdf".into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            downloaded: Set(true),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        already_downloaded.insert(&database).await.unwrap();
+
+        let handle = spawn_portal_daemon(
+            PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            database.clone(),
+            Duration::from_millis(10),
+            lock_path.clone(),
+            StorageLimits {
+                capacity: None,
+                max_files: Some(1),
+            },
+        );
+
+        time::sleep(Duration::from_millis(30)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "daemon should not call portal when max files limit is reached"
+        );
+        assert!(
+            !lock_path.exists(),
+            "lock file should be cleaned up when daemon task is dropped"
         );
     }
 
@@ -268,7 +358,7 @@ mod tests {
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
-            None,
+            StorageLimits::default(),
         );
 
         time::sleep(Duration::from_millis(50)).await;

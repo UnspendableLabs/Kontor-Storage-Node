@@ -33,6 +33,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
 | `--storage-capacity` | `STORAGE_CAPACITY` | _unlimited_ | Max storage for downloads (bytes, supports M/G/T suffix) |
+| `--storage-max-files` | `STORAGE_MAX_FILES` | _unlimited_ | Max number of files to keep locally; when reached, new agreements are not fetched |
 | `--portal-polling-interval-secs` | `PORTAL_POOLING_INTERVAL` | `30` | Interval in seconds between portal polling runs |
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
@@ -43,10 +44,11 @@ PORTAL_API_KEY=super-secret
 DATABASE_URL=sqlite:///tmp/kontor.db
 STORAGE_DIR=/tmp/kontor-files
 STORAGE_CAPACITY=10GB
+STORAGE_MAX_FILES=100
 PORTAL_POOLING_INTERVAL=45
 ```
 
-When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space.
+When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.
 
 ### Database
 

@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_CAPACITY")]
     pub storage_capacity: Option<String>,
 
+    /// Maximum number of files to store locally (unlimited by default)
+    #[arg(long, env = "STORAGE_MAX_FILES")]
+    pub storage_max_files: Option<u64>,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

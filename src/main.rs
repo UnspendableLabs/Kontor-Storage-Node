@@ -18,7 +18,7 @@ use tokio::signal;
 use cli::{Cli, Commands};
 use clients::PortalClient;
 use config::Config;
-use daemon::spawn_portal_daemon;
+use daemon::{spawn_portal_daemon, StorageLimits};
 use database::DBClient;
 
 #[tokio::main]
@@ -54,6 +54,10 @@ async fn run_with_shutdown(
         Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
         None => writeln!(writer, "Storage capacity: unlimited")?,
     }
+    match config.storage_max_files {
+        Some(limit) => writeln!(writer, "Max stored files: {limit}")?,
+        None => writeln!(writer, "Max stored files: unlimited")?,
+    }
 
     std::fs::create_dir_all(&config.storage_dir).with_context(|| {
         format!(
@@ -77,13 +81,17 @@ async fn run_with_shutdown(
             writeln!(writer, "{body}")?;
         }
         Commands::Run => {
+            let storage_limits = StorageLimits {
+                capacity: config.storage_capacity,
+                max_files: config.storage_max_files,
+            };
             run_daemon_command(
                 &mut writer,
                 client,
                 conn,
                 config.portal_polling_interval,
                 lock_path,
-                config.storage_capacity,
+                storage_limits,
                 shutdown,
             )
             .await?;
@@ -99,10 +107,10 @@ async fn run_daemon_command(
     conn: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
-    storage_capacity: Option<u64>,
+    storage_limits: StorageLimits,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let handle = spawn_portal_daemon(client, conn, interval, lock_path, storage_capacity);
+    let handle = spawn_portal_daemon(client, conn, interval, lock_path, storage_limits);
 
     writeln!(
         writer,
@@ -153,6 +161,7 @@ mod tests {
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
+            storage_max_files: None,
             command: Commands::Ping,
         };
 
@@ -200,6 +209,7 @@ mod tests {
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
+            storage_max_files: None,
             command: Commands::Ping,
         };
 
@@ -237,6 +247,7 @@ mod tests {
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: Some("1GB".into()),
+            storage_max_files: Some(5),
             command: Commands::Run,
         };
 
@@ -293,6 +304,7 @@ mod tests {
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: None,
+            storage_max_files: None,
             command: Commands::Run,
         };
 
