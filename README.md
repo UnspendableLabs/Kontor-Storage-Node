@@ -54,6 +54,17 @@ STORAGE_MAX_FILE_SIZE=500MB
 When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
 
+### Download and preparation pipeline
+
+After an agreement file is downloaded into `storage_dir`, the node:
+
+- prepares the file with `kontor_crypto::api::prepare_file`, discarding the `PreparedFile`;
+- persists the resulting `FileMetadata` row in the `file_metadata` table (1:1 with each agreement);
+- updates the aggregated ledger at `<storage_dir>/ledger.bin` via `FileLedger`, creating it when absent;
+- marks the agreement as downloaded only after metadata and ledger persistence succeed.
+
+If persisting metadata or the ledger fails, the raw file stays on disk but the agreement remains pending so a retry can reprocess it without duplicating rows.
+
 ### Database
 
 - Default: SQLite file at `<data_dir>/Kontor-Storage-Node/storage.db` (auto-created).

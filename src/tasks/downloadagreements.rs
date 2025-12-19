@@ -1,11 +1,19 @@
 use crate::clients::PortalClient;
 use crate::daemon::StorageLimits;
-use crate::entities::{agreements, prelude::Agreements};
+use crate::entities::{
+    agreements, file_metadata,
+    prelude::{Agreements, FileMetadata},
+};
 use anyhow::{anyhow, Context, Result};
+use ff::PrimeField;
+use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
+use sea_orm::{sea_query::OnConflict, ActiveValue::NotSet};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     Set,
 };
+use std::path::{Path, PathBuf};
+use tokio::fs;
 
 /// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
@@ -66,12 +74,20 @@ pub async fn download_agreements(
             }
         }
 
-        portal_client
+        let downloaded = portal_client
             .download_file(&agreement.agreement_id, &agreement.file_id)
             .await
             .with_context(|| {
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
+
+        process_downloaded_file(
+            downloaded.path.as_path(),
+            &downloaded.bytes,
+            &agreement,
+            database,
+        )
+        .await?;
 
         let mut model: agreements::ActiveModel = agreement.into();
         model.downloaded = Set(true);
@@ -118,10 +134,134 @@ async fn current_downloaded_count(database: &DatabaseConnection) -> Result<u64> 
     Ok(count)
 }
 
+async fn process_downloaded_file(
+    saved_path: &Path,
+    file_bytes: &[u8],
+    agreement: &agreements::Model,
+    database: &DatabaseConnection,
+) -> Result<()> {
+    let expected_original_size: u64 = agreement
+        .original_size
+        .try_into()
+        .context("agreement original_size does not fit into u64")?;
+
+    let metadata = prepare_file_metadata(
+        file_bytes,
+        &agreement.file_id,
+        &agreement.filename,
+        expected_original_size,
+    )?;
+    let storage_root = saved_path.parent().ok_or_else(|| {
+        anyhow!(
+            "downloaded file path {} does not have a parent directory",
+            saved_path.display()
+        )
+    })?;
+    update_ledger(storage_root, &metadata).await?;
+    persist_file_metadata(database, &agreement.agreement_id, &metadata).await?;
+    Ok(())
+}
+
+fn prepare_file_metadata(
+    bytes: &[u8],
+    expected_file_id: &str,
+    filename: &str,
+    expected_original_size: u64,
+) -> Result<CryptoFileMetadata> {
+    let (_prepared, mut metadata) =
+        api::prepare_file(bytes, filename).context("preparing file with kontor_crypto")?;
+
+    // Keep the metadata aligned with the file identifier provided by the portal.
+    metadata.file_id = expected_file_id.to_string();
+    metadata.filename = filename.to_string();
+    metadata.original_size = expected_original_size
+        .try_into()
+        .context("file metadata original_size exceeds usize")?;
+
+    Ok(metadata)
+}
+
+async fn persist_file_metadata(
+    database: &DatabaseConnection,
+    agreement_id: &str,
+    metadata: &CryptoFileMetadata,
+) -> Result<()> {
+    let original_size: i64 = metadata
+        .original_size
+        .try_into()
+        .context("file metadata original_size exceeds i64")?;
+    let padded_len: i64 = metadata
+        .padded_len
+        .try_into()
+        .context("file metadata padded_len exceeds i64")?;
+
+    let root_hex = hex::encode(metadata.root.to_repr());
+
+    let active_model = file_metadata::ActiveModel {
+        id: Set(metadata.file_id.clone()),
+        agreement_id: Set(agreement_id.to_string()),
+        filename: Set(metadata.filename.clone()),
+        root: Set(root_hex),
+        file_id: Set(metadata.file_id.clone()),
+        original_size: Set(original_size),
+        padded_len: Set(padded_len),
+        created_at: NotSet,
+    };
+
+    FileMetadata::insert(active_model)
+        .on_conflict(
+            OnConflict::column(file_metadata::Column::Id)
+                .update_columns([
+                    file_metadata::Column::Id,
+                    file_metadata::Column::Filename,
+                    file_metadata::Column::Root,
+                    file_metadata::Column::FileId,
+                    file_metadata::Column::OriginalSize,
+                    file_metadata::Column::PaddedLen,
+                ])
+                .to_owned(),
+        )
+        .exec(database)
+        .await
+        .context("persisting file metadata")?;
+
+    Ok(())
+}
+
+async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Result<()> {
+    let ledger_path = ledger_path(storage_root);
+    if let Some(parent) = ledger_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+    }
+
+    let mut ledger = if ledger_path.exists() {
+        FileLedger::load(&ledger_path)
+            .with_context(|| format!("loading ledger from {}", ledger_path.display()))?
+    } else {
+        FileLedger::new()
+    };
+
+    if !ledger.files.contains_key(&metadata.file_id) {
+        ledger
+            .add_file(metadata)
+            .map_err(|err| anyhow!(err).context("adding file to ledger"))?;
+    }
+
+    ledger
+        .save(&ledger_path)
+        .with_context(|| format!("saving ledger to {}", ledger_path.display()))
+}
+
+fn ledger_path(storage_root: &Path) -> PathBuf {
+    storage_root.join("ledger.bin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::prelude::Agreements;
+    use crate::entities::prelude::{Agreements, FileMetadata};
     use sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
     };
@@ -143,8 +283,11 @@ mod tests {
     async fn setup_in_memory_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&stmt).await.unwrap();
+        let agreements_stmt = schema.create_table_from_entity(Agreements);
+        db.execute(&agreements_stmt).await.unwrap();
+
+        let metadata_stmt = schema.create_table_from_entity(FileMetadata);
+        db.execute(&metadata_stmt).await.unwrap();
         db
     }
 
@@ -210,6 +353,114 @@ mod tests {
             .unwrap()
             .expect("agreement should exist");
         assert!(downloaded.downloaded, "downloaded flag should be set");
+
+        let metadata = FileMetadata::find()
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("file metadata should be persisted");
+        assert_eq!(metadata.agreement_id, agreement_id);
+        assert_eq!(metadata.file_id, file_id);
+        assert_eq!(metadata.filename, filename);
+        assert_eq!(metadata.original_size, 123);
+
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger file should be created alongside downloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerun_is_idempotent_and_keeps_single_metadata_row() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-idempotent";
+        let file_id = "FILE-idempotent";
+        let filename = "contract.pdf";
+        let download_path = "/files/contract-idempotent.pdf";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("idempotent");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
+
+        download_agreements(&client, &database, StorageLimits::default())
+            .await
+            .unwrap();
+
+        // Simulate a retry after metadata is already present by resetting the downloaded flag.
+        let mut stored: agreements::ActiveModel = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        stored.downloaded = Set(false);
+        stored.update(&database).await.unwrap();
+
+        download_agreements(&client, &database, StorageLimits::default())
+            .await
+            .unwrap();
+
+        let metadata_count = FileMetadata::find()
+            .count(&database)
+            .await
+            .expect("should count metadata rows");
+        assert_eq!(metadata_count, 1, "metadata should not duplicate on retry");
+
+        let latest = FileMetadata::find()
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("metadata should still exist");
+        assert_eq!(latest.file_id, file_id);
+        assert_eq!(latest.agreement_id, agreement_id);
+
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger should remain persisted after retry"
+        );
+
+        let agreement_after_retry = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(agreement_after_retry.downloaded);
     }
 
     #[tokio::test]
@@ -666,6 +917,85 @@ mod tests {
         assert!(
             !second_record.downloaded,
             "second agreement should remain pending after hitting the max"
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_when_ledger_cannot_be_written() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-ledger-error";
+        let file_id = "FILE-ledger-error";
+        let filename = "contract.pdf";
+        let download_path = "/files/bad-ledger.pdf";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ledger_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        // Create a directory where the ledger file should be written to force a failure.
+        let ledger_dir = storage_dir.join("ledger.bin");
+        stdfs::create_dir_all(&ledger_dir).unwrap();
+
+        let result = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+        )
+        .await;
+
+        assert!(result.is_err(), "ledger write failure should bubble up");
+        assert!(
+            storage_dir.join(file_id).exists(),
+            "downloaded file should be kept even when ledger fails"
+        );
+
+        let metadata_count = FileMetadata::find().count(&database).await.unwrap();
+        assert_eq!(
+            metadata_count, 0,
+            "metadata should not be persisted when ledger fails"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain unprepared when ledger fails"
         );
     }
 }

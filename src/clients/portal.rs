@@ -1,6 +1,7 @@
 #![allow(dead_code)] // Temporary until new Portal client methods are wired into commands.
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -103,7 +104,11 @@ impl PortalClient {
     }
 
     /// Download an agreement file into the configured storage directory.
-    pub async fn download_file(&self, agreement_id: &str, filename: &str) -> Result<PathBuf> {
+    pub async fn download_file(
+        &self,
+        agreement_id: &str,
+        filename: &str,
+    ) -> Result<DownloadedFile> {
         let download_url = self.fetch_download_url(agreement_id).await?;
         let target_path = self.storage_dir.join(filename);
 
@@ -131,7 +136,10 @@ impl PortalClient {
             )
         })?;
 
-        Ok(target_path)
+        Ok(DownloadedFile {
+            path: target_path,
+            bytes,
+        })
     }
 
     async fn fetch_download_url(&self, agreement_id: &str) -> Result<String> {
@@ -200,9 +208,16 @@ struct DownloadUrlResponse {
     download_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadedFile {
+    pub path: PathBuf,
+    pub bytes: Bytes,
+}
+
 #[cfg(test)]
 mod tests {
     use super::PortalClient;
+    use bytes::Bytes;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -403,12 +418,13 @@ mod tests {
 
         let dir = storage_dir("download");
         let client = PortalClient::new(mock_server.uri(), "secret", dir.clone());
-        let saved_path = client
+        let downloaded = client
             .download_file(agreement_id, "sample.txt")
             .await
             .unwrap();
 
-        let contents = fs::read_to_string(saved_path).unwrap();
+        let contents = fs::read_to_string(&downloaded.path).unwrap();
         assert_eq!(contents, "hello world");
+        assert_eq!(downloaded.bytes, Bytes::from_static(b"hello world"));
     }
 }

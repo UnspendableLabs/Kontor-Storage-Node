@@ -137,7 +137,7 @@ impl Drop for LockFileGuard {
 mod tests {
     use super::*;
     use crate::entities::agreements;
-    use crate::entities::prelude::Agreements;
+    use crate::entities::prelude::{Agreements, FileMetadata};
     use chrono::DateTime;
     use sea_orm::{
         ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
@@ -159,8 +159,11 @@ mod tests {
     async fn setup_in_memory_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&stmt).await.unwrap();
+        let agreements_stmt = schema.create_table_from_entity(Agreements);
+        db.execute(&agreements_stmt).await.unwrap();
+
+        let metadata_stmt = schema.create_table_from_entity(FileMetadata);
+        db.execute(&metadata_stmt).await.unwrap();
         db
     }
 
