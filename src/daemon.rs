@@ -366,7 +366,21 @@ mod tests {
             StorageLimits::default(),
         );
 
-        time::sleep(Duration::from_millis(50)).await;
+        // Wait for the daemon to download the agreement at least once. Give it
+        // generous time to finish a full sync cycle, since the download involves
+        // hashing, ledger writes, and metadata persistence.
+        let start = time::Instant::now();
+        let mut downloaded = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            time::sleep(Duration::from_millis(50)).await;
+            if let Some(agreement) = Agreements::find().one(&database).await.unwrap() {
+                if agreement.downloaded {
+                    downloaded = true;
+                    break;
+                }
+            }
+        }
+
         handle.abort();
         let _ = handle.await;
 
@@ -381,7 +395,7 @@ mod tests {
 
         let agreement = Agreements::find().one(&database).await.unwrap().unwrap();
         assert!(
-            agreement.downloaded,
+            downloaded && agreement.downloaded,
             "download task should mark agreements as downloaded"
         );
         let contents = fs::read_to_string(storage_dir.join("FILE-abc")).unwrap();
