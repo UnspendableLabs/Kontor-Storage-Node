@@ -45,6 +45,7 @@ mod tests {
         ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
     };
     use serde_json::json;
+    use std::fs as stdfs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
@@ -93,6 +94,7 @@ mod tests {
 
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("download");
+        stdfs::remove_dir_all(&storage_dir).ok();
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),

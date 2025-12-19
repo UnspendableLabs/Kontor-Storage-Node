@@ -250,6 +250,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let lock_path = unique_path("lock_loop");
         let storage_dir = unique_path("storage_loop");
+        fs::remove_dir_all(&storage_dir).ok();
 
         let handle = spawn_portal_daemon(
             PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
@@ -276,7 +277,7 @@ mod tests {
             agreement.downloaded,
             "download task should mark agreements as downloaded"
         );
-        let contents = fs::read_to_string(storage_dir.join("contract.pdf")).unwrap();
+        let contents = fs::read_to_string(storage_dir.join("FILE-abc")).unwrap();
         assert_eq!(contents, "file-body");
 
         assert!(
