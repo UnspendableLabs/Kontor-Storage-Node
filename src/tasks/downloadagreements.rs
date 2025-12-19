@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 
 /// Download agreement files that are ready and not yet stored locally.
-pub async fn download_ready_agreement_files(
+pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
@@ -19,7 +19,7 @@ pub async fn download_ready_agreement_files(
 
     for agreement in pending {
         portal_client
-            .download_file(&agreement.agreement_id, &agreement.filename)
+            .download_file(&agreement.agreement_id, &agreement.file_id)
             .await
             .with_context(|| {
                 format!("downloading file for agreement {}", agreement.agreement_id)
@@ -71,6 +71,7 @@ mod tests {
     async fn downloads_ready_agreements_and_marks_flag() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-download";
+        let file_id = "FILE-1";
         let filename = "contract.pdf";
         let download_path = "/files/contract.pdf";
         let download_url = format!("{}{}", mock_server.uri(), download_path);
@@ -96,7 +97,7 @@ mod tests {
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
-            file_id: Set("FILE-1".into()),
+            file_id: Set(file_id.into()),
             filename: Set(filename.into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
@@ -109,16 +110,14 @@ mod tests {
         };
         agreement.insert(&database).await.unwrap();
 
-        download_ready_agreement_files(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
         )
         .await
         .unwrap();
 
-        let stored = fs::read_to_string(storage_dir.join(filename))
-            .await
-            .unwrap();
+        let stored = fs::read_to_string(storage_dir.join(file_id)).await.unwrap();
         assert_eq!(stored, "file-body");
 
         let downloaded = Agreements::find()
@@ -135,7 +134,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("empty");
 
-        download_ready_agreement_files(
+        download_agreements(
             &PortalClient::new("http://localhost:1", "secret", storage_dir),
             &database,
         )

@@ -42,8 +42,8 @@ impl PortalClient {
         }
     }
 
-    /// Fetch agreements that are ready for signing.
-    pub async fn get_agreements_to_sign(&self) -> Result<AgreementsPage> {
+    /// Fetch agreements that are marked as ready.
+    pub async fn get_new_agreements(&self) -> Result<AgreementsPage> {
         let url = format!(
             "{}/api/agreements?status=ready",
             self.base_url.trim_end_matches('/')
@@ -60,7 +60,7 @@ impl PortalClient {
         } else {
             let body = resp.text().await.unwrap_or_default();
             Err(anyhow!(
-                "failed to fetch agreements to sign with status {status}: {body}"
+                "failed to fetch new agreements with status {status}: {body}"
             ))
         }
     }
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_agreements_to_sign_requests_ready_status() {
+    async fn get_new_agreements_requests_ready_status() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -337,7 +337,7 @@ mod tests {
                     "nodes": ["NODE-1"],
                     "transaction_id": null,
                     "curation": {},
-                    "status": "ready",
+                    "status": "new",
                     "created_at": "2024-01-15T10:30:00Z"
                 }]
             })))
@@ -345,7 +345,7 @@ mod tests {
             .await;
 
         let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("agreements"));
-        let page = client.get_agreements_to_sign().await.unwrap();
+        let page = client.get_new_agreements().await.unwrap();
 
         assert_eq!(page.total, 1);
         assert_eq!(page.agreements.len(), 1);

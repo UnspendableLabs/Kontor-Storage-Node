@@ -1,5 +1,5 @@
 use crate::clients::PortalClient;
-use crate::tasks::downloadagreements::download_ready_agreement_files;
+use crate::tasks::downloadagreements::download_agreements;
 use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
@@ -40,7 +40,7 @@ async fn run_portal_daemon(
     sync_ready_agreements(&portal_client, &database)
         .await
         .context("initial agreements sync failed")?;
-    download_ready_agreement_files(&portal_client, &database)
+    download_agreements(&portal_client, &database)
         .await
         .context("initial agreement download failed")?;
 
@@ -50,7 +50,7 @@ async fn run_portal_daemon(
         if let Err(err) = sync_ready_agreements(&portal_client, &database).await {
             eprintln!("failed to sync agreements: {err:#}");
         }
-        if let Err(err) = download_ready_agreement_files(&portal_client, &database).await {
+        if let Err(err) = download_agreements(&portal_client, &database).await {
             eprintln!("failed to download agreement files: {err:#}");
         }
     }

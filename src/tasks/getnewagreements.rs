@@ -12,9 +12,9 @@ pub async fn sync_ready_agreements(
     database: &DatabaseConnection,
 ) -> Result<()> {
     let page = portal_client
-        .get_agreements_to_sign()
+        .get_new_agreements()
         .await
-        .context("fetching agreements to sign failed")?;
+        .context("fetching new agreements failed")?;
 
     if page.agreements.is_empty() {
         println!("No new agreements found");

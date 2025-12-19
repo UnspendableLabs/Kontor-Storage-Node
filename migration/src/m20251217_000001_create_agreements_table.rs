@@ -30,7 +30,7 @@ impl MigrationTrait for Migration {
                             .default(JsonValue::Array(Vec::new())),
                     )
                     .col(boolean(Agreements::Downloaded).not_null().default(false))
-                    .col(string_len(Agreements::TransactionId, 64))
+                    .col(string_len(Agreements::TransactionId, 64).null())
                     .col(json(Agreements::Curation))
                     .col(
                         string_len(Agreements::Status, 20)
