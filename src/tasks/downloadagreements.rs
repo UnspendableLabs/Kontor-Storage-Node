@@ -15,6 +15,8 @@ pub async fn download_ready_agreement_files(
         .await
         .context("failed to load agreements to download")?;
 
+    let total = pending.len();
+
     for agreement in pending {
         portal_client
             .download_file(&agreement.agreement_id, &agreement.filename)
@@ -30,6 +32,8 @@ pub async fn download_ready_agreement_files(
             .await
             .context("marking agreement as downloaded failed")?;
     }
+
+    println!("Downloaded {} agreements", total);
 
     Ok(())
 }

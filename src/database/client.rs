@@ -50,14 +50,15 @@ pub struct DBClient {
 impl DBClient {
     /// Create a new database client, ensuring migrations are run when needed.
     pub async fn new(database_url: &str) -> Result<Self> {
-        let should_run_migrations = sqlite::prepare_sqlite(database_url)?;
+        // Always prepare the SQLite file (creating it when needed) but run
+        // migrations unconditionally so schema changes apply to existing
+        // databases as well.
+        sqlite::prepare_sqlite(database_url)?;
         let connection = connect(database_url).await?;
 
-        if should_run_migrations {
-            migration::Migrator::up(&connection, None)
-                .await
-                .context("failed to apply database migrations")?;
-        }
+        migration::Migrator::up(&connection, None)
+            .await
+            .context("failed to apply database migrations")?;
 
         Ok(Self { connection })
     }

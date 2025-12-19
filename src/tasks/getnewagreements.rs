@@ -17,6 +17,7 @@ pub async fn sync_ready_agreements(
         .context("fetching agreements to sign failed")?;
 
     if page.agreements.is_empty() {
+        println!("No new agreements found");
         return Ok(());
     }
 
@@ -45,10 +46,12 @@ pub async fn sync_ready_agreements(
         return Ok(());
     }
 
-    Agreements::insert_many(new_models)
+    Agreements::insert_many(new_models.clone())
         .exec(database)
         .await
         .context("failed to insert new agreements")?;
+
+    println!("Inserted {} new agreements", new_models.len());
 
     Ok(())
 }
