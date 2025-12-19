@@ -54,6 +54,10 @@ async fn run_with_shutdown(
         Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
         None => writeln!(writer, "Storage capacity: unlimited")?,
     }
+    match config.storage_max_file_size {
+        Some(bytes) => writeln!(writer, "Max file size: {bytes} bytes")?,
+        None => writeln!(writer, "Max file size: unlimited")?,
+    }
     match config.storage_max_files {
         Some(limit) => writeln!(writer, "Max stored files: {limit}")?,
         None => writeln!(writer, "Max stored files: unlimited")?,
@@ -83,6 +87,7 @@ async fn run_with_shutdown(
         Commands::Run => {
             let storage_limits = StorageLimits {
                 capacity: config.storage_capacity,
+                max_file_size: config.storage_max_file_size,
                 max_files: config.storage_max_files,
             };
             run_daemon_command(
@@ -161,6 +166,7 @@ mod tests {
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
+            storage_max_file_size: None,
             storage_max_files: None,
             command: Commands::Ping,
         };
@@ -209,6 +215,7 @@ mod tests {
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
+            storage_max_file_size: None,
             storage_max_files: None,
             command: Commands::Ping,
         };
@@ -247,6 +254,7 @@ mod tests {
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: Some("1GB".into()),
+            storage_max_file_size: None,
             storage_max_files: Some(5),
             command: Commands::Run,
         };
@@ -304,6 +312,7 @@ mod tests {
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: None,
+            storage_max_file_size: None,
             storage_max_files: None,
             command: Commands::Run,
         };

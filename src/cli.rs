@@ -37,6 +37,10 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_MAX_FILES")]
     pub storage_max_files: Option<u64>,
 
+    /// Maximum size of a single file to download/store (supports M/G/T suffix)
+    #[arg(long, env = "STORAGE_MAX_FILE_SIZE")]
+    pub storage_max_file_size: Option<String>,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

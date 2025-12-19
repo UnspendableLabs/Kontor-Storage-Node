@@ -22,8 +22,15 @@ pub async fn download_agreements(
         None => 0,
     };
 
-    let pending = Agreements::find()
-        .filter(agreements::Column::Downloaded.eq(false))
+    let mut query = Agreements::find().filter(agreements::Column::Downloaded.eq(false));
+    if let Some(max_file_size) = storage_limits.max_file_size {
+        let max_file_size: i64 = max_file_size
+            .try_into()
+            .map_err(|_| anyhow!("max file size exceeds trackable range"))?;
+        query = query.filter(agreements::Column::OriginalSize.lte(max_file_size));
+    }
+
+    let pending = query
         .all(database)
         .await
         .context("failed to load agreements to download")?;
@@ -283,6 +290,7 @@ mod tests {
             &database,
             StorageLimits {
                 capacity: Some(1000),
+                max_file_size: None,
                 max_files: None,
             },
         )
@@ -303,6 +311,70 @@ mod tests {
         assert!(
             !stored.downloaded,
             "downloaded flag should remain false when skipping"
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_downloads_over_max_file_size() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-too-large";
+        let file_id = "FILE-too-large";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("max_file_size_skip");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let pending = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("pending.pdf".into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(2_000),
+            nodes: Set(json!(["NODE-1"])),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap()),
+        };
+        pending.insert(&database).await.unwrap();
+
+        download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits {
+                capacity: None,
+                max_file_size: Some(1_000),
+                max_files: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "file should not be downloaded when above max file size"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("agreement should exist");
+        assert!(
+            !stored.downloaded,
+            "downloaded flag should remain false when skipping oversized file"
         );
     }
 
@@ -374,6 +446,7 @@ mod tests {
             &database,
             StorageLimits {
                 capacity: Some(1000),
+                max_file_size: None,
                 max_files: None,
             },
         )
@@ -468,6 +541,7 @@ mod tests {
             &database,
             StorageLimits {
                 capacity: None,
+                max_file_size: None,
                 max_files: Some(1),
             },
         )
@@ -559,6 +633,7 @@ mod tests {
             &database,
             StorageLimits {
                 capacity: None,
+                max_file_size: None,
                 max_files: Some(1),
             },
         )

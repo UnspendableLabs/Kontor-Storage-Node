@@ -15,11 +15,16 @@ pub struct Config {
     pub portal_polling_interval: Duration,
     pub storage_capacity: Option<u64>,
     pub storage_max_files: Option<u64>,
+    pub storage_max_file_size: Option<u64>,
 }
 
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
         let storage_capacity = match &cli.storage_capacity {
+            Some(raw) => Some(parse_storage_capacity(raw)?),
+            None => None,
+        };
+        let storage_max_file_size = match &cli.storage_max_file_size {
             Some(raw) => Some(parse_storage_capacity(raw)?),
             None => None,
         };
@@ -32,6 +37,7 @@ impl Config {
             portal_polling_interval: Duration::from_secs(cli.portal_polling_interval_secs),
             storage_capacity,
             storage_max_files: cli.storage_max_files,
+            storage_max_file_size,
         })
     }
 }
@@ -74,6 +80,7 @@ mod tests {
             portal_polling_interval_secs: 42,
             storage_capacity: Some("15GB".into()),
             storage_max_files: Some(10),
+            storage_max_file_size: Some("1GB".into()),
             command: Commands::Ping,
         };
 
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(config.portal_polling_interval, Duration::from_secs(42));
         assert_eq!(config.storage_capacity, Some(15_000_000_000));
         assert_eq!(config.storage_max_files, Some(10));
+        assert_eq!(config.storage_max_file_size, Some(1_000_000_000));
     }
 
     #[test]

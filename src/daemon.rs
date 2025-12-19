@@ -16,6 +16,7 @@ use tokio::time;
 pub struct StorageLimits {
     pub capacity: Option<u64>,
     pub max_files: Option<u64>,
+    pub max_file_size: Option<u64>,
 }
 
 /// Starts the portal synchronization daemon that periodically fetches agreements
@@ -282,6 +283,7 @@ mod tests {
             lock_path.clone(),
             StorageLimits {
                 capacity: None,
+                max_file_size: None,
                 max_files: Some(1),
             },
         );
