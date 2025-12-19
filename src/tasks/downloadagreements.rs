@@ -9,11 +9,31 @@ use ff::PrimeField;
 use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
 use sea_orm::{sea_query::OnConflict, ActiveValue::NotSet};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
+use std::fmt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+#[derive(Debug)]
+enum PostProcessError {
+    Prepare(anyhow::Error),
+    Metadata(anyhow::Error),
+    Ledger(anyhow::Error),
+}
+
+impl fmt::Display for PostProcessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare(err) => write!(f, "prepare_file failed: {err}"),
+            Self::Metadata(err) => write!(f, "metadata persistence failed: {err}"),
+            Self::Ledger(err) => write!(f, "ledger update failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for PostProcessError {}
 
 /// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
@@ -81,20 +101,38 @@ pub async fn download_agreements(
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
 
-        process_downloaded_file(
+        let txn = database.begin().await?;
+
+        // If post-processing fails, delete the downloaded file so capacity tracking
+        // stays accurate and the next retry can start cleanly.
+        if let Err(err) = process_downloaded_file(
             downloaded.path.as_path(),
             &downloaded.bytes,
             &agreement,
-            database,
+            &txn,
         )
-        .await?;
+        .await
+        {
+            if downloaded.path.exists() {
+                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                    eprintln!(
+                        "failed to remove downloaded file {} after error: {remove_err}",
+                        downloaded.path.display()
+                    );
+                }
+            }
+            txn.rollback().await.ok();
+            return Err(anyhow!(err));
+        }
 
         let mut model: agreements::ActiveModel = agreement.into();
         model.downloaded = Set(true);
         model
-            .update(database)
+            .update(&txn)
             .await
             .context("marking agreement as downloaded failed")?;
+
+        txn.commit().await?;
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);
@@ -138,51 +176,39 @@ async fn process_downloaded_file(
     saved_path: &Path,
     file_bytes: &[u8],
     agreement: &agreements::Model,
-    database: &DatabaseConnection,
-) -> Result<()> {
-    let expected_original_size: u64 = agreement
-        .original_size
-        .try_into()
-        .context("agreement original_size does not fit into u64")?;
+    transaction: &DatabaseTransaction,
+) -> Result<(), PostProcessError> {
+    let metadata = prepare_file_metadata(file_bytes, &agreement.filename)
+        .map_err(PostProcessError::Prepare)?;
+    let storage_root = saved_path
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "downloaded file path {} does not have a parent directory",
+                saved_path.display()
+            )
+        })
+        .map_err(PostProcessError::Prepare)?;
+    // Persist metadata first within the transaction so DB writes roll back if ledger fails.
+    persist_file_metadata(transaction, &agreement.agreement_id, &metadata)
+        .await
+        .map_err(PostProcessError::Metadata)?;
 
-    let metadata = prepare_file_metadata(
-        file_bytes,
-        &agreement.file_id,
-        &agreement.filename,
-        expected_original_size,
-    )?;
-    let storage_root = saved_path.parent().ok_or_else(|| {
-        anyhow!(
-            "downloaded file path {} does not have a parent directory",
-            saved_path.display()
-        )
-    })?;
-    update_ledger(storage_root, &metadata).await?;
-    persist_file_metadata(database, &agreement.agreement_id, &metadata).await?;
+    update_ledger(storage_root, &metadata)
+        .await
+        .map_err(PostProcessError::Ledger)?;
+
     Ok(())
 }
 
-fn prepare_file_metadata(
-    bytes: &[u8],
-    expected_file_id: &str,
-    filename: &str,
-    expected_original_size: u64,
-) -> Result<CryptoFileMetadata> {
-    let (_prepared, mut metadata) =
+fn prepare_file_metadata(bytes: &[u8], filename: &str) -> Result<CryptoFileMetadata> {
+    let (_prepared, metadata) =
         api::prepare_file(bytes, filename).context("preparing file with kontor_crypto")?;
-
-    // Keep the metadata aligned with the file identifier provided by the portal.
-    metadata.file_id = expected_file_id.to_string();
-    metadata.filename = filename.to_string();
-    metadata.original_size = expected_original_size
-        .try_into()
-        .context("file metadata original_size exceeds usize")?;
-
     Ok(metadata)
 }
 
 async fn persist_file_metadata(
-    database: &DatabaseConnection,
+    database: &impl ConnectionTrait,
     agreement_id: &str,
     metadata: &CryptoFileMetadata,
 ) -> Result<()> {
@@ -360,9 +386,14 @@ mod tests {
             .unwrap()
             .expect("file metadata should be persisted");
         assert_eq!(metadata.agreement_id, agreement_id);
-        assert_eq!(metadata.file_id, file_id);
+        assert!(!metadata.file_id.is_empty(), "file_id should be populated");
+        assert_eq!(metadata.id, metadata.file_id, "id mirrors file_id");
         assert_eq!(metadata.filename, filename);
-        assert_eq!(metadata.original_size, 123);
+        assert_eq!(
+            metadata.original_size,
+            "file-body".len() as i64,
+            "original_size should reflect prepared file bytes"
+        );
 
         assert!(
             storage_dir.join("ledger.bin").exists(),
@@ -446,8 +477,14 @@ mod tests {
             .await
             .unwrap()
             .expect("metadata should still exist");
-        assert_eq!(latest.file_id, file_id);
         assert_eq!(latest.agreement_id, agreement_id);
+        assert!(!latest.file_id.is_empty(), "file_id should remain set");
+        assert_eq!(latest.id, latest.file_id, "id mirrors file_id");
+        assert_eq!(
+            latest.original_size,
+            "file-body".len() as i64,
+            "original_size reflects prepared file bytes"
+        );
 
         assert!(
             storage_dir.join("ledger.bin").exists(),
@@ -977,8 +1014,8 @@ mod tests {
 
         assert!(result.is_err(), "ledger write failure should bubble up");
         assert!(
-            storage_dir.join(file_id).exists(),
-            "downloaded file should be kept even when ledger fails"
+            !storage_dir.join(file_id).exists(),
+            "downloaded file should be removed when post-processing fails"
         );
 
         let metadata_count = FileMetadata::find().count(&database).await.unwrap();

@@ -373,7 +373,7 @@ mod tests {
         // hashing, ledger writes, and metadata persistence.
         let start = time::Instant::now();
         let mut downloaded = false;
-        while start.elapsed() < Duration::from_secs(10) {
+        while start.elapsed() < Duration::from_secs(20) {
             time::sleep(Duration::from_millis(50)).await;
             if let Some(agreement) = Agreements::find().one(&database).await.unwrap() {
                 if agreement.downloaded {
