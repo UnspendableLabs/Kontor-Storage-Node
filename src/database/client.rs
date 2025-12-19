@@ -232,4 +232,10 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn default_storage_dir_falls_back_when_no_dir_available() {
+        let dir = with_data_dir_override(None, default_storage_dir);
+        assert_eq!(dir, PathBuf::from(DEFAULT_FILES_DIR));
+    }
 }

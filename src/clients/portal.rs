@@ -427,4 +427,102 @@ mod tests {
         assert_eq!(contents, "hello world");
         assert_eq!(downloaded.bytes, Bytes::from_static(b"hello world"));
     }
+
+    #[tokio::test]
+    async fn join_agreement_returns_error_on_failure() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-error";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/api/agreements/{agreement_id}/join")))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("join_error"));
+        let err = client
+            .join_agreement(agreement_id, "txid:0")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("status 400"),
+            "expected error to include status, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_propagates_http_error() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-http-error";
+        let download_url = format!("{}/files/error", mock_server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/files/error"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("download_http"));
+        let err = client
+            .download_file(agreement_id, "file.bin")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to download file"),
+            "expected http error to be surfaced, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_errors_when_storage_dir_is_file() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-bad-dir";
+        let download_url = format!("{}/files/ok", mock_server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/files/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&mock_server)
+            .await;
+
+        let storage_file = storage_dir("storage_file");
+        std::fs::remove_dir_all(&storage_file).ok();
+        std::fs::create_dir_all(storage_file.parent().unwrap()).unwrap();
+        std::fs::write(&storage_file, "not a dir").unwrap();
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_file.clone());
+        let err = client
+            .download_file(agreement_id, "ignored.bin")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unable to create storage directory"),
+            "expected directory creation error, got {err}"
+        );
+    }
 }

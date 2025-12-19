@@ -1077,6 +1077,28 @@ mod tests {
         assert_eq!(agreement_rows, 0, "no agreements should be persisted");
     }
 
+    #[test]
+    fn post_process_error_display_is_readable() {
+        let prepare_err = PostProcessError::Prepare(anyhow!("prep"));
+        let metadata_err = PostProcessError::Metadata(anyhow!("meta"));
+        let ledger_err = PostProcessError::Ledger(anyhow!("ledger"));
+
+        assert!(
+            prepare_err.to_string().contains("prepare_file failed"),
+            "prepare variant should mention prepare failure"
+        );
+        assert!(
+            metadata_err
+                .to_string()
+                .contains("metadata persistence failed"),
+            "metadata variant should mention persistence failure"
+        );
+        assert!(
+            ledger_err.to_string().contains("ledger update failed"),
+            "ledger variant should mention ledger failure"
+        );
+    }
+
     #[tokio::test]
     async fn persist_file_metadata_rejects_overflow_sizes() {
         let database = setup_in_memory_db().await;
