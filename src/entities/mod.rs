@@ -3,4 +3,3 @@
 pub mod prelude;
 
 pub mod agreements;
-pub mod file_metadata;

@@ -221,10 +221,6 @@ mod tests {
             schema.has_table("agreements").await?,
             "expected agreements table to exist after running migrations"
         );
-        assert!(
-            schema.has_table("file_metadata").await?,
-            "expected file_metadata table to exist after running migrations"
-        );
 
         let steps = migration::Migrator::migrations().len() as u32;
         migration::Migrator::down(&conn, Some(steps)).await?;
@@ -232,10 +228,6 @@ mod tests {
         assert!(
             !schema.has_table("agreements").await?,
             "expected agreements table to be dropped after rolling back migrations"
-        );
-        assert!(
-            !schema.has_table("file_metadata").await?,
-            "expected file_metadata table to be dropped after rolling back migrations"
         );
 
         Ok(())

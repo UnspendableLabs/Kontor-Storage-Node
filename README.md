@@ -59,11 +59,10 @@ When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or bel
 After an agreement file is downloaded into `storage_dir`, the node:
 
 - prepares the file with `kontor_crypto::api::prepare_file`, discarding the `PreparedFile`;
-- persists the resulting `FileMetadata` row in the `file_metadata` table (1:1 with each agreement);
+- persists the resulting metadata directly on the `agreements` table (1:1 with each agreement);
 - updates the aggregated ledger at `<storage_dir>/ledger.bin` via `FileLedger`, creating it when absent;
 - marks the agreement as downloaded only after metadata and ledger persistence succeed.
 
-If persisting metadata or the ledger fails, the raw file stays on disk but the agreement remains pending so a retry can reprocess it without duplicating rows.
 
 ### Database
 

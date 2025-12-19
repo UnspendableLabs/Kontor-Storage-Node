@@ -137,7 +137,7 @@ impl Drop for LockFileGuard {
 mod tests {
     use super::*;
     use crate::entities::agreements;
-    use crate::entities::prelude::{Agreements, FileMetadata};
+    use crate::entities::prelude::Agreements;
     use chrono::DateTime;
     use sea_orm::{
         ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
@@ -162,9 +162,6 @@ mod tests {
         let schema = Schema::new(DatabaseBackend::Sqlite);
         let agreements_stmt = schema.create_table_from_entity(Agreements);
         db.execute(&agreements_stmt).await.unwrap();
-
-        let metadata_stmt = schema.create_table_from_entity(FileMetadata);
-        db.execute(&metadata_stmt).await.unwrap();
         db
     }
 
@@ -272,6 +269,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),

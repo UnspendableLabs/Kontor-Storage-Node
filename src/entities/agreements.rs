@@ -13,6 +13,8 @@ pub struct Model {
     pub mime_type: String,
     pub original_size: i64,
     pub nodes: Json,
+    pub root: Option<String>,
+    pub padded_len: Option<i64>,
     pub downloaded: bool,
     pub transaction_id: Option<String>,
     pub curation: Json,

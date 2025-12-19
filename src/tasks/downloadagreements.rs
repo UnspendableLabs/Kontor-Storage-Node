@@ -1,13 +1,9 @@
 use crate::clients::PortalClient;
 use crate::daemon::StorageLimits;
-use crate::entities::{
-    agreements, file_metadata,
-    prelude::{Agreements, FileMetadata},
-};
+use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
-use sea_orm::{sea_query::OnConflict, ActiveValue::NotSet};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
     EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
@@ -125,8 +121,11 @@ pub async fn download_agreements(
             return Err(anyhow!(err));
         }
 
-        let mut model: agreements::ActiveModel = agreement.into();
-        model.downloaded = Set(true);
+        let model = agreements::ActiveModel {
+            agreement_id: Set(agreement.agreement_id.clone()),
+            downloaded: Set(true),
+            ..Default::default()
+        };
         model
             .update(&txn)
             .await
@@ -197,7 +196,7 @@ async fn process_downloaded_file(
         })
         .map_err(PostProcessError::Prepare)?;
     // Persist metadata first within the transaction so DB writes roll back if ledger fails.
-    persist_file_metadata(transaction, &agreement.agreement_id, &metadata)
+    persist_file_metadata(transaction, agreement, &metadata)
         .await
         .map_err(PostProcessError::Metadata)?;
 
@@ -216,7 +215,7 @@ fn prepare_file_metadata(bytes: &[u8], filename: &str) -> Result<CryptoFileMetad
 
 async fn persist_file_metadata(
     database: &impl ConnectionTrait,
-    agreement_id: &str,
+    agreement: &agreements::Model,
     metadata: &CryptoFileMetadata,
 ) -> Result<()> {
     let original_size: i64 = metadata
@@ -230,33 +229,18 @@ async fn persist_file_metadata(
 
     let root_hex = hex::encode(metadata.root.to_repr());
 
-    let active_model = file_metadata::ActiveModel {
-        id: Set(metadata.file_id.clone()),
-        agreement_id: Set(agreement_id.to_string()),
-        filename: Set(metadata.filename.clone()),
-        root: Set(root_hex),
-        file_id: Set(metadata.file_id.clone()),
+    let active = agreements::ActiveModel {
+        agreement_id: Set(agreement.agreement_id.clone()),
         original_size: Set(original_size),
-        padded_len: Set(padded_len),
-        created_at: NotSet,
+        root: Set(Some(root_hex)),
+        padded_len: Set(Some(padded_len)),
+        ..Default::default()
     };
 
-    FileMetadata::insert(active_model)
-        .on_conflict(
-            OnConflict::column(file_metadata::Column::Id)
-                .update_columns([
-                    file_metadata::Column::Id,
-                    file_metadata::Column::Filename,
-                    file_metadata::Column::Root,
-                    file_metadata::Column::FileId,
-                    file_metadata::Column::OriginalSize,
-                    file_metadata::Column::PaddedLen,
-                ])
-                .to_owned(),
-        )
-        .exec(database)
+    active
+        .update(database)
         .await
-        .context("persisting file metadata")?;
+        .context("persisting file metadata onto agreement")?;
 
     Ok(())
 }
@@ -294,7 +278,7 @@ fn ledger_path(storage_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::prelude::{Agreements, FileMetadata};
+    use crate::entities::prelude::Agreements;
     use halo2curves::pasta::Fq;
     use sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
@@ -319,9 +303,6 @@ mod tests {
         let schema = Schema::new(DatabaseBackend::Sqlite);
         let agreements_stmt = schema.create_table_from_entity(Agreements);
         db.execute(&agreements_stmt).await.unwrap();
-
-        let metadata_stmt = schema.create_table_from_entity(FileMetadata);
-        db.execute(&metadata_stmt).await.unwrap();
         db
     }
 
@@ -361,6 +342,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -388,20 +371,21 @@ mod tests {
             .expect("agreement should exist");
         assert!(downloaded.downloaded, "downloaded flag should be set");
 
-        let metadata = FileMetadata::find()
-            .one(&database)
-            .await
-            .unwrap()
-            .expect("file metadata should be persisted");
-        assert_eq!(metadata.agreement_id, agreement_id);
-        assert!(!metadata.file_id.is_empty(), "file_id should be populated");
-        assert_eq!(metadata.id, metadata.file_id, "id mirrors file_id");
-        assert_eq!(metadata.filename, filename);
+        assert!(
+            downloaded.root.is_some(),
+            "metadata root should be persisted on the agreement"
+        );
         assert_eq!(
-            metadata.original_size,
+            downloaded.original_size,
             "file-body".len() as i64,
             "original_size should reflect prepared file bytes"
         );
+        assert!(
+            downloaded.padded_len.is_some(),
+            "padded_len should be stored on the agreement"
+        );
+        assert_eq!(downloaded.filename, filename);
+        assert_eq!(downloaded.file_id, file_id);
 
         assert!(
             storage_dir.join("ledger.bin").exists(),
@@ -445,6 +429,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -474,22 +460,23 @@ mod tests {
             .await
             .unwrap();
 
-        let metadata_count = FileMetadata::find()
-            .count(&database)
-            .await
-            .expect("should count metadata rows");
-        assert_eq!(metadata_count, 1, "metadata should not duplicate on retry");
-
-        let latest = FileMetadata::find()
+        let agreement_after_retry = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
             .one(&database)
             .await
             .unwrap()
-            .expect("metadata should still exist");
-        assert_eq!(latest.agreement_id, agreement_id);
-        assert!(!latest.file_id.is_empty(), "file_id should remain set");
-        assert_eq!(latest.id, latest.file_id, "id mirrors file_id");
+            .unwrap();
+        assert!(agreement_after_retry.downloaded);
+        assert!(
+            agreement_after_retry.root.is_some(),
+            "root should remain set after retry"
+        );
+        assert!(
+            agreement_after_retry.padded_len.is_some(),
+            "padded_len should remain set after retry"
+        );
         assert_eq!(
-            latest.original_size,
+            agreement_after_retry.original_size,
             "file-body".len() as i64,
             "original_size reflects prepared file bytes"
         );
@@ -498,14 +485,6 @@ mod tests {
             storage_dir.join("ledger.bin").exists(),
             "ledger should remain persisted after retry"
         );
-
-        let agreement_after_retry = Agreements::find()
-            .filter(agreements::Column::AgreementId.eq(agreement_id))
-            .one(&database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(agreement_after_retry.downloaded);
     }
 
     #[tokio::test]
@@ -556,6 +535,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(900),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -572,6 +553,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -637,6 +620,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(2_000),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -713,6 +698,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(600),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -729,6 +716,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(500),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -808,6 +797,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(100),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -824,6 +815,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -900,6 +893,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -916,6 +911,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -1001,6 +998,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -1026,12 +1025,6 @@ mod tests {
             "downloaded file should be removed when post-processing fails"
         );
 
-        let metadata_count = FileMetadata::find().count(&database).await.unwrap();
-        assert_eq!(
-            metadata_count, 0,
-            "metadata should not be persisted when ledger fails"
-        );
-
         let stored = Agreements::find()
             .filter(agreements::Column::AgreementId.eq(agreement_id))
             .one(&database)
@@ -1041,6 +1034,10 @@ mod tests {
         assert!(
             !stored.downloaded,
             "agreement should remain unprepared when ledger fails"
+        );
+        assert!(
+            stored.root.is_none(),
+            "metadata should not be persisted when ledger fails"
         );
     }
 
@@ -1056,6 +1053,8 @@ mod tests {
             mime_type: "application/pdf".into(),
             original_size: 10,
             nodes: json!(["NODE-1"]),
+            root: None,
+            padded_len: None,
             downloaded: false,
             transaction_id: None,
             curation: json!({}),
@@ -1074,11 +1073,8 @@ mod tests {
 
         txn.rollback().await.unwrap();
 
-        let metadata_rows = FileMetadata::find().count(&database).await.unwrap();
-        assert_eq!(
-            metadata_rows, 0,
-            "metadata should not be persisted on prepare errors"
-        );
+        let agreement_rows = Agreements::find().count(&database).await.unwrap();
+        assert_eq!(agreement_rows, 0, "no agreements should be persisted");
     }
 
     #[tokio::test]
@@ -1092,7 +1088,24 @@ mod tests {
             filename: "huge.bin".into(),
         };
 
-        let err = persist_file_metadata(&database, "AGREEMENT-overflow", &metadata)
+        let agreement = agreements::Model {
+            agreement_id: "AGREEMENT-overflow".into(),
+            user_id: "user_1".into(),
+            file_id: "FILE-overflow".into(),
+            filename: "huge.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            original_size: 1,
+            nodes: json!(["NODE-1"]),
+            root: None,
+            padded_len: None,
+            downloaded: false,
+            transaction_id: None,
+            curation: json!({}),
+            status: "ready".into(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
+        };
+
+        let err = persist_file_metadata(&database, &agreement, &metadata)
             .await
             .expect_err("overflowing metadata should return an error");
 
@@ -1101,9 +1114,9 @@ mod tests {
             "error should mention i64 overflow"
         );
 
-        let metadata_rows = FileMetadata::find().count(&database).await.unwrap();
+        let agreement_rows = Agreements::find().count(&database).await.unwrap();
         assert_eq!(
-            metadata_rows, 0,
+            agreement_rows, 0,
             "overflowing metadata should not be stored"
         );
     }
