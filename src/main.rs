@@ -135,6 +135,9 @@ async fn run_daemon_command(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{sleep, Duration};
@@ -336,5 +339,44 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    #[test]
+    fn load_local_env_returns_ok_when_missing() {
+        let temp_dir = unique_storage_dir("load_env_missing");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&temp_dir).unwrap();
+
+        let result = load_local_env();
+
+        env::set_current_dir(original_dir).unwrap();
+        std::fs::remove_dir_all(&temp_dir).ok();
+        assert!(result.is_ok(), "missing .env.local should not error");
+    }
+
+    #[test]
+    fn load_local_env_propagates_io_error() {
+        let temp_dir = unique_storage_dir("load_env_error");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&temp_dir).unwrap();
+
+        let env_path = temp_dir.join(".env.local");
+        std::fs::write(&env_path, "SHOULD_NOT_LOAD=1").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = load_local_env();
+
+        #[cfg(unix)]
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600)).ok();
+        env::set_current_dir(original_dir).unwrap();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(
+            result.is_err(),
+            "directory at .env.local should cause an IO error"
+        );
     }
 }

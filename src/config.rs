@@ -117,4 +117,29 @@ mod tests {
         assert!(parse_storage_capacity("abc").is_err());
         assert!(parse_storage_capacity("10 XB").is_err());
     }
+
+    #[test]
+    fn from_trait_invokes_from_cli() {
+        let cli = Cli {
+            portal_url: "https://portal.example/api".to_string(),
+            portal_api_key: "secret".to_string(),
+            database_url: "sqlite://localhost/mydb".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/files")),
+            portal_polling_interval_secs: 10,
+            storage_capacity: None,
+            storage_max_files: None,
+            storage_max_file_size: None,
+            command: Commands::Ping,
+        };
+
+        let config: Config = (&cli).into();
+        assert_eq!(config.portal_url, cli.portal_url);
+        assert_eq!(config.portal_api_key, cli.portal_api_key);
+        assert_eq!(config.database_url, cli.database_url);
+        assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
+        assert_eq!(
+            config.portal_polling_interval,
+            Duration::from_secs(cli.portal_polling_interval_secs)
+        );
+    }
 }

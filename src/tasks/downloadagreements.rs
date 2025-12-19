@@ -2,10 +2,34 @@ use crate::clients::PortalClient;
 use crate::daemon::StorageLimits;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
+use ff::PrimeField;
+use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
+use std::fmt;
+use std::path::{Path, PathBuf};
+use tokio::fs;
+
+#[derive(Debug)]
+enum PostProcessError {
+    Prepare(anyhow::Error),
+    Metadata(anyhow::Error),
+    Ledger(anyhow::Error),
+}
+
+impl fmt::Display for PostProcessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare(err) => write!(f, "prepare_file failed: {err}"),
+            Self::Metadata(err) => write!(f, "metadata persistence failed: {err}"),
+            Self::Ledger(err) => write!(f, "ledger update failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for PostProcessError {}
 
 /// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
@@ -66,19 +90,48 @@ pub async fn download_agreements(
             }
         }
 
-        portal_client
+        let downloaded = portal_client
             .download_file(&agreement.agreement_id, &agreement.file_id)
             .await
             .with_context(|| {
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
 
-        let mut model: agreements::ActiveModel = agreement.into();
-        model.downloaded = Set(true);
+        let txn = database.begin().await?;
+
+        // If post-processing fails, delete the downloaded file so capacity tracking
+        // stays accurate and the next retry can start cleanly.
+        if let Err(err) = process_downloaded_file(
+            downloaded.path.as_path(),
+            &downloaded.bytes,
+            &agreement,
+            &txn,
+        )
+        .await
+        {
+            if downloaded.path.exists() {
+                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                    eprintln!(
+                        "failed to remove downloaded file {} after error: {remove_err}",
+                        downloaded.path.display()
+                    );
+                }
+            }
+            txn.rollback().await.ok();
+            return Err(anyhow!(err));
+        }
+
+        let model = agreements::ActiveModel {
+            agreement_id: Set(agreement.agreement_id.clone()),
+            downloaded: Set(true),
+            ..Default::default()
+        };
         model
-            .update(database)
+            .update(&txn)
             .await
             .context("marking agreement as downloaded failed")?;
+
+        txn.commit().await?;
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);
@@ -118,16 +171,121 @@ async fn current_downloaded_count(database: &DatabaseConnection) -> Result<u64> 
     Ok(count)
 }
 
+async fn process_downloaded_file(
+    saved_path: &Path,
+    file_bytes: &[u8],
+    agreement: &agreements::Model,
+    transaction: &DatabaseTransaction,
+) -> Result<(), PostProcessError> {
+    let metadata = prepare_file_metadata(file_bytes, &agreement.filename)
+        .map_err(PostProcessError::Prepare)?;
+    let storage_root = saved_path
+        .parent()
+        .and_then(|parent| {
+            if parent.as_os_str().is_empty() {
+                None
+            } else {
+                Some(parent)
+            }
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "downloaded file path {} does not have a parent directory",
+                saved_path.display()
+            )
+        })
+        .map_err(PostProcessError::Prepare)?;
+    // Persist metadata first within the transaction so DB writes roll back if ledger fails.
+    persist_file_metadata(transaction, agreement, &metadata)
+        .await
+        .map_err(PostProcessError::Metadata)?;
+
+    update_ledger(storage_root, &metadata)
+        .await
+        .map_err(PostProcessError::Ledger)?;
+
+    Ok(())
+}
+
+fn prepare_file_metadata(bytes: &[u8], filename: &str) -> Result<CryptoFileMetadata> {
+    let (_prepared, metadata) =
+        api::prepare_file(bytes, filename).context("preparing file with kontor_crypto")?;
+    Ok(metadata)
+}
+
+async fn persist_file_metadata(
+    database: &impl ConnectionTrait,
+    agreement: &agreements::Model,
+    metadata: &CryptoFileMetadata,
+) -> Result<()> {
+    let original_size: i64 = metadata
+        .original_size
+        .try_into()
+        .context("file metadata original_size exceeds i64")?;
+    let padded_len: i64 = metadata
+        .padded_len
+        .try_into()
+        .context("file metadata padded_len exceeds i64")?;
+
+    let root_hex = hex::encode(metadata.root.to_repr());
+
+    let active = agreements::ActiveModel {
+        agreement_id: Set(agreement.agreement_id.clone()),
+        original_size: Set(original_size),
+        root: Set(Some(root_hex)),
+        padded_len: Set(Some(padded_len)),
+        ..Default::default()
+    };
+
+    active
+        .update(database)
+        .await
+        .context("persisting file metadata onto agreement")?;
+
+    Ok(())
+}
+
+async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Result<()> {
+    let ledger_path = ledger_path(storage_root);
+    if let Some(parent) = ledger_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+    }
+
+    let mut ledger = if ledger_path.exists() {
+        FileLedger::load(&ledger_path)
+            .with_context(|| format!("loading ledger from {}", ledger_path.display()))?
+    } else {
+        FileLedger::new()
+    };
+
+    if !ledger.files.contains_key(&metadata.file_id) {
+        ledger
+            .add_file(metadata)
+            .map_err(|err| anyhow!(err).context("adding file to ledger"))?;
+    }
+
+    ledger
+        .save(&ledger_path)
+        .with_context(|| format!("saving ledger to {}", ledger_path.display()))
+}
+
+fn ledger_path(storage_root: &Path) -> PathBuf {
+    storage_root.join("ledger.bin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entities::prelude::Agreements;
+    use halo2curves::pasta::Fq;
     use sea_orm::{
         ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
     };
     use serde_json::json;
     use std::fs as stdfs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
     use wiremock::matchers::{header, method, path, query_param};
@@ -143,8 +301,8 @@ mod tests {
     async fn setup_in_memory_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&stmt).await.unwrap();
+        let agreements_stmt = schema.create_table_from_entity(Agreements);
+        db.execute(&agreements_stmt).await.unwrap();
         db
     }
 
@@ -184,6 +342,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -210,6 +370,121 @@ mod tests {
             .unwrap()
             .expect("agreement should exist");
         assert!(downloaded.downloaded, "downloaded flag should be set");
+
+        assert!(
+            downloaded.root.is_some(),
+            "metadata root should be persisted on the agreement"
+        );
+        assert_eq!(
+            downloaded.original_size,
+            "file-body".len() as i64,
+            "original_size should reflect prepared file bytes"
+        );
+        assert!(
+            downloaded.padded_len.is_some(),
+            "padded_len should be stored on the agreement"
+        );
+        assert_eq!(downloaded.filename, filename);
+        assert_eq!(downloaded.file_id, file_id);
+
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger file should be created alongside downloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerun_is_idempotent_and_keeps_single_metadata_row() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-idempotent";
+        let file_id = "FILE-idempotent";
+        let filename = "contract.pdf";
+        let download_path = "/files/contract-idempotent.pdf";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("idempotent");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
+
+        download_agreements(&client, &database, StorageLimits::default())
+            .await
+            .unwrap();
+
+        // Simulate a retry after metadata is already present by resetting the downloaded flag.
+        let mut stored: agreements::ActiveModel = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        stored.downloaded = Set(false);
+        stored.update(&database).await.unwrap();
+
+        download_agreements(&client, &database, StorageLimits::default())
+            .await
+            .unwrap();
+
+        let agreement_after_retry = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(agreement_after_retry.downloaded);
+        assert!(
+            agreement_after_retry.root.is_some(),
+            "root should remain set after retry"
+        );
+        assert!(
+            agreement_after_retry.padded_len.is_some(),
+            "padded_len should remain set after retry"
+        );
+        assert_eq!(
+            agreement_after_retry.original_size,
+            "file-body".len() as i64,
+            "original_size reflects prepared file bytes"
+        );
+
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger should remain persisted after retry"
+        );
     }
 
     #[tokio::test]
@@ -260,6 +535,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(900),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -276,6 +553,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -341,6 +620,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(2_000),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -417,6 +698,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(600),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -433,6 +716,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(500),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -512,6 +797,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(100),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -528,6 +815,8 @@ mod tests {
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -604,6 +893,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -620,6 +911,8 @@ mod tests {
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
             nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
             downloaded: Set(false),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -666,6 +959,187 @@ mod tests {
         assert!(
             !second_record.downloaded,
             "second agreement should remain pending after hitting the max"
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_when_ledger_cannot_be_written() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-ledger-error";
+        let file_id = "FILE-ledger-error";
+        let filename = "contract.pdf";
+        let download_path = "/files/bad-ledger.pdf";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ledger_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        // Create a directory where the ledger file should be written to force a failure.
+        let ledger_dir = storage_dir.join("ledger.bin");
+        stdfs::create_dir_all(&ledger_dir).unwrap();
+
+        let result = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+        )
+        .await;
+
+        assert!(result.is_err(), "ledger write failure should bubble up");
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "downloaded file should be removed when post-processing fails"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain unprepared when ledger fails"
+        );
+        assert!(
+            stored.root.is_none(),
+            "metadata should not be persisted when ledger fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_downloaded_file_errors_when_path_missing_parent() {
+        let database = setup_in_memory_db().await;
+        let txn = database.begin().await.unwrap();
+        let agreement = agreements::Model {
+            agreement_id: "AGREEMENT-no-parent".into(),
+            user_id: "user_1".into(),
+            file_id: "FILE-no-parent".into(),
+            filename: "file.pdf".into(),
+            mime_type: "application/pdf".into(),
+            original_size: 10,
+            nodes: json!(["NODE-1"]),
+            root: None,
+            padded_len: None,
+            downloaded: false,
+            transaction_id: None,
+            curation: json!({}),
+            status: "ready".into(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
+        };
+
+        let result =
+            process_downloaded_file(Path::new("orphaned_file"), b"file-body", &agreement, &txn)
+                .await;
+
+        assert!(
+            matches!(result, Err(PostProcessError::Prepare(_))),
+            "expected missing parent path to be reported as prepare error"
+        );
+
+        txn.rollback().await.unwrap();
+
+        let agreement_rows = Agreements::find().count(&database).await.unwrap();
+        assert_eq!(agreement_rows, 0, "no agreements should be persisted");
+    }
+
+    #[test]
+    fn post_process_error_display_is_readable() {
+        let prepare_err = PostProcessError::Prepare(anyhow!("prep"));
+        let metadata_err = PostProcessError::Metadata(anyhow!("meta"));
+        let ledger_err = PostProcessError::Ledger(anyhow!("ledger"));
+
+        assert!(
+            prepare_err.to_string().contains("prepare_file failed"),
+            "prepare variant should mention prepare failure"
+        );
+        assert!(
+            metadata_err
+                .to_string()
+                .contains("metadata persistence failed"),
+            "metadata variant should mention persistence failure"
+        );
+        assert!(
+            ledger_err.to_string().contains("ledger update failed"),
+            "ledger variant should mention ledger failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_file_metadata_rejects_overflow_sizes() {
+        let database = setup_in_memory_db().await;
+        let metadata = CryptoFileMetadata {
+            root: Fq::one(),
+            file_id: "FILE-overflow".into(),
+            padded_len: usize::MAX,
+            original_size: usize::MAX,
+            filename: "huge.bin".into(),
+        };
+
+        let agreement = agreements::Model {
+            agreement_id: "AGREEMENT-overflow".into(),
+            user_id: "user_1".into(),
+            file_id: "FILE-overflow".into(),
+            filename: "huge.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            original_size: 1,
+            nodes: json!(["NODE-1"]),
+            root: None,
+            padded_len: None,
+            downloaded: false,
+            transaction_id: None,
+            curation: json!({}),
+            status: "ready".into(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
+        };
+
+        let err = persist_file_metadata(&database, &agreement, &metadata)
+            .await
+            .expect_err("overflowing metadata should return an error");
+
+        assert!(
+            err.to_string().contains("exceeds i64"),
+            "error should mention i64 overflow"
+        );
+
+        let agreement_rows = Agreements::find().count(&database).await.unwrap();
+        assert_eq!(
+            agreement_rows, 0,
+            "overflowing metadata should not be stored"
         );
     }
 }

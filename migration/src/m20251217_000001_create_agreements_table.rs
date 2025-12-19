@@ -29,6 +29,8 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(JsonValue::Array(Vec::new())),
                     )
+                    .col(string_len(Agreements::Root, 128).null())
+                    .col(big_integer(Agreements::PaddedLen).null())
                     .col(boolean(Agreements::Downloaded).not_null().default(false))
                     .col(string_len(Agreements::TransactionId, 64).null())
                     .col(json(Agreements::Curation))
@@ -109,6 +111,8 @@ enum Agreements {
     MimeType,
     OriginalSize,
     Nodes,
+    Root,
+    PaddedLen,
     Downloaded,
     TransactionId,
     Curation,
