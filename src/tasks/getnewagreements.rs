@@ -6,6 +6,7 @@ use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::JsonValue;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::collections::HashSet;
+use tracing::info;
 
 pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
@@ -17,7 +18,7 @@ pub async fn sync_ready_agreements(
         .context("fetching new agreements failed")?;
 
     if page.agreements.is_empty() {
-        println!("No new agreements found");
+        info!("No new agreements found");
         return Ok(());
     }
 
@@ -51,7 +52,7 @@ pub async fn sync_ready_agreements(
         .await
         .context("failed to insert new agreements")?;
 
-    println!("Inserted {} new agreements", new_models.len());
+    info!("Inserted {} new agreements", new_models.len());
 
     Ok(())
 }

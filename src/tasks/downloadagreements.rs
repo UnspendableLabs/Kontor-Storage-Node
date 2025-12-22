@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
+use tracing::{info, warn};
 
 #[cfg(test)]
 use self::tests::should_fail_commit;
@@ -133,7 +134,7 @@ pub async fn download_agreements(
 
         if let Some(max_files) = storage_limits.max_files {
             if downloaded_files >= max_files {
-                println!(
+                info!(
                     "Skipping download for {} - max stored files {} reached",
                     agreement.agreement_id, max_files
                 );
@@ -145,7 +146,7 @@ pub async fn download_agreements(
             match used_bytes.checked_add(original_size) {
                 Some(next) if next <= capacity => {}
                 _ => {
-                    println!(
+                    info!(
                         "Skipping download for {} ({} bytes) - capacity {} bytes would be exceeded",
                         agreement.agreement_id, original_size, capacity
                     );
@@ -173,7 +174,7 @@ pub async fn download_agreements(
             {
                 if downloaded.path.exists() {
                     if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                        eprintln!(
+                        warn!(
                             "failed to remove downloaded file {} after GCS error: {remove_err}",
                             downloaded.path.display()
                         );
@@ -184,6 +185,10 @@ pub async fn download_agreements(
                     anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
                 );
             }
+            info!(
+                "Uploaded {} to GCS ({} bytes)",
+                agreement.file_id, agreement.original_size
+            );
             uploaded_to_gcs = true;
         }
 
@@ -200,7 +205,7 @@ pub async fn download_agreements(
             if uploaded_to_gcs {
                 if let Some(gcs) = gcs {
                     if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
-                        eprintln!(
+                        warn!(
                             "failed to delete {} from GCS after post-processing error: {clean_err}",
                             agreement.file_id
                         );
@@ -209,7 +214,7 @@ pub async fn download_agreements(
             }
             if downloaded.path.exists() {
                 if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                    eprintln!(
+                    warn!(
                         "failed to remove downloaded file {} after error: {remove_err}",
                         downloaded.path.display()
                     );
@@ -243,7 +248,7 @@ pub async fn download_agreements(
             if uploaded_to_gcs {
                 if let Some(gcs) = gcs {
                     if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
-                        eprintln!(
+                        warn!(
                             "failed to delete {} from GCS after commit error: {clean_err}",
                             agreement.file_id
                         );
@@ -252,7 +257,7 @@ pub async fn download_agreements(
             }
             if downloaded.path.exists() {
                 if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                    eprintln!(
+                    warn!(
                         "failed to remove downloaded file {} after commit error: {remove_err}",
                         downloaded.path.display()
                     );
@@ -263,7 +268,7 @@ pub async fn download_agreements(
 
         if storage_backend.method == StorageMethod::Gcs && downloaded.path.exists() {
             if let Err(err) = fs::remove_file(&downloaded.path).await {
-                eprintln!(
+                warn!(
                     "failed to remove local file {} after GCS upload: {err}",
                     downloaded.path.display()
                 );
@@ -275,7 +280,9 @@ pub async fn download_agreements(
         downloaded_count += 1;
     }
 
-    println!("Downloaded {} agreements", downloaded_count);
+    if downloaded_count > 0 {
+        info!("Downloaded {} agreements", downloaded_count);
+    }
 
     Ok(())
 }

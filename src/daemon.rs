@@ -11,6 +11,7 @@ use std::process;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tracing::{error, info};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StorageLimits {
@@ -40,7 +41,7 @@ pub fn spawn_portal_daemon(
         )
         .await
         {
-            eprintln!("portal daemon stopped with error: {err:#}");
+            error!("portal daemon stopped with error: {err:#}");
         }
     })
 }
@@ -68,7 +69,7 @@ async fn run_portal_daemon(
         if let Err(err) =
             sync_portal_once(&portal_client, &database, storage_limits, &storage_backend).await
         {
-            eprintln!("portal sync failed: {err:#}");
+            error!("portal sync failed: {err:#}");
         }
     }
 }
@@ -82,7 +83,7 @@ async fn sync_portal_once(
     if let Some(max_files) = storage_limits.max_files {
         let downloaded = downloaded_files_count(database).await?;
         if downloaded >= max_files {
-            println!(
+            info!(
                 "Max stored files limit ({max_files}) reached; skipping agreement fetch and downloads"
             );
             return Ok(());

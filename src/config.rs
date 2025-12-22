@@ -2,6 +2,7 @@ use crate::cli::Cli;
 use crate::database::default_storage_dir;
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,6 +22,15 @@ impl StorageMethod {
                 "invalid storage method '{}': expected 'local' or 'gcs'",
                 other
             )),
+        }
+    }
+}
+
+impl fmt::Display for StorageMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageMethod::Local => write!(f, "local"),
+            StorageMethod::Gcs => write!(f, "gcs"),
         }
     }
 }

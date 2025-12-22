@@ -12,18 +12,21 @@ use sea_orm::DatabaseConnection;
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Once;
 use std::time::Duration;
 use tokio::signal;
+use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Commands};
 use clients::PortalClient;
-use config::Config;
+use config::{Config, StorageMethod};
 use daemon::{spawn_portal_daemon, StorageLimits};
 use database::DBClient;
 use tasks::downloadagreements::StorageBackend;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logging();
     load_local_env()?;
     let cli = Cli::parse();
     let mut stdout = io::stdout();
@@ -59,7 +62,16 @@ async fn run_with_shutdown(
     let config = Config::from_cli(&cli)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
-    writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
+    writeln!(writer, "Storage method: {}", config.storage_method)?;
+    if config.storage_method == StorageMethod::Gcs {
+        let bucket = config
+            .storage_gcs_bucket_name
+            .as_deref()
+            .unwrap_or("<missing bucket>");
+        writeln!(writer, "GCS bucket name: {bucket}")?;
+    } else {
+        writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
+    }
     match config.storage_capacity {
         Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
         None => writeln!(writer, "Storage capacity: unlimited")?,
@@ -72,6 +84,11 @@ async fn run_with_shutdown(
         Some(limit) => writeln!(writer, "Max stored files: {limit}")?,
         None => writeln!(writer, "Max stored files: unlimited")?,
     }
+    writeln!(
+        writer,
+        "Portal polling interval: {}s",
+        config.portal_polling_interval.as_secs()
+    )?;
 
     std::fs::create_dir_all(&config.storage_dir).with_context(|| {
         format!(
@@ -110,7 +127,6 @@ async fn run_with_shutdown(
                 max_files: config.storage_max_files,
             };
             run_daemon_command(
-                &mut writer,
                 client,
                 conn,
                 config.portal_polling_interval,
@@ -128,7 +144,6 @@ async fn run_with_shutdown(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_daemon_command(
-    mut writer: impl Write,
     client: PortalClient,
     conn: DatabaseConnection,
     interval: Duration,
@@ -146,18 +161,27 @@ async fn run_daemon_command(
         storage_backend,
     );
 
-    writeln!(
-        writer,
-        "Portal sync daemon running every {}s",
-        interval.as_secs()
-    )?;
-
     let shutdown_result = shutdown.await;
     handle.abort();
     let _ = handle.await;
 
     shutdown_result?;
     Ok(())
+}
+
+fn init_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new("info"))
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .compact()
+            .try_init();
+    });
 }
 
 #[cfg(test)]
@@ -225,6 +249,10 @@ mod tests {
             "expected database url line in output"
         );
         assert!(
+            output.contains("Storage method:"),
+            "expected storage method line in output"
+        );
+        assert!(
             output.contains("Storage dir:"),
             "expected storage dir line in output"
         );
@@ -274,6 +302,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_prints_gcs_bucket_when_storage_method_is_gcs() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
+            .mount(&mock_server)
+            .await;
+
+        let service_account_path = unique_storage_dir("sa").join("service_account.json");
+        std::fs::create_dir_all(service_account_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &service_account_path,
+            r#"{"private_key":"dummy","client_email":"test@example.com"}"#,
+        )
+        .unwrap();
+
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/storage")),
+            portal_polling_interval_secs: 5,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "gcs".to_string(),
+            storage_gcs_bucket_name: Some("my-bucket".to_string()),
+            storage_gcs_service_account_json: Some(
+                service_account_path.to_string_lossy().to_string(),
+            ),
+            command: Commands::Ping,
+        };
+
+        let mut buffer = Vec::new();
+        run(cli, &mut buffer).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            output.contains("Storage method: gcs"),
+            "expected storage method to be printed, got {output}"
+        );
+        assert!(
+            output.contains("GCS bucket name: my-bucket"),
+            "expected gcs bucket line in output, got {output}"
+        );
+        assert!(
+            !output.contains("Storage dir:"),
+            "should not print storage dir when using gcs"
+        );
+    }
+
+    #[tokio::test]
     async fn run_starts_daemon_and_aborts_on_shutdown() {
         let mock_server = MockServer::start().await;
 
@@ -316,8 +398,8 @@ mod tests {
         let output = String::from_utf8(buffer).unwrap();
 
         assert!(
-            output.contains("Portal sync daemon running every"),
-            "expected daemon startup message in output: {output}"
+            output.contains("Portal polling interval:"),
+            "expected polling interval in output: {output}"
         );
 
         let lock_path = storage_dir.join(".portal-daemon.lock");
