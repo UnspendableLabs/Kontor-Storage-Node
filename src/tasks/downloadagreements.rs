@@ -1,4 +1,5 @@
-use crate::clients::PortalClient;
+use crate::clients::{GcsClient, PortalClient};
+use crate::config::StorageMethod;
 use crate::daemon::StorageLimits;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
@@ -31,12 +32,58 @@ impl fmt::Display for PostProcessError {
 
 impl std::error::Error for PostProcessError {}
 
+#[derive(Clone, Debug)]
+pub struct StorageBackend {
+    pub method: StorageMethod,
+    pub gcs_bucket_name: Option<String>,
+    pub gcs_service_account_json: Option<PathBuf>,
+}
+
+impl StorageBackend {
+    #[allow(dead_code)]
+    pub fn local() -> Self {
+        Self {
+            method: StorageMethod::Local,
+            gcs_bucket_name: None,
+            gcs_service_account_json: None,
+        }
+    }
+}
+
 /// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
 ) -> Result<()> {
+    let gcs_client = match storage_backend.method {
+        StorageMethod::Local => None,
+        StorageMethod::Gcs => {
+            let bucket = storage_backend
+                .gcs_bucket_name
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("STORAGE_GCS_BUCKET_NAME is required when STORAGE_METHOD is gcs")
+                })?;
+            let service_account = storage_backend
+                .gcs_service_account_json
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "STORAGE_GCS_SERVICE_ACCOUNT_JSON is required when STORAGE_METHOD is gcs"
+                    )
+                })?;
+
+            Some(
+                GcsClient::from_service_account_file(bucket, service_account)
+                    .await
+                    .context("initializing GCS client")?,
+            )
+        }
+    };
+
     let mut used_bytes = match storage_limits.capacity {
         Some(_) => current_used_capacity(database).await?,
         None => 0,
@@ -98,6 +145,26 @@ pub async fn download_agreements(
             })?;
 
         let txn = database.begin().await?;
+
+        if let Some(gcs) = gcs_client.as_ref() {
+            if let Err(err) = gcs
+                .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
+                .await
+            {
+                if downloaded.path.exists() {
+                    if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                        eprintln!(
+                            "failed to remove downloaded file {} after GCS error: {remove_err}",
+                            downloaded.path.display()
+                        );
+                    }
+                }
+                txn.rollback().await.ok();
+                return Err(
+                    anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
+                );
+            }
+        }
 
         // If post-processing fails, delete the downloaded file so capacity tracking
         // stays accurate and the next retry can start cleanly.
@@ -334,6 +401,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("download");
         stdfs::remove_dir_all(&storage_dir).ok();
+        let backend = StorageBackend::local();
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -356,6 +424,7 @@ mod tests {
             &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
             StorageLimits::default(),
+            &backend,
         )
         .await
         .unwrap();
@@ -421,6 +490,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("idempotent");
         stdfs::remove_dir_all(&storage_dir).ok();
+        let backend = StorageBackend::local();
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -441,7 +511,7 @@ mod tests {
 
         let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
 
-        download_agreements(&client, &database, StorageLimits::default())
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
             .await
             .unwrap();
 
@@ -456,7 +526,7 @@ mod tests {
         stored.downloaded = Set(false);
         stored.update(&database).await.unwrap();
 
-        download_agreements(&client, &database, StorageLimits::default())
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
             .await
             .unwrap();
 
@@ -496,6 +566,7 @@ mod tests {
             &PortalClient::new("http://localhost:1", "secret", storage_dir),
             &database,
             StorageLimits::default(),
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -572,6 +643,7 @@ mod tests {
                 max_file_size: None,
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -638,6 +710,7 @@ mod tests {
                 max_file_size: Some(1_000),
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -734,6 +807,7 @@ mod tests {
                 max_file_size: None,
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -833,6 +907,7 @@ mod tests {
                 max_file_size: None,
                 max_files: Some(1),
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -929,6 +1004,7 @@ mod tests {
                 max_file_size: None,
                 max_files: Some(1),
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -1016,6 +1092,7 @@ mod tests {
             &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
             StorageLimits::default(),
+            &StorageBackend::local(),
         )
         .await;
 

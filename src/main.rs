@@ -20,6 +20,7 @@ use clients::PortalClient;
 use config::Config;
 use daemon::{spawn_portal_daemon, StorageLimits};
 use database::DBClient;
+use tasks::downloadagreements::StorageBackend;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -72,6 +73,14 @@ async fn run_with_shutdown(
 
     let db = DBClient::new(&config.database_url).await?;
     let conn = db.connection().clone();
+    let storage_backend = StorageBackend {
+        method: config.storage_method.clone(),
+        gcs_bucket_name: config.storage_gcs_bucket_name.clone(),
+        gcs_service_account_json: config
+            .storage_gcs_service_account_json
+            .as_ref()
+            .map(PathBuf::from),
+    };
     let client = PortalClient::new(
         &config.portal_url,
         &config.portal_api_key,
@@ -97,6 +106,7 @@ async fn run_with_shutdown(
                 config.portal_polling_interval,
                 lock_path,
                 storage_limits,
+                storage_backend,
                 shutdown,
             )
             .await?;
@@ -106,6 +116,7 @@ async fn run_with_shutdown(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon_command(
     mut writer: impl Write,
     client: PortalClient,
@@ -113,9 +124,17 @@ async fn run_daemon_command(
     interval: Duration,
     lock_path: PathBuf,
     storage_limits: StorageLimits,
+    storage_backend: StorageBackend,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let handle = spawn_portal_daemon(client, conn, interval, lock_path, storage_limits);
+    let handle = spawn_portal_daemon(
+        client,
+        conn,
+        interval,
+        lock_path,
+        storage_limits,
+        storage_backend,
+    );
 
     writeln!(
         writer,
@@ -171,6 +190,9 @@ mod tests {
             storage_capacity: None,
             storage_max_file_size: None,
             storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
             command: Commands::Ping,
         };
 
@@ -220,6 +242,9 @@ mod tests {
             storage_capacity: None,
             storage_max_file_size: None,
             storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
             command: Commands::Ping,
         };
 
@@ -259,6 +284,9 @@ mod tests {
             storage_capacity: Some("1GB".into()),
             storage_max_file_size: None,
             storage_max_files: Some(5),
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
             command: Commands::Run,
         };
 
@@ -317,6 +345,9 @@ mod tests {
             storage_capacity: None,
             storage_max_file_size: None,
             storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
             command: Commands::Run,
         };
 

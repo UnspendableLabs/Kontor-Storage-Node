@@ -41,6 +41,18 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_MAX_FILE_SIZE")]
     pub storage_max_file_size: Option<String>,
 
+    /// Storage method: "local" for local filesystem or "gcs" for Google Cloud Storage
+    #[arg(long, env = "STORAGE_METHOD", default_value = "local")]
+    pub storage_method: String,
+
+    /// GCS bucket name (required when storage_method is "gcs")
+    #[arg(long, env = "STORAGE_GCS_BUCKET_NAME")]
+    pub storage_gcs_bucket_name: Option<String>,
+
+    /// Path to GCS service account JSON file (required when storage_method is "gcs")
+    #[arg(long, env = "STORAGE_GCS_SERVICE_ACCOUNT_JSON")]
+    pub storage_gcs_service_account_json: Option<String>,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

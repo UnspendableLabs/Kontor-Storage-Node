@@ -36,6 +36,9 @@ The node can be configured via command-line arguments or environment variables:
 | `--storage-capacity` | `STORAGE_CAPACITY` | _unlimited_ | Max storage for downloads (bytes, supports M/G/T suffix) |
 | `--storage-max-files` | `STORAGE_MAX_FILES` | _unlimited_ | Max number of files to keep locally; when reached, new agreements are not fetched |
 | `--storage-max-file-size` | `STORAGE_MAX_FILE_SIZE` | _unlimited_ | Max size for a single downloaded file (bytes, supports M/G/T suffix) |
+| `--storage-method` | `STORAGE_METHOD` | `local` | Storage backend: `local` for local filesystem or `gcs` for Google Cloud Storage |
+| `--storage-gcs-bucket-name` | `STORAGE_GCS_BUCKET_NAME` | _required if gcs_ | GCS bucket name (required when `STORAGE_METHOD=gcs`) |
+| `--storage-gcs-service-account-json` | `STORAGE_GCS_SERVICE_ACCOUNT_JSON` | _required if gcs_ | Path to GCS service account JSON file (required when `STORAGE_METHOD=gcs`) |
 
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
@@ -49,6 +52,15 @@ STORAGE_DIR=/tmp/kontor-files
 STORAGE_CAPACITY=10GB
 STORAGE_MAX_FILES=100
 STORAGE_MAX_FILE_SIZE=500MB
+STORAGE_METHOD=local
+```
+
+For Google Cloud Storage backend:
+
+```
+STORAGE_METHOD=gcs
+STORAGE_GCS_BUCKET_NAME=my-kontor-bucket
+STORAGE_GCS_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
 ```
 
 When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.

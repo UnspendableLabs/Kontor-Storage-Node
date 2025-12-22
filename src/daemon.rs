@@ -1,6 +1,6 @@
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
-use crate::tasks::downloadagreements::download_agreements;
+use crate::tasks::downloadagreements::{download_agreements, StorageBackend};
 use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
@@ -27,10 +27,18 @@ pub fn spawn_portal_daemon(
     interval: Duration,
     lock_path: PathBuf,
     storage_limits: StorageLimits,
+    storage_backend: StorageBackend,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) =
-            run_portal_daemon(portal_client, database, interval, lock_path, storage_limits).await
+        if let Err(err) = run_portal_daemon(
+            portal_client,
+            database,
+            interval,
+            lock_path,
+            storage_limits,
+            storage_backend,
+        )
+        .await
         {
             eprintln!("portal daemon stopped with error: {err:#}");
         }
@@ -43,20 +51,23 @@ async fn run_portal_daemon(
     interval: Duration,
     lock_path: PathBuf,
     storage_limits: StorageLimits,
+    storage_backend: StorageBackend,
 ) -> Result<()> {
     // Ensure only a single daemon instance runs at a time.
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
 
     // Run immediately, then on each tick.
-    sync_portal_once(&portal_client, &database, storage_limits)
+    sync_portal_once(&portal_client, &database, storage_limits, &storage_backend)
         .await
         .context("initial portal sync failed")?;
 
     let mut ticker = time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = sync_portal_once(&portal_client, &database, storage_limits).await {
+        if let Err(err) =
+            sync_portal_once(&portal_client, &database, storage_limits, &storage_backend).await
+        {
             eprintln!("portal sync failed: {err:#}");
         }
     }
@@ -66,6 +77,7 @@ async fn sync_portal_once(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
 ) -> Result<()> {
     if let Some(max_files) = storage_limits.max_files {
         let downloaded = downloaded_files_count(database).await?;
@@ -80,7 +92,7 @@ async fn sync_portal_once(
     sync_ready_agreements(portal_client, database)
         .await
         .context("fetching new agreements failed")?;
-    download_agreements(portal_client, database, storage_limits)
+    download_agreements(portal_client, database, storage_limits, storage_backend)
         .await
         .context("downloading agreements failed")?;
 
@@ -230,6 +242,7 @@ mod tests {
             Duration::from_millis(5),
             lock_path.clone(),
             StorageLimits::default(),
+            StorageBackend::local(),
         )
         .await
         .unwrap_err();
@@ -289,6 +302,7 @@ mod tests {
                 max_file_size: None,
                 max_files: Some(1),
             },
+            StorageBackend::local(),
         );
 
         time::sleep(Duration::from_millis(30)).await;
@@ -366,6 +380,7 @@ mod tests {
             Duration::from_millis(10),
             lock_path.clone(),
             StorageLimits::default(),
+            StorageBackend::local(),
         );
 
         // Wait for the daemon to download the agreement at least once. Give it
