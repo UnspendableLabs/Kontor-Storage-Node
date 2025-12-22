@@ -63,6 +63,8 @@ STORAGE_GCS_BUCKET_NAME=my-kontor-bucket
 STORAGE_GCS_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
 ```
 
+The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits apply in both `local` and `gcs` modes to respect quotas (for example, free tiers) even when files are stored remotely (uploaded to GCS).
+
 When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
 

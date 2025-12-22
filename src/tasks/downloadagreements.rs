@@ -11,6 +11,7 @@ use sea_orm::{
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 
 #[derive(Debug)]
@@ -35,8 +36,7 @@ impl std::error::Error for PostProcessError {}
 #[derive(Clone, Debug)]
 pub struct StorageBackend {
     pub method: StorageMethod,
-    pub gcs_bucket_name: Option<String>,
-    pub gcs_service_account_json: Option<PathBuf>,
+    gcs_client: Option<Arc<GcsClient>>,
 }
 
 impl StorageBackend {
@@ -44,9 +44,37 @@ impl StorageBackend {
     pub fn local() -> Self {
         Self {
             method: StorageMethod::Local,
-            gcs_bucket_name: None,
-            gcs_service_account_json: None,
+            gcs_client: None,
         }
+    }
+
+    /// Build a storage backend, initializing the GCS client once when needed.
+    pub async fn new(
+        method: StorageMethod,
+        gcs_bucket_name: Option<String>,
+        gcs_service_account_json: Option<PathBuf>,
+    ) -> Result<Self> {
+        let gcs_client = match method {
+            StorageMethod::Local => None,
+            StorageMethod::Gcs => {
+                let bucket = gcs_bucket_name.clone().ok_or_else(|| {
+                    anyhow!("STORAGE_GCS_BUCKET_NAME is required when STORAGE_METHOD is gcs")
+                })?;
+                let service_account = gcs_service_account_json.clone().ok_or_else(|| {
+                    anyhow!(
+                        "STORAGE_GCS_SERVICE_ACCOUNT_JSON is required when STORAGE_METHOD is gcs"
+                    )
+                })?;
+
+                Some(Arc::new(
+                    GcsClient::from_service_account_file(bucket, service_account)
+                        .await
+                        .context("initializing GCS client")?,
+                ))
+            }
+        };
+
+        Ok(Self { method, gcs_client })
     }
 }
 
@@ -59,29 +87,13 @@ pub async fn download_agreements(
 ) -> Result<()> {
     let gcs_client = match storage_backend.method {
         StorageMethod::Local => None,
-        StorageMethod::Gcs => {
-            let bucket = storage_backend
-                .gcs_bucket_name
+        StorageMethod::Gcs => Some(
+            storage_backend
+                .gcs_client
                 .as_ref()
                 .cloned()
-                .ok_or_else(|| {
-                    anyhow!("STORAGE_GCS_BUCKET_NAME is required when STORAGE_METHOD is gcs")
-                })?;
-            let service_account = storage_backend
-                .gcs_service_account_json
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "STORAGE_GCS_SERVICE_ACCOUNT_JSON is required when STORAGE_METHOD is gcs"
-                    )
-                })?;
-
-            Some(
-                GcsClient::from_service_account_file(bucket, service_account)
-                    .await
-                    .context("initializing GCS client")?,
-            )
-        }
+                .ok_or_else(|| anyhow!("GCS storage backend is not initialized"))?,
+        ),
     };
 
     let mut used_bytes = match storage_limits.capacity {
@@ -145,8 +157,11 @@ pub async fn download_agreements(
             })?;
 
         let txn = database.begin().await?;
+        let mut uploaded_to_gcs = false;
 
-        if let Some(gcs) = gcs_client.as_ref() {
+        let gcs = gcs_client.as_ref();
+
+        if let Some(gcs) = gcs {
             if let Err(err) = gcs
                 .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
                 .await
@@ -164,6 +179,7 @@ pub async fn download_agreements(
                     anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
                 );
             }
+            uploaded_to_gcs = true;
         }
 
         // If post-processing fails, delete the downloaded file so capacity tracking
@@ -176,6 +192,16 @@ pub async fn download_agreements(
         )
         .await
         {
+            if uploaded_to_gcs {
+                if let Some(gcs) = gcs {
+                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
+                        eprintln!(
+                            "failed to delete {} from GCS after post-processing error: {clean_err}",
+                            agreement.file_id
+                        );
+                    }
+                }
+            }
             if downloaded.path.exists() {
                 if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
                     eprintln!(
@@ -198,7 +224,36 @@ pub async fn download_agreements(
             .await
             .context("marking agreement as downloaded failed")?;
 
-        txn.commit().await?;
+        if let Err(err) = txn.commit().await {
+            if uploaded_to_gcs {
+                if let Some(gcs) = gcs {
+                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
+                        eprintln!(
+                            "failed to delete {} from GCS after commit error: {clean_err}",
+                            agreement.file_id
+                        );
+                    }
+                }
+            }
+            if downloaded.path.exists() {
+                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                    eprintln!(
+                        "failed to remove downloaded file {} after commit error: {remove_err}",
+                        downloaded.path.display()
+                    );
+                }
+            }
+            return Err(err.into());
+        }
+
+        if storage_backend.method == StorageMethod::Gcs && downloaded.path.exists() {
+            if let Err(err) = fs::remove_file(&downloaded.path).await {
+                eprintln!(
+                    "failed to remove local file {} after GCS upload: {err}",
+                    downloaded.path.display()
+                );
+            }
+        }
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);

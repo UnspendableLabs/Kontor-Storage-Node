@@ -73,14 +73,15 @@ async fn run_with_shutdown(
 
     let db = DBClient::new(&config.database_url).await?;
     let conn = db.connection().clone();
-    let storage_backend = StorageBackend {
-        method: config.storage_method.clone(),
-        gcs_bucket_name: config.storage_gcs_bucket_name.clone(),
-        gcs_service_account_json: config
+    let storage_backend = StorageBackend::new(
+        config.storage_method.clone(),
+        config.storage_gcs_bucket_name.clone(),
+        config
             .storage_gcs_service_account_json
             .as_ref()
             .map(PathBuf::from),
-    };
+    )
+    .await?;
     let client = PortalClient::new(
         &config.portal_url,
         &config.portal_api_key,

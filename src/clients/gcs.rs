@@ -9,7 +9,7 @@ use urlencoding::encode as url_encode;
 
 /// Minimal Google Cloud Storage client for uploading agreement files using
 /// service-account JWT flow and direct HTTP requests.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GcsClient {
     http: Client,
     bucket: String,
@@ -18,7 +18,7 @@ pub struct GcsClient {
     endpoint_url: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 struct ServiceAccountKey {
     private_key: String,
     client_email: String,
@@ -81,6 +81,38 @@ impl GcsClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
                 "uploading object {} failed with status {}: {}",
+                object_name,
+                status,
+                body
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Best-effort deletion of an object previously uploaded.
+    pub async fn delete_object(&self, object_name: &str) -> Result<()> {
+        let token = self.fetch_access_token().await?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint_url,
+            self.bucket,
+            url_encode(object_name)
+        );
+
+        let resp = self
+            .http
+            .delete(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("sending delete request to GCS")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "deleting object {} failed with status {}: {}",
                 object_name,
                 status,
                 body
