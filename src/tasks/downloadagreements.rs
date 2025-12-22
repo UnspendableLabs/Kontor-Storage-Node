@@ -1,16 +1,23 @@
-use crate::clients::PortalClient;
+use crate::clients::{GcsClient, PortalClient};
+use crate::config::StorageMethod;
 use crate::daemon::StorageLimits;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
+#[cfg(test)]
+use sea_orm::DbErr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
     EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
+
+#[cfg(test)]
+use self::tests::should_fail_commit;
 
 #[derive(Debug)]
 enum PostProcessError {
@@ -31,12 +38,69 @@ impl fmt::Display for PostProcessError {
 
 impl std::error::Error for PostProcessError {}
 
+#[derive(Clone, Debug)]
+pub struct StorageBackend {
+    pub method: StorageMethod,
+    gcs_client: Option<Arc<GcsClient>>,
+}
+
+impl StorageBackend {
+    #[allow(dead_code)]
+    pub fn local() -> Self {
+        Self {
+            method: StorageMethod::Local,
+            gcs_client: None,
+        }
+    }
+
+    /// Build a storage backend, initializing the GCS client once when needed.
+    pub async fn new(
+        method: StorageMethod,
+        gcs_bucket_name: Option<String>,
+        gcs_service_account_json: Option<PathBuf>,
+    ) -> Result<Self> {
+        let gcs_client = match method {
+            StorageMethod::Local => None,
+            StorageMethod::Gcs => {
+                let bucket = gcs_bucket_name.clone().ok_or_else(|| {
+                    anyhow!("STORAGE_GCS_BUCKET_NAME is required when STORAGE_METHOD is gcs")
+                })?;
+                let service_account = gcs_service_account_json.clone().ok_or_else(|| {
+                    anyhow!(
+                        "STORAGE_GCS_SERVICE_ACCOUNT_JSON is required when STORAGE_METHOD is gcs"
+                    )
+                })?;
+
+                Some(Arc::new(
+                    GcsClient::from_service_account_file(bucket, service_account)
+                        .await
+                        .context("initializing GCS client")?,
+                ))
+            }
+        };
+
+        Ok(Self { method, gcs_client })
+    }
+}
+
 /// Download agreement files that are not yet stored locally.
 pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
 ) -> Result<()> {
+    let gcs_client = match storage_backend.method {
+        StorageMethod::Local => None,
+        StorageMethod::Gcs => Some(
+            storage_backend
+                .gcs_client
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("GCS storage backend is not initialized"))?,
+        ),
+    };
+
     let mut used_bytes = match storage_limits.capacity {
         Some(_) => current_used_capacity(database).await?,
         None => 0,
@@ -98,6 +162,30 @@ pub async fn download_agreements(
             })?;
 
         let txn = database.begin().await?;
+        let mut uploaded_to_gcs = false;
+
+        let gcs = gcs_client.as_ref();
+
+        if let Some(gcs) = gcs {
+            if let Err(err) = gcs
+                .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
+                .await
+            {
+                if downloaded.path.exists() {
+                    if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                        eprintln!(
+                            "failed to remove downloaded file {} after GCS error: {remove_err}",
+                            downloaded.path.display()
+                        );
+                    }
+                }
+                txn.rollback().await.ok();
+                return Err(
+                    anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
+                );
+            }
+            uploaded_to_gcs = true;
+        }
 
         // If post-processing fails, delete the downloaded file so capacity tracking
         // stays accurate and the next retry can start cleanly.
@@ -109,6 +197,16 @@ pub async fn download_agreements(
         )
         .await
         {
+            if uploaded_to_gcs {
+                if let Some(gcs) = gcs {
+                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
+                        eprintln!(
+                            "failed to delete {} from GCS after post-processing error: {clean_err}",
+                            agreement.file_id
+                        );
+                    }
+                }
+            }
             if downloaded.path.exists() {
                 if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
                     eprintln!(
@@ -131,7 +229,46 @@ pub async fn download_agreements(
             .await
             .context("marking agreement as downloaded failed")?;
 
-        txn.commit().await?;
+        #[cfg(test)]
+        let commit_result = if should_fail_commit() {
+            Err(DbErr::Custom("simulated commit failure".to_string()))
+        } else {
+            txn.commit().await
+        };
+
+        #[cfg(not(test))]
+        let commit_result = txn.commit().await;
+
+        if let Err(err) = commit_result {
+            if uploaded_to_gcs {
+                if let Some(gcs) = gcs {
+                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
+                        eprintln!(
+                            "failed to delete {} from GCS after commit error: {clean_err}",
+                            agreement.file_id
+                        );
+                    }
+                }
+            }
+            if downloaded.path.exists() {
+                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
+                    eprintln!(
+                        "failed to remove downloaded file {} after commit error: {remove_err}",
+                        downloaded.path.display()
+                    );
+                }
+            }
+            return Err(err.into());
+        }
+
+        if storage_backend.method == StorageMethod::Gcs && downloaded.path.exists() {
+            if let Err(err) = fs::remove_file(&downloaded.path).await {
+                eprintln!(
+                    "failed to remove local file {} after GCS upload: {err}",
+                    downloaded.path.display()
+                );
+            }
+        }
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);
@@ -287,15 +424,80 @@ mod tests {
     use std::fs as stdfs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::thread::ThreadId;
     use tokio::fs;
-    use wiremock::matchers::{header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{body_bytes, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    static FAIL_COMMIT_THREAD: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
+
+    pub(crate) struct CommitFailGuard;
+
+    fn fail_commit_slot() -> &'static Mutex<Option<ThreadId>> {
+        FAIL_COMMIT_THREAD.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) fn simulate_commit_failure_once() -> CommitFailGuard {
+        let tid = thread::current().id();
+        let slot = fail_commit_slot();
+        *slot.lock().expect("commit fail mutex poisoned") = Some(tid);
+        CommitFailGuard
+    }
+
+    impl Drop for CommitFailGuard {
+        fn drop(&mut self) {
+            let slot = fail_commit_slot();
+            let _ = slot.lock().ok().and_then(|mut guard| guard.take());
+        }
+    }
+
+    pub(super) fn should_fail_commit() -> bool {
+        let tid = thread::current().id();
+        let slot = fail_commit_slot();
+        let mut guard = slot.lock().expect("commit fail mutex poisoned");
+        if guard.is_some_and(|t| t == tid) {
+            guard.take();
+            true
+        } else {
+            false
+        }
+    }
 
     fn unique_storage_dir(prefix: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("kontor_download_agreements_{prefix}_{id}"))
+    }
+
+    #[tokio::test]
+    async fn storage_backend_new_requires_bucket_for_gcs() {
+        let err = StorageBackend::new(
+            StorageMethod::Gcs,
+            None,
+            Some(PathBuf::from("/tmp/sa.json")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("STORAGE_GCS_BUCKET_NAME"),
+            "expected bucket validation error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_backend_new_requires_service_account_for_gcs() {
+        let err = StorageBackend::new(StorageMethod::Gcs, Some("bucket".into()), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("STORAGE_GCS_SERVICE_ACCOUNT_JSON"),
+            "expected service account validation error, got {err}"
+        );
     }
 
     async fn setup_in_memory_db() -> DatabaseConnection {
@@ -334,6 +536,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("download");
         stdfs::remove_dir_all(&storage_dir).ok();
+        let backend = StorageBackend::local();
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -356,6 +559,7 @@ mod tests {
             &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
             StorageLimits::default(),
+            &backend,
         )
         .await
         .unwrap();
@@ -394,6 +598,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploads_to_gcs_and_removes_local_file_after_success() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-upload";
+        let file_id = "FILE-gcs-upload";
+        let filename = "gcs.bin";
+        let download_path = "/files/gcs.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-gcs";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .and(header("authorization", "Bearer token-gcs"))
+            .and(header("content-type", "application/octet-stream"))
+            .and(body_bytes("file-body"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_backend");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "local file should be removed after GCS upload"
+        );
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger should still be written when using the GCS backend"
+        );
+
+        let downloaded = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("agreement should exist");
+        assert!(downloaded.downloaded, "downloaded flag should be set");
+        assert!(
+            downloaded.root.is_some(),
+            "metadata root should be persisted after GCS upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_upload_error_rolls_back_and_cleans_local_file() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-fail";
+        let file_id = "FILE-gcs-fail";
+        let download_path = "/files/gcs-fail.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-gcs-fail";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_upload_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("gcs.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("uploading FILE-gcs-fail to GCS bucket"),
+            "expected upload failure to be surfaced, got {err}"
+        );
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "local file should be removed after GCS upload failure"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_upload_error_logs_cleanup_failure() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-cleanup-fail";
+        let file_id = "FILE-gcs-cleanup-fail";
+        let download_path = "/files/gcs-cleanup.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-gcs-cleanup";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("gcs_cleanup_fail");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let file_path = storage_dir.join(file_id);
+        let file_path_for_mock = file_path.clone();
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(move |_req: &Request| {
+                let _ = stdfs::remove_file(&file_path_for_mock);
+                let _ = stdfs::create_dir_all(&file_path_for_mock);
+                ResponseTemplate::new(500).set_body_string("boom")
+            })
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("gcs.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("uploading FILE-gcs-cleanup-fail to GCS bucket"),
+            "upload failure should surface"
+        );
+        assert!(
+            file_path.is_dir(),
+            "cleanup failure should leave directory behind for coverage"
+        );
+    }
+
+    #[tokio::test]
     async fn rerun_is_idempotent_and_keeps_single_metadata_row() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-idempotent";
@@ -421,6 +943,7 @@ mod tests {
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("idempotent");
         stdfs::remove_dir_all(&storage_dir).ok();
+        let backend = StorageBackend::local();
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -441,7 +964,7 @@ mod tests {
 
         let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
 
-        download_agreements(&client, &database, StorageLimits::default())
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
             .await
             .unwrap();
 
@@ -456,7 +979,7 @@ mod tests {
         stored.downloaded = Set(false);
         stored.update(&database).await.unwrap();
 
-        download_agreements(&client, &database, StorageLimits::default())
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
             .await
             .unwrap();
 
@@ -496,6 +1019,7 @@ mod tests {
             &PortalClient::new("http://localhost:1", "secret", storage_dir),
             &database,
             StorageLimits::default(),
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -572,6 +1096,7 @@ mod tests {
                 max_file_size: None,
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -638,6 +1163,7 @@ mod tests {
                 max_file_size: Some(1_000),
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -734,6 +1260,7 @@ mod tests {
                 max_file_size: None,
                 max_files: None,
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -833,6 +1360,7 @@ mod tests {
                 max_file_size: None,
                 max_files: Some(1),
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -929,6 +1457,7 @@ mod tests {
                 max_file_size: None,
                 max_files: Some(1),
             },
+            &StorageBackend::local(),
         )
         .await
         .unwrap();
@@ -1016,6 +1545,7 @@ mod tests {
             &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
             &database,
             StorageLimits::default(),
+            &StorageBackend::local(),
         )
         .await;
 
@@ -1140,6 +1670,743 @@ mod tests {
         assert_eq!(
             agreement_rows, 0,
             "overflowing metadata should not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_backend_new_initializes_gcs_client_with_valid_config() {
+        // Write a valid service account file
+        let storage_dir = unique_storage_dir("gcs_backend_new");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+        let sa_path = storage_dir.join("sa.json");
+        stdfs::write(
+            &sa_path,
+            serde_json::json!({
+                "private_key": TEST_PRIVATE_KEY,
+                "client_email": "svc@example.com",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let backend = StorageBackend::new(
+            StorageMethod::Gcs,
+            Some("my-bucket".into()),
+            Some(sa_path.clone()),
+        )
+        .await
+        .expect("should initialize GCS backend");
+
+        assert_eq!(backend.method, StorageMethod::Gcs);
+        assert!(
+            backend.gcs_client.is_some(),
+            "gcs_client should be initialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_error_is_propagated_with_context() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-download-error";
+        let file_id = "FILE-download-error";
+
+        // Mock the download URL endpoint to return successfully
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": format!("{}/files/error.bin", mock_server.uri())
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock the actual file download to fail
+        Mock::given(method("GET"))
+            .and(path("/files/error.bin"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("download failed"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("download_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("error.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(100),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("downloading file for agreement AGREEMENT-download-error"),
+            "error should contain context about the agreement, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_processing_error_cleans_up_gcs_object() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-postprocess-fail";
+        let file_id = "FILE-gcs-postprocess-fail";
+        let download_path = "/files/postprocess-fail.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-postprocess-fail";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // GCS upload succeeds
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // GCS delete should be called when post-processing fails
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{bucket}/o/{file_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_postprocess_fail");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("postprocess.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        // Create a directory where the ledger should be to force post-processing failure
+        let ledger_dir = storage_dir.join("ledger.bin");
+        stdfs::create_dir_all(&ledger_dir).unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let result = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await;
+
+        assert!(result.is_err(), "post-processing failure should bubble up");
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "local file should be cleaned up after post-processing failure"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after post-processing failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_processing_error_logs_gcs_delete_failure() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-delete-fail";
+        let file_id = "FILE-gcs-delete-fail";
+        let download_path = "/files/delete-fail.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-delete-fail";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // GCS upload succeeds
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        // GCS delete fails
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{bucket}/o/{file_id}")))
+            .respond_with(ResponseTemplate::new(500).set_body_string("delete failed"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_delete_fail");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("delete-fail.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        // Create a directory where the ledger should be to force post-processing failure
+        let ledger_dir = storage_dir.join("ledger.bin");
+        stdfs::create_dir_all(&ledger_dir).unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        // This should still fail (post-processing error) but GCS delete failure is logged
+        let result = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "post-processing failure should still bubble up even when GCS delete fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_directory_is_created_when_missing() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-ledger-dir";
+        let file_id = "FILE-ledger-dir";
+        let download_path = "/files/ledger-dir.pdf";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        // Use a deeply nested directory that doesn't exist
+        let storage_dir = unique_storage_dir("ledger_dir_create")
+            .join("nested")
+            .join("deep");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        // Don't pre-create the directory - let the code create it
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("ledger.pdf".into()),
+            mime_type: Set("application/pdf".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger file should be created in the nested directory"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("agreement should exist");
+        assert!(
+            stored.downloaded,
+            "agreement should be marked as downloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_error_triggers_cleanup_paths() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-commit-fail";
+        let file_id = "FILE-commit-fail";
+        let download_path = "/files/commit-fail.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-commit-fail";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("commit_fail_cleanup");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let file_path = storage_dir.join(file_id);
+        let file_path_for_mock = file_path.clone();
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{bucket}/o/{file_id}")))
+            .respond_with(move |_req: &Request| {
+                let _ = stdfs::remove_file(&file_path_for_mock);
+                let _ = stdfs::create_dir_all(&file_path_for_mock);
+                ResponseTemplate::new(500).set_body_string("delete failed")
+            })
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("commit-fail.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let _guard = simulate_commit_failure_once();
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("simulated commit failure"),
+            "commit error should be surfaced"
+        );
+        assert!(
+            file_path.is_dir(),
+            "cleanup removal should fail when file path becomes a directory"
+        );
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after commit failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_processing_error_handles_cleanup_failures() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-post-cleanup";
+        let file_id = "FILE-post-cleanup";
+        let download_path = "/files/post-cleanup.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-post-cleanup";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("post_cleanup");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let ledger_dir = storage_dir.join("ledger.bin");
+        stdfs::create_dir_all(&ledger_dir).unwrap();
+        let file_path = storage_dir.join(file_id);
+        let file_path_for_mock = file_path.clone();
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{bucket}/o/{file_id}")))
+            .respond_with(move |_req: &Request| {
+                let _ = stdfs::remove_file(&file_path_for_mock);
+                let _ = stdfs::create_dir_all(&file_path_for_mock);
+                ResponseTemplate::new(500).set_body_string("delete boom")
+            })
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("cleanup.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("ledger update failed"),
+            "post-processing failure should bubble up"
+        );
+        assert!(
+            file_path.is_dir(),
+            "cleanup failure should leave directory behind after delete failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_error_after_successful_gcs_upload_is_logged() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-remove-error";
+        let file_id = "FILE-gcs-remove-error";
+        let download_path = "/files/gcs-remove.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-remove-error";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("gcs_remove_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+        let file_path = storage_dir.join(file_id);
+        let file_path_for_mock = file_path.clone();
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(move |_req: &Request| {
+                let _ = stdfs::remove_file(&file_path_for_mock);
+                let _ = stdfs::create_dir_all(&file_path_for_mock);
+                ResponseTemplate::new(200)
+            })
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{bucket}/o/{file_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("gcs-remove.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            file_path.is_dir(),
+            "removal failure should leave directory behind for logging branch"
+        );
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.downloaded,
+            "agreement should still be marked downloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_backend_local_does_not_initialize_gcs() {
+        let backend = StorageBackend::new(StorageMethod::Local, None, None)
+            .await
+            .expect("local backend should succeed without GCS params");
+
+        assert_eq!(backend.method, StorageMethod::Local);
+        assert!(
+            backend.gcs_client.is_none(),
+            "gcs_client should be None for local backend"
         );
     }
 }
