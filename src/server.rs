@@ -171,6 +171,24 @@ async fn serve_local(
     file_id: &str,
 ) -> Result<Response, DownloadError> {
     let path = state.storage_dir.join(file_id);
+    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            DownloadError::NotFound
+        } else {
+            DownloadError::Internal(format!(
+                "failed to read local file metadata {}: {err}",
+                path.display()
+            ))
+        }
+    })?;
+
+    if !metadata.is_file() {
+        return Err(DownloadError::Internal(format!(
+            "local path is not a file: {}",
+            path.display()
+        )));
+    }
+
     let file = File::open(&path).await.map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             DownloadError::NotFound
@@ -311,14 +329,22 @@ impl IntoResponse for ListFilesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use axum::http::Request;
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, Set};
     use std::fs;
+    use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
     use tower::ServiceExt;
+
+    use crate::clients::gcs::GcsClient;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -362,6 +388,51 @@ mod tests {
         };
 
         active.insert(db).await.expect("insert agreement");
+    }
+
+    fn dummy_agreement(file_id: &str, filename: &str, mime: &str, size: i64) -> agreements::Model {
+        agreements::Model {
+            agreement_id: format!("AGREEMENT-{file_id}"),
+            user_id: "user".into(),
+            file_id: file_id.into(),
+            filename: filename.into(),
+            mime_type: mime.into(),
+            original_size: size,
+            nodes: serde_json::json!([]),
+            root: None,
+            padded_len: Some(size),
+            downloaded: true,
+            transaction_id: None,
+            curation: serde_json::json!({}),
+            status: "ready".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+        }
+    }
+
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
+
+    fn write_service_account_json(dir: &Path, key: &str) -> PathBuf {
+        let path = dir.join("service_account.json");
+        fs::create_dir_all(dir).unwrap();
+        let json = serde_json::json!({
+            "private_key": key,
+            "client_email": "svc@example.com",
+            "token_uri": "https://auth.example/token"
+        });
+        fs::write(&path, json.to_string()).unwrap();
+        path
+    }
+
+    async fn gcs_backend_with_key(key: &str) -> StorageBackend {
+        let dir = unique_storage_dir().join("gcs");
+        let sa = write_service_account_json(&dir, key);
+        let client = GcsClient::from_service_account_file("bucket", sa)
+            .await
+            .expect("service account should parse");
+        StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(client)),
+        }
     }
 
     #[tokio::test]
@@ -525,5 +596,218 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_binds_and_exits_on_shutdown() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        let (tx, rx) = oneshot::channel();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+        };
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = tokio::spawn(serve(addr, state, async move {
+            let _ = rx.await;
+        }));
+
+        tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should stop");
+        result
+            .expect("server task should complete")
+            .expect("serve should succeed");
+    }
+
+    #[tokio::test]
+    async fn serve_local_returns_not_found_when_file_missing() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        insert_agreement(&db, "FILE-missing", "missing.bin", 10, true).await;
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/FILE-missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_local_returns_internal_when_path_not_file() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        let file_path = storage_dir.join("FILE-dir");
+        tokio::fs::create_dir_all(&file_path).await.unwrap();
+
+        insert_agreement(&db, "FILE-dir", "dir.bin", 10, true).await;
+
+        let response = router(DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/files/FILE-dir")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn gcs_download_redirects_with_signed_url() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        insert_agreement(&db, "FILE-gcs", "gcs.bin", 12, true).await;
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/FILE-gcs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            location.contains("X-Goog-Signature="),
+            "expected signed URL, got {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_download_returns_storage_unavailable_without_client() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        insert_agreement(&db, "FILE-gcs-none", "gcs.bin", 12, true).await;
+
+        let response = router(DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend {
+                method: StorageMethod::Gcs,
+                gcs_client: None,
+            },
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/files/FILE-gcs-none")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn gcs_download_surfaces_signed_url_errors() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir();
+        insert_agreement(&db, "FILE-gcs-bad", "gcs.bin", 12, true).await;
+
+        let response = router(DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: gcs_backend_with_key("not-a-key").await,
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/files/FILE-gcs-bad")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn response_builder_uses_defaults_for_missing_fields() {
+        let agreement = dummy_agreement("FILE-meta", "", "", -1);
+        let response = response_builder(&agreement)
+            .unwrap()
+            .body(Body::empty())
+            .unwrap();
+
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+        assert!(headers.get(header::CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn download_error_into_response_maps_status_codes() {
+        let responses = [
+            (
+                DownloadError::NotFound.into_response(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                DownloadError::StorageUnavailable.into_response(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                DownloadError::Upstream("boom".into()).into_response(),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                DownloadError::Internal("oops".into()).into_response(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (resp, expected) in responses {
+            assert_eq!(resp.status(), expected);
+        }
+    }
+
+    #[test]
+    fn list_files_error_internal_masks_message() {
+        let resp = ListFilesError::Internal("boom".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

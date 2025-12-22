@@ -50,6 +50,7 @@ halo2curves = "0.8"
 http-body-util = "0.1"
 tempfile = "3.13"
 tower = { version = "0.5", features = ["util"] }
+assert_cmd = "2.0"
 
 # Optimize crypto dependencies even in dev/test builds to avoid extremely
 # slow execution under coverage instrumentation (cargo llvm-cov).

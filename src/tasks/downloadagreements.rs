@@ -42,7 +42,7 @@ impl std::error::Error for PostProcessError {}
 #[derive(Clone, Debug)]
 pub struct StorageBackend {
     pub method: StorageMethod,
-    gcs_client: Option<Arc<GcsClient>>,
+    pub(crate) gcs_client: Option<Arc<GcsClient>>,
 }
 
 impl StorageBackend {
