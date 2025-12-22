@@ -169,11 +169,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use tokio::time::{sleep, Duration};
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn unique_storage_dir(prefix: &str) -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -384,6 +390,7 @@ mod tests {
 
     #[test]
     fn load_local_env_returns_ok_when_missing() {
+        let _guard = cwd_lock().lock().unwrap();
         let temp_dir = unique_storage_dir("load_env_missing");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let original_dir = env::current_dir().unwrap();
@@ -398,6 +405,7 @@ mod tests {
 
     #[test]
     fn load_local_env_propagates_io_error() {
+        let _guard = cwd_lock().lock().unwrap();
         let temp_dir = unique_storage_dir("load_env_error");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let original_dir = env::current_dir().unwrap();
@@ -423,6 +431,7 @@ mod tests {
 
     #[test]
     fn load_local_env_errors_when_env_is_directory() {
+        let _guard = cwd_lock().lock().unwrap();
         let temp_dir = unique_storage_dir("load_env_dir");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let original_dir = env::current_dir().unwrap();

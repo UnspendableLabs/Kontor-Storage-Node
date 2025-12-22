@@ -38,3 +38,17 @@ wiremock = "0.6"
 serial_test = "2"
 pasta_curves = "0.5"
 halo2curves = "0.8"
+
+# Optimize crypto dependencies even in dev/test builds to avoid extremely
+# slow execution under coverage instrumentation (cargo llvm-cov).
+[profile.dev.package.kontor-crypto]
+opt-level = 3
+
+[profile.dev.package.ff]
+opt-level = 3
+
+[profile.dev.package.halo2curves]
+opt-level = 3
+
+[profile.dev.package.pasta_curves]
+opt-level = 3
