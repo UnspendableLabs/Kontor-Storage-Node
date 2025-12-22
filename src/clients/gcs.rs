@@ -740,6 +740,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_stream_surfaces_http_errors() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "stream-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/b/test-bucket/o/fail.bin"))
+            .and(query_param("alt", "media"))
+            .and(header("authorization", "Bearer stream-token"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let err = client
+            .download_stream("fail.bin")
+            .await
+            .err()
+            .expect("non-200 should bubble up");
+
+        let msg = err.to_string();
+        assert!(msg.contains("failed with status 500"), "got {msg}");
+        assert!(msg.contains("boom"), "expected body to be included: {msg}");
+    }
+
+    #[tokio::test]
+    async fn download_to_bytes_surfaces_http_errors() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "byte-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/b/test-bucket/o/fail-bytes.bin"))
+            .and(query_param("alt", "media"))
+            .and(header("authorization", "Bearer byte-token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("nope"))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let err = client
+            .download_to_bytes("fail-bytes.bin")
+            .await
+            .expect_err("non-success should error");
+
+        let msg = err.to_string();
+        assert!(msg.contains("status 503"), "unexpected message: {msg}");
+        assert!(msg.contains("nope"), "expected body text: {msg}");
+    }
+
+    #[tokio::test]
     async fn create_signed_download_url_includes_required_params() {
         let mock_server = MockServer::start().await;
 
@@ -782,6 +853,56 @@ mod tests {
             url.contains("X-Goog-Signature="),
             "signature must be included: {url}"
         );
+    }
+
+    #[tokio::test]
+    async fn download_url_embeds_token_and_disposition() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "url-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let url = client
+            .download_url("folder spaced/object.bin", Some("my file.bin"))
+            .await
+            .expect("url generation should succeed");
+
+        assert!(
+            url.contains("access_token=url-token"),
+            "token should be embedded: {url}"
+        );
+        assert!(
+            url.contains(
+                "response-content-disposition=attachment%3B%20filename%3D%22my%20file.bin%22"
+            ),
+            "disposition should preserve filename: {url}"
+        );
+        assert!(
+            url.contains("/storage/v1/b/test-bucket/o/folder%20spaced%2Fobject.bin"),
+            "object path should be encoded and include bucket/object: {url}"
+        );
+    }
+
+    #[test]
+    fn content_disposition_encodes_filenames() {
+        let with_name = GcsClient::content_disposition(Some("a \"weird\" name.txt"));
+        assert_eq!(
+            with_name, "attachment; filename=\"a \\\"weird\\\" name.txt\"",
+            "quotes should be escaped"
+        );
+
+        let defaulted = GcsClient::content_disposition(None);
+        assert_eq!(defaulted, "attachment");
     }
 
     #[tokio::test]

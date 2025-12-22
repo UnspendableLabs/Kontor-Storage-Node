@@ -229,6 +229,7 @@ mod tests {
     use bytes::Bytes;
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_json, header, method, path, query_param};
@@ -532,6 +533,51 @@ mod tests {
             err.to_string()
                 .contains("unable to create storage directory"),
             "expected directory creation error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_errors_when_write_fails() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-permission";
+        let download_url = format!("{}/files/read-only", mock_server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/files/read-only"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = storage_dir("write_fail");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let mut perms = fs::metadata(&storage_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&storage_dir, perms).unwrap();
+
+        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
+        let err = client
+            .download_file(agreement_id, "read-only.bin")
+            .await
+            .unwrap_err();
+
+        // Restore permissions for cleanup to avoid flaky FS state.
+        let mut cleanup_perms = fs::metadata(&storage_dir).unwrap().permissions();
+        cleanup_perms.set_mode(0o755);
+        fs::set_permissions(&storage_dir, cleanup_perms).unwrap();
+
+        assert!(
+            err.to_string().contains("unable to write downloaded file"),
+            "expected write error, got {err}"
         );
     }
 
