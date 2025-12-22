@@ -410,10 +410,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::fs;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_bytes, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
     fn unique_storage_dir(prefix: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -514,6 +515,117 @@ mod tests {
         assert!(
             storage_dir.join("ledger.bin").exists(),
             "ledger file should be created alongside downloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_to_gcs_and_removes_local_file_after_success() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-upload";
+        let file_id = "FILE-gcs-upload";
+        let filename = "gcs.bin";
+        let download_path = "/files/gcs.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-gcs";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .and(header("authorization", "Bearer token-gcs"))
+            .and(header("content-type", "application/octet-stream"))
+            .and(body_bytes("file-body"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_backend");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set(filename.into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "local file should be removed after GCS upload"
+        );
+        assert!(
+            storage_dir.join("ledger.bin").exists(),
+            "ledger should still be written when using the GCS backend"
+        );
+
+        let downloaded = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("agreement should exist");
+        assert!(downloaded.downloaded, "downloaded flag should be set");
+        assert!(
+            downloaded.root.is_some(),
+            "metadata root should be persisted after GCS upload"
         );
     }
 

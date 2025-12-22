@@ -6,7 +6,7 @@ mod database;
 mod entities;
 mod tasks;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use sea_orm::DatabaseConnection;
 use std::future::Future;
@@ -31,10 +31,19 @@ async fn main() -> Result<()> {
 }
 
 fn load_local_env() -> Result<()> {
-    match dotenvy::from_filename(".env.local") {
-        Ok(_) => Ok(()),
-        Err(dotenvy::Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).context("failed to load .env.local"),
+    match std::fs::metadata(".env.local") {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return Err(anyhow!("failed to load .env.local: path is a directory"));
+            }
+
+            let contents =
+                std::fs::read_to_string(".env.local").context("failed to read .env.local")?;
+            dotenvy::from_read(contents.as_bytes()).context("failed to load .env.local")?;
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).context("failed to stat .env.local"),
     }
 }
 
