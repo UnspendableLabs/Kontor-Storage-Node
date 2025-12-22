@@ -421,6 +421,34 @@ mod tests {
         std::env::temp_dir().join(format!("kontor_download_agreements_{prefix}_{id}"))
     }
 
+    #[tokio::test]
+    async fn storage_backend_new_requires_bucket_for_gcs() {
+        let err = StorageBackend::new(
+            StorageMethod::Gcs,
+            None,
+            Some(PathBuf::from("/tmp/sa.json")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("STORAGE_GCS_BUCKET_NAME"),
+            "expected bucket validation error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_backend_new_requires_service_account_for_gcs() {
+        let err = StorageBackend::new(StorageMethod::Gcs, Some("bucket".into()), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("STORAGE_GCS_SERVICE_ACCOUNT_JSON"),
+            "expected service account validation error, got {err}"
+        );
+    }
+
     async fn setup_in_memory_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let schema = Schema::new(DatabaseBackend::Sqlite);
@@ -626,6 +654,112 @@ mod tests {
         assert!(
             downloaded.root.is_some(),
             "metadata root should be persisted after GCS upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_upload_error_rolls_back_and_cleans_local_file() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-gcs-fail";
+        let file_id = "FILE-gcs-fail";
+        let download_path = "/files/gcs-fail.bin";
+        let download_url = format!("{}{}", mock_server.uri(), download_path);
+        let bucket = "bucket-gcs-fail";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{bucket}/o")))
+            .and(query_param("uploadType", "media"))
+            .and(query_param("name", file_id))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("gcs_upload_error");
+        stdfs::remove_dir_all(&storage_dir).ok();
+
+        let agreement = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("gcs.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!(["NODE-1"])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(false),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        agreement.insert(&database).await.unwrap();
+
+        let gcs_client = GcsClient::with_test_endpoints(
+            bucket,
+            "svc@example.com",
+            TEST_PRIVATE_KEY,
+            format!("{}/token", mock_server.uri()),
+            mock_server.uri(),
+        );
+        let backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(gcs_client)),
+        };
+
+        let err = download_agreements(
+            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &backend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("uploading FILE-gcs-fail to GCS bucket"),
+            "expected upload failure to be surfaced, got {err}"
+        );
+        assert!(
+            !storage_dir.join(file_id).exists(),
+            "local file should be removed after GCS upload failure"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after rollback"
         );
     }
 

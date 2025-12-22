@@ -420,4 +420,28 @@ mod tests {
             "directory at .env.local should cause an IO error"
         );
     }
+
+    #[test]
+    fn load_local_env_errors_when_env_is_directory() {
+        let temp_dir = unique_storage_dir("load_env_dir");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&temp_dir).unwrap();
+
+        let env_dir = temp_dir.join(".env.local");
+        std::fs::create_dir_all(&env_dir).unwrap();
+
+        let result = load_local_env();
+
+        env::set_current_dir(original_dir).unwrap();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("path is a directory"),
+            "expected directory .env.local to be rejected"
+        );
+    }
 }

@@ -5,7 +5,11 @@ use bytes::Bytes;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::fs;
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct PortalClient {
@@ -22,11 +26,16 @@ impl PortalClient {
         storage_dir: impl Into<PathBuf>,
     ) -> Self {
         let base_url = base_url.into();
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .expect("building Portal HTTP client");
         Self {
             base_url,
             api_key: api_key.into(),
             storage_dir: storage_dir.into(),
-            http: Client::new(),
+            http,
         }
     }
 
@@ -523,6 +532,35 @@ mod tests {
             err.to_string()
                 .contains("unable to create storage directory"),
             "expected directory creation error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_surfaces_download_url_errors() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-missing";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(
+            mock_server.uri(),
+            "secret",
+            storage_dir("download_url_error"),
+        );
+        let err = client
+            .download_file(agreement_id, "ignored.txt")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("status 404"),
+            "expected status code to be in error, got {err}"
         );
     }
 }

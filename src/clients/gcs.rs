@@ -7,6 +7,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::encode as url_encode;
 
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Minimal Google Cloud Storage client for uploading agreement files using
 /// service-account JWT flow and direct HTTP requests.
 #[derive(Clone, Debug)]
@@ -59,7 +62,11 @@ impl GcsClient {
             .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
 
         Ok(Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .expect("building GCS HTTP client"),
             bucket: bucket.into(),
             service_account,
             auth_url,
@@ -78,7 +85,11 @@ impl GcsClient {
     ) -> Self {
         let auth_url = auth_url.into();
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .expect("building test GCS HTTP client"),
             bucket: bucket.into(),
             service_account: ServiceAccountKey {
                 private_key: private_key.into(),
