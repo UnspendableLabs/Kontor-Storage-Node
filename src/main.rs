@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod database;
 mod entities;
+mod server;
 mod tasks;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,10 +12,11 @@ use clap::Parser;
 use sea_orm::DatabaseConnection;
 use std::future::Future;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
-use tokio::signal;
+use tokio::{pin, signal, sync::oneshot};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Commands};
@@ -114,6 +116,10 @@ async fn run_with_shutdown(
         &config.storage_dir,
     );
     let lock_path = config.storage_dir.join(".portal-daemon.lock");
+    let download_addr: SocketAddr = config
+        .server_address
+        .parse()
+        .context("invalid server address")?;
 
     match cli.command {
         Commands::Ping => {
@@ -133,6 +139,8 @@ async fn run_with_shutdown(
                 lock_path,
                 storage_limits,
                 storage_backend,
+                config.storage_dir.clone(),
+                download_addr,
                 shutdown,
             )
             .await?;
@@ -150,21 +158,53 @@ async fn run_daemon_command(
     lock_path: PathBuf,
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
+    storage_dir: PathBuf,
+    download_addr: SocketAddr,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
+    let daemon_backend = storage_backend.clone();
     let handle = spawn_portal_daemon(
         client,
-        conn,
+        conn.clone(),
         interval,
         lock_path,
         storage_limits,
-        storage_backend,
+        daemon_backend,
     );
 
-    let shutdown_result = shutdown.await;
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server = server::serve(
+        download_addr,
+        server::DownloadServerState {
+            db: conn,
+            storage_dir,
+            storage_backend,
+        },
+        async move {
+            let _ = server_shutdown_rx.await;
+        },
+    );
+
+    pin!(server);
+    pin!(shutdown);
+
+    let shutdown_result = tokio::select! {
+        server_result = &mut server => {
+            handle.abort();
+            let _ = handle.await;
+            return server_result;
+        }
+        shutdown_result = &mut shutdown => shutdown_result,
+    };
+
+    let _ = server_shutdown_tx.send(());
+
+    let server_result = server.await;
+
     handle.abort();
     let _ = handle.await;
 
+    server_result?;
     shutdown_result?;
     Ok(())
 }
@@ -233,6 +273,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -289,6 +330,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -334,6 +376,7 @@ mod tests {
             storage_gcs_service_account_json: Some(
                 service_account_path.to_string_lossy().to_string(),
             ),
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -385,6 +428,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Run,
         };
 
@@ -446,6 +490,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Run,
         };
 

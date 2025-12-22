@@ -54,6 +54,11 @@ impl StorageBackend {
         }
     }
 
+    /// Access the configured GCS client when storage method is GCS.
+    pub fn gcs_client(&self) -> Option<Arc<GcsClient>> {
+        self.gcs_client.clone()
+    }
+
     /// Build a storage backend, initializing the GCS client once when needed.
     pub async fn new(
         method: StorageMethod,
