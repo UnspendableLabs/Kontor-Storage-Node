@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_GCS_SERVICE_ACCOUNT_JSON")]
     pub storage_gcs_service_account_json: Option<String>,
 
+    /// Address the server binds to (e.g. 0.0.0.0:8081)
+    #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
+    pub server_address: String,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

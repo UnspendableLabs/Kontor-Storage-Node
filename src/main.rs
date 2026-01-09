@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod database;
 mod entities;
+mod server;
 mod tasks;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,19 +12,23 @@ use clap::Parser;
 use sea_orm::DatabaseConnection;
 use std::future::Future;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Once;
 use std::time::Duration;
-use tokio::signal;
+use tokio::{pin, signal, sync::oneshot};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{Cli, Commands};
 use clients::PortalClient;
-use config::Config;
+use config::{Config, StorageMethod};
 use daemon::{spawn_portal_daemon, StorageLimits};
 use database::DBClient;
 use tasks::downloadagreements::StorageBackend;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logging();
     load_local_env()?;
     let cli = Cli::parse();
     let mut stdout = io::stdout();
@@ -59,7 +64,16 @@ async fn run_with_shutdown(
     let config = Config::from_cli(&cli)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
-    writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
+    writeln!(writer, "Storage method: {}", config.storage_method)?;
+    if config.storage_method == StorageMethod::Gcs {
+        let bucket = config
+            .storage_gcs_bucket_name
+            .as_deref()
+            .unwrap_or("<missing bucket>");
+        writeln!(writer, "GCS bucket name: {bucket}")?;
+    } else {
+        writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
+    }
     match config.storage_capacity {
         Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
         None => writeln!(writer, "Storage capacity: unlimited")?,
@@ -72,6 +86,11 @@ async fn run_with_shutdown(
         Some(limit) => writeln!(writer, "Max stored files: {limit}")?,
         None => writeln!(writer, "Max stored files: unlimited")?,
     }
+    writeln!(
+        writer,
+        "Portal polling interval: {}s",
+        config.portal_polling_interval.as_secs()
+    )?;
 
     std::fs::create_dir_all(&config.storage_dir).with_context(|| {
         format!(
@@ -97,6 +116,10 @@ async fn run_with_shutdown(
         &config.storage_dir,
     );
     let lock_path = config.storage_dir.join(".portal-daemon.lock");
+    let download_addr: SocketAddr = config
+        .server_address
+        .parse()
+        .context("invalid server address")?;
 
     match cli.command {
         Commands::Ping => {
@@ -110,13 +133,14 @@ async fn run_with_shutdown(
                 max_files: config.storage_max_files,
             };
             run_daemon_command(
-                &mut writer,
                 client,
                 conn,
                 config.portal_polling_interval,
                 lock_path,
                 storage_limits,
                 storage_backend,
+                config.storage_dir.clone(),
+                download_addr,
                 shutdown,
             )
             .await?;
@@ -128,43 +152,87 @@ async fn run_with_shutdown(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_daemon_command(
-    mut writer: impl Write,
     client: PortalClient,
     conn: DatabaseConnection,
     interval: Duration,
     lock_path: PathBuf,
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
+    storage_dir: PathBuf,
+    download_addr: SocketAddr,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
+    let daemon_backend = storage_backend.clone();
     let handle = spawn_portal_daemon(
         client,
-        conn,
+        conn.clone(),
         interval,
         lock_path,
         storage_limits,
-        storage_backend,
+        daemon_backend,
     );
 
-    writeln!(
-        writer,
-        "Portal sync daemon running every {}s",
-        interval.as_secs()
-    )?;
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server = server::serve(
+        download_addr,
+        server::DownloadServerState {
+            db: conn,
+            storage_dir,
+            storage_backend,
+        },
+        async move {
+            let _ = server_shutdown_rx.await;
+        },
+    );
 
-    let shutdown_result = shutdown.await;
+    pin!(server);
+    pin!(shutdown);
+
+    let shutdown_result = tokio::select! {
+        server_result = &mut server => {
+            handle.abort();
+            let _ = handle.await;
+            return server_result;
+        }
+        shutdown_result = &mut shutdown => shutdown_result,
+    };
+
+    let _ = server_shutdown_tx.send(());
+
+    let server_result = server.await;
+
     handle.abort();
     let _ = handle.await;
 
+    server_result?;
     shutdown_result?;
     Ok(())
+}
+
+fn init_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new("info"))
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .compact()
+            .try_init();
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::future;
     use serde_json::json;
     use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -209,6 +277,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -223,6 +292,10 @@ mod tests {
         assert!(
             output.contains("Database URL:"),
             "expected database url line in output"
+        );
+        assert!(
+            output.contains("Storage method:"),
+            "expected storage method line in output"
         );
         assert!(
             output.contains("Storage dir:"),
@@ -261,6 +334,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -271,6 +345,152 @@ mod tests {
             err.to_string().contains("Portal ping failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_prints_gcs_bucket_when_storage_method_is_gcs() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
+            .mount(&mock_server)
+            .await;
+
+        let service_account_path = unique_storage_dir("sa").join("service_account.json");
+        std::fs::create_dir_all(service_account_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &service_account_path,
+            r#"{"private_key":"dummy","client_email":"test@example.com"}"#,
+        )
+        .unwrap();
+
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/storage")),
+            portal_polling_interval_secs: 5,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "gcs".to_string(),
+            storage_gcs_bucket_name: Some("my-bucket".to_string()),
+            storage_gcs_service_account_json: Some(
+                service_account_path.to_string_lossy().to_string(),
+            ),
+            server_address: "127.0.0.1:0".to_string(),
+            command: Commands::Ping,
+        };
+
+        let mut buffer = Vec::new();
+        run(cli, &mut buffer).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            output.contains("Storage method: gcs"),
+            "expected storage method to be printed, got {output}"
+        );
+        assert!(
+            output.contains("GCS bucket name: my-bucket"),
+            "expected gcs bucket line in output, got {output}"
+        );
+        assert!(
+            !output.contains("Storage dir:"),
+            "should not print storage dir when using gcs"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_prints_limits_when_configured() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
+            .mount(&mock_server)
+            .await;
+
+        let storage_dir = unique_storage_dir("limits");
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_dir.clone()),
+            portal_polling_interval_secs: 3,
+            storage_capacity: Some("2GB".into()),
+            storage_max_file_size: Some("50MB".into()),
+            storage_max_files: Some(7),
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            command: Commands::Ping,
+        };
+
+        let mut buffer = Vec::new();
+        run(cli, &mut buffer).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            output.contains("Storage capacity: 2000000000 bytes"),
+            "expected capacity line, got {output}"
+        );
+        assert!(
+            output.contains("Max file size: 50000000 bytes"),
+            "expected max file size line, got {output}"
+        );
+        assert!(
+            output.contains("Max stored files: 7"),
+            "expected max files line, got {output}"
+        );
+
+        std::fs::remove_dir_all(storage_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_errors_when_storage_dir_is_file() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
+            .mount(&mock_server)
+            .await;
+
+        let storage_file = unique_storage_dir("dir_as_file");
+        fs::create_dir_all(storage_file.parent().unwrap()).unwrap();
+        fs::write(&storage_file, "not a directory").unwrap();
+
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            portal_api_key: "secret".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_file.clone()),
+            portal_polling_interval_secs: 5,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            command: Commands::Ping,
+        };
+
+        let mut buffer = Vec::new();
+        let err = run(cli, &mut buffer).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("failed to create storage directory"),
+            "expected storage dir creation error, got {err}"
+        );
+
+        std::fs::remove_file(storage_file).ok();
     }
 
     #[tokio::test]
@@ -303,6 +523,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Run,
         };
 
@@ -316,8 +537,8 @@ mod tests {
         let output = String::from_utf8(buffer).unwrap();
 
         assert!(
-            output.contains("Portal sync daemon running every"),
-            "expected daemon startup message in output: {output}"
+            output.contains("Portal polling interval:"),
+            "expected polling interval in output: {output}"
         );
 
         let lock_path = storage_dir.join(".portal-daemon.lock");
@@ -364,6 +585,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Run,
         };
 
@@ -385,6 +607,43 @@ mod tests {
             "lock file should be cleaned even when shutdown fails"
         );
 
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_daemon_command_returns_server_error_when_binding_fails() {
+        let storage_dir = unique_storage_dir("bind_error");
+        let lock_path = storage_dir.join(".portal-daemon.lock");
+        let db = DBClient::new("sqlite::memory:").await.unwrap();
+        let storage_backend = StorageBackend::local();
+        let portal_client = PortalClient::new("http://localhost:0", "secret", storage_dir.clone());
+        let storage_limits = StorageLimits {
+            capacity: None,
+            max_files: Some(0),
+            max_file_size: None,
+        };
+        let shutdown = future::pending::<io::Result<()>>();
+
+        let err = run_daemon_command(
+            portal_client,
+            db.connection().clone(),
+            Duration::from_millis(10),
+            lock_path.clone(),
+            storage_limits,
+            storage_backend,
+            storage_dir.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            shutdown,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("binding download server"),
+            "expected download server bind error, got {err}"
+        );
+
+        std::fs::remove_file(&lock_path).ok();
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 
@@ -452,5 +711,60 @@ mod tests {
                 .contains("path is a directory"),
             "expected directory .env.local to be rejected"
         );
+    }
+
+    #[test]
+    fn load_local_env_reads_file_and_sets_vars() {
+        let _guard = cwd_lock().lock().unwrap();
+        let temp_dir = unique_storage_dir("load_env_file");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&temp_dir).unwrap();
+
+        std::fs::write(temp_dir.join(".env.local"), "FOO=bar\nBAZ=qux").unwrap();
+        env::remove_var("FOO");
+        env::remove_var("BAZ");
+
+        let result = load_local_env();
+
+        env::set_current_dir(original_dir).unwrap();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(result.is_ok());
+        assert_eq!(env::var("FOO").unwrap(), "bar");
+        assert_eq!(env::var("BAZ").unwrap(), "qux");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_local_env_propagates_metadata_error() {
+        let _guard = cwd_lock().lock().unwrap();
+        let temp_dir = unique_storage_dir("load_env_metadata");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let protected_dir = temp_dir.join("protected");
+        std::fs::create_dir_all(&protected_dir).unwrap();
+        std::fs::write(protected_dir.join("secret.env"), "FOO=bar").unwrap();
+        std::fs::set_permissions(&protected_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let symlink_path = temp_dir.join(".env.local");
+        symlink(protected_dir.join("secret.env"), &symlink_path).unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(&temp_dir).unwrap();
+        let result = load_local_env();
+
+        std::fs::set_permissions(&protected_dir, std::fs::Permissions::from_mode(0o700)).ok();
+        env::set_current_dir(original_dir).unwrap();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(
+            result.is_err(),
+            "metadata permission error should be propagated"
+        );
+    }
+
+    #[test]
+    fn init_logging_runs_once() {
+        init_logging();
+        init_logging();
     }
 }

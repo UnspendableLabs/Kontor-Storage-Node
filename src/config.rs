@@ -2,6 +2,7 @@ use crate::cli::Cli;
 use crate::database::default_storage_dir;
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,6 +26,15 @@ impl StorageMethod {
     }
 }
 
+impl fmt::Display for StorageMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageMethod::Local => write!(f, "local"),
+            StorageMethod::Gcs => write!(f, "gcs"),
+        }
+    }
+}
+
 /// Application configuration derived from CLI arguments and environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -39,6 +49,7 @@ pub struct Config {
     pub storage_method: StorageMethod,
     pub storage_gcs_bucket_name: Option<String>,
     pub storage_gcs_service_account_json: Option<String>,
+    pub server_address: String,
 }
 
 impl Config {
@@ -80,6 +91,7 @@ impl Config {
             storage_method,
             storage_gcs_bucket_name: cli.storage_gcs_bucket_name.clone(),
             storage_gcs_service_account_json: cli.storage_gcs_service_account_json.clone(),
+            server_address: cli.server_address.clone(),
         })
     }
 }
@@ -126,6 +138,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -147,6 +160,7 @@ mod tests {
         assert_eq!(config.storage_max_files, Some(10));
         assert_eq!(config.storage_max_file_size, Some(1_000_000_000));
         assert_eq!(config.storage_method, StorageMethod::Local);
+        assert_eq!(config.server_address, "127.0.0.1:0");
     }
 
     #[test]
@@ -178,6 +192,7 @@ mod tests {
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -230,6 +245,7 @@ mod tests {
             storage_method: "gcs".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -251,6 +267,7 @@ mod tests {
             storage_method: "gcs".to_string(),
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
             storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
@@ -272,6 +289,7 @@ mod tests {
             storage_method: "gcs".to_string(),
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
+            server_address: "127.0.0.1:0".to_string(),
             command: Commands::Ping,
         };
 
