@@ -538,4 +538,308 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn storage_method_display_local() {
+        assert_eq!(StorageMethod::Local.to_string(), "local");
+    }
+
+    #[test]
+    fn storage_method_display_gcs() {
+        assert_eq!(StorageMethod::Gcs.to_string(), "gcs");
+    }
+
+    #[test]
+    #[serial]
+    fn persisted_config_load_returns_error_on_invalid_json() {
+        with_temp_app_dir("invalid_json", || {
+            let path = PersistedConfig::config_path().unwrap();
+            std::fs::write(&path, "not valid json {{{").unwrap();
+
+            let err = PersistedConfig::load().unwrap_err();
+            assert!(err.to_string().contains("failed to parse config file"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_does_not_save_when_node_id_unchanged() {
+        with_temp_app_dir("node_id_unchanged", || {
+            // Save a node_id to the persisted config
+            let persisted = PersistedConfig {
+                node_id: Some("NODE-same".to_string()),
+            };
+            persisted.save().unwrap();
+
+            // Record the file modification time
+            let path = PersistedConfig::config_path().unwrap();
+            let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            // Small delay to ensure different mtime if file is rewritten
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            let cli = Cli {
+                node_id: Some("NODE-same".to_string()), // Same as persisted
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let config = Config::from_cli(&cli).unwrap();
+            assert_eq!(config.node_id, "NODE-same");
+
+            // File should not have been rewritten since node_id didn't change
+            let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(mtime_before, mtime_after);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_uses_default_storage_dir_when_none() {
+        with_temp_app_dir("default_storage_dir", || {
+            let cli = Cli {
+                node_id: Some("NODE-default-dir".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: None, // Not provided
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let config = Config::from_cli(&cli).unwrap();
+            assert_eq!(config.storage_dir, crate::database::default_storage_dir());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_clones_bls_key_path() {
+        with_temp_app_dir("bls_key_path", || {
+            let cli = Cli {
+                node_id: Some("NODE-bls".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: Some(PathBuf::from("/path/to/bls_key.enc")),
+                command: Commands::Ping,
+            };
+
+            let config = Config::from_cli(&cli).unwrap();
+            assert_eq!(
+                config.bls_key_path,
+                Some(PathBuf::from("/path/to/bls_key.enc"))
+            );
+        });
+    }
+
+    #[test]
+    fn parse_storage_capacity_supports_pure_bytes() {
+        // Pure numeric value (no unit) should be interpreted as bytes
+        assert_eq!(parse_storage_capacity("1024").unwrap(), 1024);
+        assert_eq!(parse_storage_capacity("  500  ").unwrap(), 500);
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_saves_new_node_id_when_different() {
+        with_temp_app_dir("node_id_different", || {
+            // Save a node_id to the persisted config
+            let persisted = PersistedConfig {
+                node_id: Some("NODE-old".to_string()),
+            };
+            persisted.save().unwrap();
+
+            let cli = Cli {
+                node_id: Some("NODE-new".to_string()), // Different from persisted
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let config = Config::from_cli(&cli).unwrap();
+            assert_eq!(config.node_id, "NODE-new");
+
+            // Verify the new node_id was persisted
+            let reloaded = PersistedConfig::load().unwrap();
+            assert_eq!(reloaded.node_id, Some("NODE-new".to_string()));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn persisted_config_default_has_no_node_id() {
+        let config = PersistedConfig::default();
+        assert!(config.node_id.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn persisted_config_save_and_load_roundtrip() {
+        with_temp_app_dir("roundtrip", || {
+            let original = PersistedConfig {
+                node_id: Some("NODE-roundtrip".to_string()),
+            };
+            original.save().unwrap();
+
+            let loaded = PersistedConfig::load().unwrap();
+            assert_eq!(loaded.node_id, original.node_id);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_rejects_invalid_storage_method() {
+        with_temp_app_dir("invalid_storage_method", || {
+            let cli = Cli {
+                node_id: Some("NODE-invalid".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "invalid_method".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let err = Config::from_cli(&cli).unwrap_err();
+            assert!(err.to_string().contains("invalid storage method"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_rejects_invalid_storage_capacity() {
+        with_temp_app_dir("invalid_capacity", || {
+            let cli = Cli {
+                node_id: Some("NODE-cap".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: Some("not_a_number".to_string()),
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let err = Config::from_cli(&cli).unwrap_err();
+            assert!(err.to_string().contains("invalid storage capacity"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_rejects_invalid_storage_max_file_size() {
+        with_temp_app_dir("invalid_max_file_size", || {
+            let cli = Cli {
+                node_id: Some("NODE-maxfs".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: Some("bad_value".to_string()),
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let err = Config::from_cli(&cli).unwrap_err();
+            assert!(err.to_string().contains("invalid storage capacity"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn config_from_cli_saves_node_id_when_no_persisted_config() {
+        with_temp_app_dir("no_persisted", || {
+            // Ensure no persisted config exists
+            let path = PersistedConfig::config_path().unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            let cli = Cli {
+                node_id: Some("NODE-fresh".to_string()),
+                portal_url: "https://portal.example/api".to_string(),
+                database_url: "sqlite://localhost/mydb".to_string(),
+                storage_dir: Some(PathBuf::from("/tmp/files")),
+                portal_polling_interval_secs: 10,
+                storage_capacity: None,
+                storage_max_files: None,
+                storage_max_file_size: None,
+                storage_method: "local".to_string(),
+                storage_gcs_bucket_name: None,
+                storage_gcs_service_account_json: None,
+                server_address: "127.0.0.1:0".to_string(),
+                bls_key_path: None,
+                command: Commands::Ping,
+            };
+
+            let config = Config::from_cli(&cli).unwrap();
+            assert_eq!(config.node_id, "NODE-fresh");
+
+            // Verify the node_id was persisted
+            let loaded = PersistedConfig::load().unwrap();
+            assert_eq!(loaded.node_id, Some("NODE-fresh".to_string()));
+        });
+    }
+
+    #[test]
+    fn parse_storage_capacity_rejects_overflow() {
+        // 1 zettabyte = 10^21 bytes, which exceeds u64::MAX (~18.4 exabytes / 1.8*10^19)
+        let result = parse_storage_capacity("1 ZB");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds u64"));
+    }
 }
