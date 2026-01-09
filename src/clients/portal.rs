@@ -1,24 +1,60 @@
 #![allow(dead_code)] // Temporary until new Portal client methods are wired into commands.
 
+use super::http_signature;
+use crate::bls::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::OnceCell;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+/// Authentication credentials for Portal API requests.
+#[derive(Clone)]
+pub struct PortalAuth {
+    keypair: Arc<BlsKeyPair>,
+    node_id: String,
+}
+
+impl std::fmt::Debug for PortalAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalAuth")
+            .field("node_id", &self.node_id)
+            .field("keypair", &"<BlsKeyPair>")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PortalClient {
     base_url: String,
     storage_dir: PathBuf,
     http: Client,
+    /// Optional authentication for signed requests.
+    auth: Option<PortalAuth>,
+    /// Cached portal signing xpub (fetched lazily on first use).
+    cached_portal_xpub: Arc<OnceCell<String>>,
+}
+
+impl std::fmt::Debug for PortalClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalClient")
+            .field("base_url", &self.base_url)
+            .field("storage_dir", &self.storage_dir)
+            .field("auth", &self.auth)
+            .field("cached_portal_xpub", &self.cached_portal_xpub.get())
+            .finish()
+    }
 }
 
 impl PortalClient {
+    /// Create an unauthenticated client for public endpoints only.
     pub fn new(base_url: impl Into<String>, storage_dir: impl Into<PathBuf>) -> Self {
         let base_url = base_url.into();
         let http = Client::builder()
@@ -30,7 +66,66 @@ impl PortalClient {
             base_url,
             storage_dir: storage_dir.into(),
             http,
+            auth: None,
+            cached_portal_xpub: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Create an authenticated client with BLS keypair for signed requests.
+    pub fn with_auth(
+        base_url: impl Into<String>,
+        storage_dir: impl Into<PathBuf>,
+        keypair: Arc<BlsKeyPair>,
+        node_id: impl Into<String>,
+    ) -> Self {
+        let base_url = base_url.into();
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .expect("building Portal HTTP client");
+        Self {
+            base_url,
+            storage_dir: storage_dir.into(),
+            http,
+            auth: Some(PortalAuth {
+                keypair,
+                node_id: node_id.into(),
+            }),
+            cached_portal_xpub: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Get the node ID if authenticated.
+    pub fn node_id(&self) -> Option<&str> {
+        self.auth.as_ref().map(|a| a.node_id.as_str())
+    }
+
+    /// Sign a request if authentication is configured.
+    fn sign_headers(
+        &self,
+        method: &str,
+        target_uri: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<Option<reqwest::header::HeaderMap>> {
+        match &self.auth {
+            Some(auth) => {
+                let headers = http_signature::sign_request(
+                    &auth.keypair,
+                    &auth.node_id,
+                    method,
+                    target_uri,
+                    body,
+                )?;
+                Ok(Some(headers))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get the full URL for an API path (for signing).
+    fn api_path(&self, path: &str) -> String {
+        format!("{}{}", self.base_url.trim_end_matches('/'), path)
     }
 
     pub async fn ping(&self) -> Result<String> {
@@ -75,17 +170,54 @@ impl PortalClient {
         }
     }
 
-    /// Fetch agreements that are marked as new.
+    /// Fetch the Portal signing xpub from the public API endpoint.
+    /// This xpub is used to bind agreement signatures to this Portal.
+    pub async fn get_portal_signing_xpub(&self) -> Result<String> {
+        self.get_or_fetch_portal_xpub().await.cloned()
+    }
+
+    /// Get the cached portal signing xpub, or fetch it if not yet cached.
+    /// The xpub is cached for the lifetime of the client.
+    async fn get_or_fetch_portal_xpub(&self) -> Result<&String> {
+        self.cached_portal_xpub
+            .get_or_try_init(|| async {
+                let url = format!("{}/api/", self.base_url.trim_end_matches('/'));
+                let resp = self.http.get(&url).send().await?;
+                let status = resp.status();
+
+                if status.is_success() {
+                    let body = resp
+                        .json::<PortalInfoResponse>()
+                        .await
+                        .context("failed to deserialize portal info")?;
+                    Ok(body.portal_signing_xpub)
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    Err(anyhow!(
+                        "failed to fetch portal signing xpub with status {status}: {body}"
+                    ))
+                }
+            })
+            .await
+    }
+
+    /// Fetch agreements that are marked as new or ready.
     ///
-    /// TODO: This method needs to be updated to use RFC 9421 BLS signatures
-    /// for authentication instead of bearer token.
+    /// This method requires authentication via RFC 9421 BLS signatures.
     pub async fn get_new_agreements(&self) -> Result<AgreementsPage> {
-        let url = format!(
-            "{}/api/agreements?status=new",
-            self.base_url.trim_end_matches('/')
-        );
-        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
-        let resp = self.http.get(url).send().await?;
+        let path = "/api/agreements?status=new|ready";
+        let url = self.api_path(path);
+
+        let mut request = self.http.get(&url);
+
+        // Add signature headers if authenticated
+        if let Some(headers) = self.sign_headers("GET", path, None)? {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        let resp = request.send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -102,25 +234,56 @@ impl PortalClient {
         }
     }
 
-    /// Join an agreement using the provided UTXO.
+    /// Join an agreement as a storage node.
     ///
-    /// TODO: This method needs to be updated to use RFC 9421 BLS signatures
-    /// for authentication and include a BLS signature over the join instruction.
-    pub async fn join_agreement(
-        &self,
-        agreement_id: &str,
-        utxo: &str,
-    ) -> Result<JoinAgreementResponse> {
-        let url = format!(
-            "{}/api/agreements/{agreement_id}/join",
-            self.base_url.trim_end_matches('/')
-        );
-        let payload = JoinAgreementRequest {
-            utxo: utxo.to_string(),
-        };
+    /// This method:
+    /// 1. Fetches the Portal signing xpub (cached after first fetch)
+    /// 2. Creates a BLS signature over `(portal_signing_xpub, ["join_agreement", node_id, agreement_id])`
+    /// 3. Submits the join request with both HTTP signature and agreement signature
+    ///
+    /// Requires authentication via RFC 9421 BLS signatures.
+    pub async fn join_agreement(&self, agreement_id: &str) -> Result<JoinAgreementResponse> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow!("authentication required to join agreement: no keypair configured")
+        })?;
 
-        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
-        let resp = self.http.post(url).json(&payload).send().await?;
+        // Get the portal signing xpub (cached after first fetch)
+        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
+
+        // Create the join instruction: ["join_agreement", node_id, agreement_id]
+        // Must be Vec<String> to match Portal's serialization format
+        let instruction: Vec<String> = vec![
+            "join_agreement".to_string(),
+            auth.node_id.clone(),
+            agreement_id.to_string(),
+        ];
+
+        // Serialize with postcard: (portal_signing_xpub, instruction)
+        let message_to_sign = postcard::to_allocvec(&(portal_xpub, instruction))
+            .context("failed to serialize join instruction")?;
+
+        // Sign with agreement DST
+        let bls_signature = auth.keypair.sign_agreement_instruction(&message_to_sign)?;
+
+        let path = format!("/api/agreements/{agreement_id}/join");
+        let url = self.api_path(&path);
+
+        let payload = JoinAgreementRequest { bls_signature };
+        let body_bytes =
+            serde_json::to_vec(&payload).context("failed to serialize join request")?;
+
+        let mut request = self.http.post(&url);
+
+        // Add HTTP signature headers (includes Content-Type, Content-Length, Content-Digest)
+        if let Some(headers) =
+            self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
+        {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        let resp = request.body(body_bytes).send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -177,12 +340,19 @@ impl PortalClient {
     }
 
     async fn fetch_download_url(&self, agreement_id: &str) -> Result<String> {
-        let url = format!(
-            "{}/api/agreements/{agreement_id}/download?no_redirect=true",
-            self.base_url.trim_end_matches('/')
-        );
-        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
-        let resp = self.http.get(url).send().await?;
+        let path = format!("/api/agreements/{agreement_id}/download?no_redirect=true");
+        let url = self.api_path(&path);
+
+        let mut request = self.http.get(&url);
+
+        // Add signature headers if authenticated
+        if let Some(headers) = self.sign_headers("GET", &path, None)? {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        let resp = request.send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -224,18 +394,24 @@ pub struct Agreement {
     pub created_at: String,
 }
 
+/// Response from the Portal API root endpoint.
+#[derive(Debug, Deserialize)]
+struct PortalInfoResponse {
+    portal_signing_xpub: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct JoinAgreementResponse {
     pub agreement_id: String,
     pub node_id: String,
-    pub utxo: String,
+    pub bls_signature: String,
     pub joined_at: String,
     pub created: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 struct JoinAgreementRequest {
-    utxo: String,
+    bls_signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,13 +447,15 @@ pub struct NodeInfo {
 #[cfg(test)]
 mod tests {
     use super::PortalClient;
+    use crate::bls::BlsKeyPair;
     use bytes::Bytes;
     use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{body_json, method, path, query_param};
+    use std::sync::Arc;
+    use wiremock::matchers::{header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -297,6 +475,21 @@ mod tests {
     fn portal_client_new_stores_base_url() {
         let client = PortalClient::new("https://example.com/api", "/tmp/storage");
         assert_eq!(client.base_url, "https://example.com/api");
+        assert!(client.auth.is_none());
+    }
+
+    #[test]
+    fn portal_client_with_auth_stores_credentials() {
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            "https://example.com/api",
+            "/tmp/storage",
+            keypair,
+            "NODE-test123",
+        );
+        assert_eq!(client.base_url, "https://example.com/api");
+        assert!(client.auth.is_some());
+        assert_eq!(client.node_id(), Some("NODE-test123"));
     }
 
     #[test]
@@ -381,12 +574,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_new_agreements_requests_new_status() {
+    async fn get_portal_signing_xpub_fetches_from_api_root() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("portal_xpub"));
+        let xpub = client.get_portal_signing_xpub().await.unwrap();
+
+        assert_eq!(xpub, "xpub661MyMwAqRbctest");
+    }
+
+    #[tokio::test]
+    async fn get_new_agreements_requests_new_ready_status() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -417,28 +628,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_agreement_posts_utxo() {
+    async fn get_new_agreements_includes_signature_headers_when_authenticated() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "new|ready"))
+            .and(header_exists("Signature-Input"))
+            .and(header_exists("Signature"))
+            .and(header_exists("X-Request-Timestamp"))
+            .and(header_exists("X-Request-Nonce"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("agreements_auth"),
+            keypair,
+            "NODE-test",
+        );
+        let page = client.get_new_agreements().await.unwrap();
+
+        assert_eq!(page.total, 0);
+    }
+
+    #[tokio::test]
+    async fn join_agreement_requires_authentication() {
+        let client = PortalClient::new("http://localhost:1234", storage_dir("join_no_auth"));
+        let err = client.join_agreement("AGREEMENT-test").await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("authentication required"),
+            "expected auth error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_agreement_sends_bls_signature() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-join";
 
+        // Mock the portal xpub endpoint
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock the join endpoint - verify it receives signature headers and bls_signature in body
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .and(body_json(json!({ "utxo": "txid:1" })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            .and(header_exists("Signature-Input"))
+            .and(header_exists("Signature"))
+            .and(header_exists("Content-Digest"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "agreement_id": agreement_id,
-                "node_id": "NODE-9f8e",
-                "utxo": "txid:1",
+                "node_id": "NODE-test",
+                "bls_signature": "0xabcdef...",
                 "joined_at": "2025-01-01T00:00:00Z",
                 "created": true
             })))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), storage_dir("join"));
-        let response = client.join_agreement(agreement_id, "txid:1").await.unwrap();
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client =
+            PortalClient::with_auth(mock_server.uri(), storage_dir("join"), keypair, "NODE-test");
+        let response = client.join_agreement(agreement_id).await.unwrap();
 
         assert_eq!(response.agreement_id, agreement_id);
         assert!(response.created);
+    }
+
+    #[tokio::test]
+    async fn join_agreement_returns_error_on_failure() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-error";
+
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/api/agreements/{agreement_id}/join")))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("join_error"),
+            keypair,
+            "NODE-test",
+        );
+        let err = client.join_agreement(agreement_id).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("status 400"),
+            "expected error to include status, got {err}"
+        );
     }
 
     #[tokio::test]
@@ -473,29 +775,6 @@ mod tests {
         let contents = fs::read_to_string(&downloaded.path).unwrap();
         assert_eq!(contents, "hello world");
         assert_eq!(downloaded.bytes, Bytes::from_static(b"hello world"));
-    }
-
-    #[tokio::test]
-    async fn join_agreement_returns_error_on_failure() {
-        let mock_server = MockServer::start().await;
-        let agreement_id = "AGREEMENT-error";
-
-        Mock::given(method("POST"))
-            .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
-            .mount(&mock_server)
-            .await;
-
-        let client = PortalClient::new(mock_server.uri(), storage_dir("join_error"));
-        let err = client
-            .join_agreement(agreement_id, "txid:0")
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.to_string().contains("status 400"),
-            "expected error to include status, got {err}"
-        );
     }
 
     #[tokio::test]
@@ -636,5 +915,98 @@ mod tests {
             err.to_string().contains("status 404"),
             "expected status code to be in error, got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn download_file_includes_signature_headers_when_authenticated() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGREEMENT-auth-download";
+        let download_url_path = "/files/auth-sample.txt";
+        let download_url = format!("{}{}", mock_server.uri(), download_url_path);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .and(header_exists("Signature-Input"))
+            .and(header_exists("Signature"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": download_url
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(download_url_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("authenticated content"))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let dir = storage_dir("download_auth");
+        let client = PortalClient::with_auth(mock_server.uri(), dir.clone(), keypair, "NODE-auth");
+        let downloaded = client
+            .download_file(agreement_id, "auth-sample.txt")
+            .await
+            .unwrap();
+
+        let contents = fs::read_to_string(&downloaded.path).unwrap();
+        assert_eq!(contents, "authenticated content");
+    }
+
+    #[tokio::test]
+    async fn portal_signing_xpub_is_cached_across_multiple_join_calls() {
+        let mock_server = MockServer::start().await;
+
+        // Mock the portal xpub endpoint - expect exactly 1 call due to caching
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbcCached"
+            })))
+            .expect(1) // Should only be called once due to caching
+            .mount(&mock_server)
+            .await;
+
+        // Mock the join endpoint for multiple agreements
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGREEMENT-1/join"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "agreement_id": "AGREEMENT-1",
+                "node_id": "NODE-cache-test",
+                "bls_signature": "0xsig1",
+                "joined_at": "2025-01-01T00:00:00Z",
+                "created": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGREEMENT-2/join"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "agreement_id": "AGREEMENT-2",
+                "node_id": "NODE-cache-test",
+                "bls_signature": "0xsig2",
+                "joined_at": "2025-01-01T00:00:00Z",
+                "created": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("cache_test"),
+            keypair,
+            "NODE-cache-test",
+        );
+
+        // Join two agreements - xpub should only be fetched once
+        let resp1 = client.join_agreement("AGREEMENT-1").await.unwrap();
+        let resp2 = client.join_agreement("AGREEMENT-2").await.unwrap();
+
+        assert_eq!(resp1.agreement_id, "AGREEMENT-1");
+        assert_eq!(resp2.agreement_id, "AGREEMENT-2");
+
+        // The expect(1) on the mock will fail if xpub was fetched more than once
     }
 }

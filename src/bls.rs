@@ -9,12 +9,18 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
-use blst::min_sig::{PublicKey, SecretKey};
+use blst::min_sig::{PublicKey, SecretKey, Signature};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
 use zeroize::Zeroizing;
+
+/// Domain Separation Tag for HTTP Message Signatures (RFC 9421).
+pub const HTTP_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_HTTP_SIG";
+
+/// Domain Separation Tag for agreement instruction signatures.
+pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_BLS_DST";
 
 /// BLS key file name stored in app data directory.
 pub const BLS_KEY_FILENAME: &str = "bls_key.enc";
@@ -82,6 +88,56 @@ impl BlsKeyPair {
     pub fn secret_key(&self) -> Result<SecretKey> {
         SecretKey::from_bytes(&self.secret_key)
             .map_err(|_| anyhow!("failed to deserialize secret key"))
+    }
+
+    /// Sign a message with the BLS private key using the HTTP signature DST.
+    /// Returns the signature as a hex-encoded string (96 characters).
+    pub fn sign_http_message(&self, message: &[u8]) -> Result<String> {
+        self.sign_with_dst(message, HTTP_SIGNATURE_DST)
+    }
+
+    /// Sign a message with the BLS private key using the agreement signature DST.
+    /// Returns the signature as a hex-encoded string (96 characters).
+    pub fn sign_agreement_instruction(&self, message: &[u8]) -> Result<String> {
+        self.sign_with_dst(message, AGREEMENT_SIGNATURE_DST)
+    }
+
+    /// Sign a message with the BLS private key using a specific DST.
+    /// Returns the signature as a hex-encoded string (96 characters).
+    fn sign_with_dst(&self, message: &[u8], dst: &[u8]) -> Result<String> {
+        let sk = self.secret_key()?;
+        let sig = sk.sign(message, dst, &[]);
+        Ok(hex::encode(sig.to_bytes()))
+    }
+
+    /// Verify a BLS signature against a message and public key.
+    #[allow(dead_code)]
+    pub fn verify_http_signature(
+        public_key_hex: &str,
+        message: &[u8],
+        signature_hex: &str,
+    ) -> Result<bool> {
+        Self::verify_signature_with_dst(public_key_hex, message, signature_hex, HTTP_SIGNATURE_DST)
+    }
+
+    /// Verify a BLS signature against a message, public key, and DST.
+    #[allow(dead_code)]
+    fn verify_signature_with_dst(
+        public_key_hex: &str,
+        message: &[u8],
+        signature_hex: &str,
+        dst: &[u8],
+    ) -> Result<bool> {
+        let pk_bytes = hex::decode(public_key_hex).context("invalid public key hex")?;
+        let pk =
+            PublicKey::from_bytes(&pk_bytes).map_err(|_| anyhow!("invalid public key bytes"))?;
+
+        let sig_bytes = hex::decode(signature_hex).context("invalid signature hex")?;
+        let sig =
+            Signature::from_bytes(&sig_bytes).map_err(|_| anyhow!("invalid signature bytes"))?;
+
+        let result = sig.verify(true, message, dst, &[], &pk, true);
+        Ok(result == blst::BLST_ERROR::BLST_SUCCESS)
     }
 
     /// Save the keypair to an encrypted file.
@@ -243,6 +299,103 @@ mod tests {
             sk.sk_to_pk().to_bytes().to_vec(),
             keypair.public_key_bytes()
         );
+    }
+
+    #[test]
+    fn sign_http_message_produces_valid_signature() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let message = b"test message for signing";
+
+        let signature = keypair.sign_http_message(message).unwrap();
+
+        // BLS12-381 MinSig signature is 48 bytes = 96 hex characters
+        assert_eq!(signature.len(), 96);
+
+        // Verify the signature
+        let is_valid =
+            BlsKeyPair::verify_http_signature(&keypair.public_key_hex(), message, &signature)
+                .unwrap();
+        assert!(is_valid, "signature should be valid");
+    }
+
+    #[test]
+    fn sign_agreement_instruction_produces_valid_signature() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let message = b"agreement instruction data";
+
+        let signature = keypair.sign_agreement_instruction(message).unwrap();
+
+        // BLS12-381 MinSig signature is 48 bytes = 96 hex characters
+        assert_eq!(signature.len(), 96);
+
+        // Verify with the agreement DST
+        let is_valid = BlsKeyPair::verify_signature_with_dst(
+            &keypair.public_key_hex(),
+            message,
+            &signature,
+            AGREEMENT_SIGNATURE_DST,
+        )
+        .unwrap();
+        assert!(is_valid, "agreement signature should be valid");
+    }
+
+    #[test]
+    fn signature_verification_fails_for_wrong_message() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let message = b"original message";
+        let wrong_message = b"wrong message";
+
+        let signature = keypair.sign_http_message(message).unwrap();
+
+        let is_valid =
+            BlsKeyPair::verify_http_signature(&keypair.public_key_hex(), wrong_message, &signature)
+                .unwrap();
+        assert!(!is_valid, "signature should not verify with wrong message");
+    }
+
+    #[test]
+    fn signature_verification_fails_for_wrong_dst() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let message = b"test message";
+
+        // Sign with HTTP DST
+        let signature = keypair.sign_http_message(message).unwrap();
+
+        // Try to verify with agreement DST
+        let is_valid = BlsKeyPair::verify_signature_with_dst(
+            &keypair.public_key_hex(),
+            message,
+            &signature,
+            AGREEMENT_SIGNATURE_DST,
+        )
+        .unwrap();
+        assert!(!is_valid, "signature should not verify with wrong DST");
+    }
+
+    #[test]
+    fn verify_signature_rejects_invalid_public_key_hex() {
+        let result = BlsKeyPair::verify_http_signature(
+            "not-valid-hex",
+            b"message",
+            "00".repeat(48).as_str(),
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid public key"));
+    }
+
+    #[test]
+    fn verify_signature_rejects_invalid_signature_hex() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let result =
+            BlsKeyPair::verify_http_signature(&keypair.public_key_hex(), b"message", "invalid");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid signature"));
     }
 
     #[tokio::test]

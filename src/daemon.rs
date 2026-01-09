@@ -227,7 +227,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock_server)
             .await;
@@ -263,7 +263,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&mock_server)
@@ -346,7 +346,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
             .mount(&mock_server)
             .await;

@@ -164,7 +164,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -194,7 +194,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -267,7 +267,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "new|ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,

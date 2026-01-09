@@ -16,7 +16,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::{pin, signal, sync::oneshot};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -114,7 +114,7 @@ async fn run_with_shutdown(
             let onboarding_config = onboarding::OnboardingConfig {
                 bls_key_path: config.bls_key_path.clone(),
             };
-            let _onboarding_result = onboarding::perform_onboarding(
+            let onboarding_result = onboarding::perform_onboarding(
                 &client,
                 &config.node_id,
                 &onboarding_config,
@@ -125,6 +125,14 @@ async fn run_with_shutdown(
             writeln!(writer)?;
             writeln!(writer, "Node onboarding complete. Starting services...")?;
             writeln!(writer)?;
+
+            // Create authenticated client with the BLS keypair from onboarding
+            let authenticated_client = PortalClient::with_auth(
+                &config.portal_url,
+                &config.storage_dir,
+                Arc::new(onboarding_result.keypair),
+                &config.node_id,
+            );
 
             let db = DBClient::new(&config.database_url).await?;
             let conn = db.connection().clone();
@@ -150,7 +158,7 @@ async fn run_with_shutdown(
                 max_files: config.storage_max_files,
             };
             run_daemon_command(
-                client,
+                authenticated_client,
                 conn,
                 config.portal_polling_interval,
                 lock_path,
