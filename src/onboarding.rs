@@ -9,17 +9,12 @@ use crate::database::default_app_dir;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::time::sleep;
-
-/// Interval between checks when waiting for the user to register their BLS key on Horizon Market.
-const BLS_REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Environment variable name for providing the BLS password non-interactively.
 /// This is useful for automation, testing, and scripted deployments.
 pub const BLS_PASSWORD_ENV: &str = "BLS_PASSWORD";
 
-/// Trait for reading passwords from the user.
+/// Trait for reading passwords and interactive input from the user.
 /// This abstraction enables testing without interactive input.
 pub trait PasswordReader {
     /// Read a password (for existing key).
@@ -28,6 +23,9 @@ pub trait PasswordReader {
     /// Read and confirm a new password.
     /// Returns an error if passwords don't match or validation fails.
     fn read_new_password(&self, writer: &mut dyn Write) -> Result<String>;
+
+    /// Wait for the user to press Enter.
+    fn wait_for_enter(&self) -> Result<()>;
 }
 
 /// Default implementation that reads from the terminal using rpassword.
@@ -68,6 +66,14 @@ impl PasswordReader for TerminalPasswordReader {
             return Ok(password);
         }
     }
+
+    fn wait_for_enter(&self) -> Result<()> {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| anyhow!("failed to read input: {e}"))?;
+        Ok(())
+    }
 }
 
 /// Password reader that reads from the BLS_PASSWORD environment variable.
@@ -101,6 +107,11 @@ impl PasswordReader for EnvPasswordReader {
         }
 
         Ok(password)
+    }
+
+    fn wait_for_enter(&self) -> Result<()> {
+        // In non-interactive mode, we don't wait for user input
+        Ok(())
     }
 }
 
@@ -168,7 +179,10 @@ pub async fn perform_onboarding_with_reader(
     let keypair = ensure_bls_keypair(&key_path, writer, password_reader).await?;
     let local_public_key = keypair.public_key_hex();
 
-    match &node_info.bls_public_key {
+    // Treat empty string as None (no BLS key configured)
+    let remote_bls_key = node_info.bls_public_key.as_ref().filter(|k| !k.is_empty());
+
+    match remote_bls_key {
         Some(remote_key) => {
             // Node has a BLS key configured on Horizon Market
             verify_bls_key_match(&local_public_key, remote_key)?;
@@ -182,7 +196,7 @@ pub async fn perform_onboarding_with_reader(
                 writer,
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )?;
-            writeln!(writer, "Your BLS public key has been generated:")?;
+            writeln!(writer, "Your BLS public key:")?;
             writeln!(writer)?;
             writeln!(writer, "  {}", local_public_key)?;
             writeln!(writer)?;
@@ -196,10 +210,18 @@ pub async fn perform_onboarding_with_reader(
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )?;
             writeln!(writer)?;
-            writeln!(writer, "Waiting for BLS key registration...")?;
+            writeln!(
+                writer,
+                "Press Enter once you have registered your BLS key..."
+            )?;
+            writer.flush().ok();
 
-            let updated_info =
-                wait_for_bls_registration(client, node_id, &local_public_key, writer).await?;
+            // Wait for user to press Enter
+            password_reader.wait_for_enter()?;
+
+            writeln!(writer, "Verifying BLS key registration...")?;
+
+            let updated_info = verify_bls_registration(client, node_id, &local_public_key).await?;
 
             writeln!(writer, "✓ BLS public key registered and verified")?;
             Ok(OnboardingResult {
@@ -310,40 +332,31 @@ fn verify_bls_key_match(local_key: &str, remote_key: &str) -> Result<()> {
     }
 }
 
-/// Wait for the user to register their BLS key on Horizon Market.
-/// Polls every 10 seconds until the key is registered and matches.
-async fn wait_for_bls_registration(
+/// Verify that the BLS key has been registered on Horizon Market.
+async fn verify_bls_registration(
     client: &PortalClient,
     node_id: &str,
     expected_key: &str,
-    writer: &mut impl Write,
 ) -> Result<NodeInfo> {
-    let mut dots = 0;
-    loop {
-        sleep(BLS_REGISTRATION_POLL_INTERVAL).await;
-
-        // Print progress
-        dots = (dots + 1) % 4;
-        write!(writer, "\rChecking{}", ".".repeat(dots))?;
-        write!(writer, "{}", " ".repeat(3 - dots))?;
-        writer.flush().ok();
-
-        match client.check_node(node_id).await? {
-            NodeCheckResult::Found(info) => {
-                if let Some(ref remote_key) = info.bls_public_key {
-                    writeln!(writer)?; // Clear the progress line
-                    verify_bls_key_match(expected_key, remote_key)?;
-                    return Ok(info);
-                }
-                // Key still not registered, continue waiting
-            }
-            NodeCheckResult::NotFound => {
-                writeln!(writer)?;
-                return Err(anyhow!(
-                    "Node {} was removed from Horizon Market during registration",
-                    node_id
-                ));
-            }
+    match client.check_node(node_id).await? {
+        NodeCheckResult::Found(info) => {
+            let remote_key = info
+                .bls_public_key
+                .as_ref()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "BLS key not found on Horizon Market.\n\n\
+                        Please make sure you have registered your BLS public key at:\n\
+                        https://horizon.market/profile?show=node-storage\n\n\
+                        Then restart the application to try again."
+                    )
+                })?;
+            verify_bls_key_match(expected_key, remote_key)?;
+            Ok(info)
+        }
+        NodeCheckResult::NotFound => {
+            Err(anyhow!("Node {} was removed from Horizon Market", node_id))
         }
     }
 }
@@ -373,6 +386,11 @@ impl PasswordReader for MockPasswordReader {
 
     fn read_new_password(&self, _writer: &mut dyn Write) -> Result<String> {
         Ok(self.password.clone())
+    }
+
+    fn wait_for_enter(&self) -> Result<()> {
+        // In tests, we don't wait for user input
+        Ok(())
     }
 }
 
@@ -630,24 +648,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onboarding_generates_new_key_when_none_exists() {
+    async fn onboarding_generates_new_key_and_waits_for_registration() {
         let mock_server = MockServer::start().await;
         let dir = tempdir().unwrap();
         let key_path = dir.path().join(unique_key_filename());
         let storage_dir = dir.path().join("storage");
 
-        // Start with no BLS key on portal, then simulate registration after first check
+        // We need to pre-generate a keypair so we know its public key for the mock
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Track call count to simulate: first call no key, second call has key registered
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
+        let pk_clone = public_key.clone();
 
-        // We need to capture the generated public key, so we'll use a simpler approach:
-        // Just test that a new key is generated when no key file exists
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-newkey/check"))
             .respond_with(move |_: &wiremock::Request| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    // First call: node exists but no BLS key
+                    // First call: node exists but no BLS key (triggers "press Enter" flow)
                     ResponseTemplate::new(200).set_body_json(json!({
                         "node_id": "NODE-newkey",
                         "address": "bc1qtest",
@@ -655,12 +678,12 @@ mod tests {
                         "bls_public_key": null
                     }))
                 } else {
-                    // Subsequent calls: still waiting (test will timeout, but that's ok for this test)
+                    // Second call (after Enter): key is now registered
                     ResponseTemplate::new(200).set_body_json(json!({
                         "node_id": "NODE-newkey",
                         "address": "bc1qtest",
                         "xpubkey": "xpub123",
-                        "bls_public_key": null
+                        "bls_public_key": pk_clone.clone()
                     }))
                 }
             })
@@ -672,29 +695,126 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path.clone()),
         };
-        let reader = MockPasswordReader::new("testpassword123");
+        let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
 
-        // This will start the onboarding but will wait for BLS registration indefinitely.
-        // We use a longer timeout to allow for Argon2id key derivation (which can take ~1s).
-        // The timeout should be > key generation time but < BLS_REGISTRATION_POLL_INTERVAL (10s).
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            perform_onboarding_with_reader(&client, "NODE-newkey", &config, &mut buffer, &reader),
-        )
-        .await;
+        let result =
+            perform_onboarding_with_reader(&client, "NODE-newkey", &config, &mut buffer, &reader)
+                .await
+                .unwrap();
 
-        // We expect a timeout because we're waiting for BLS registration (10s poll interval)
-        assert!(
-            result.is_err(),
-            "expected timeout while waiting for BLS registration"
-        );
-
-        // But the key file should have been created
-        assert!(key_path.exists(), "BLS key file should have been created");
+        assert_eq!(result.node_info.node_id, "NODE-newkey");
+        assert_eq!(result.keypair.public_key_hex(), public_key);
 
         let output = String::from_utf8(buffer).unwrap();
-        assert!(output.contains("BLS keypair generated"));
         assert!(output.contains("horizon.market/profile?show=node-storage"));
+        assert!(output.contains("Press Enter"));
+        assert!(output.contains("BLS public key registered and verified"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_fails_if_key_not_registered_after_enter() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(unique_key_filename());
+        let storage_dir = dir.path().join("storage");
+
+        // Generate a keypair
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Always return no BLS key
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-nokey/check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "NODE-nokey",
+                "address": "bc1qtest",
+                "xpubkey": "xpub123",
+                "bls_public_key": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let err =
+            perform_onboarding_with_reader(&client, "NODE-nokey", &config, &mut buffer, &reader)
+                .await
+                .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("BLS key not found on Horizon Market"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_treats_empty_bls_key_as_none() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(unique_key_filename());
+        let storage_dir = dir.path().join("storage");
+
+        // Generate a keypair
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Track call count
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let pk_clone = public_key.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-empty/check"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call: empty string BLS key (should be treated as None)
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-empty",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": ""
+                    }))
+                } else {
+                    // Second call: key is now registered
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-empty",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": pk_clone.clone()
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let result =
+            perform_onboarding_with_reader(&client, "NODE-empty", &config, &mut buffer, &reader)
+                .await
+                .unwrap();
+
+        assert_eq!(result.node_info.node_id, "NODE-empty");
+
+        let output = String::from_utf8(buffer).unwrap();
+        // Should have gone through the "Press Enter" flow since empty string is treated as None
+        assert!(output.contains("Press Enter"));
+        assert!(output.contains("BLS public key registered and verified"));
     }
 }
