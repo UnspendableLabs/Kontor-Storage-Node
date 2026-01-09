@@ -109,7 +109,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -165,7 +165,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -177,7 +176,7 @@ mod tests {
 
         let db = setup_in_memory_db().await;
         let result = sync_ready_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", unique_storage_dir("empty")),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("empty")),
             &db,
         )
         .await;
@@ -196,7 +195,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -230,7 +228,7 @@ mod tests {
         seeded.insert(&db).await.unwrap();
 
         sync_ready_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", unique_storage_dir("mixed")),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("mixed")),
             &db,
         )
         .await
@@ -270,7 +268,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -300,11 +297,7 @@ mod tests {
         existing.insert(&db).await.unwrap();
 
         sync_ready_agreements(
-            &PortalClient::new(
-                mock_server.uri(),
-                "secret",
-                unique_storage_dir("all_existing"),
-            ),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("all_existing")),
             &db,
         )
         .await

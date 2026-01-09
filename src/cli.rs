@@ -5,13 +5,13 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
 pub struct Cli {
+    /// Node ID provided by Horizon Market (e.g. NODE-abc123def456)
+    #[arg(long, env = "NODE_ID")]
+    pub node_id: Option<String>,
+
     /// Portal API base URL (e.g. https://portal.example.com/api)
     #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
     pub portal_url: String,
-
-    /// Portal API key used for Bearer authentication
-    #[arg(long, env = "PORTAL_API_KEY")]
-    pub portal_api_key: String,
 
     /// Database connection string (default: local SQLite file)
     #[arg(
@@ -56,6 +56,11 @@ pub struct Cli {
     /// Address the server binds to (e.g. 0.0.0.0:8081)
     #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
     pub server_address: String,
+
+    /// Path to the BLS key file (default: app data dir/bls_key.enc)
+    /// For non-interactive mode, also set BLS_PASSWORD environment variable.
+    #[arg(long, env = "BLS_KEY_PATH")]
+    pub bls_key_path: Option<PathBuf>,
 
     /// Command to run
     #[command(subcommand)]

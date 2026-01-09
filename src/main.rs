@@ -1,9 +1,11 @@
+mod bls;
 mod cli;
 mod clients;
 mod config;
 mod daemon;
 mod database;
 mod entities;
+mod onboarding;
 mod server;
 mod tasks;
 
@@ -62,6 +64,7 @@ async fn run_with_shutdown(
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
     let config = Config::from_cli(&cli)?;
+    writeln!(writer, "Node ID: {}", config.node_id)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
@@ -99,27 +102,7 @@ async fn run_with_shutdown(
         )
     })?;
 
-    let db = DBClient::new(&config.database_url).await?;
-    let conn = db.connection().clone();
-    let storage_backend = StorageBackend::new(
-        config.storage_method.clone(),
-        config.storage_gcs_bucket_name.clone(),
-        config
-            .storage_gcs_service_account_json
-            .as_ref()
-            .map(PathBuf::from),
-    )
-    .await?;
-    let client = PortalClient::new(
-        &config.portal_url,
-        &config.portal_api_key,
-        &config.storage_dir,
-    );
-    let lock_path = config.storage_dir.join(".portal-daemon.lock");
-    let download_addr: SocketAddr = config
-        .server_address
-        .parse()
-        .context("invalid server address")?;
+    let client = PortalClient::new(&config.portal_url, &config.storage_dir);
 
     match cli.command {
         Commands::Ping => {
@@ -127,6 +110,40 @@ async fn run_with_shutdown(
             writeln!(writer, "{body}")?;
         }
         Commands::Run => {
+            // Perform node onboarding (verify registration and BLS key)
+            let onboarding_config = onboarding::OnboardingConfig {
+                bls_key_path: config.bls_key_path.clone(),
+            };
+            let _onboarding_result = onboarding::perform_onboarding(
+                &client,
+                &config.node_id,
+                &onboarding_config,
+                &mut writer,
+            )
+            .await?;
+
+            writeln!(writer)?;
+            writeln!(writer, "Node onboarding complete. Starting services...")?;
+            writeln!(writer)?;
+
+            let db = DBClient::new(&config.database_url).await?;
+            let conn = db.connection().clone();
+            let storage_backend = StorageBackend::new(
+                config.storage_method.clone(),
+                config.storage_gcs_bucket_name.clone(),
+                config
+                    .storage_gcs_service_account_json
+                    .as_ref()
+                    .map(PathBuf::from),
+            )
+            .await?;
+
+            let lock_path = config.storage_dir.join(".portal-daemon.lock");
+            let download_addr: SocketAddr = config
+                .server_address
+                .parse()
+                .context("invalid server address")?;
+
             let storage_limits = StorageLimits {
                 capacity: config.storage_capacity,
                 max_file_size: config.storage_max_file_size,
@@ -239,7 +256,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
     use tokio::time::{sleep, Duration};
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -260,14 +277,13 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
             .mount(&mock_server)
             .await;
 
         let cli = Cli {
+            node_id: Some("NODE-test123".to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
@@ -278,6 +294,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -285,6 +302,10 @@ mod tests {
         run(cli, &mut buffer).await.unwrap();
         let output = String::from_utf8(buffer).unwrap();
 
+        assert!(
+            output.contains("Node ID:"),
+            "expected node id line in output"
+        );
         assert!(
             output.contains("Portal URL:"),
             "expected portal url line in output"
@@ -317,14 +338,13 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
             .mount(&mock_server)
             .await;
 
         let cli = Cli {
+            node_id: Some("NODE-test456".to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
@@ -335,6 +355,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -353,7 +374,6 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
             .mount(&mock_server)
             .await;
@@ -367,8 +387,8 @@ mod tests {
         .unwrap();
 
         let cli = Cli {
+            node_id: Some("NODE-gcs-test".to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
@@ -381,6 +401,7 @@ mod tests {
                 service_account_path.to_string_lossy().to_string(),
             ),
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -408,15 +429,14 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
             .mount(&mock_server)
             .await;
 
         let storage_dir = unique_storage_dir("limits");
         let cli = Cli {
+            node_id: Some("NODE-limits".to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 3,
@@ -427,6 +447,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -456,7 +477,6 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
             .mount(&mock_server)
             .await;
@@ -466,8 +486,8 @@ mod tests {
         fs::write(&storage_file, "not a directory").unwrap();
 
         let cli = Cli {
+            node_id: Some("NODE-dirfile".to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_file.clone()),
             portal_polling_interval_secs: 5,
@@ -478,6 +498,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -493,14 +514,62 @@ mod tests {
         std::fs::remove_file(storage_file).ok();
     }
 
-    #[tokio::test]
-    async fn run_starts_daemon_and_aborts_on_shutdown() {
-        let mock_server = MockServer::start().await;
+    /// Helper to set up onboarding fixtures for tests.
+    /// Creates a BLS key file and mocks the portal to return a matching node.
+    async fn setup_onboarding_fixtures(
+        mock_server: &MockServer,
+        node_id: &str,
+        storage_dir: &PathBuf,
+    ) -> PathBuf {
+        use crate::bls::BlsKeyPair;
 
+        let password = "testpassword123";
+        let key_path = storage_dir.join("bls_key.enc");
+
+        // Generate and save BLS keypair
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        fs::create_dir_all(storage_dir).unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Set password in environment for non-interactive mode
+        env::set_var(onboarding::BLS_PASSWORD_ENV, password);
+
+        // Mock portal node check endpoint
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", node_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": node_id,
+                "address": "bc1qtest",
+                "xpubkey": "xpub123",
+                "bls_public_key": public_key
+            })))
+            .mount(mock_server)
+            .await;
+
+        key_path
+    }
+
+    /// Cleanup onboarding environment after test.
+    fn cleanup_onboarding_env() {
+        env::remove_var(onboarding::BLS_PASSWORD_ENV);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_starts_daemon_and_aborts_on_shutdown() {
+        cleanup_onboarding_env(); // Ensure clean state
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("daemon");
+        let node_id = "NODE-daemon";
+
+        // Set up onboarding fixtures
+        let bls_key_path = setup_onboarding_fixtures(&mock_server, node_id, &storage_dir).await;
+
+        // Mock agreements endpoint
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -510,10 +579,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let storage_dir = unique_storage_dir("daemon");
         let cli = Cli {
+            node_id: Some(node_id.to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
@@ -524,6 +592,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: Some(bls_key_path),
             command: Commands::Run,
         };
 
@@ -536,9 +605,16 @@ mod tests {
         run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
         let output = String::from_utf8(buffer).unwrap();
 
+        // Cleanup
+        cleanup_onboarding_env();
+
         assert!(
             output.contains("Portal polling interval:"),
             "expected polling interval in output: {output}"
+        );
+        assert!(
+            output.contains("Node onboarding complete"),
+            "expected onboarding complete message: {output}"
         );
 
         let lock_path = storage_dir.join(".portal-daemon.lock");
@@ -557,9 +633,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_propagates_shutdown_error() {
+        cleanup_onboarding_env(); // Ensure clean state
         let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("shutdown_error");
+        let node_id = "NODE-shutdown";
 
+        // Set up onboarding fixtures
+        let bls_key_path = setup_onboarding_fixtures(&mock_server, node_id, &storage_dir).await;
+
+        // Mock agreements endpoint
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
@@ -572,10 +656,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let storage_dir = unique_storage_dir("shutdown_error");
         let cli = Cli {
+            node_id: Some(node_id.to_string()),
             portal_url: mock_server.uri(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
@@ -586,6 +669,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: Some(bls_key_path),
             command: Commands::Run,
         };
 
@@ -595,6 +679,9 @@ mod tests {
         let err = run_with_shutdown(cli, &mut buffer, shutdown)
             .await
             .unwrap_err();
+
+        // Cleanup
+        cleanup_onboarding_env();
 
         assert!(
             err.to_string().contains("ctrlc failure"),
@@ -616,7 +703,7 @@ mod tests {
         let lock_path = storage_dir.join(".portal-daemon.lock");
         let db = DBClient::new("sqlite::memory:").await.unwrap();
         let storage_backend = StorageBackend::local();
-        let portal_client = PortalClient::new("http://localhost:0", "secret", storage_dir.clone());
+        let portal_client = PortalClient::new("http://localhost:0", storage_dir.clone());
         let storage_limits = StorageLimits {
             capacity: None,
             max_files: Some(0),

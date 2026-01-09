@@ -4,11 +4,9 @@ FORMAT: 1A
 
 The roles of the Portal API are:
 
-- enable users to upload small files in transactiones or large files in chunks,
+- enable users to upload files (of any size, directly to Google Cloud Storage),
 - create agreements and allow Nodes to join them,
-- compose transactions to join agreements and allow Nodes to sign them,
-- every X blocks, aggregate nodes signatures for ongoing agreements and compose a transaction transaction,
-- make transaction transactions available to the Portal Signer so it can sign and broadcast them,
+- compose transactions aggregating BLS signatures for agreements (handled by the daemon),
 - allow administrators to curate files.
 
 
@@ -18,34 +16,102 @@ The roles of the Portal API are:
 
 ## Authentication
 
-All endpoints require JWT authentication via the `Authorization` header.
-The token must be obtained from Horizon Market.
+All endpoints require **RFC 9421 HTTP Message Signatures** with **BLS cryptography**, except the public
+`GET /api/` endpoint (Portal signing xpub), `GET /api/nodes/{node_id}/check` (node existence check, no client auth required),
+`GET /health`, and `POST /api/webhooks/gcs` (webhook signature).
+
+The Portal verifies each request by:
+1. Parsing `Signature-Input` and `Signature` headers
+2. Fetching the caller's BLS public key from Horizon Market
+3. Verifying the BLS signature over the signing string
+4. Checking timestamp and nonce for replay protection
+5. Verifying `Content-Digest` matches the body (for requests with body)
+
+### Required Headers
+
+| Header | Description | Required |
+|--------|-------------|----------|
+| `Signature-Input` | Declares covered components, keyid, algorithm | Always |
+| `Signature` | Hex-encoded BLS signature | Always |
+| `X-Request-Timestamp` | Unix timestamp (seconds) | Always |
+| `X-Request-Nonce` | Unique per-request identifier | Always |
+| `Content-Digest` | SHA-256 hash of body (RFC 9483) | If body present |
+| `Content-Type` | MIME type | If body present |
+| `Content-Length` | Body size in bytes | If body present |
+
+### Signature-Input Format
 
 ```
-Authorization: Bearer <jwt_token>
+sig1=("@method" "@target-uri" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
 ```
 
-The server derives the authenticated `user_id` from the JWT. Clients MUST NOT send `user_id` fields in request bodies.
+For requests with body, add body components:
 
-### Role-based Access Control
+```
+sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+```
 
-Access to each endpoint is restricted to one or more roles carried by the JWT in the `roles` claim (array of strings).
+### Signature Format
 
-- `user` — end users uploading and managing files they own
-- `node` — nodes participating in agreements and signing transactions
-- `admin` — administrators with elevated permissions (including curation)
-- `portal_signer` — portal signer service for transaction signing and management
+```
+sig1=:<hex-encoded-bls-signature>:
+```
 
-Each action below lists its "Required Roles". Requests from authenticated principals lacking at least one of the required roles MUST be rejected with HTTP 403.
+### Signing String Construction
 
-## ID Formats
+The signing string is a newline-separated list of `component: value` pairs:
 
-All resource identifiers are deterministic strings with prefixes:
+```
+@method: post
+@target-uri: /api/files
+content-digest: sha-256=:base64hash:
+content-length: 42
+content-type: application/json
+x-request-timestamp: 1704067200
+x-request-nonce: nonce-abc123
+```
+
+### Security Features
+
+- **Timestamp validation**: Requests must be within ±5 minutes of server time
+- **Nonce replay protection**: Each `(user_id, nonce)` pair is tracked for 5 minutes
+- **Content-Digest verification**: Body integrity is verified using SHA-256 (RFC 9483)
+- **Key refresh**: On verification failure, the server fetches a fresh key from Market
+
+### BLS Signature Details
+
+- **Domain Separation Tag**: `HORIZON_PORTAL_HTTP_SIG`
+- **Curve**: BLS12-381 (MinSig scheme)
+- **Signature size**: 48 bytes (96 hex characters)
+- **Public key size**: 96 bytes (192 hex characters)
+
+### ID Formats
+
+Resource identifiers:
 
 - Files: `FILE-<16hex>` — first 16 characters of the SHA-256 hash of file content
 - Agreements: `AGREEMENT-<16hex>`
 - Nodes: `NODE-<16hex>`
-- Transactions: `TX-<16hex>` - truncated txid of the transaction
+- Transactions: UUID v4 strings (no prefix). `batch_id` is the double SHA-256 of the instructions array.
+
+### Role-based Access Control
+
+The user's role is determined from the `roles` array returned by Horizon Market when fetching the BLS public key. If multiple roles are present, the highest-priority role is selected:
+
+1. `portal_signer` — portal signer service for signing transactions
+2. `admin` — administrators with elevated permissions (including curation)
+3. `node` — storage nodes participating in agreements
+4. `user` — end users uploading and managing files they own
+
+Each action below lists its "Required Roles". Requests from authenticated principals lacking at least one of the required roles MUST be rejected with HTTP 403.
+
+## Portal Signing Xpub [GET /api/]
+
+Returns the Portal signing extended public key used to bind BLS signatures. This endpoint is public and requires no authentication.
+
++ Response 200 (application/json)
+    + Attributes
+        + portal_signing_xpub: `xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKpDKp82MmsKPFw4r7dGZZu2t4EzNVVRR1y8U5bQxe7sFUk2d` (string) - Portal signing xpub that must be included in all `(portal_signing_xpub, instruction)` signatures
 
 # Group Files
 
@@ -55,14 +121,18 @@ Upload files to create agreements.
 
 Initiate upload sessions for one or multiple files of any size. All uploads are resumable by default using Google Cloud Storage (GCS) direct upload. Files are uploaded directly from client to GCS without passing through the Portal server.
 
-Each upload request creates one session per file. All file sizes and MIME types are accepted. Only filename validation is performed (safe characters, reasonable length, no reserved names).
+Each upload request creates one session per file. Tags are required (can be empty). If the optional `size` is provided, it is validated against `gcs.max_file_size_bytes` (10 GB by default). MIME type and final size are taken from GCS metadata; only filename validation is performed client-side.
 
 Required Roles: `user`, `node`
 
 + Request (application/json)
     + Headers
     
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+            Content-Digest: sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:
 
     + Attributes
         + files (array[FileUploadRequest], required) - One or more files to upload
@@ -94,7 +164,7 @@ Required Roles: `user`, `node`
 + Response 401 (application/json)
     + Body
 
-            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or expired token", "status": 401 } }
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 403 (application/json)
     + Body
@@ -103,28 +173,35 @@ Required Roles: `user`, `node`
 
 ### Manual Upload Validation [POST /api/files/validate{?session_id}]
 
-Allows authenticated users to manually verify their uploaded files by checking with Google Cloud Storage directly. This is a fallback mechanism when the automatic webhook validation fails or is delayed.
+Allows authenticated users to manually verify their uploaded files by checking with Google Cloud Storage directly. This is a fallback mechanism when the automatic webhook validation fails or is delayed. The `session_id` may be provided either as a query parameter or in a JSON body.
 
 Required Roles: `user`, `node` (with session ownership)
 
 + Parameters
-    + session_id: `123e4567-e89b-12d3-a456-426614174000` (string, required) - Upload session ID returned from file upload. Can be provided as query parameter.
+    + session_id: `123e4567-e89b-12d3-a456-426614174000` (string, required) - Upload session ID returned from file upload. Can be provided as query parameter or JSON body.
 
 + Request (application/json)
     + Headers
     
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
 
 + Response 200 (application/json)
 
-    Returns session info. The status field is `queued` while the daemon processes the file, or `already_completed` if the file was already processed.
+    Returns session info. The status field indicates processing state:
+    - `queued`: file is queued for daemon processing
+    - `completed`: file was successfully processed
+    - `already_completed`: file was already processed previously
+    - `failed`: file processing failed
+    
+    Agreements and file identifiers become available once the daemon finishes processing queued sessions.
 
     + Attributes
         + session_id: `123e4567-e89b-12d3-a456-426614174000` (string) - Upload session ID
-        + status: `queued` (string) - Validation status (`queued` or `already_completed`)
+        + status: `queued` (string) - Validation status (`queued`, `completed`, `already_completed`, or `failed`)
         + completed_files (array[ValidatedFile], optional) - Present only after daemon processing completes
-        
-    Agreements and file identifiers become available once the daemon finishes processing queued sessions.
 
 + Response 400 (application/json)
     + Body
@@ -134,7 +211,7 @@ Required Roles: `user`, `node` (with session ownership)
 + Response 401 (application/json)
     + Body
 
-            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or expired token", "status": 401 } }
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 404 (application/json)
     + Body
@@ -162,10 +239,10 @@ Required Roles: None (webhook signature verification)
             X-Goog-Signature: sha256_signature_here
 
     + Attributes
-        + event_type: `OBJECT_FINALIZE` (string, required) - GCS event type
-        + bucket_id: `portal-uploads` (string, required) - GCS bucket name
-        + object_name: `550e8400-e29b-41d4-a716-446655440000` (string, required) - Upload session ID (UUID, no slashes)
-        + object_generation: `1640995200000` (string, required) - Object generation number
+        + eventType: `OBJECT_FINALIZE` (string, required) - GCS event type
+        + bucketId: `portal-uploads` (string, required) - GCS bucket name
+        + objectName: `550e8400-e29b-41d4-a716-446655440000` (string, required) - Upload session ID (UUID, no slashes)
+        + objectGeneration: `1640995200000` (string, required) - Object generation number
         + size: `1048576` (string, required) - File size in bytes
 
 + Response 200 (application/json)
@@ -174,10 +251,11 @@ Required Roles: None (webhook signature verification)
 
     + Attributes
         + status: `queued` (string) - Processing status (queued, ignored, or already_completed)
+        + session_id: `550e8400-e29b-41d4-a716-446655440000` (string) - Upload session ID
 
     + Body
 
-            { "status": "queued" }
+            { "status": "queued", "session_id": "550e8400-e29b-41d4-a716-446655440000" }
 
 + Response 400 (application/json)
     + Body
@@ -203,6 +281,14 @@ Required Roles: None (webhook signature verification)
 
 Manage agreements.
 
+## Signing & Replay Protection
+
+- The Portal exposes its signing xpub at `GET /api/`; nodes must fetch it before signing.
+- Each signer signs the Postcard serialization of `(portal_signing_xpub, instruction)`.
+- Join instructions use `["join_agreement", "<node_id>", "<agreement_id>"]`.
+- Batch replay protection relies on `batch_id = double_sha256(instructions_array)` plus
+  per-instruction idempotence (for joins the `(node_id, agreement_id)` pair is unique).
+
 ## Agreement [/api/agreements/{agreement_id}]
 
 + Parameters
@@ -217,22 +303,28 @@ Required Roles: `user`, `node`, `admin`
 + Request (application/json)
     + Headers
             
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
 
 + Response 200 (application/json)
     + Attributes (Agreement)
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 404 (application/json)
-    + Attributes
-        + error: `Agreement not found` (string) - Invalid agreement_id
+    + Body
+
+            { "error": { "code": "AGREEMENT_NOT_FOUND", "message": "Agreement not found", "status": 404 } }
 
 + Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
 
 ### Curate Agreement [PUT]
 
@@ -243,7 +335,11 @@ Required Roles: `admin`
 + Request (application/json)
     + Headers
             
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="ADMIN-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+            Content-Digest: sha-256=:base64hash:
 
     + Attributes
         + curation (object, required) - Arbitrary JSON describing curation decisions
@@ -252,36 +348,36 @@ Required Roles: `admin`
     + Attributes (Agreement)
 
 + Response 400 (application/json)
-    + Attributes
-        + error: `Invalid agreement payload` (string) - Validation error
+    + Body
+
+            { "error": { "code": "INVALID_REQUEST", "message": "Invalid agreement payload", "status": 400 } }
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 404 (application/json)
-    + Attributes
-        + error: `Agreement not found` (string) - Invalid agreement_id
+    + Body
+
+            { "error": { "code": "AGREEMENT_NOT_FOUND", "message": "Agreement not found", "status": 404 } }
 
 + Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
 
 ### List Agreements [GET /api/agreements{?status,users,nodes,mime_type,offset,limit,sort,sort_dir}]
 
 List agreements filtered by optional status, with pagination using offset and limit.
-This endpoint is used by Nodes to fetch new agreements with `&status=new` and optionally join them.
+This endpoint is used by Nodes to fetch agreements to join with `&status=new|ready`.
 
+The `status` parameter supports pipe-separated values to filter by multiple statuses (e.g., `new|ready`).
 
 Required Roles: `user`, `node`, `admin`
 
 + Parameters
-    + status: `new` (enum[string], optional) - Filter by agreement status
-        + Members
-            + `new`
-            + `pending`
-            + `ready`
-            + `confirmed`
+    + status: `new` (string, optional) - Filter by agreement status. Supports pipe-separated values (e.g., `new|ready`). Valid values: `new`, `ready`, `pending`, `confirmed`, `completed`.
     + users: `user_1,user_2` (string, optional) - Comma-separated list of user IDs to filter by
     + nodes: `NODE-9f8e7d6c5b4a3210,NODE-1a2b3c4d5e6f7890` (string, optional) - Comma-separated list of node IDs to filter by
     + mime_type: `application/pdf` (string, optional) - Filter by file MIME type
@@ -293,7 +389,10 @@ Required Roles: `user`, `node`, `admin`
 + Request (application/json)
     + Headers
             
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
 
 + Response 200 (application/json)
     + Attributes
@@ -303,22 +402,26 @@ Required Roles: `user`, `node`, `admin`
         + agreements (array[Agreement]) - List of agreements
 
 + Response 400 (application/json)
-    + Attributes
-        + error: `Invalid filters or pagination parameters` (string) - Validation error
+    + Body
+
+            { "error": { "code": "INVALID_QUERY", "message": "Invalid filters or pagination parameters", "status": 400 } }
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
 
 ### Download File Agreement [GET /api/agreements/{agreement_id}/download{?force_download,no_redirect}]
 
-Download an agreement by its ID. By default, returns a redirect to a signed Google Cloud Storage URL for downloading the file.
+Download an agreement file by its ID. By default, returns a redirect to a signed Google Cloud Storage URL for downloading the file.
 When `no_redirect=true` is specified, returns a JSON response containing the signed download URL instead of redirecting.
-This endpoint is primarily used by Nodes to download the agreement once it is confirmed.
+This endpoint is primarily used by Nodes to download the file before joining an agreement.
+The download is allowed when the agreement status is `new` or `ready`.
 
 Required Roles: `user`, `node`, `admin`
 
@@ -330,7 +433,10 @@ Required Roles: `user`, `node`, `admin`
 + Request (application/json)
     + Headers
             
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "x-request-timestamp" "x-request-nonce");keyid="NODE-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
 
 + Response 307
     + Headers
@@ -343,20 +449,26 @@ Required Roles: `user`, `node`, `admin`
         + download_url: `https://storage.googleapis.com/bucket/path/to/file?GoogleAccessId=...&Expires=...&Signature=...` (string) - Signed URL for downloading the file
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 404 (application/json)
-    + Attributes
-        + error: `Agreement not found` (string) - Invalid agreement_id
+    + Body
+
+            { "error": { "code": "AGREEMENT_NOT_FOUND", "message": "Agreement not found", "status": 404 } }
 
 + Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
 
 ### Join Agreement [POST /api/agreements/{agreement_id}/join]
 
-Join an agreement as a node.
+Join an agreement as a node. This endpoint requires two BLS signatures:
+
+1. **HTTP request signature** (in headers) - authenticates the caller
+2. **Join agreement signature** (in body) - commits the node to the agreement using DST `HORIZON_PORTAL_BLS_DST`
 
 Required Roles: `node`
 
@@ -366,160 +478,110 @@ Required Roles: `node`
 + Request (application/json)
     + Headers
             
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="NODE-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+            Content-Digest: sha-256=:base64hash:
 
     + Attributes
-        + utxo: `950851b81b890e410ae8b162816376e6c398dfa57c4be4374d6c4544a0cda60c:1` (string, required) - UTXO in format txid:vout
+        + bls_signature: `0x...` (string, required) - Hex-encoded BLS signature over the Postcard serialization of `(portal_signing_xpub, ["join_agreement", "<node_id>", "<agreement_id>"])`. The `portal_signing_xpub` must be fetched from `GET /api/` to bind authorization to this Portal. Uses DST `HORIZON_PORTAL_BLS_DST`.
 
 + Response 201 (application/json)
+
+    Submitting the same `(node_id, agreement_id)` again is idempotent and returns `created=false` with HTTP 200.
     + Attributes
         + agreement_id: `AGREEMENT-0f1e2d3c4b5a6978` (string) - Agreement ID
         + node_id: `NODE-9f8e7d6c5b4a3210` (string) - Node ID
-        + utxo: `950851b8...:1` (string) - UTXO in format txid:vout
+        + bls_signature: `0x...` (string) - Submitted BLS signature
         + joined_at: `2025-01-01T12:34:56Z` (string) - Join timestamp
         + created: true (boolean) - Whether a new join was created
 
 + Response 400 (application/json)
-    + Attributes
-        + error: `Invalid request parameters` (string) - Validation error
+    + Body
+
+            { "error": { "code": "INVALID_REQUEST", "message": "Invalid request parameters", "status": 400 } }
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 404 (application/json)
-    + Attributes
-        + error: `Agreement not found` (string) - Invalid agreement_id
-
-+ Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
-
-# Group Transactions
-
-Manage transactions and signatures.
-
-### List Transactions [GET /api/transactions{?status,offset,limit}]
-
-Retrieve transactions for the authenticated node with optional filtering and pagination.
-The node_id or portal_signer identifier is automatically derived from the JWT token.
-
-At regular intervals, Nodes call this endpoint to retrieve transactions they need to sign.
-Nodes can filter by status (e.g., `status=unsigned`) and use pagination for large result sets.
-
-Required Roles: `node`, `portal_signer`
-
-+ Parameters
-    + status (string, optional) - Filter transactions by status (e.g., `unsigned`, `signed`)
-    + offset: 0 (number, optional) - Number of items to skip (default: 0)
-    + limit: 20 (number, optional) - Maximum number of items to return (default: 20, max: 100)
-
-+ Request (application/json)
-    + Headers
-            
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
-
-+ Response 200 (application/json)
-    + Attributes
-        + offset: 0 (number) - Current offset
-        + limit: 20 (number) - Page size
-        + total: 45 (number) - Total number of matching transactions
-        + transactions (array[TransactionParticipant]) - List of transaction participants for the node
-
     + Body
 
-            {
-              "offset": 0,
-              "limit": 20,
-              "total": 45,
-              "transactions": [
-                {
-                  "transaction_id": "TX-abcdef0123456789",
-                  "unsigned_commit_psbt": "cHNidP8BAHECAAAA...",
-                  "unsigned_reveal_psbt": "cHNidP8BAHECAAAA...",
-                  "txid": "abc123def456...",
-                  "reveal_input_index": 0,
-                  "commit_control_block": "c0abcd1234...",
-                  "participation_id": "123",
-                  "status": "unsigned"
-                }
-              ]
-            }
-
-+ Response 401 (application/json)
-    + Body
-
-            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or expired token", "status": 401 } }
+            { "error": { "code": "AGREEMENT_NOT_FOUND", "message": "Agreement not found", "status": 404 } }
 
 + Response 403 (application/json)
     + Body
 
             { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
 
-### Submit Signed Transaction [POST /api/transactions]
+### Sign Agreement [POST /api/agreements/{agreement_id}/sign]
 
-Submit signed PSBTs for a transaction. The node_id or portal_signer identifier is automatically derived from the JWT token.
-Nodes use this endpoint to submit their signatures for transactions they need to sign.
-The participation_id is sufficient to identify the transaction and agreement.
+Submit a pre-signed `create_agreement` instruction for an agreement. This endpoint is called by Horizon Market
+on behalf of the file owner to store the BLS signature that will be used when composing the transaction.
 
-Required Roles: `node`, `portal_signer`
+The user signs the instruction `["create_agreement", user_id, file_id, ...]` with their BLS key,
+and Market submits it here. The Portal fetches the user's BLS public key from Market to verify the signature,
+stores it, and transitions the agreement status from `new` to `ready`.
+
+Agreements in `ready` status are eligible for daemon transaction composition.
+
+Required Roles: `user`, `node` (must be the file owner)
+
++ Parameters
+    + agreement_id: `AGREEMENT-0f1e2d3c4b5a6978` (string, required) - Agreement ID
 
 + Request (application/json)
     + Headers
-
-            Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+            
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="USER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+            Content-Digest: sha-256=:base64hash:
 
     + Attributes
-        + participation_id: `123` (string, required) - Participation ID from the transaction list
-        + signed_commit_psbt: `cHNidP8BAHECAAAA...` (string, required) - Base64-encoded signed commit PSBT
-        + signed_reveal_psbt: `cHNidP8BAHECAAAA...` (string, required) - Base64-encoded signed reveal PSBT
-
-    + Body
-
-            {
-              "participation_id": "123",
-              "signed_commit_psbt": "cHNidP8BAHECAAAA...",
-              "signed_reveal_psbt": "cHNidP8BAHECAAAA..."
-            }
+        + bls_signature: `0x...` (string, required) - Hex-encoded BLS signature over the Postcard serialization of `(portal_signing_xpub, ["create_agreement", user_id, file_id, ...])`. Uses DST `HORIZON_PORTAL_BLS_DST`. Signed by the file owner (where `user_id` is the file owner's ID).
 
 + Response 200 (application/json)
-    + Attributes
-        + success: true (boolean) - Whether the submission was successful
-        + signed_at: `2025-01-15T10:30:00Z` (string) - Timestamp when signed
-        + status: `signed` (string) - Updated status
-
-    + Body
-
-            {
-              "success": true,
-              "signed_at": "2025-01-15T10:30:00.123456Z",
-              "status": "signed"
-            }
+    + Attributes (Agreement)
 
 + Response 400 (application/json)
-    + Attributes
-        + error: `Invalid request parameters` (string) - Validation error
+    + Body
+
+            { "error": { "code": "INVALID_SIGNATURE", "message": "Invalid BLS signature", "status": 400 } }
 
 + Response 401 (application/json)
-    + Attributes
-        + error: `Invalid or expired token` (string) - Authentication error
+    + Body
 
-+ Response 404 (application/json)
-    + Attributes
-        + error: `Transaction agreement not found` (string) - Invalid transaction_id or agreement_id for this node
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
 
 + Response 403 (application/json)
-    + Attributes
-        + error: `Forbidden` (string) - Insufficient role
+    + Body
+
+            { "error": { "code": "NOT_FILE_OWNER", "message": "User is not the file owner", "status": 403 } }
+
++ Response 404 (application/json)
+    + Body
+
+            { "error": { "code": "AGREEMENT_NOT_FOUND", "message": "Agreement not found", "status": 404 } }
+
++ Response 409 (application/json)
+    + Body
+
+            { "error": { "code": "AGREEMENT_ALREADY_SIGNED", "message": "Agreement already has a BLS signature or is not in new status", "status": 409 } }
 
 ## Data Structures
 
 ### FileUploadRequest (object)
 
-File upload request object. File size and MIME type are automatically detected from the uploaded file by Google Cloud Storage and do not need to be provided in the request. All file sizes and MIME types are accepted.
+File upload request object. File size and MIME type are ultimately determined from GCS; an optional `size` can be provided for pre-upload validation and is rejected if above `gcs.max_file_size_bytes` (10 GB by default).
 
 + filename: `document.pdf` (string, required) - Original filename
-+ tags (array[string], optional) - Tags associated with the file
++ tags (array[string], required) - Tags associated with the file (may be empty)
++ size: 1048576 (number, optional) - File size in bytes for pre-upload validation
 
 ### UploadUrl (object)
 + upload_session_id: `550e8400-e29b-41d4-a716-446655440000` (string, required) - Upload session ID
@@ -541,27 +603,37 @@ File upload request object. File size and MIME type are automatically detected f
 + original_size: 1048576 (number) - Original file size in bytes
 + created_at: `2024-01-15T10:30:00Z` (string) - Creation timestamp (ISO 8601)
 + nodes (array[string]) - List of node_id values associated with the agreement
-+ transaction_id: `TX-abcdef0123456789` (string, optional) - Transaction ID (null if not yet assigned to a transaction)
++ transaction_id: `9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23` (string, optional) - UUID transaction ID (null if not yet assigned to a transaction)
 + curation (object, optional) - Arbitrary JSON describing curation decisions
 + status: `pending` (enum) - Agreement status
     + Members
         + `new`
-        + `pending`
         + `ready`
+        + `pending`
         + `confirmed`
+        + `completed`
++ merkle_root: `0xdeadbeef1234...` (string, optional) - Poseidon Merkle tree root hash
++ data_symbols: 100 (number, optional) - Number of Reed-Solomon data symbols
++ parity_symbols: 10 (number, optional) - Number of Reed-Solomon parity symbols
++ padded_len: 2048 (number, optional) - Padded length for processing
++ blob_size: 4096 (number, optional) - Total blob size in bytes
++ file_hash: `a1b2c3d4e5f6...` (string) - SHA-256 hash of file content (64 hex characters)
 
-### TransactionParticipant (object)
-+ transaction_id: `TX-0a1b2c3d4e5f6789` (string) - Transaction ID
-+ unsigned_commit_psbt: `cHNidP8BAHECAAAA...` (string) - Base64-encoded unsigned commit PSBT
-+ unsigned_reveal_psbt: `cHNidP8BAHECAAAA...` (string) - Base64-encoded unsigned reveal PSBT
-+ txid: `abc123...` (string) - Transaction hash
-+ reveal_input_index: 0 (number, optional) - Input index for reveal transaction
-+ commit_control_block: `hex_string` (string, optional) - Control block for commit transaction
-+ participation_id: `123` (string) - Unique participation identifier
-+ status: `unsigned` (enum) - Transaction participant status
+### Transaction (object)
++ transaction_id: `9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23` (string) - UUID transaction ID
++ unsigned_commit_psbt: `cHNidP8BAH...` (string) - Base64-encoded unsigned commit PSBT
++ unsigned_reveal_psbt: `cHNidP8BAH...` (string) - Base64-encoded unsigned reveal PSBT
++ status: `unsigned` (enum) - Transaction status
     + Members
         + `unsigned`
         + `signed`
+        + `broadcasting`
+        + `broadcast_failed`
+        + `broadcasted`
+        + `confirmed`
+        + `cancelled`
++ created_at: `2024-01-15T10:30:00Z` (string) - Creation timestamp (ISO 8601)
++ txid: `a1b2c3d4e5f6...` (string, optional) - Bitcoin transaction ID (computed on signing, null if not yet available)
 
 ### Role (enum[string])
 + `user`
@@ -578,12 +650,197 @@ All error responses follow this JSON envelope format:
 Common HTTP status codes:
 
 + `400` - Bad Request: Invalid request parameters
-+ `401` - Unauthorized: Invalid or missing JWT token
++ `401` - Unauthorized: Signature verification failed (invalid signature, stale timestamp, replayed nonce, content-digest mismatch, unknown user)
 + `403` - Forbidden: Insufficient role
 + `404` - Not Found: Resource not found
 + `409` - Conflict: Duplicate or conflicting operation
 + `422` - Unprocessable Entity: File processing failed
 + `500` - Internal Server Error: Server error
++ `502` - Bad Gateway: External service failure (e.g., broadcast failed)
+
+# Group Transactions
+
+Manage transactions for the Portal Signer service. These endpoints allow retrieving unsigned transactions and submitting signed PSBTs for finalization and persistence before the daemon broadcasts them.
+
+### List Transactions [GET /api/transactions{?status,offset,limit}]
+
+Retrieve transactions with optional filtering and pagination. Primarily used to fetch unsigned transactions that need signing.
+
+Required Roles: `portal_signer`
+
++ Parameters
+    + status: `unsigned` (enum[string], optional) - Filter by transaction status
+        + Members
+            + `unsigned`
+            + `signed`
+            + `broadcasting`
+            + `broadcast_failed`
+            + `broadcasted`
+            + `confirmed`
+            + `cancelled`
+    + offset: 0 (number, optional) - Number of items to skip (default: 0)
+    + limit: 20 (number, optional) - Maximum number of items to return (default: 20, max: 100)
+
++ Request (application/json)
+    + Headers
+            
+            Signature-Input: sig1=("@method" "@target-uri" "x-request-timestamp" "x-request-nonce");keyid="SIGNER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+
++ Response 200 (application/json)
+    + Attributes
+        + offset: 0 (number) - Current offset
+        + limit: 20 (number) - Page size
+        + total: 5 (number) - Total number of matching transactions
+        + transactions (array[Transaction]) - List of transactions
+
++ Response 401 (application/json)
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
+
++ Response 403 (application/json)
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
+
++ Response 500 (application/json)
+    + Body
+
+            { "error": { "code": "INTERNAL_ERROR", "message": "Internal server error", "status": 500 } }
+
+### Sign Transaction [POST /api/transactions]
+
+Submit signed PSBTs for a transaction. The portal will finalize the PSBTs, store the signed data and finalized hex, and mark the transaction as `signed` for the daemon to broadcast.
+
+Required Roles: `portal_signer`
+
++ Request (application/json)
+    + Headers
+            
+            Signature-Input: sig1=("@method" "@target-uri" "content-digest" "content-length" "content-type" "x-request-timestamp" "x-request-nonce");keyid="SIGNER-123";alg="bls"
+            Signature: sig1=:<hex-encoded-bls-signature>:
+            X-Request-Timestamp: 1704067200
+            X-Request-Nonce: nonce-abc123
+            Content-Digest: sha-256=:base64hash:
+
+    + Attributes
+        + transaction_id: `9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23` (string, required) - Transaction ID to sign (UUID v4 format)
+        + signed_commit_psbt: `cHNidP8BAH...` (string, required) - Base64-encoded signed commit PSBT
+        + signed_reveal_psbt: `cHNidP8BAH...` (string, required) - Base64-encoded signed reveal PSBT
+
+    + Body
+
+            {
+              "transaction_id": "9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23",
+              "signed_commit_psbt": "cHNidP8BAH0CAAAAAb...",
+              "signed_reveal_psbt": "cHNidP8BAH0CAAAAAb..."
+            }
+
++ Response 200 (application/json)
+    + Attributes
+        + success: true (boolean) - Whether the operation succeeded
+        + transaction_id: `9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23` (string) - Transaction ID (UUID v4 format)
+        + txid: `a1b2c3d4e5f6...` (string) - Bitcoin transaction ID (reveal txid)
+        + status: `signed` (string) - Updated transaction status
+
+    + Body
+
+            {
+              "success": true,
+              "transaction_id": "9bde6f2a-7c2c-4c6d-9a5c-1d1b1c9e8f23",
+              "txid": "a1b2c3d4e5f6789012345678901234567890123456789012345678901234abcd",
+              "status": "signed"
+            }
+
++ Response 400 (application/json)
+    + Body
+
+            { "error": { "code": "INVALID_REQUEST", "message": "Failed to decode/finalize PSBT", "status": 400 } }
+
++ Response 401 (application/json)
+    + Body
+
+            { "error": { "code": "AUTHENTICATION_REQUIRED", "message": "Invalid or missing signature", "status": 401 } }
+
++ Response 403 (application/json)
+    + Body
+
+            { "error": { "code": "FORBIDDEN", "message": "Forbidden", "status": 403 } }
+
++ Response 404 (application/json)
+    + Body
+
+            { "error": { "code": "NOT_FOUND", "message": "Transaction not found", "status": 404 } }
+
++ Response 409 (application/json)
+    + Body
+
+            { "error": { "code": "CONFLICT", "message": "Transaction is not in unsigned status", "status": 409 } }
+
++ Response 500 (application/json)
+    + Body
+
+            { "error": { "code": "INTERNAL_ERROR", "message": "Internal server error", "status": 500 } }
+
+# Group Nodes
+
+Node verification endpoints.
+
+### Check Node Existence [GET /api/nodes/{node_id}/check]
+
+Checks if a node exists in Horizon Market.
+This endpoint does not require client authentication (no HTTP signature needed).
+Portal authenticates with Market using a shared secret.
+
+Returns 200 OK if the node exists, even if the BLS public key is not yet configured (in which case `bls_public_key` will be `null`).
+
++ Parameters
+    + node_id: `NODE-abc123def456` (string, required) - The node identifier
+
++ Response 200 (application/json)
+
+    Node exists and was found in Market. The `bls_public_key` may be `null` if not yet configured.
+
+    + Body
+
+            {
+                "node_id": "NODE-abc123def456",
+                "address": "bc1q...",
+                "xpubkey": "xpub...",
+                "bls_public_key": "abc123..."
+            }
+
++ Response 200 (application/json)
+
+    Node exists but BLS key not yet configured.
+
+    + Body
+
+            {
+                "node_id": "NODE-abc123def456",
+                "address": "bc1q...",
+                "xpubkey": "xpub...",
+                "bls_public_key": null
+            }
+
++ Response 404 (application/json)
+
+    Node not found in Market.
+
+    + Body
+
+            { "error": { "code": "NODE_NOT_FOUND", "message": "node not found: NODE-abc123def456", "status": 404 } }
+
++ Response 500 (application/json)
+
+    Market server error or network issue.
+
+    + Body
+
+            { "error": { "code": "SERVER_ERROR", "message": "failed to contact market: timeout", "status": 500 } }
 
 # Group Health
 

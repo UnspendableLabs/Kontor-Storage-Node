@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,17 +14,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct PortalClient {
     base_url: String,
-    api_key: String,
     storage_dir: PathBuf,
     http: Client,
 }
 
 impl PortalClient {
-    pub fn new(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        storage_dir: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(base_url: impl Into<String>, storage_dir: impl Into<PathBuf>) -> Self {
         let base_url = base_url.into();
         let http = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -33,7 +28,6 @@ impl PortalClient {
             .expect("building Portal HTTP client");
         Self {
             base_url,
-            api_key: api_key.into(),
             storage_dir: storage_dir.into(),
             http,
         }
@@ -41,7 +35,7 @@ impl PortalClient {
 
     pub async fn ping(&self) -> Result<String> {
         let url = format!("{}/health", self.base_url.trim_end_matches('/'));
-        let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
 
@@ -52,13 +46,46 @@ impl PortalClient {
         }
     }
 
+    /// Check if a node exists in the system. This is a public endpoint that
+    /// does not require authentication.
+    pub async fn check_node(&self, node_id: &str) -> Result<NodeCheckResult> {
+        let url = format!(
+            "{}/api/nodes/{}/check",
+            self.base_url.trim_end_matches('/'),
+            node_id
+        );
+        let resp = self.http.get(&url).send().await?;
+        let status = resp.status();
+
+        if status == StatusCode::NOT_FOUND {
+            return Ok(NodeCheckResult::NotFound);
+        }
+
+        if status.is_success() {
+            let info = resp
+                .json::<NodeInfo>()
+                .await
+                .context("failed to deserialize node info")?;
+            Ok(NodeCheckResult::Found(info))
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "failed to check node {node_id} with status {status}: {body}"
+            ))
+        }
+    }
+
     /// Fetch agreements that are marked as new.
+    ///
+    /// TODO: This method needs to be updated to use RFC 9421 BLS signatures
+    /// for authentication instead of bearer token.
     pub async fn get_new_agreements(&self) -> Result<AgreementsPage> {
         let url = format!(
             "{}/api/agreements?status=new",
             self.base_url.trim_end_matches('/')
         );
-        let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
+        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -76,6 +103,9 @@ impl PortalClient {
     }
 
     /// Join an agreement using the provided UTXO.
+    ///
+    /// TODO: This method needs to be updated to use RFC 9421 BLS signatures
+    /// for authentication and include a BLS signature over the join instruction.
     pub async fn join_agreement(
         &self,
         agreement_id: &str,
@@ -89,13 +119,8 @@ impl PortalClient {
             utxo: utxo.to_string(),
         };
 
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
+        let resp = self.http.post(url).json(&payload).send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -156,7 +181,8 @@ impl PortalClient {
             "{}/api/agreements/{agreement_id}/download?no_redirect=true",
             self.base_url.trim_end_matches('/')
         );
-        let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
+        // TODO: Add RFC 9421 HTTP Message Signature headers with BLS
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -223,6 +249,25 @@ pub struct DownloadedFile {
     pub bytes: Bytes,
 }
 
+/// Result of checking if a node exists.
+#[derive(Debug, Clone)]
+pub enum NodeCheckResult {
+    /// Node was not found (404).
+    NotFound,
+    /// Node exists with the given info.
+    Found(NodeInfo),
+}
+
+/// Information about a registered node.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub address: String,
+    pub xpubkey: String,
+    /// BLS public key, if configured. Hex-encoded (96 characters).
+    pub bls_public_key: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::PortalClient;
@@ -232,7 +277,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -250,13 +295,13 @@ mod tests {
 
     #[test]
     fn portal_client_new_stores_base_url() {
-        let client = PortalClient::new("https://example.com/api", "secret", "/tmp/storage");
+        let client = PortalClient::new("https://example.com/api", "/tmp/storage");
         assert_eq!(client.base_url, "https://example.com/api");
     }
 
     #[test]
     fn portal_client_new_trims_trailing_slash_in_ping() {
-        let client = PortalClient::new("https://example.com/api/", "secret", "/tmp/storage");
+        let client = PortalClient::new("https://example.com/api/", "/tmp/storage");
         // The trailing slash trimming happens in ping(), not in new()
         assert_eq!(client.base_url, "https://example.com/api/");
     }
@@ -267,12 +312,11 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("ping_success"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("ping_success"));
         let result = client.ping().await;
 
         assert!(result.is_ok());
@@ -285,14 +329,12 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("healthy"))
             .mount(&mock_server)
             .await;
 
         let client = PortalClient::new(
             format!("{}/", mock_server.uri()),
-            "secret",
             storage_dir("ping_trailing"),
         );
         let result = client.ping().await;
@@ -307,12 +349,11 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("ping_fail"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("ping_fail"));
         let result = client.ping().await;
 
         assert!(result.is_err());
@@ -327,12 +368,11 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/health"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("ping_404"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("ping_404"));
         let result = client.ping().await;
 
         assert!(result.is_err());
@@ -347,7 +387,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -369,7 +408,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("agreements"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("agreements"));
         let page = client.get_new_agreements().await.unwrap();
 
         assert_eq!(page.total, 1);
@@ -384,7 +423,6 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .and(header("authorization", "Bearer secret"))
             .and(body_json(json!({ "utxo": "txid:1" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "agreement_id": agreement_id,
@@ -396,7 +434,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("join"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("join"));
         let response = client.join_agreement(agreement_id, "txid:1").await.unwrap();
 
         assert_eq!(response.agreement_id, agreement_id);
@@ -413,7 +451,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -427,7 +464,7 @@ mod tests {
             .await;
 
         let dir = storage_dir("download");
-        let client = PortalClient::new(mock_server.uri(), "secret", dir.clone());
+        let client = PortalClient::new(mock_server.uri(), dir.clone());
         let downloaded = client
             .download_file(agreement_id, "sample.txt")
             .await
@@ -445,12 +482,11 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("join_error"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("join_error"));
         let err = client
             .join_agreement(agreement_id, "txid:0")
             .await
@@ -471,7 +507,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -484,7 +519,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir("download_http"));
+        let client = PortalClient::new(mock_server.uri(), storage_dir("download_http"));
         let err = client
             .download_file(agreement_id, "file.bin")
             .await
@@ -505,7 +540,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -523,7 +557,7 @@ mod tests {
         std::fs::create_dir_all(storage_file.parent().unwrap()).unwrap();
         std::fs::write(&storage_file, "not a dir").unwrap();
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_file.clone());
+        let client = PortalClient::new(mock_server.uri(), storage_file.clone());
         let err = client
             .download_file(agreement_id, "ignored.bin")
             .await
@@ -545,7 +579,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -564,7 +597,7 @@ mod tests {
         perms.set_mode(0o555);
         fs::set_permissions(&storage_dir, perms).unwrap();
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
+        let client = PortalClient::new(mock_server.uri(), storage_dir.clone());
         let err = client
             .download_file(agreement_id, "read-only.bin")
             .await
@@ -589,16 +622,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&mock_server)
             .await;
 
-        let client = PortalClient::new(
-            mock_server.uri(),
-            "secret",
-            storage_dir("download_url_error"),
-        );
+        let client = PortalClient::new(mock_server.uri(), storage_dir("download_url_error"));
         let err = client
             .download_file(agreement_id, "ignored.txt")
             .await

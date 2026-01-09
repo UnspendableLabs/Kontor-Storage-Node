@@ -38,8 +38,8 @@ impl fmt::Display for StorageMethod {
 /// Application configuration derived from CLI arguments and environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub node_id: String,
     pub portal_url: String,
-    pub portal_api_key: String,
     pub database_url: String,
     pub storage_dir: PathBuf,
     pub portal_polling_interval: Duration,
@@ -50,10 +50,21 @@ pub struct Config {
     pub storage_gcs_bucket_name: Option<String>,
     pub storage_gcs_service_account_json: Option<String>,
     pub server_address: String,
+    pub bls_key_path: Option<PathBuf>,
 }
 
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let node_id = cli.node_id.clone().ok_or_else(|| {
+            anyhow!(
+                "NODE_ID is required.\n\n\
+                Please enter your Node ID provided by Horizon Market.\n\
+                You can set it via the NODE_ID environment variable or --node-id flag.\n\n\
+                If you don't have a Node ID yet, please register as a Storage Node at:\n\
+                https://horizon.market"
+            )
+        })?;
+
         let storage_capacity = match &cli.storage_capacity {
             Some(raw) => Some(parse_storage_capacity(raw)?),
             None => None,
@@ -80,8 +91,8 @@ impl Config {
         }
 
         Ok(Self {
+            node_id,
             portal_url: cli.portal_url.clone(),
-            portal_api_key: cli.portal_api_key.clone(),
             database_url: cli.database_url.clone(),
             storage_dir: cli.storage_dir.clone().unwrap_or_else(default_storage_dir),
             portal_polling_interval: Duration::from_secs(cli.portal_polling_interval_secs),
@@ -92,6 +103,7 @@ impl Config {
             storage_gcs_bucket_name: cli.storage_gcs_bucket_name.clone(),
             storage_gcs_service_account_json: cli.storage_gcs_service_account_json.clone(),
             server_address: cli.server_address.clone(),
+            bls_key_path: cli.bls_key_path.clone(),
         })
     }
 }
@@ -127,8 +139,8 @@ mod tests {
     #[test]
     fn config_from_cli_clones_fields() {
         let mut cli = Cli {
+            node_id: Some("NODE-abc123".to_string()),
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 42,
@@ -139,20 +151,20 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
         let config = Config::from_cli(&cli).unwrap();
 
         cli.portal_url.push_str("/extra");
-        cli.portal_api_key.push_str("123");
         cli.database_url.push_str("?mode=ro");
         cli.storage_dir = Some(PathBuf::from("/other"));
         cli.storage_capacity = Some("20GB".into());
         cli.storage_max_files = Some(20);
 
+        assert_eq!(config.node_id, "NODE-abc123");
         assert_eq!(config.portal_url, "https://portal.example/api");
-        assert_eq!(config.portal_api_key, "secret");
         assert_eq!(config.database_url, "sqlite://localhost/mydb");
         assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
         assert_eq!(config.portal_polling_interval, Duration::from_secs(42));
@@ -161,6 +173,29 @@ mod tests {
         assert_eq!(config.storage_max_file_size, Some(1_000_000_000));
         assert_eq!(config.storage_method, StorageMethod::Local);
         assert_eq!(config.server_address, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn config_from_cli_requires_node_id() {
+        let cli = Cli {
+            node_id: None,
+            portal_url: "https://portal.example/api".to_string(),
+            database_url: "sqlite://localhost/mydb".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/files")),
+            portal_polling_interval_secs: 10,
+            storage_capacity: None,
+            storage_max_files: None,
+            storage_max_file_size: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
+            command: Commands::Ping,
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("NODE_ID is required"));
     }
 
     #[test]
@@ -181,8 +216,8 @@ mod tests {
     #[test]
     fn from_trait_invokes_from_cli() {
         let cli = Cli {
+            node_id: Some("NODE-xyz789".to_string()),
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 10,
@@ -193,12 +228,13 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
         let config: Config = (&cli).into();
+        assert_eq!(config.node_id, "NODE-xyz789");
         assert_eq!(config.portal_url, cli.portal_url);
-        assert_eq!(config.portal_api_key, cli.portal_api_key);
         assert_eq!(config.database_url, cli.database_url);
         assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
         assert_eq!(
@@ -234,8 +270,8 @@ mod tests {
     #[test]
     fn config_from_cli_validates_gcs_bucket_required() {
         let cli = Cli {
+            node_id: Some("NODE-gcs1".to_string()),
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 10,
@@ -246,6 +282,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -256,8 +293,8 @@ mod tests {
     #[test]
     fn config_from_cli_validates_gcs_service_account_required() {
         let cli = Cli {
+            node_id: Some("NODE-gcs2".to_string()),
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 10,
@@ -268,6 +305,7 @@ mod tests {
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 
@@ -278,8 +316,8 @@ mod tests {
     #[test]
     fn config_from_cli_accepts_valid_gcs_config() {
         let cli = Cli {
+            node_id: Some("NODE-gcs3".to_string()),
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 10,
@@ -290,6 +328,7 @@ mod tests {
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
             server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
         };
 

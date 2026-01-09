@@ -1,7 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -10,7 +10,6 @@ async fn main_entry_runs_ping_with_cli_args() {
 
     Mock::given(method("GET"))
         .and(path("/health"))
-        .and(header("authorization", "Bearer secret"))
         .respond_with(ResponseTemplate::new(200).set_body_string("pong"))
         .mount(&mock_server)
         .await;
@@ -20,10 +19,10 @@ async fn main_entry_runs_ping_with_cli_args() {
 
     let mut cmd = cargo_bin_cmd!(env!("CARGO_PKG_NAME"));
     cmd.current_dir(temp_dir.path())
+        .arg("--node-id")
+        .arg("NODE-test123")
         .arg("--portal-url")
         .arg(mock_server.uri())
-        .arg("--portal-api-key")
-        .arg("secret")
         .arg("--database-url")
         .arg("sqlite::memory:")
         .arg("--storage-dir")
@@ -36,6 +35,10 @@ async fn main_entry_runs_ping_with_cli_args() {
     assert!(output.status.success(), "status: {}", output.status);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Node ID:"),
+        "expected node id info in stdout: {stdout}"
+    );
     assert!(
         stdout.contains("Portal URL:"),
         "expected cli info in stdout: {stdout}"

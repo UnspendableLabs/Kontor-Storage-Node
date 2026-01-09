@@ -160,7 +160,7 @@ mod tests {
     use serial_test::serial;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -228,7 +228,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock_server)
             .await;
@@ -238,7 +237,7 @@ mod tests {
         let storage_dir = unique_path("storage_error");
 
         let error = run_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir),
+            PortalClient::new(mock_server.uri(), storage_dir),
             database,
             Duration::from_millis(5),
             lock_path.clone(),
@@ -294,7 +293,7 @@ mod tests {
         already_downloaded.insert(&database).await.unwrap();
 
         let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
@@ -348,7 +347,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
             .mount(&mock_server)
             .await;
@@ -356,7 +354,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements/AGREEMENT-test/download"))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -376,7 +373,7 @@ mod tests {
         fs::remove_dir_all(&storage_dir).ok();
 
         let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),

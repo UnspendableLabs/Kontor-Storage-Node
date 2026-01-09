@@ -532,7 +532,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -568,7 +567,7 @@ mod tests {
         agreement.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -622,7 +621,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -690,7 +688,7 @@ mod tests {
         };
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -732,7 +730,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -796,7 +793,7 @@ mod tests {
         };
 
         let err = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -838,7 +835,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -908,7 +904,7 @@ mod tests {
         };
 
         let err = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -939,7 +935,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -974,7 +969,7 @@ mod tests {
         };
         agreement.insert(&database).await.unwrap();
 
-        let client = PortalClient::new(mock_server.uri(), "secret", storage_dir.clone());
+        let client = PortalClient::new(mock_server.uri(), storage_dir.clone());
 
         download_agreements(&client, &database, StorageLimits::default(), &backend)
             .await
@@ -1028,7 +1023,7 @@ mod tests {
         let storage_dir = unique_storage_dir("empty");
 
         download_agreements(
-            &PortalClient::new("http://localhost:1", "secret", storage_dir),
+            &PortalClient::new("http://localhost:1", storage_dir),
             &database,
             StorageLimits::default(),
             &StorageBackend::local(),
@@ -1051,7 +1046,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -1101,7 +1095,7 @@ mod tests {
 
         // Capacity is below the sum of downloaded (900) + pending (200).
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits {
                 capacity: Some(1000),
@@ -1139,7 +1133,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&mock_server)
@@ -1168,7 +1161,7 @@ mod tests {
         pending.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits {
                 capacity: None,
@@ -1210,7 +1203,6 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/api/agreements/{agreement_id}/download")))
                 .and(query_param("no_redirect", "true"))
-                .and(header("authorization", "Bearer secret"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "download_url": download_url
                 })))
@@ -1265,7 +1257,7 @@ mod tests {
         second.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits {
                 capacity: Some(1000),
@@ -1316,7 +1308,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": format!("{}{}", mock_server.uri(), download_path)
             })))
@@ -1365,7 +1356,7 @@ mod tests {
         pending.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits {
                 capacity: None,
@@ -1407,7 +1398,6 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/api/agreements/{agreement_id}/download")))
                 .and(query_param("no_redirect", "true"))
-                .and(header("authorization", "Bearer secret"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "download_url": download_url
                 })))
@@ -1462,7 +1452,7 @@ mod tests {
         second.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits {
                 capacity: None,
@@ -1515,7 +1505,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -1554,7 +1543,7 @@ mod tests {
         stdfs::create_dir_all(&ledger_dir).unwrap();
 
         let result = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &StorageBackend::local(),
@@ -1727,7 +1716,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": format!("{}/files/error.bin", mock_server.uri())
             })))
@@ -1764,7 +1752,7 @@ mod tests {
         agreement.insert(&database).await.unwrap();
 
         let err = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir),
+            &PortalClient::new(mock_server.uri(), storage_dir),
             &database,
             StorageLimits::default(),
             &StorageBackend::local(),
@@ -1791,7 +1779,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -1868,7 +1855,7 @@ mod tests {
         };
 
         let result = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -1905,7 +1892,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -1983,7 +1969,7 @@ mod tests {
 
         // This should still fail (post-processing error) but GCS delete failure is logged
         let result = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -2007,7 +1993,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -2047,7 +2032,7 @@ mod tests {
         agreement.insert(&database).await.unwrap();
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &StorageBackend::local(),
@@ -2084,7 +2069,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -2161,7 +2145,7 @@ mod tests {
 
         let _guard = simulate_commit_failure_once();
         let err = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -2201,7 +2185,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -2279,7 +2262,7 @@ mod tests {
         };
 
         let err = download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
@@ -2309,7 +2292,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -2385,7 +2367,7 @@ mod tests {
         };
 
         download_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
