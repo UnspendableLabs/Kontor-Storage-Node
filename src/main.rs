@@ -267,6 +267,10 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Environment variable used to override the app directory.
+    /// This ensures tests don't write to the real application config directory.
+    const APP_DIR_ENV_VAR: &str = "KONTOR_APP_DIR";
+
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn cwd_lock() -> &'static Mutex<()> {
@@ -279,8 +283,50 @@ mod tests {
         std::env::temp_dir().join(format!("kontor_main_{prefix}_{id}"))
     }
 
+    /// Returns a unique temporary directory for test app data to avoid conflicts.
+    fn test_app_dir(prefix: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join("main")
+            .join(format!("{prefix}_{id}"))
+    }
+
+    /// RAII guard that sets KONTOR_APP_DIR to a temporary directory and restores
+    /// the original value when dropped. This works with both sync and async tests.
+    struct TempAppDirGuard {
+        previous: Option<String>,
+        dir: PathBuf,
+    }
+
+    impl TempAppDirGuard {
+        fn new(prefix: &str) -> Self {
+            let dir = test_app_dir(prefix);
+            // Clean up any leftover files from previous test runs
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create test app dir");
+            let previous = std::env::var(APP_DIR_ENV_VAR).ok();
+            std::env::set_var(APP_DIR_ENV_VAR, &dir);
+            Self { previous, dir }
+        }
+    }
+
+    impl Drop for TempAppDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+                None => std::env::remove_var(APP_DIR_ENV_VAR),
+            }
+            // Clean up the temp directory
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_writes_ping_output() {
+        let _guard = TempAppDirGuard::new("ping_output");
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -341,7 +387,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_propagates_ping_error() {
+        let _guard = TempAppDirGuard::new("ping_error");
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -377,7 +425,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_prints_gcs_bucket_when_storage_method_is_gcs() {
+        let _guard = TempAppDirGuard::new("gcs_bucket");
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -432,7 +482,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_prints_limits_when_configured() {
+        let _guard = TempAppDirGuard::new("limits");
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -480,7 +532,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_errors_when_storage_dir_is_file() {
+        let _guard = TempAppDirGuard::new("dir_as_file");
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -566,6 +620,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_starts_daemon_and_aborts_on_shutdown() {
+        let _guard = TempAppDirGuard::new("daemon");
         cleanup_onboarding_env(); // Ensure clean state
         let mock_server = MockServer::start().await;
         let storage_dir = unique_storage_dir("daemon");
@@ -643,6 +698,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn run_propagates_shutdown_error() {
+        let _guard = TempAppDirGuard::new("shutdown_error");
         cleanup_onboarding_env(); // Ensure clean state
         let mock_server = MockServer::start().await;
         let storage_dir = unique_storage_dir("shutdown_error");

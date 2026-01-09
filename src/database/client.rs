@@ -12,33 +12,69 @@ const DEFAULT_DB_DIR: &str = "Kontor-Storage-Node";
 const DEFAULT_DB_FILE: &str = "storage.db";
 const DEFAULT_FILES_DIR: &str = "files";
 
+/// Environment variable to override the application data directory.
+/// This is primarily intended for testing to avoid writing to the real app directory.
+const APP_DIR_ENV_VAR: &str = "KONTOR_APP_DIR";
+
+// Thread-local override for testing scenarios where we need to simulate
+// the absence of a data directory (when `dirs::data_dir()` returns None).
 #[cfg(test)]
 thread_local! {
     static DATA_DIR_OVERRIDE: RefCell<Option<Option<PathBuf>>> = const { RefCell::new(None) };
 }
 
-fn data_dir() -> Option<PathBuf> {
+/// Returns the default application data directory.
+///
+/// Priority:
+/// 1. Thread-local override (test-only, for simulating None)
+/// 2. `KONTOR_APP_DIR` environment variable (for testing/custom deployments)
+/// 3. Platform-specific data directory (e.g. `~/.local/share/Kontor-Storage-Node`)
+#[must_use]
+pub fn default_app_dir() -> Option<PathBuf> {
+    // In tests, check thread-local override first (used to simulate None)
     #[cfg(test)]
     {
         if let Some(overridden) = DATA_DIR_OVERRIDE.with(|cell| cell.borrow().clone()) {
-            return overridden;
+            return overridden.map(|dir| dir.join(DEFAULT_DB_DIR));
         }
     }
 
-    dirs::data_dir()
+    // Check environment variable (useful for tests and custom deployments)
+    if let Ok(dir) = std::env::var(APP_DIR_ENV_VAR) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+
+    dirs::data_dir().map(|dir| dir.join(DEFAULT_DB_DIR))
 }
 
+/// Runs a closure with the data directory overridden.
+/// Pass `Some(path)` to override to a specific path, or `None` to simulate no data directory.
+/// This also temporarily clears the environment variable to prevent interference.
 #[cfg(test)]
 fn with_data_dir_override<F, T>(value: Option<PathBuf>, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    DATA_DIR_OVERRIDE.with(|cell| {
+    // Save and clear env var to prevent interference
+    let prev_env = std::env::var(APP_DIR_ENV_VAR).ok();
+    std::env::remove_var(APP_DIR_ENV_VAR);
+
+    let result = DATA_DIR_OVERRIDE.with(|cell| {
         let previous = cell.replace(Some(value));
         let result = f();
         cell.replace(previous);
         result
-    })
+    });
+
+    // Restore env var
+    match prev_env {
+        Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+        None => std::env::remove_var(APP_DIR_ENV_VAR),
+    }
+
+    result
 }
 
 /// Convenience wrapper around a SeaORM database connection that ensures
@@ -80,12 +116,6 @@ pub fn default_database_url() -> String {
 
     // Safe fallback if the platform does not expose a data directory.
     "sqlite::memory:".to_string()
-}
-
-/// Returns the default application data directory (e.g. `~/.local/share/Kontor-Storage-Node`).
-#[must_use]
-pub fn default_app_dir() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join(DEFAULT_DB_DIR))
 }
 
 /// Returns the default directory used to store downloaded files.
