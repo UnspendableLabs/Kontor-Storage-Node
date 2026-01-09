@@ -1,10 +1,57 @@
 use crate::cli::Cli;
-use crate::database::default_storage_dir;
+use crate::database::{default_app_dir, default_storage_dir};
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Name of the persistent config file stored in app data directory.
+const NODE_CONFIG_FILENAME: &str = "node_config.json";
+
+/// Persistent node configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedConfig {
+    /// The node ID registered with Horizon Market.
+    pub node_id: Option<String>,
+}
+
+impl PersistedConfig {
+    /// Load the persisted config from the default location.
+    /// Returns a default config if the file doesn't exist.
+    pub fn load() -> Result<Self> {
+        let path = Self::config_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| anyhow!("failed to read config file {}: {e}", path.display()))?;
+        serde_json::from_str(&contents)
+            .map_err(|e| anyhow!("failed to parse config file {}: {e}", path.display()))
+    }
+
+    /// Save the config to the default location.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("failed to create config directory: {e}"))?;
+        }
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("failed to serialize config: {e}"))?;
+        fs::write(&path, contents)
+            .map_err(|e| anyhow!("failed to write config file {}: {e}", path.display()))
+    }
+
+    /// Get the path to the config file.
+    pub fn config_path() -> Result<PathBuf> {
+        let app_dir = default_app_dir()
+            .ok_or_else(|| anyhow!("unable to determine application data directory"))?;
+        Ok(app_dir.join(NODE_CONFIG_FILENAME))
+    }
+}
 
 /// Storage backend method.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,15 +102,28 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
-        let node_id = cli.node_id.clone().ok_or_else(|| {
-            anyhow!(
-                "NODE_ID is required.\n\n\
-                Please enter your Node ID provided by Horizon Market.\n\
-                You can set it via the NODE_ID environment variable or --node-id flag.\n\n\
-                If you don't have a Node ID yet, please register as a Storage Node at:\n\
-                https://horizon.market"
-            )
-        })?;
+        // Try to get node_id from CLI/env first, then fall back to persisted config
+        let node_id = if let Some(ref id) = cli.node_id {
+            // If provided via CLI/env, persist it for future use
+            let mut persisted = PersistedConfig::load().unwrap_or_default();
+            if persisted.node_id.as_ref() != Some(id) {
+                persisted.node_id = Some(id.clone());
+                persisted.save().ok(); // Best effort save
+            }
+            id.clone()
+        } else {
+            // Try to load from persisted config
+            let persisted = PersistedConfig::load().unwrap_or_default();
+            persisted.node_id.ok_or_else(|| {
+                anyhow!(
+                    "NODE_ID is required.\n\n\
+                    Please enter your Node ID provided by Horizon Market.\n\
+                    You can set it via the NODE_ID environment variable or --node-id flag.\n\n\
+                    If you don't have a Node ID yet, please register as a Storage Node at:\n\
+                    https://horizon.market"
+                )
+            })?
+        };
 
         let storage_capacity = match &cli.storage_capacity {
             Some(raw) => Some(parse_storage_capacity(raw)?),
@@ -135,8 +195,10 @@ fn parse_storage_capacity(raw: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Commands};
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn config_from_cli_clones_fields() {
         let mut cli = Cli {
             node_id: Some("NODE-abc123".to_string()),
@@ -176,7 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn config_from_cli_requires_node_id() {
+    #[serial]
+    fn config_from_cli_requires_node_id_when_not_persisted() {
+        // Clear any persisted config from previous test runs
+        if let Ok(path) = PersistedConfig::config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+
         let cli = Cli {
             node_id: None,
             portal_url: "https://portal.example/api".to_string(),
@@ -199,6 +267,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn config_from_cli_uses_persisted_node_id() {
+        // Clear any existing config first
+        if let Ok(path) = PersistedConfig::config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Save a node_id to the persisted config
+        let persisted = PersistedConfig {
+            node_id: Some("NODE-persisted".to_string()),
+        };
+        persisted.save().unwrap();
+
+        let cli = Cli {
+            node_id: None, // Not provided via CLI
+            portal_url: "https://portal.example/api".to_string(),
+            database_url: "sqlite://localhost/mydb".to_string(),
+            storage_dir: Some(PathBuf::from("/tmp/files")),
+            portal_polling_interval_secs: 10,
+            storage_capacity: None,
+            storage_max_files: None,
+            storage_max_file_size: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            bls_key_path: None,
+            command: Commands::Ping,
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.node_id, "NODE-persisted");
+
+        // Clean up
+        if let Ok(path) = PersistedConfig::config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn parse_storage_capacity_supports_units() {
         assert_eq!(parse_storage_capacity("10M").unwrap(), 10_000_000);
         assert_eq!(parse_storage_capacity("2GB").unwrap(), 2_000_000_000);
@@ -214,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_trait_invokes_from_cli() {
         let cli = Cli {
             node_id: Some("NODE-xyz789".to_string()),
@@ -268,6 +377,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn config_from_cli_validates_gcs_bucket_required() {
         let cli = Cli {
             node_id: Some("NODE-gcs1".to_string()),
@@ -291,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn config_from_cli_validates_gcs_service_account_required() {
         let cli = Cli {
             node_id: Some("NODE-gcs2".to_string()),
@@ -314,6 +425,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn config_from_cli_accepts_valid_gcs_config() {
         let cli = Cli {
             node_id: Some("NODE-gcs3".to_string()),

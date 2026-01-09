@@ -167,6 +167,33 @@ pub async fn download_agreements(
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
 
+        // Join the agreement on Portal after successful download.
+        // This is idempotent - Portal returns created=false if already joined.
+        // Skip if client is not authenticated (e.g., in legacy tests).
+        if portal_client.node_id().is_some() {
+            let join_response = portal_client
+                .join_agreement(&agreement.agreement_id)
+                .await
+                .with_context(|| format!("joining agreement {}", agreement.agreement_id))?;
+
+            if join_response.created {
+                info!(
+                    "Joined agreement {} as node {}",
+                    agreement.agreement_id, join_response.node_id
+                );
+            } else {
+                info!(
+                    "Already joined agreement {} (idempotent)",
+                    agreement.agreement_id
+                );
+            }
+        } else {
+            warn!(
+                "Skipping join for agreement {} - client not authenticated",
+                agreement.agreement_id
+            );
+        }
+
         let txn = database.begin().await?;
         let mut uploaded_to_gcs = false;
 
@@ -427,6 +454,7 @@ fn ledger_path(storage_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bls::BlsKeyPair;
     use crate::entities::prelude::Agreements;
     use halo2curves::pasta::Fq;
     use sea_orm::{
@@ -436,12 +464,47 @@ mod tests {
     use std::fs as stdfs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::thread::ThreadId;
     use tokio::fs;
-    use wiremock::matchers::{body_bytes, header, method, path, query_param};
+    use wiremock::matchers::{body_bytes, header, header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// Helper to create an authenticated PortalClient and mount required mocks for join_agreement.
+    async fn create_authenticated_client(
+        mock_server: &MockServer,
+        storage_dir: PathBuf,
+    ) -> PortalClient {
+        // Mock the portal xpub endpoint
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        PortalClient::with_auth(mock_server.uri(), storage_dir, keypair, "NODE-test")
+    }
+
+    /// Helper to mount the join_agreement mock for a specific agreement.
+    async fn mount_join_agreement_mock(mock_server: &MockServer, agreement_id: &str) {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/agreements/{agreement_id}/join")))
+            .and(header_exists("Signature-Input"))
+            .and(header_exists("Signature"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "agreement_id": agreement_id,
+                "node_id": "NODE-test",
+                "bls_signature": "0xabcdef",
+                "joined_at": "2025-01-01T00:00:00Z",
+                "created": true
+            })))
+            .mount(mock_server)
+            .await;
+    }
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
     static FAIL_COMMIT_THREAD: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
@@ -544,6 +607,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        mount_join_agreement_mock(&mock_server, agreement_id).await;
+
         let database = setup_in_memory_db().await;
         let storage_dir = unique_storage_dir("download");
         stdfs::remove_dir_all(&storage_dir).ok();
@@ -566,14 +631,10 @@ mod tests {
         };
         agreement.insert(&database).await.unwrap();
 
-        download_agreements(
-            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
-            &database,
-            StorageLimits::default(),
-            &backend,
-        )
-        .await
-        .unwrap();
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
+            .await
+            .unwrap();
 
         let stored = fs::read_to_string(storage_dir.join(file_id)).await.unwrap();
         assert_eq!(stored, "file-body");
@@ -675,6 +736,8 @@ mod tests {
         };
         agreement.insert(&database).await.unwrap();
 
+        mount_join_agreement_mock(&mock_server, agreement_id).await;
+
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
             "svc@example.com",
@@ -687,14 +750,10 @@ mod tests {
             gcs_client: Some(Arc::new(gcs_client)),
         };
 
-        download_agreements(
-            &PortalClient::new(mock_server.uri(), storage_dir.clone()),
-            &database,
-            StorageLimits::default(),
-            &backend,
-        )
-        .await
-        .unwrap();
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        download_agreements(&client, &database, StorageLimits::default(), &backend)
+            .await
+            .unwrap();
 
         assert!(
             !storage_dir.join(file_id).exists(),
