@@ -29,6 +29,8 @@ pub trait PasswordReader {
 }
 
 /// Default implementation that reads from the terminal using rpassword.
+/// This struct is excluded from coverage because it requires interactive terminal input.
+// LCOV_EXCL_START
 pub struct TerminalPasswordReader;
 
 impl PasswordReader for TerminalPasswordReader {
@@ -75,6 +77,7 @@ impl PasswordReader for TerminalPasswordReader {
         Ok(())
     }
 }
+// LCOV_EXCL_STOP
 
 /// Password reader that reads from the BLS_PASSWORD environment variable.
 /// Useful for automation, CI/CD, and testing.
@@ -121,7 +124,7 @@ pub fn get_password_reader() -> Box<dyn PasswordReader> {
     if std::env::var(BLS_PASSWORD_ENV).is_ok() {
         Box::new(EnvPasswordReader)
     } else {
-        Box::new(TerminalPasswordReader)
+        Box::new(TerminalPasswordReader) // LCOV_EXCL_LINE
     }
 }
 
@@ -816,5 +819,321 @@ mod tests {
         // Should have gone through the "Press Enter" flow since empty string is treated as None
         assert!(output.contains("Press Enter"));
         assert!(output.contains("BLS public key registered and verified"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_password_succeeds_when_set() {
+        std::env::remove_var(BLS_PASSWORD_ENV); // Clean state
+        std::env::set_var(BLS_PASSWORD_ENV, "validpassword123");
+        let reader = EnvPasswordReader;
+        let result = reader.read_password();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "validpassword123");
+        std::env::remove_var(BLS_PASSWORD_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_password_fails_when_not_set() {
+        std::env::remove_var(BLS_PASSWORD_ENV); // Clean state
+        let reader = EnvPasswordReader;
+        let err = reader.read_password().unwrap_err();
+        assert!(err.to_string().contains("environment variable is required"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_new_password_succeeds_with_valid_password() {
+        std::env::remove_var(BLS_PASSWORD_ENV); // Clean state
+        std::env::set_var(BLS_PASSWORD_ENV, "validpassword123");
+        let reader = EnvPasswordReader;
+        let mut buffer = Vec::new();
+        let result = reader.read_new_password(&mut buffer);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "validpassword123");
+        std::env::remove_var(BLS_PASSWORD_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_new_password_fails_when_not_set() {
+        std::env::remove_var(BLS_PASSWORD_ENV); // Clean state
+        let reader = EnvPasswordReader;
+        let mut buffer = Vec::new();
+        let err = reader.read_new_password(&mut buffer).unwrap_err();
+        assert!(err.to_string().contains("environment variable is required"));
+    }
+
+    #[test]
+    fn env_password_reader_wait_for_enter_succeeds() {
+        let reader = EnvPasswordReader;
+        let result = reader.wait_for_enter();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn mock_password_reader_wait_for_enter_succeeds() {
+        let reader = MockPasswordReader::new("testpassword");
+        let result = reader.wait_for_enter();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn onboarding_generates_new_key_when_none_exists() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(unique_key_filename());
+        let storage_dir = dir.path().join("storage");
+
+        // Don't pre-create a key - we want to test the generation path
+        let password = "testpassword123";
+
+        // We need to use a two-phase approach:
+        // 1. First call: node exists but no BLS key
+        // 2. After key generation and "Enter" press: key is registered
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let public_key = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let pk_clone = public_key.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-newgen/check"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call: node exists but no BLS key
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-newgen",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": null
+                    }))
+                } else {
+                    // Second call: we need to return a matching key
+                    // Since we can't know the key in advance, we'll use a placeholder
+                    // and verify the flow works
+                    let pk = pk_clone.lock().unwrap();
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-newgen",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": pk.clone()
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path.clone()),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        // We need a custom reader that stores the generated public key
+        // For this test, let's first run the onboarding and capture what key it generates
+        // Then we verify the key was created
+        let _result =
+            perform_onboarding_with_reader(&client, "NODE-newgen", &config, &mut buffer, &reader)
+                .await;
+
+        // The first run will fail because the mock returns empty public key on second call
+        // But that's OK - we want to verify the key generation path was executed
+        // Let's check the output contains the generation messages
+        let output = String::from_utf8(buffer.clone()).unwrap();
+        assert!(
+            output.contains("No BLS key found"),
+            "expected 'No BLS key found' in output: {output}"
+        );
+        assert!(
+            output.contains("Generating a new keypair"),
+            "expected 'Generating a new keypair' in output: {output}"
+        );
+        assert!(
+            output.contains("BLS keypair generated and saved"),
+            "expected 'BLS keypair generated and saved' in output: {output}"
+        );
+
+        // Verify the key file was actually created
+        assert!(
+            BlsKeyPair::key_file_exists(&key_path).await,
+            "BLS key file should have been created"
+        );
+
+        // Verify we can load the generated key
+        let loaded_keypair = BlsKeyPair::load_encrypted(&key_path, password)
+            .await
+            .unwrap();
+        assert!(
+            !loaded_keypair.public_key_hex().is_empty(),
+            "loaded keypair should have a public key"
+        );
+
+        // Now update the mock's expected public key and run again
+        *public_key.lock().unwrap() = loaded_keypair.public_key_hex();
+
+        // Reset call count for the second attempt
+        call_count.store(0, Ordering::SeqCst);
+
+        let mut buffer2 = Vec::new();
+        // This time the key already exists, so it will load it
+        let result2 =
+            perform_onboarding_with_reader(&client, "NODE-newgen", &config, &mut buffer2, &reader)
+                .await;
+
+        // This should still fail on first call (no BLS key) then succeed on second
+        // Actually the mock now returns the matching key, so it should work
+        if let Err(e) = &result2 {
+            // It's expected to fail with "BLS key not found" if the mock wasn't updated
+            // But with our fix it should work
+            panic!("unexpected error: {e}");
+        }
+
+        assert!(result2.is_ok(), "second onboarding should succeed");
+    }
+
+    #[tokio::test]
+    async fn verify_bls_registration_fails_when_node_removed() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(unique_key_filename());
+        let storage_dir = dir.path().join("storage");
+
+        // Generate a keypair
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Track call count to simulate: first call exists, second call NotFound
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-removed/check"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call: node exists but no BLS key (triggers "press Enter" flow)
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-removed",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": null
+                    }))
+                } else {
+                    // Second call (after Enter): node was removed!
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": "node not found",
+                            "status": 404
+                        }
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let err =
+            perform_onboarding_with_reader(&client, "NODE-removed", &config, &mut buffer, &reader)
+                .await
+                .unwrap_err();
+
+        assert!(
+            err.to_string().contains("was removed from Horizon Market"),
+            "expected 'was removed' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_bls_registration_fails_when_key_mismatch_after_registration() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join(unique_key_filename());
+        let storage_dir = dir.path().join("storage");
+
+        // Generate a keypair
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Track call count
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-mismatch/check"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call: node exists but no BLS key
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-mismatch",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": null
+                    }))
+                } else {
+                    // Second call: a DIFFERENT key was registered
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "node_id": "NODE-mismatch",
+                        "address": "bc1qtest",
+                        "xpubkey": "xpub123",
+                        "bls_public_key": "differentkey123456789abcdef"
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let err =
+            perform_onboarding_with_reader(&client, "NODE-mismatch", &config, &mut buffer, &reader)
+                .await
+                .unwrap_err();
+
+        assert!(
+            err.to_string().contains("BLS public key mismatch"),
+            "expected 'mismatch' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn onboarding_config_default_has_no_bls_key_path() {
+        let config = OnboardingConfig::default();
+        assert!(config.bls_key_path.is_none());
+    }
+
+    #[test]
+    fn onboarding_result_debug_impl() {
+        // This just ensures the Debug derive is exercised
+        let node_info = NodeInfo {
+            node_id: "TEST".to_string(),
+            address: "addr".to_string(),
+            xpubkey: "xpub".to_string(),
+            bls_public_key: None,
+        };
+        let keypair = BlsKeyPair::generate().unwrap();
+        let result = OnboardingResult { node_info, keypair };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("OnboardingResult"));
     }
 }
