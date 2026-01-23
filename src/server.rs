@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
+use tower_http::services::ServeDir;
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ pub struct DownloadServerState {
     pub db: DatabaseConnection,
     pub storage_dir: PathBuf,
     pub storage_backend: StorageBackend,
+    pub node_id: String,
 }
 
 const DEFAULT_LIMIT: u64 = 20;
@@ -36,9 +38,32 @@ const MAX_LIMIT: u64 = 100;
 
 pub fn router(state: DownloadServerState) -> Router {
     Router::new()
+        .route("/", get(dashboard))
+        .route("/api/info", get(node_info))
         .route("/files", get(list_files))
         .route("/files/:file_id", get(download_file))
+        .nest_service("/static", ServeDir::new("static"))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct NodeInfoResponse {
+    node_id: String,
+}
+
+async fn node_info(State(state): State<DownloadServerState>) -> Json<NodeInfoResponse> {
+    Json(NodeInfoResponse {
+        node_id: state.node_id.clone(),
+    })
+}
+
+async fn dashboard() -> Response {
+    const INDEX_HTML: &str = include_str!("../static/index.html");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(INDEX_HTML))
+        .unwrap()
 }
 
 pub async fn serve(
@@ -453,6 +478,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let app = router(state);
@@ -491,6 +517,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let app = router(state);
@@ -521,6 +548,7 @@ mod tests {
             db: db.clone(),
             storage_dir,
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let app = router(state);
@@ -551,6 +579,7 @@ mod tests {
             db,
             storage_dir: PathBuf::new(),
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         });
         let response = next
             .oneshot(
@@ -582,6 +611,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let app = router(state);
@@ -608,6 +638,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -636,6 +667,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         };
 
         let response = router(state)
@@ -664,6 +696,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
         })
         .oneshot(
             Request::builder()
@@ -687,6 +720,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
+            node_id: "NODE-TEST".to_string(),
         };
 
         let response = router(state)
@@ -724,6 +758,7 @@ mod tests {
                 method: StorageMethod::Gcs,
                 gcs_client: None,
             },
+            node_id: "NODE-TEST".to_string(),
         })
         .oneshot(
             Request::builder()
@@ -747,6 +782,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key("not-a-key").await,
+            node_id: "NODE-TEST".to_string(),
         })
         .oneshot(
             Request::builder()

@@ -166,6 +166,7 @@ async fn run_with_shutdown(
                 storage_backend,
                 config.storage_dir.clone(),
                 download_addr,
+                config.node_id.clone(),
                 shutdown,
             )
             .await?;
@@ -185,6 +186,7 @@ async fn run_daemon_command(
     storage_backend: StorageBackend,
     storage_dir: PathBuf,
     download_addr: SocketAddr,
+    node_id: String,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
     let daemon_backend = storage_backend.clone();
@@ -204,6 +206,7 @@ async fn run_daemon_command(
             db: conn,
             storage_dir,
             storage_backend,
+            node_id,
         },
         async move {
             let _ = server_shutdown_rx.await;
@@ -784,6 +787,7 @@ mod tests {
             storage_backend,
             storage_dir.clone(),
             "127.0.0.1:1".parse().unwrap(),
+            "NODE-TEST".to_string(),
             shutdown,
         )
         .await
