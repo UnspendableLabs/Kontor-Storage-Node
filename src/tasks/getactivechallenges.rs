@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Temporary until wired into daemon loop.
-
 use crate::clients::PortalClient;
 use crate::entities::{challenges, prelude::Challenges};
 use anyhow::{Context, Result};

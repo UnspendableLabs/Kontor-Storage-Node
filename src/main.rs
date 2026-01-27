@@ -197,6 +197,7 @@ async fn run_daemon_command(
         lock_path,
         storage_limits,
         daemon_backend,
+        storage_dir.clone(),
     );
 
     let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();

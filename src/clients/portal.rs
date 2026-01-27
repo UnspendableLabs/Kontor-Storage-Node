@@ -406,6 +406,79 @@ impl PortalClient {
             ))
         }
     }
+
+    /// Submit a storage proof for a challenge.
+    ///
+    /// This method:
+    /// 1. Fetches the Portal signing xpub (cached)
+    /// 2. Creates a BLS signature over `(portal_signing_xpub, ["send_proof", node_id, proof_hex])`
+    /// 3. Submits the proof with both HTTP signature and BLS signature
+    ///
+    /// Requires authentication.
+    pub async fn submit_proof(
+        &self,
+        challenge_id: &str,
+        proof_hex: &str,
+    ) -> Result<SubmitProofResponse> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow!("authentication required to submit proof: no keypair configured")
+        })?;
+
+        // Get the portal signing xpub (cached after first fetch)
+        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
+
+        // Create the send_proof instruction: ["send_proof", node_id, proof_hex]
+        // Must be Vec<String> to match Portal's serialization format
+        let instruction: Vec<String> = vec![
+            "send_proof".to_string(),
+            auth.node_id.clone(),
+            proof_hex.to_string(),
+        ];
+
+        // Serialize with postcard: (portal_signing_xpub, instruction)
+        let message_to_sign = postcard::to_allocvec(&(portal_xpub, instruction))
+            .context("failed to serialize send_proof instruction")?;
+
+        // Sign with agreement DST
+        let bls_signature = auth.keypair.sign_agreement_instruction(&message_to_sign)?;
+
+        let path = format!("/api/challenges/{challenge_id}");
+        let url = self.api_path(&path);
+
+        let payload = SubmitProofRequest {
+            proof: proof_hex.to_string(),
+            bls_signature,
+        };
+        let body_bytes =
+            serde_json::to_vec(&payload).context("failed to serialize submit proof request")?;
+
+        let mut request = self.http.post(&url);
+
+        // Add HTTP signature headers (includes Content-Type, Content-Length, Content-Digest)
+        if let Some(headers) =
+            self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
+        {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        let resp = request.body(body_bytes).send().await?;
+        let status = resp.status();
+
+        if status.is_success() {
+            let body = resp
+                .json::<SubmitProofResponse>()
+                .await
+                .context("failed to deserialize submit proof response")?;
+            Ok(body)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "failed to submit proof for challenge {challenge_id} with status {status}: {body}"
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +547,20 @@ pub struct JoinAgreementResponse {
 
 #[derive(Debug, Serialize)]
 struct JoinAgreementRequest {
+    bls_signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitProofResponse {
+    pub challenge_id: String,
+    pub status: String,
+    pub proof: Option<String>,
+    pub bls_signature: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitProofRequest {
+    proof: String,
     bls_signature: String,
 }
 
@@ -1069,6 +1156,195 @@ mod tests {
 
         assert_eq!(resp1.agreement_id, "AGREEMENT-1");
         assert_eq!(resp2.agreement_id, "AGREEMENT-2");
+
+        // The expect(1) on the mock will fail if xpub was fetched more than once
+    }
+
+    #[tokio::test]
+    async fn submit_proof_requires_authentication() {
+        let client = PortalClient::new("http://localhost:1234", storage_dir("proof_no_auth"));
+        let err = client
+            .submit_proof("CHALLENGE-test", "0102030405")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("authentication required"),
+            "expected auth error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_proof_sends_proof_and_bls_signature() {
+        let mock_server = MockServer::start().await;
+        let challenge_id = "CHALLENGE-proof";
+
+        // Mock the portal xpub endpoint
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock the submit proof endpoint - verify it receives signature headers
+        Mock::given(method("POST"))
+            .and(path(format!("/api/challenges/{challenge_id}")))
+            .and(header_exists("Signature-Input"))
+            .and(header_exists("Signature"))
+            .and(header_exists("Content-Digest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge_id": challenge_id,
+                "status": "proved",
+                "proof": "0102030405060708",
+                "bls_signature": "8a3b4c5d6e7f..."
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("proof_submit"),
+            keypair,
+            "NODE-test",
+        );
+        let response = client
+            .submit_proof(challenge_id, "0102030405060708")
+            .await
+            .unwrap();
+
+        assert_eq!(response.challenge_id, challenge_id);
+        assert_eq!(response.status, "proved");
+        assert_eq!(response.proof, Some("0102030405060708".to_string()));
+    }
+
+    #[tokio::test]
+    async fn submit_proof_returns_error_on_failure() {
+        let mock_server = MockServer::start().await;
+        let challenge_id = "CHALLENGE-error";
+
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/api/challenges/{challenge_id}")))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid proof"))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("proof_error"),
+            keypair,
+            "NODE-test",
+        );
+        let err = client
+            .submit_proof(challenge_id, "badproof")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("status 400"),
+            "expected error to include status, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_proof_returns_error_on_not_found() {
+        let mock_server = MockServer::start().await;
+        let challenge_id = "CHALLENGE-notfound";
+
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbctest"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/api/challenges/{challenge_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_string("challenge not found"))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("proof_notfound"),
+            keypair,
+            "NODE-test",
+        );
+        let err = client
+            .submit_proof(challenge_id, "0102030405")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("status 404"),
+            "expected error to include status, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_proof_uses_cached_portal_xpub() {
+        let mock_server = MockServer::start().await;
+
+        // Mock the portal xpub endpoint - expect exactly 1 call due to caching
+        Mock::given(method("GET"))
+            .and(path("/api/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "portal_signing_xpub": "xpub661MyMwAqRbcCached"
+            })))
+            .expect(1) // Should only be called once due to caching
+            .mount(&mock_server)
+            .await;
+
+        // Mock the submit proof endpoint for multiple challenges
+        Mock::given(method("POST"))
+            .and(path("/api/challenges/CHALLENGE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge_id": "CHALLENGE-1",
+                "status": "proved",
+                "proof": "proof1",
+                "bls_signature": "sig1"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/challenges/CHALLENGE-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge_id": "CHALLENGE-2",
+                "status": "proved",
+                "proof": "proof2",
+                "bls_signature": "sig2"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("proof_cache"),
+            keypair,
+            "NODE-cache-test",
+        );
+
+        // Submit two proofs - xpub should only be fetched once
+        let resp1 = client.submit_proof("CHALLENGE-1", "proof1").await.unwrap();
+        let resp2 = client.submit_proof("CHALLENGE-2", "proof2").await.unwrap();
+
+        assert_eq!(resp1.challenge_id, "CHALLENGE-1");
+        assert_eq!(resp2.challenge_id, "CHALLENGE-2");
 
         // The expect(1) on the mock will fail if xpub was fetched more than once
     }
