@@ -368,6 +368,44 @@ impl PortalClient {
             ))
         }
     }
+
+    /// Fetch active challenges for this node.
+    ///
+    /// This method requires authentication via RFC 9421 BLS signatures.
+    pub async fn get_node_challenges(&self) -> Result<ChallengesPage> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow!("authentication required to fetch challenges: no keypair configured")
+        })?;
+
+        let path = format!("/api/nodes/{}/challenges?status=active", auth.node_id);
+        let url = self.api_path(&path);
+
+        let mut request = self.http.get(&url);
+
+        // Add signature headers if authenticated
+        if let Some(headers) = self.sign_headers("GET", &path, None)? {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        let resp = request.send().await?;
+        let status = resp.status();
+
+        if status.is_success() {
+            let page = resp
+                .json::<ChallengesPage>()
+                .await
+                .context("failed to deserialize challenges page")?;
+            Ok(page)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "failed to fetch challenges for node {} with status {status}: {body}",
+                auth.node_id
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +414,31 @@ pub struct AgreementsPage {
     pub limit: u32,
     pub total: u32,
     pub agreements: Vec<Agreement>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChallengesPage {
+    pub offset: u32,
+    pub limit: u32,
+    pub total: u32,
+    pub node_id: String,
+    pub challenges: Vec<Challenge>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Challenge {
+    pub challenge_id: String,
+    pub agreement_id: String,
+    pub block_height: u64,
+    pub challenge_count: u64,
+    pub seed: String,
+    pub prover_id: String,
+    pub deadline_height: u64,
+    pub status: String,
+    pub proof: Option<String>,
+    pub bls_signature: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
