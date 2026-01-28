@@ -1,7 +1,5 @@
 //! `SeaORM` Entity for challenges table
 
-#![allow(dead_code)] // Temporary until challenges are wired into daemon tasks.
-
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]

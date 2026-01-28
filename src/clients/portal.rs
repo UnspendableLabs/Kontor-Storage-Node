@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Temporary until new Portal client methods are wired into commands.
-
 use super::http_signature;
 use crate::bls::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
@@ -14,6 +12,10 @@ use tokio::sync::OnceCell;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Instruction names for BLS-signed Portal operations.
+const INSTRUCTION_JOIN_AGREEMENT: &str = "join_agreement";
+const INSTRUCTION_SEND_PROOF: &str = "send_proof";
 
 /// Authentication credentials for Portal API requests.
 #[derive(Clone)]
@@ -172,6 +174,7 @@ impl PortalClient {
 
     /// Fetch the Portal signing xpub from the public API endpoint.
     /// This xpub is used to bind agreement signatures to this Portal.
+    #[allow(dead_code)]
     pub async fn get_portal_signing_xpub(&self) -> Result<String> {
         self.get_or_fetch_portal_xpub().await.cloned()
     }
@@ -234,6 +237,28 @@ impl PortalClient {
         }
     }
 
+    /// Sign a Portal instruction with BLS.
+    ///
+    /// This helper:
+    /// 1. Fetches the Portal signing xpub (cached)
+    /// 2. Serializes `(portal_signing_xpub, instruction)` with postcard
+    /// 3. Signs with the BLS keypair using the agreement DST
+    ///
+    /// Returns the hex-encoded BLS signature.
+    async fn sign_instruction(&self, instruction: Vec<String>) -> Result<String> {
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| anyhow!("authentication required: no keypair configured"))?;
+
+        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
+
+        let message = postcard::to_allocvec(&(portal_xpub, instruction))
+            .context("failed to serialize instruction")?;
+
+        auth.keypair.sign_agreement_instruction(&message)
+    }
+
     /// Join an agreement as a storage node.
     ///
     /// This method:
@@ -243,27 +268,17 @@ impl PortalClient {
     ///
     /// Requires authentication via RFC 9421 BLS signatures.
     pub async fn join_agreement(&self, agreement_id: &str) -> Result<JoinAgreementResponse> {
-        let auth = self.auth.as_ref().ok_or_else(|| {
-            anyhow!("authentication required to join agreement: no keypair configured")
-        })?;
+        let node_id = self
+            .node_id()
+            .ok_or_else(|| anyhow!("authentication required to join agreement"))?
+            .to_string();
 
-        // Get the portal signing xpub (cached after first fetch)
-        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
-
-        // Create the join instruction: ["join_agreement", node_id, agreement_id]
-        // Must be Vec<String> to match Portal's serialization format
-        let instruction: Vec<String> = vec![
-            "join_agreement".to_string(),
-            auth.node_id.clone(),
+        let instruction = vec![
+            INSTRUCTION_JOIN_AGREEMENT.to_string(),
+            node_id,
             agreement_id.to_string(),
         ];
-
-        // Serialize with postcard: (portal_signing_xpub, instruction)
-        let message_to_sign = postcard::to_allocvec(&(portal_xpub, instruction))
-            .context("failed to serialize join instruction")?;
-
-        // Sign with agreement DST
-        let bls_signature = auth.keypair.sign_agreement_instruction(&message_to_sign)?;
+        let bls_signature = self.sign_instruction(instruction).await?;
 
         let path = format!("/api/agreements/{agreement_id}/join");
         let url = self.api_path(&path);
@@ -274,7 +289,6 @@ impl PortalClient {
 
         let mut request = self.http.post(&url);
 
-        // Add HTTP signature headers (includes Content-Type, Content-Length, Content-Digest)
         if let Some(headers) =
             self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
         {
@@ -420,27 +434,17 @@ impl PortalClient {
         challenge_id: &str,
         proof_hex: &str,
     ) -> Result<SubmitProofResponse> {
-        let auth = self.auth.as_ref().ok_or_else(|| {
-            anyhow!("authentication required to submit proof: no keypair configured")
-        })?;
+        let node_id = self
+            .node_id()
+            .ok_or_else(|| anyhow!("authentication required to submit proof"))?
+            .to_string();
 
-        // Get the portal signing xpub (cached after first fetch)
-        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
-
-        // Create the send_proof instruction: ["send_proof", node_id, proof_hex]
-        // Must be Vec<String> to match Portal's serialization format
-        let instruction: Vec<String> = vec![
-            "send_proof".to_string(),
-            auth.node_id.clone(),
+        let instruction = vec![
+            INSTRUCTION_SEND_PROOF.to_string(),
+            node_id,
             proof_hex.to_string(),
         ];
-
-        // Serialize with postcard: (portal_signing_xpub, instruction)
-        let message_to_sign = postcard::to_allocvec(&(portal_xpub, instruction))
-            .context("failed to serialize send_proof instruction")?;
-
-        // Sign with agreement DST
-        let bls_signature = auth.keypair.sign_agreement_instruction(&message_to_sign)?;
+        let bls_signature = self.sign_instruction(instruction).await?;
 
         let path = format!("/api/challenges/{challenge_id}");
         let url = self.api_path(&path);
@@ -454,7 +458,6 @@ impl PortalClient {
 
         let mut request = self.http.post(&url);
 
-        // Add HTTP signature headers (includes Content-Type, Content-Length, Content-Digest)
         if let Some(headers) =
             self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
         {
@@ -482,6 +485,7 @@ impl PortalClient {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AgreementsPage {
     pub offset: u32,
     pub limit: u32,
@@ -490,6 +494,7 @@ pub struct AgreementsPage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ChallengesPage {
     pub offset: u32,
     pub limit: u32,
@@ -537,6 +542,7 @@ struct PortalInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JoinAgreementResponse {
     pub agreement_id: String,
     pub node_id: String,
@@ -551,6 +557,7 @@ struct JoinAgreementRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SubmitProofResponse {
     pub challenge_id: String,
     pub status: String,
@@ -586,6 +593,7 @@ pub enum NodeCheckResult {
 
 /// Information about a registered node.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct NodeInfo {
     pub node_id: String,
     pub address: String,
