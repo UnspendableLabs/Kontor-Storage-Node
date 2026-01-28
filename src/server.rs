@@ -264,6 +264,13 @@ fn response_builder(agreement: &agreements::Model) -> Result<Builder, DownloadEr
         builder = builder.header(header::CONTENT_LENGTH, len);
     }
 
+    // Files are immutable (content-addressed by hash), cache for 1 year
+    builder = builder.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+
+    // CORS headers to allow cross-origin access
+    builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    builder = builder.header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS");
+
     Ok(builder)
 }
 
