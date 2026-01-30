@@ -28,6 +28,18 @@ use daemon::{spawn_portal_daemon, StorageLimits};
 use database::DBClient;
 use tasks::downloadagreements::StorageBackend;
 
+struct DaemonConfig {
+    client: PortalClient,
+    conn: DatabaseConnection,
+    interval: Duration,
+    lock_path: PathBuf,
+    storage_limits: StorageLimits,
+    storage_backend: StorageBackend,
+    storage_dir: PathBuf,
+    download_addr: SocketAddr,
+    node_id: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
@@ -158,15 +170,17 @@ async fn run_with_shutdown(
                 max_files: config.storage_max_files,
             };
             run_daemon_command(
-                authenticated_client,
-                conn,
-                config.portal_polling_interval,
-                lock_path,
-                storage_limits,
-                storage_backend,
-                config.storage_dir.clone(),
-                download_addr,
-                config.node_id.clone(),
+                DaemonConfig {
+                    client: authenticated_client,
+                    conn,
+                    interval: config.portal_polling_interval,
+                    lock_path,
+                    storage_limits,
+                    storage_backend,
+                    storage_dir: config.storage_dir.clone(),
+                    download_addr,
+                    node_id: config.node_id.clone(),
+                },
                 shutdown,
             )
             .await?;
@@ -176,38 +190,29 @@ async fn run_with_shutdown(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_daemon_command(
-    client: PortalClient,
-    conn: DatabaseConnection,
-    interval: Duration,
-    lock_path: PathBuf,
-    storage_limits: StorageLimits,
-    storage_backend: StorageBackend,
-    storage_dir: PathBuf,
-    download_addr: SocketAddr,
-    node_id: String,
+    config: DaemonConfig,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let daemon_backend = storage_backend.clone();
+    let daemon_backend = config.storage_backend.clone();
     let handle = spawn_portal_daemon(
-        client,
-        conn.clone(),
-        interval,
-        lock_path,
-        storage_limits,
+        config.client,
+        config.conn.clone(),
+        config.interval,
+        config.lock_path,
+        config.storage_limits,
         daemon_backend,
-        storage_dir.clone(),
+        config.storage_dir.clone(),
     );
 
     let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
     let server = server::serve(
-        download_addr,
+        config.download_addr,
         server::DownloadServerState {
-            db: conn,
-            storage_dir,
-            storage_backend,
-            node_id,
+            db: config.conn,
+            storage_dir: config.storage_dir,
+            storage_backend: config.storage_backend,
+            node_id: config.node_id,
         },
         async move {
             let _ = server_shutdown_rx.await;
@@ -780,15 +785,17 @@ mod tests {
         let shutdown = future::pending::<io::Result<()>>();
 
         let err = run_daemon_command(
-            portal_client,
-            db.connection().clone(),
-            Duration::from_millis(10),
-            lock_path.clone(),
-            storage_limits,
-            storage_backend,
-            storage_dir.clone(),
-            "127.0.0.1:1".parse().unwrap(),
-            "NODE-TEST".to_string(),
+            DaemonConfig {
+                client: portal_client,
+                conn: db.connection().clone(),
+                interval: Duration::from_millis(10),
+                lock_path: lock_path.clone(),
+                storage_limits,
+                storage_backend,
+                storage_dir: storage_dir.clone(),
+                download_addr: "127.0.0.1:1".parse().unwrap(),
+                node_id: "NODE-TEST".to_string(),
+            },
             shutdown,
         )
         .await
