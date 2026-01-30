@@ -1,6 +1,6 @@
+use crate::app::config::StorageMethod;
+use crate::app::daemon::StorageLimits;
 use crate::clients::{GcsClient, PortalClient};
-use crate::config::StorageMethod;
-use crate::daemon::StorageLimits;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
@@ -585,7 +585,7 @@ fn ledger_path(storage_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bls::BlsKeyPair;
+    use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Agreements;
     use crate::testutils::{setup_agreements_db, unique_storage_dir};
     use halo2curves::pasta::Fq;

@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::app::cli::Cli;
 use crate::database::{default_app_dir, default_storage_dir};
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
@@ -241,7 +241,7 @@ fn parse_storage_capacity(raw: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Commands};
+    use crate::app::cli::{Cli, Commands};
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

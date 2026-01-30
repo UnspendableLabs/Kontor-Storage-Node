@@ -1,6 +1,6 @@
 use super::http_helpers::{build_http_client, check_response_status};
 use super::http_signature;
-use crate::bls::BlsKeyPair;
+use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use reqwest::{Client, Method, StatusCode};
@@ -651,7 +651,7 @@ pub struct NodeInfo {
 #[cfg(test)]
 mod tests {
     use super::PortalClient;
-    use crate::bls::BlsKeyPair;
+    use crate::crypto::BlsKeyPair;
     use bytes::Bytes;
     use serde_json::json;
     use std::fs;

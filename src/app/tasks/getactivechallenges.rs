@@ -85,8 +85,8 @@ fn challenge_to_active_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bls::BlsKeyPair;
     use crate::clients::portal::Challenge;
+    use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Challenges;
     use crate::testutils::{setup_challenges_db, unique_storage_dir};
     use chrono::DateTime;

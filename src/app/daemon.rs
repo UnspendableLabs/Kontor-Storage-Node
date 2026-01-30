@@ -1,9 +1,9 @@
+use crate::app::tasks::computeproofs::compute_and_submit_proofs;
+use crate::app::tasks::downloadagreements::{download_agreements, StorageBackend};
+use crate::app::tasks::getactivechallenges::sync_active_challenges;
+use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
-use crate::tasks::computeproofs::compute_and_submit_proofs;
-use crate::tasks::downloadagreements::{download_agreements, StorageBackend};
-use crate::tasks::getactivechallenges::sync_active_challenges;
-use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::fs::{self, OpenOptions};

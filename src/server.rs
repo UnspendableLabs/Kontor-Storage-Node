@@ -1,71 +1,20 @@
-use crate::config::StorageMethod;
-use crate::entities::{agreements, prelude::Agreements};
-use crate::tasks::downloadagreements::StorageBackend;
+//! HTTP download server module.
+//!
+//! Provides a REST API for downloading stored files and listing available files.
+
+pub mod handlers;
+pub mod routes;
+pub mod state;
+
+pub use routes::router;
+pub use state::DownloadServerState;
+
 use anyhow::{Context, Result};
-use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Redirect, Response},
-    routing::get,
-    Json, Router,
-};
-use http::response::Builder;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect,
-};
-use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
-use tower_http::services::ServeDir;
-use tracing::{error, info};
+use tracing::info;
 
-#[derive(Clone)]
-pub struct DownloadServerState {
-    pub db: DatabaseConnection,
-    pub storage_dir: PathBuf,
-    pub storage_backend: StorageBackend,
-    pub node_id: String,
-}
-
-const DEFAULT_LIMIT: u64 = 20;
-const MAX_LIMIT: u64 = 100;
-
-pub fn router(state: DownloadServerState) -> Router {
-    Router::new()
-        .route("/", get(dashboard))
-        .route("/api/info", get(node_info))
-        .route("/files", get(list_files))
-        .route("/files/:file_id", get(download_file))
-        .nest_service("/static", ServeDir::new("static"))
-        .with_state(state)
-}
-
-#[derive(Serialize)]
-struct NodeInfoResponse {
-    node_id: String,
-}
-
-async fn node_info(State(state): State<DownloadServerState>) -> Json<NodeInfoResponse> {
-    Json(NodeInfoResponse {
-        node_id: state.node_id.clone(),
-    })
-}
-
-async fn dashboard() -> Response {
-    const INDEX_HTML: &str = include_str!("../static/index.html");
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(INDEX_HTML))
-        .unwrap()
-}
-
+/// Start the download server and serve requests until shutdown is signaled.
 pub async fn serve(
     addr: SocketAddr,
     state: DownloadServerState,
@@ -85,298 +34,29 @@ pub async fn serve(
         .context("download server failed")
 }
 
-async fn download_file(
-    State(state): State<DownloadServerState>,
-    Path(file_id): Path<String>,
-) -> Result<Response, DownloadError> {
-    let agreement = Agreements::find()
-        .filter(agreements::Column::FileId.eq(file_id.clone()))
-        .one(&state.db)
-        .await
-        .map_err(|err| DownloadError::Internal(format!("database error: {err}")))?
-        .ok_or(DownloadError::NotFound)?;
-
-    if !agreement.downloaded {
-        return Err(DownloadError::NotReady);
-    }
-
-    match state.storage_backend.method {
-        StorageMethod::Local => serve_local(&state, &agreement, &file_id).await,
-        StorageMethod::Gcs => serve_gcs(&state, &agreement, &file_id).await,
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct FilesQuery {
-    offset: Option<u64>,
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct FilesResponse {
-    offset: u64,
-    limit: u64,
-    total: u64,
-    files: Vec<FileEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct FileEntry {
-    file_id: String,
-    filename: String,
-    mime_type: String,
-    original_size: Option<u64>,
-    status: String,
-    downloaded: bool,
-    created_at: String,
-    download_path: String,
-}
-
-impl From<agreements::Model> for FileEntry {
-    fn from(model: agreements::Model) -> Self {
-        let original_size = model.original_size.try_into().ok();
-        FileEntry {
-            download_path: format!("/files/{}", model.file_id),
-            file_id: model.file_id,
-            filename: model.filename,
-            mime_type: model.mime_type,
-            original_size,
-            status: model.status,
-            downloaded: model.downloaded,
-            created_at: model.created_at.to_rfc3339(),
-        }
-    }
-}
-
-async fn list_files(
-    State(state): State<DownloadServerState>,
-    Query(query): Query<FilesQuery>,
-) -> Result<Json<FilesResponse>, ListFilesError> {
-    let offset = query.offset.unwrap_or(0);
-    let requested_limit = query.limit.unwrap_or(DEFAULT_LIMIT);
-
-    if requested_limit == 0 {
-        return Err(ListFilesError::BadRequest(
-            "limit must be greater than 0".into(),
-        ));
-    }
-
-    let limit = requested_limit.min(MAX_LIMIT);
-
-    let base_query = Agreements::find().filter(agreements::Column::Downloaded.eq(true));
-
-    let total = base_query
-        .clone()
-        .count(&state.db)
-        .await
-        .map_err(|err| ListFilesError::Internal(format!("database error: {err}")))?;
-
-    let files = base_query
-        .order_by_desc(agreements::Column::CreatedAt)
-        .offset(offset)
-        .limit(limit)
-        .all(&state.db)
-        .await
-        .map_err(|err| ListFilesError::Internal(format!("database error: {err}")))?
-        .into_iter()
-        .map(FileEntry::from)
-        .collect();
-
-    Ok(Json(FilesResponse {
-        offset,
-        limit,
-        total,
-        files,
-    }))
-}
-
-async fn serve_local(
-    state: &DownloadServerState,
-    agreement: &agreements::Model,
-    file_id: &str,
-) -> Result<Response, DownloadError> {
-    let path = state.storage_dir.join(file_id);
-    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            DownloadError::NotFound
-        } else {
-            DownloadError::Internal(format!(
-                "failed to read local file metadata {}: {err}",
-                path.display()
-            ))
-        }
-    })?;
-
-    if !metadata.is_file() {
-        return Err(DownloadError::Internal(format!(
-            "local path is not a file: {}",
-            path.display()
-        )));
-    }
-
-    let file = File::open(&path).await.map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            DownloadError::NotFound
-        } else {
-            DownloadError::Internal(format!(
-                "failed to open local file {}: {err}",
-                path.display()
-            ))
-        }
-    })?;
-
-    let stream = ReaderStream::new(file);
-    let builder = response_builder(agreement)?;
-    builder
-        .body(Body::from_stream(stream))
-        .map_err(|err| DownloadError::Internal(err.to_string()))
-}
-
-async fn serve_gcs(
-    state: &DownloadServerState,
-    agreement: &agreements::Model,
-    file_id: &str,
-) -> Result<Response, DownloadError> {
-    let client = state
-        .storage_backend
-        .gcs_client()
-        .ok_or(DownloadError::StorageUnavailable)?;
-
-    let download_url = client
-        .create_signed_download_url(file_id, true, Some(&agreement.filename))
-        .map_err(|err| DownloadError::Upstream(format!("gcs signed url failed: {err}")))?;
-
-    Ok(Redirect::temporary(&download_url).into_response())
-}
-
-fn response_builder(agreement: &agreements::Model) -> Result<Builder, DownloadError> {
-    let mut builder: Builder = Response::builder().status(StatusCode::OK);
-
-    let mime = header_value_or_default(&agreement.mime_type, "application/octet-stream")
-        .map_err(DownloadError::Internal)?;
-    builder = builder.header(header::CONTENT_TYPE, mime);
-
-    if let Some(value) = content_disposition(&agreement.filename)? {
-        builder = builder.header(header::CONTENT_DISPOSITION, value);
-    }
-
-    if let Some(len) = original_size_header(agreement)? {
-        builder = builder.header(header::CONTENT_LENGTH, len);
-    }
-
-    // Files are immutable (content-addressed by hash), cache for 1 year
-    builder = builder.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
-
-    // CORS headers to allow cross-origin access
-    builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-    builder = builder.header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS");
-
-    Ok(builder)
-}
-
-fn header_value_or_default(value: &str, default: &str) -> Result<HeaderValue, String> {
-    let chosen = if value.trim().is_empty() {
-        default
-    } else {
-        value
-    };
-    HeaderValue::from_str(chosen).map_err(|err| err.to_string())
-}
-
-fn content_disposition(filename: &str) -> Result<Option<HeaderValue>, DownloadError> {
-    if filename.trim().is_empty() {
-        return Ok(None);
-    }
-    let escaped = filename.replace('"', "\\\"");
-    HeaderValue::from_str(&format!("attachment; filename=\"{}\"", escaped))
-        .map(Some)
-        .map_err(|err| DownloadError::Internal(format!("invalid filename: {err}")))
-}
-
-fn original_size_header(
-    agreement: &agreements::Model,
-) -> Result<Option<HeaderValue>, DownloadError> {
-    let size: u64 = match agreement.original_size.try_into() {
-        Ok(len) => len,
-        Err(_) => return Ok(None),
-    };
-    HeaderValue::from_str(&size.to_string())
-        .map(Some)
-        .map_err(|err| DownloadError::Internal(format!("invalid content length: {err}")))
-}
-
-#[derive(Debug)]
-enum DownloadError {
-    NotFound,
-    NotReady,
-    StorageUnavailable,
-    Upstream(String),
-    Internal(String),
-}
-
-impl IntoResponse for DownloadError {
-    fn into_response(self) -> Response {
-        match self {
-            DownloadError::NotFound => (StatusCode::NOT_FOUND, "file not found").into_response(),
-            DownloadError::NotReady => (
-                StatusCode::CONFLICT,
-                "file is not yet available on this node",
-            )
-                .into_response(),
-            DownloadError::StorageUnavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "storage backend unavailable",
-            )
-                .into_response(),
-            DownloadError::Upstream(reason) => {
-                error!("GCS download failed: {}", reason);
-                (StatusCode::BAD_GATEWAY, reason).into_response()
-            }
-            DownloadError::Internal(reason) => {
-                error!("Download failed: {}", reason);
-                (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response()
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ListFilesError {
-    BadRequest(String),
-    Internal(String),
-}
-
-impl IntoResponse for ListFilesError {
-    fn into_response(self) -> Response {
-        match self {
-            ListFilesError::BadRequest(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
-            ListFilesError::Internal(reason) => {
-                error!("List files failed: {}", reason);
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::config::StorageMethod;
+    use crate::app::tasks::downloadagreements::StorageBackend;
+    use crate::clients::gcs::GcsClient;
+    use crate::entities::agreements;
+    use crate::server::handlers::{DownloadError, FilesResponse, ListFilesError};
     use crate::testutils::unique_storage_dir;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request, StatusCode};
+    use axum::response::IntoResponse;
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
     use std::fs;
     use std::net::SocketAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
-
-    use crate::clients::gcs::GcsClient;
 
     /// Setup database using migrations (different from testutils::setup_in_memory_db which uses schema).
     async fn setup_db() -> DatabaseConnection {
@@ -798,7 +478,7 @@ mod tests {
     #[test]
     fn response_builder_uses_defaults_for_missing_fields() {
         let agreement = dummy_agreement("FILE-meta", "", "", -1);
-        let response = response_builder(&agreement)
+        let response = handlers::response_builder_test(&agreement)
             .unwrap()
             .body(Body::empty())
             .unwrap();

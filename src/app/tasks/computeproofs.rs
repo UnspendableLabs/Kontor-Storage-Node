@@ -6,11 +6,11 @@
 //! 3. Generate cryptographic proofs using `kontor_crypto`
 //! 4. Submit proofs to the Portal and update challenge status
 
+use crate::app::config::StorageMethod;
+use crate::app::tasks::downloadagreements::StorageBackend;
+use crate::app::tasks::{STATUS_ACTIVE, STATUS_PROVED};
 use crate::clients::PortalClient;
-use crate::config::StorageMethod;
 use crate::entities::{agreements, challenges, prelude::Agreements, prelude::Challenges};
-use crate::tasks::downloadagreements::StorageBackend;
-use crate::tasks::{STATUS_ACTIVE, STATUS_PROVED};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, Challenge as CryptoChallenge, FileLedger, FileMetadata, PorSystem};
@@ -303,7 +303,7 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bls::BlsKeyPair;
+    use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Challenges;
     use crate::testutils::{setup_in_memory_db, unique_storage_dir};
     use chrono::DateTime;

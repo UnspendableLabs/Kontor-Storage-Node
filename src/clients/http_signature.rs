@@ -2,7 +2,7 @@
 //!
 //! Implements HTTP request signing for Portal API authentication.
 
-use crate::bls::BlsKeyPair;
+use crate::crypto::BlsKeyPair;
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::{HeaderMap, HeaderValue};
