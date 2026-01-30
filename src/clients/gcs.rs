@@ -1,3 +1,4 @@
+use super::http_helpers::{build_http_client, check_response_status, HTTP_TIMEOUT};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -10,9 +11,6 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::encode as url_encode;
-
-const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimal Google Cloud Storage client for uploading agreement files using
 /// service-account JWT flow and direct HTTP requests.
@@ -65,12 +63,10 @@ impl GcsClient {
             .clone()
             .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
 
+        let http = build_http_client().context("building GCS HTTP client")?;
+
         Ok(Self {
-            http: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .expect("building GCS HTTP client"),
+            http,
             bucket: bucket.into(),
             service_account,
             auth_url,
@@ -88,12 +84,9 @@ impl GcsClient {
         endpoint_url: impl Into<String>,
     ) -> Self {
         let auth_url = auth_url.into();
+        let http = build_http_client().expect("building test GCS HTTP client");
         Self {
-            http: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .expect("building test GCS HTTP client"),
+            http,
             bucket: bucket.into(),
             service_account: ServiceAccountKey {
                 private_key: private_key.into(),
@@ -125,17 +118,7 @@ impl GcsClient {
             .await
             .context("sending upload request to GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "uploading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        check_response_status(resp, &format!("upload object {object_name}")).await?;
         Ok(())
     }
 
@@ -157,17 +140,7 @@ impl GcsClient {
             .await
             .context("sending delete request to GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "deleting object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        check_response_status(resp, &format!("delete object {object_name}")).await?;
         Ok(())
     }
 
@@ -190,17 +163,7 @@ impl GcsClient {
             .await
             .context("downloading object from GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "downloading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        let resp = check_response_status(resp, &format!("download object {object_name}")).await?;
         resp.bytes()
             .await
             .context("reading object body from GCS response")
@@ -348,14 +311,7 @@ impl GcsClient {
             .await
             .context("exchanging JWT for access token")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "token exchange failed with status {status}: {body}"
-            ));
-        }
-
+        let resp = check_response_status(resp, "token exchange").await?;
         let token: AccessTokenResponse =
             resp.json().await.context("parsing access token response")?;
         Ok(token.access_token)
@@ -666,7 +622,10 @@ mod tests {
             .expect_err("non-success should error");
 
         let msg = err.to_string();
-        assert!(msg.contains("status 503"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("download object") && msg.contains("failed with status 503"),
+            "unexpected message: {msg}"
+        );
         assert!(msg.contains("nope"), "expected body text: {msg}");
     }
 

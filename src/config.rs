@@ -168,9 +168,11 @@ impl Config {
     }
 }
 
-impl From<&Cli> for Config {
-    fn from(cli: &Cli) -> Self {
-        Config::from_cli(cli).expect("invalid CLI values")
+impl TryFrom<&Cli> for Config {
+    type Error = anyhow::Error;
+
+    fn try_from(cli: &Cli) -> Result<Self> {
+        Config::from_cli(cli)
     }
 }
 
@@ -398,8 +400,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn from_trait_invokes_from_cli() {
-        with_temp_app_dir("from_trait", || {
+    fn try_from_trait_invokes_from_cli() {
+        with_temp_app_dir("try_from_trait", || {
             let cli = Cli {
                 node_id: Some("NODE-xyz789".to_string()),
                 portal_url: "https://portal.example/api".to_string(),
@@ -417,7 +419,7 @@ mod tests {
                 command: Commands::Ping,
             };
 
-            let config: Config = (&cli).into();
+            let config: Config = Config::try_from(&cli).unwrap();
             assert_eq!(config.node_id, "NODE-xyz789");
             assert_eq!(config.portal_url, cli.portal_url);
             assert_eq!(config.database_url, cli.database_url);

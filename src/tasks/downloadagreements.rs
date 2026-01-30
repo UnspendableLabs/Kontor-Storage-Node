@@ -20,6 +20,69 @@ use tracing::{info, warn};
 #[cfg(test)]
 use self::tests::should_fail_commit;
 
+/// RAII guard for cleaning up resources on error during download processing.
+///
+/// This guard ensures that local files and GCS objects are cleaned up if an error
+/// occurs during the download workflow. Call `defuse()` on success to prevent cleanup.
+struct CleanupGuard<'a> {
+    local_path: PathBuf,
+    gcs_client: Option<&'a Arc<GcsClient>>,
+    file_id: String,
+    uploaded_to_gcs: bool,
+    defused: bool,
+}
+
+impl<'a> CleanupGuard<'a> {
+    fn new(local_path: PathBuf, gcs_client: Option<&'a Arc<GcsClient>>, file_id: String) -> Self {
+        Self {
+            local_path,
+            gcs_client,
+            file_id,
+            uploaded_to_gcs: false,
+            defused: false,
+        }
+    }
+
+    /// Mark that the file has been uploaded to GCS.
+    fn mark_gcs_uploaded(&mut self) {
+        self.uploaded_to_gcs = true;
+    }
+
+    /// Prevent cleanup on drop (call this on success).
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+
+    /// Perform async cleanup. This is called explicitly before drop for async operations.
+    async fn cleanup(&mut self) {
+        if self.defused {
+            return;
+        }
+
+        // Clean up GCS object if uploaded
+        if self.uploaded_to_gcs {
+            if let Some(gcs) = self.gcs_client {
+                if let Err(err) = gcs.delete_object(&self.file_id).await {
+                    warn!(
+                        "failed to delete {} from GCS during cleanup: {err}",
+                        self.file_id
+                    );
+                }
+            }
+        }
+
+        // Clean up local file
+        if self.local_path.exists() {
+            if let Err(err) = fs::remove_file(&self.local_path).await {
+                warn!(
+                    "failed to remove local file {} during cleanup: {err}",
+                    self.local_path.display()
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum PostProcessError {
     Prepare(anyhow::Error),
@@ -90,7 +153,219 @@ impl StorageBackend {
     }
 }
 
+/// Result of checking storage limits for a single agreement.
+enum StorageLimitCheck {
+    /// Storage limits allow this download.
+    Allowed,
+    /// Max files limit reached.
+    MaxFilesReached,
+    /// Capacity would be exceeded.
+    CapacityExceeded,
+}
+
+/// Check if storage limits allow downloading this agreement.
+///
+/// # Arguments
+/// * `agreement` - The agreement to check
+/// * `storage_limits` - The configured storage limits
+/// * `used_bytes` - Current total bytes used by downloaded files
+/// * `downloaded_files` - Current count of downloaded files
+///
+/// # Returns
+/// `StorageLimitCheck` indicating whether the download is allowed
+fn check_storage_limits(
+    agreement: &agreements::Model,
+    storage_limits: &StorageLimits,
+    used_bytes: u64,
+    downloaded_files: u64,
+    original_size: u64,
+) -> StorageLimitCheck {
+    if let Some(max_files) = storage_limits.max_files {
+        if downloaded_files >= max_files {
+            info!(
+                "Skipping download for {} - max stored files {} reached",
+                agreement.agreement_id, max_files
+            );
+            return StorageLimitCheck::MaxFilesReached;
+        }
+    }
+
+    if let Some(capacity) = storage_limits.capacity {
+        match used_bytes.checked_add(original_size) {
+            Some(next) if next <= capacity => {}
+            _ => {
+                info!(
+                    "Skipping download for {} ({} bytes) - capacity {} bytes would be exceeded",
+                    agreement.agreement_id, original_size, capacity
+                );
+                return StorageLimitCheck::CapacityExceeded;
+            }
+        }
+    }
+
+    StorageLimitCheck::Allowed
+}
+
+/// Download an agreement file and join it on the Portal.
+///
+/// # Arguments
+/// * `portal_client` - The Portal client for API calls
+/// * `agreement` - The agreement to download
+///
+/// # Returns
+/// The downloaded file data on success
+async fn download_and_join_agreement(
+    portal_client: &PortalClient,
+    agreement: &agreements::Model,
+) -> Result<crate::clients::portal::DownloadedFile> {
+    let downloaded = portal_client
+        .download_file(&agreement.agreement_id, &agreement.file_id)
+        .await
+        .with_context(|| format!("downloading file for agreement {}", agreement.agreement_id))?;
+
+    // Join the agreement on Portal after successful download.
+    // This is idempotent - Portal returns created=false if already joined.
+    // Skip if client is not authenticated (e.g., in legacy tests).
+    if portal_client.node_id().is_some() {
+        let join_response = portal_client
+            .join_agreement(&agreement.agreement_id)
+            .await
+            .with_context(|| format!("joining agreement {}", agreement.agreement_id))?;
+
+        if join_response.created {
+            info!(
+                "Joined agreement {} as node {}",
+                agreement.agreement_id, join_response.node_id
+            );
+        } else {
+            info!(
+                "Already joined agreement {} (idempotent)",
+                agreement.agreement_id
+            );
+        }
+    } else {
+        warn!(
+            "Skipping join for agreement {} - client not authenticated",
+            agreement.agreement_id
+        );
+    }
+
+    Ok(downloaded)
+}
+
+/// Store an agreement file to the configured storage backend and update the database.
+///
+/// This function handles:
+/// - Uploading to GCS if configured
+/// - Processing the downloaded file (metadata extraction, ledger update)
+/// - Marking the agreement as downloaded in the database
+/// - Transaction management and cleanup on error
+///
+/// # Arguments
+/// * `downloaded` - The downloaded file data
+/// * `agreement` - The agreement being processed
+/// * `database` - Database connection
+/// * `gcs_client` - Optional GCS client if using GCS storage
+/// * `storage_backend` - The configured storage backend
+///
+/// # Returns
+/// `Ok(())` on success, error on failure (cleanup is handled internally)
+async fn store_agreement_file(
+    downloaded: &crate::clients::portal::DownloadedFile,
+    agreement: &agreements::Model,
+    database: &DatabaseConnection,
+    gcs_client: Option<&Arc<GcsClient>>,
+    storage_backend: &StorageBackend,
+) -> Result<()> {
+    let txn = database.begin().await?;
+
+    // Create cleanup guard to handle resource cleanup on error
+    let mut cleanup_guard = CleanupGuard::new(
+        downloaded.path.clone(),
+        gcs_client,
+        agreement.file_id.clone(),
+    );
+
+    if let Some(gcs) = gcs_client {
+        if let Err(err) = gcs
+            .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
+            .await
+        {
+            cleanup_guard.cleanup().await;
+            txn.rollback().await.ok();
+            return Err(
+                anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
+            );
+        }
+        info!(
+            "Uploaded {} to GCS ({} bytes)",
+            agreement.file_id, agreement.original_size
+        );
+        cleanup_guard.mark_gcs_uploaded();
+    }
+
+    // If post-processing fails, cleanup guard will handle resource cleanup
+    if let Err(err) = process_downloaded_file(
+        downloaded.path.as_path(),
+        &downloaded.bytes,
+        agreement,
+        &txn,
+    )
+    .await
+    {
+        cleanup_guard.cleanup().await;
+        txn.rollback().await.ok();
+        return Err(anyhow!(err));
+    }
+
+    let model = agreements::ActiveModel {
+        agreement_id: Set(agreement.agreement_id.clone()),
+        downloaded: Set(true),
+        ..Default::default()
+    };
+    model
+        .update(&txn)
+        .await
+        .context("marking agreement as downloaded failed")?;
+
+    #[cfg(test)]
+    let commit_result = if should_fail_commit() {
+        Err(DbErr::Custom("simulated commit failure".to_string()))
+    } else {
+        txn.commit().await
+    };
+
+    #[cfg(not(test))]
+    let commit_result = txn.commit().await;
+
+    if let Err(err) = commit_result {
+        cleanup_guard.cleanup().await;
+        return Err(err.into());
+    }
+
+    // Success - defuse the guard and handle final GCS cleanup
+    cleanup_guard.defuse();
+
+    if storage_backend.method == StorageMethod::Gcs && downloaded.path.exists() {
+        if let Err(err) = fs::remove_file(&downloaded.path).await {
+            warn!(
+                "failed to remove local file {} after GCS upload: {err}",
+                downloaded.path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Download agreement files that are not yet stored locally.
+///
+/// This function orchestrates the download workflow:
+/// 1. Queries for pending agreements respecting storage limits
+/// 2. For each agreement, checks storage limits
+/// 3. Downloads the file and joins the agreement on Portal
+/// 4. Stores the file to the configured backend (local or GCS)
+/// 5. Updates the database to mark the agreement as downloaded
 pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
@@ -138,175 +413,30 @@ pub async fn download_agreements(
             .try_into()
             .context("original_size does not fit into u64")?;
 
-        if let Some(max_files) = storage_limits.max_files {
-            if downloaded_files >= max_files {
-                info!(
-                    "Skipping download for {} - max stored files {} reached",
-                    agreement.agreement_id, max_files
-                );
-                continue;
-            }
-        }
-
-        if let Some(capacity) = storage_limits.capacity {
-            match used_bytes.checked_add(original_size) {
-                Some(next) if next <= capacity => {}
-                _ => {
-                    info!(
-                        "Skipping download for {} ({} bytes) - capacity {} bytes would be exceeded",
-                        agreement.agreement_id, original_size, capacity
-                    );
-                    continue;
-                }
-            }
-        }
-
-        let downloaded = portal_client
-            .download_file(&agreement.agreement_id, &agreement.file_id)
-            .await
-            .with_context(|| {
-                format!("downloading file for agreement {}", agreement.agreement_id)
-            })?;
-
-        // Join the agreement on Portal after successful download.
-        // This is idempotent - Portal returns created=false if already joined.
-        // Skip if client is not authenticated (e.g., in legacy tests).
-        if portal_client.node_id().is_some() {
-            let join_response = portal_client
-                .join_agreement(&agreement.agreement_id)
-                .await
-                .with_context(|| format!("joining agreement {}", agreement.agreement_id))?;
-
-            if join_response.created {
-                info!(
-                    "Joined agreement {} as node {}",
-                    agreement.agreement_id, join_response.node_id
-                );
-            } else {
-                info!(
-                    "Already joined agreement {} (idempotent)",
-                    agreement.agreement_id
-                );
-            }
-        } else {
-            warn!(
-                "Skipping join for agreement {} - client not authenticated",
-                agreement.agreement_id
-            );
-        }
-
-        let txn = database.begin().await?;
-        let mut uploaded_to_gcs = false;
-
-        let gcs = gcs_client.as_ref();
-
-        if let Some(gcs) = gcs {
-            if let Err(err) = gcs
-                .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
-                .await
-            {
-                if downloaded.path.exists() {
-                    if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                        warn!(
-                            "failed to remove downloaded file {} after GCS error: {remove_err}",
-                            downloaded.path.display()
-                        );
-                    }
-                }
-                txn.rollback().await.ok();
-                return Err(
-                    anyhow!(err).context(format!("uploading {} to GCS bucket", agreement.file_id))
-                );
-            }
-            info!(
-                "Uploaded {} to GCS ({} bytes)",
-                agreement.file_id, agreement.original_size
-            );
-            uploaded_to_gcs = true;
-        }
-
-        // If post-processing fails, delete the downloaded file so capacity tracking
-        // stays accurate and the next retry can start cleanly.
-        if let Err(err) = process_downloaded_file(
-            downloaded.path.as_path(),
-            &downloaded.bytes,
+        // Check storage limits before downloading
+        match check_storage_limits(
             &agreement,
-            &txn,
+            &storage_limits,
+            used_bytes,
+            downloaded_files,
+            original_size,
+        ) {
+            StorageLimitCheck::Allowed => {}
+            StorageLimitCheck::MaxFilesReached | StorageLimitCheck::CapacityExceeded => continue,
+        }
+
+        // Download file and join agreement
+        let downloaded = download_and_join_agreement(portal_client, &agreement).await?;
+
+        // Store file to backend and update database
+        store_agreement_file(
+            &downloaded,
+            &agreement,
+            database,
+            gcs_client.as_ref(),
+            storage_backend,
         )
-        .await
-        {
-            if uploaded_to_gcs {
-                if let Some(gcs) = gcs {
-                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
-                        warn!(
-                            "failed to delete {} from GCS after post-processing error: {clean_err}",
-                            agreement.file_id
-                        );
-                    }
-                }
-            }
-            if downloaded.path.exists() {
-                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                    warn!(
-                        "failed to remove downloaded file {} after error: {remove_err}",
-                        downloaded.path.display()
-                    );
-                }
-            }
-            txn.rollback().await.ok();
-            return Err(anyhow!(err));
-        }
-
-        let model = agreements::ActiveModel {
-            agreement_id: Set(agreement.agreement_id.clone()),
-            downloaded: Set(true),
-            ..Default::default()
-        };
-        model
-            .update(&txn)
-            .await
-            .context("marking agreement as downloaded failed")?;
-
-        #[cfg(test)]
-        let commit_result = if should_fail_commit() {
-            Err(DbErr::Custom("simulated commit failure".to_string()))
-        } else {
-            txn.commit().await
-        };
-
-        #[cfg(not(test))]
-        let commit_result = txn.commit().await;
-
-        if let Err(err) = commit_result {
-            if uploaded_to_gcs {
-                if let Some(gcs) = gcs {
-                    if let Err(clean_err) = gcs.delete_object(&agreement.file_id).await {
-                        warn!(
-                            "failed to delete {} from GCS after commit error: {clean_err}",
-                            agreement.file_id
-                        );
-                    }
-                }
-            }
-            if downloaded.path.exists() {
-                if let Err(remove_err) = fs::remove_file(&downloaded.path).await {
-                    warn!(
-                        "failed to remove downloaded file {} after commit error: {remove_err}",
-                        downloaded.path.display()
-                    );
-                }
-            }
-            return Err(err.into());
-        }
-
-        if storage_backend.method == StorageMethod::Gcs && downloaded.path.exists() {
-            if let Err(err) = fs::remove_file(&downloaded.path).await {
-                warn!(
-                    "failed to remove local file {} after GCS upload: {err}",
-                    downloaded.path.display()
-                );
-            }
-        }
+        .await?;
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);
@@ -457,14 +587,12 @@ mod tests {
     use super::*;
     use crate::bls::BlsKeyPair;
     use crate::entities::prelude::Agreements;
+    use crate::testutils::{setup_agreements_db, unique_storage_dir};
     use halo2curves::pasta::Fq;
-    use sea_orm::{
-        ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait, Schema,
-    };
+    use sea_orm::{EntityTrait, PaginatorTrait};
     use serde_json::json;
     use std::fs as stdfs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::Path;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::thread::ThreadId;
@@ -507,7 +635,6 @@ mod tests {
             .await;
     }
 
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
     static FAIL_COMMIT_THREAD: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
     const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
@@ -543,11 +670,6 @@ mod tests {
         }
     }
 
-    fn unique_storage_dir(prefix: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_download_agreements_{prefix}_{id}"))
-    }
-
     #[tokio::test]
     async fn storage_backend_new_requires_bucket_for_gcs() {
         let err = StorageBackend::new(
@@ -576,14 +698,6 @@ mod tests {
         );
     }
 
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-        let agreements_stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&agreements_stmt).await.unwrap();
-        db
-    }
-
     #[tokio::test]
     async fn downloads_ready_agreements_and_marks_flag() {
         let mock_server = MockServer::start().await;
@@ -610,7 +724,7 @@ mod tests {
 
         mount_join_agreement_mock(&mock_server, agreement_id).await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("download");
         stdfs::remove_dir_all(&storage_dir).ok();
         let backend = StorageBackend::local();
@@ -715,7 +829,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("gcs_backend");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -818,7 +932,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("gcs_upload_error");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -932,7 +1046,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -1007,7 +1121,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("idempotent");
         stdfs::remove_dir_all(&storage_dir).ok();
         let backend = StorageBackend::local();
@@ -1079,7 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_when_nothing_to_download() {
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("empty");
 
         download_agreements(
@@ -1113,7 +1227,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("capacity_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1198,7 +1312,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("max_file_size_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1276,7 +1390,7 @@ mod tests {
                 .await;
         }
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("capacity_mid_batch");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1375,7 +1489,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("max_files_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1471,7 +1585,7 @@ mod tests {
                 .await;
         }
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("max_files_mid_batch");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1577,7 +1691,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("ledger_error");
         stdfs::remove_dir_all(&storage_dir).ok();
         let agreement = agreements::ActiveModel {
@@ -1634,7 +1748,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_downloaded_file_errors_when_path_missing_parent() {
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let txn = database.begin().await.unwrap();
         let agreement = agreements::Model {
             agreement_id: "AGREEMENT-no-parent".into(),
@@ -1692,7 +1806,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_file_metadata_rejects_overflow_sizes() {
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let metadata = CryptoFileMetadata {
             root: Fq::one(),
             file_id: "FILE-overflow".into(),
@@ -1789,7 +1903,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("download_error");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1876,7 +1990,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("gcs_postprocess_fail");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -1989,7 +2103,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("gcs_delete_fail");
         stdfs::remove_dir_all(&storage_dir).ok();
 
@@ -2065,7 +2179,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         // Use a deeply nested directory that doesn't exist
         let storage_dir = unique_storage_dir("ledger_dir_create")
             .join("nested")
@@ -2172,7 +2286,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -2290,7 +2404,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
@@ -2395,7 +2509,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let database = setup_in_memory_db().await;
+        let database = setup_agreements_db().await;
         let agreement = agreements::ActiveModel {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),

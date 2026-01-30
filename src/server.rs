@@ -361,6 +361,7 @@ impl IntoResponse for ListFilesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutils::unique_storage_dir;
     use axum::body::Body;
     use axum::http::Request;
     use bytes::Bytes;
@@ -370,7 +371,6 @@ mod tests {
     use std::fs;
     use std::net::SocketAddr;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -378,15 +378,7 @@ mod tests {
 
     use crate::clients::gcs::GcsClient;
 
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_storage_dir() -> PathBuf {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("kontor_server_{id}"));
-        fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
-
+    /// Setup database using migrations (different from testutils::setup_in_memory_db which uses schema).
     async fn setup_db() -> DatabaseConnection {
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
@@ -456,7 +448,7 @@ mod tests {
     }
 
     async fn gcs_backend_with_key(key: &str) -> StorageBackend {
-        let dir = unique_storage_dir().join("gcs");
+        let dir = unique_storage_dir("server").join("gcs");
         let sa = write_service_account_json(&dir, key);
         let client = GcsClient::from_service_account_file("bucket", sa)
             .await
@@ -470,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn serves_local_file_streaming() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
 
         let file_id = "FILE-123";
@@ -515,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn returns_conflict_when_not_downloaded() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
 
         insert_agreement(&db, "FILE-999", "x.bin", 1, false).await;
@@ -544,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn lists_downloaded_files_with_pagination() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
 
         insert_agreement(&db, "FILE-1", "one.pdf", 10, true).await;
@@ -609,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn list_files_rejects_zero_limit() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
 
         insert_agreement(&db, "FILE-1", "one.pdf", 10, true).await;
@@ -638,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn serve_binds_and_exits_on_shutdown() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         let (tx, rx) = oneshot::channel();
 
         let state = DownloadServerState {
@@ -665,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn serve_local_returns_not_found_when_file_missing() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         tokio::fs::create_dir_all(&storage_dir).await.unwrap();
 
         insert_agreement(&db, "FILE-missing", "missing.bin", 10, true).await;
@@ -693,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn serve_local_returns_internal_when_path_not_file() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         let file_path = storage_dir.join("FILE-dir");
         tokio::fs::create_dir_all(&file_path).await.unwrap();
 
@@ -720,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn gcs_download_redirects_with_signed_url() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         insert_agreement(&db, "FILE-gcs", "gcs.bin", 12, true).await;
 
         let state = DownloadServerState {
@@ -755,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn gcs_download_returns_storage_unavailable_without_client() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         insert_agreement(&db, "FILE-gcs-none", "gcs.bin", 12, true).await;
 
         let response = router(DownloadServerState {
@@ -782,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn gcs_download_surfaces_signed_url_errors() {
         let db = setup_db().await;
-        let storage_dir = unique_storage_dir();
+        let storage_dir = unique_storage_dir("server");
         insert_agreement(&db, "FILE-gcs-bad", "gcs.bin", 12, true).await;
 
         let response = router(DownloadServerState {

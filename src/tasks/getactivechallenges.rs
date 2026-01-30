@@ -1,3 +1,4 @@
+use super::{sync_new_items, ITEM_TYPE_CHALLENGES};
 use crate::clients::PortalClient;
 use crate::entities::{challenges, prelude::Challenges};
 use anyhow::{Context, Result};
@@ -5,7 +6,6 @@ use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::collections::HashSet;
-use tracing::info;
 
 pub async fn sync_active_challenges(
     portal_client: &PortalClient,
@@ -15,11 +15,6 @@ pub async fn sync_active_challenges(
         .get_node_challenges()
         .await
         .context("fetching active challenges failed")?;
-
-    if challenges.is_empty() {
-        info!("No active challenges found");
-        return Ok(());
-    }
 
     let requested_ids: Vec<String> = challenges
         .iter()
@@ -34,25 +29,15 @@ pub async fn sync_active_challenges(
         .map(|model| model.challenge_id)
         .collect();
 
-    let new_models: Vec<challenges::ActiveModel> = challenges
-        .iter()
-        .filter(|challenge| !existing_ids.contains(&challenge.challenge_id))
-        .map(challenge_to_active_model)
-        .collect::<Result<Vec<_>>>()?;
-
-    if new_models.is_empty() {
-        info!("All {} challenges already stored", challenges.len());
-        return Ok(());
-    }
-
-    Challenges::insert_many(new_models.clone())
-        .exec(database)
-        .await
-        .context("failed to insert new challenges")?;
-
-    info!("Inserted {} new challenges", new_models.len());
-
-    Ok(())
+    sync_new_items(
+        challenges,
+        existing_ids,
+        ITEM_TYPE_CHALLENGES,
+        |c| c.challenge_id.clone(),
+        challenge_to_active_model,
+        database,
+    )
+    .await
 }
 
 fn challenge_to_active_model(
@@ -103,32 +88,13 @@ mod tests {
     use crate::bls::BlsKeyPair;
     use crate::clients::portal::Challenge;
     use crate::entities::prelude::Challenges;
+    use crate::testutils::{setup_challenges_db, unique_storage_dir};
     use chrono::DateTime;
-    use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
-        Schema, Set,
-    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_storage_dir(name: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_sync_active_challenges_{name}_{id}"))
-    }
-
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Challenges);
-        db.execute(&stmt).await.unwrap();
-        db
-    }
 
     fn sample_challenge(id: &str) -> Challenge {
         Challenge {
@@ -180,11 +146,11 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_challenges_db().await;
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = PortalClient::with_auth(
             mock_server.uri(),
-            unique_storage_dir("empty"),
+            unique_storage_dir("challenges_empty"),
             keypair,
             "NODE-test",
         );
@@ -217,7 +183,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_challenges_db().await;
         // Seed an existing challenge that should not be duplicated.
         let seeded = challenges::ActiveModel {
             challenge_id: Set("chal_existing".into()),
@@ -280,7 +246,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_challenges_db().await;
         let existing = challenges::ActiveModel {
             challenge_id: Set(challenge.challenge_id.clone()),
             agreement_id: Set(challenge.agreement_id.clone()),

@@ -42,6 +42,9 @@ pub fn generate_nonce() -> String {
 }
 
 /// Get the current Unix timestamp in seconds.
+///
+/// # Panics
+/// Panics if system time is before Unix epoch (should never happen in practice).
 pub fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -135,34 +138,39 @@ pub fn sign_request_with_params(
     let sig_input = build_signature_input(node_id, has_body);
     headers.insert(
         "Signature-Input",
-        HeaderValue::from_str(&sig_input).expect("valid signature-input header"),
+        HeaderValue::from_str(&sig_input)
+            .map_err(|e| anyhow::anyhow!("invalid signature-input header: {e}"))?,
     );
 
     let sig_header = format!("sig1=:{signature}:");
     headers.insert(
         "Signature",
-        HeaderValue::from_str(&sig_header).expect("valid signature header"),
+        HeaderValue::from_str(&sig_header)
+            .map_err(|e| anyhow::anyhow!("invalid signature header: {e}"))?,
     );
 
     headers.insert(
         "X-Request-Timestamp",
-        HeaderValue::from_str(&timestamp.to_string()).expect("valid timestamp"),
+        HeaderValue::from_str(&timestamp.to_string())
+            .map_err(|e| anyhow::anyhow!("invalid timestamp header: {e}"))?,
     );
 
     headers.insert(
         "X-Request-Nonce",
-        HeaderValue::from_str(nonce).expect("valid nonce"),
+        HeaderValue::from_str(nonce).map_err(|e| anyhow::anyhow!("invalid nonce header: {e}"))?,
     );
 
     if let Some((body_bytes, content_type)) = body {
         let digest = content_digest(body_bytes);
         headers.insert(
             "Content-Digest",
-            HeaderValue::from_str(&digest).expect("valid content-digest"),
+            HeaderValue::from_str(&digest)
+                .map_err(|e| anyhow::anyhow!("invalid content-digest header: {e}"))?,
         );
         headers.insert(
             "Content-Type",
-            HeaderValue::from_str(content_type).expect("valid content-type"),
+            HeaderValue::from_str(content_type)
+                .map_err(|e| anyhow::anyhow!("invalid content-type header: {e}"))?,
         );
         headers.insert("Content-Length", HeaderValue::from(body_bytes.len()));
     }

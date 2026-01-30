@@ -1,3 +1,4 @@
+use super::{sync_new_items, ITEM_TYPE_AGREEMENTS};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
@@ -6,7 +7,6 @@ use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::JsonValue;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::collections::HashSet;
-use tracing::info;
 
 pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
@@ -16,11 +16,6 @@ pub async fn sync_ready_agreements(
         .get_new_agreements()
         .await
         .context("fetching new agreements failed")?;
-
-    if agreements.is_empty() {
-        info!("No new agreements found");
-        return Ok(());
-    }
 
     let requested_ids: Vec<String> = agreements
         .iter()
@@ -35,24 +30,15 @@ pub async fn sync_ready_agreements(
         .map(|model| model.agreement_id)
         .collect();
 
-    let new_models: Vec<agreements::ActiveModel> = agreements
-        .iter()
-        .filter(|agreement| !existing_ids.contains(&agreement.agreement_id))
-        .map(agreement_to_active_model)
-        .collect::<Result<Vec<_>>>()?;
-
-    if new_models.is_empty() {
-        return Ok(());
-    }
-
-    Agreements::insert_many(new_models.clone())
-        .exec(database)
-        .await
-        .context("failed to insert new agreements")?;
-
-    info!("Inserted {} new agreements", new_models.len());
-
-    Ok(())
+    sync_new_items(
+        agreements,
+        existing_ids,
+        ITEM_TYPE_AGREEMENTS,
+        |a| a.agreement_id.clone(),
+        agreement_to_active_model,
+        database,
+    )
+    .await
 }
 
 fn agreement_to_active_model(
@@ -99,31 +85,12 @@ mod tests {
     use super::*;
     use crate::clients::portal::Agreement;
     use crate::entities::prelude::Agreements;
+    use crate::testutils::{setup_agreements_db, unique_storage_dir};
     use chrono::DateTime;
-    use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
-        Schema, Set,
-    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_storage_dir(name: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_sync_ready_agreements_{name}_{id}"))
-    }
-
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&stmt).await.unwrap();
-        db
-    }
 
     fn sample_agreement(id: &str) -> Agreement {
         Agreement {
@@ -172,7 +139,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         let result = sync_ready_agreements(
             &PortalClient::new(mock_server.uri(), unique_storage_dir("empty")),
             &db,
@@ -205,7 +172,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         // Seed an existing agreement that should not be duplicated.
         let seeded = agreements::ActiveModel {
             agreement_id: Set("AGREEMENT-existing".into()),
@@ -275,7 +242,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         let existing = agreements::ActiveModel {
             agreement_id: Set(agreement.agreement_id.clone()),
             user_id: Set(agreement.user_id.clone()),

@@ -9,6 +9,9 @@ mod onboarding;
 mod server;
 mod tasks;
 
+#[cfg(test)]
+pub mod testutils;
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use sea_orm::DatabaseConnection;
@@ -70,16 +73,13 @@ async fn run(cli: Cli, writer: impl Write) -> Result<()> {
     run_with_shutdown(cli, writer, signal::ctrl_c()).await
 }
 
-async fn run_with_shutdown(
-    cli: Cli,
-    mut writer: impl Write,
-    shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<()> {
-    let config = Config::from_cli(&cli)?;
+/// Print configuration information to the writer.
+fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
     writeln!(writer, "Node ID: {}", config.node_id)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
+
     if config.storage_method == StorageMethod::Gcs {
         let bucket = config
             .storage_gcs_bucket_name
@@ -89,6 +89,7 @@ async fn run_with_shutdown(
     } else {
         writeln!(writer, "Storage dir: {}", config.storage_dir.display())?;
     }
+
     match config.storage_capacity {
         Some(bytes) => writeln!(writer, "Storage capacity: {bytes} bytes")?,
         None => writeln!(writer, "Storage capacity: unlimited")?,
@@ -101,18 +102,78 @@ async fn run_with_shutdown(
         Some(limit) => writeln!(writer, "Max stored files: {limit}")?,
         None => writeln!(writer, "Max stored files: unlimited")?,
     }
+
     writeln!(
         writer,
         "Portal polling interval: {}s",
         config.portal_polling_interval.as_secs()
     )?;
 
+    Ok(())
+}
+
+/// Create the storage directory if it doesn't exist.
+fn setup_storage_directory(config: &Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage_dir).with_context(|| {
         format!(
             "failed to create storage directory {}",
             config.storage_dir.display()
         )
-    })?;
+    })
+}
+
+/// Build the daemon configuration from the app config and onboarding result.
+async fn build_daemon_config(
+    config: &Config,
+    authenticated_client: PortalClient,
+) -> Result<DaemonConfig> {
+    let db = DBClient::new(&config.database_url).await?;
+    let conn = db.connection().clone();
+
+    let storage_backend = StorageBackend::new(
+        config.storage_method.clone(),
+        config.storage_gcs_bucket_name.clone(),
+        config
+            .storage_gcs_service_account_json
+            .as_ref()
+            .map(PathBuf::from),
+    )
+    .await?;
+
+    let lock_path = config.storage_dir.join(".portal-daemon.lock");
+    let download_addr: SocketAddr = config
+        .server_address
+        .parse()
+        .context("invalid server address")?;
+
+    let storage_limits = StorageLimits {
+        capacity: config.storage_capacity,
+        max_file_size: config.storage_max_file_size,
+        max_files: config.storage_max_files,
+    };
+
+    Ok(DaemonConfig {
+        client: authenticated_client,
+        conn,
+        interval: config.portal_polling_interval,
+        lock_path,
+        storage_limits,
+        storage_backend,
+        storage_dir: config.storage_dir.clone(),
+        download_addr,
+        node_id: config.node_id.clone(),
+    })
+}
+
+async fn run_with_shutdown(
+    cli: Cli,
+    mut writer: impl Write,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<()> {
+    let config = Config::from_cli(&cli)?;
+
+    print_config_info(&config, &mut writer)?;
+    setup_storage_directory(&config)?;
 
     let client = PortalClient::new(&config.portal_url, &config.storage_dir);
 
@@ -146,44 +207,8 @@ async fn run_with_shutdown(
                 &config.node_id,
             );
 
-            let db = DBClient::new(&config.database_url).await?;
-            let conn = db.connection().clone();
-            let storage_backend = StorageBackend::new(
-                config.storage_method.clone(),
-                config.storage_gcs_bucket_name.clone(),
-                config
-                    .storage_gcs_service_account_json
-                    .as_ref()
-                    .map(PathBuf::from),
-            )
-            .await?;
-
-            let lock_path = config.storage_dir.join(".portal-daemon.lock");
-            let download_addr: SocketAddr = config
-                .server_address
-                .parse()
-                .context("invalid server address")?;
-
-            let storage_limits = StorageLimits {
-                capacity: config.storage_capacity,
-                max_file_size: config.storage_max_file_size,
-                max_files: config.storage_max_files,
-            };
-            run_daemon_command(
-                DaemonConfig {
-                    client: authenticated_client,
-                    conn,
-                    interval: config.portal_polling_interval,
-                    lock_path,
-                    storage_limits,
-                    storage_backend,
-                    storage_dir: config.storage_dir.clone(),
-                    download_addr,
-                    node_id: config.node_id.clone(),
-                },
-                shutdown,
-            )
-            .await?;
+            let daemon_config = build_daemon_config(&config, authenticated_client).await?;
+            run_daemon_command(daemon_config, shutdown).await?;
         }
     }
 
@@ -231,7 +256,9 @@ async fn run_daemon_command(
         shutdown_result = &mut shutdown => shutdown_result,
     };
 
-    let _ = server_shutdown_tx.send(());
+    if server_shutdown_tx.send(()).is_err() {
+        tracing::warn!("failed to send server shutdown signal: receiver dropped");
+    }
 
     let server_result = server.await;
 
@@ -428,7 +455,7 @@ mod tests {
         let err = run(cli, &mut buffer).await.unwrap_err();
 
         assert!(
-            err.to_string().contains("Portal ping failed"),
+            err.to_string().contains("portal ping failed"),
             "unexpected error: {err}"
         );
     }

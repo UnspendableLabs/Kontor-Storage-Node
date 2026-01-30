@@ -10,6 +10,7 @@ use crate::clients::PortalClient;
 use crate::config::StorageMethod;
 use crate::entities::{agreements, challenges, prelude::Agreements, prelude::Challenges};
 use crate::tasks::downloadagreements::StorageBackend;
+use crate::tasks::{STATUS_ACTIVE, STATUS_PROVED};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, Challenge as CryptoChallenge, FileLedger, FileMetadata, PorSystem};
@@ -33,7 +34,7 @@ pub async fn compute_and_submit_proofs(
 ) -> Result<()> {
     // Query all active challenges
     let active_challenges = Challenges::find()
-        .filter(challenges::Column::Status.eq("active"))
+        .filter(challenges::Column::Status.eq(STATUS_ACTIVE))
         .all(database)
         .await
         .context("failed to query active challenges")?;
@@ -184,7 +185,7 @@ async fn process_single_challenge(
         .with_context(|| format!("submitting proof for challenge {}", challenge.challenge_id))?;
 
     // Check response status - Portal may reject proof
-    if response.status != "proved" {
+    if response.status != STATUS_PROVED {
         return Err(anyhow!(
             "proof rejected by Portal with status: {}",
             response.status
@@ -198,7 +199,7 @@ async fn process_single_challenge(
     let now = chrono::Utc::now().fixed_offset();
     let active_model = challenges::ActiveModel {
         challenge_id: Set(challenge.challenge_id.clone()),
-        status: Set("proved".to_string()),
+        status: Set(STATUS_PROVED.to_string()),
         // Store the proof returned by Portal if available, otherwise use our computed proof.
         // Portal may canonicalize or transform the proof representation.
         proof: Set(Some(response.proof.unwrap_or_else(|| proof_hex.clone()))),
@@ -303,36 +304,13 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 mod tests {
     use super::*;
     use crate::bls::BlsKeyPair;
-    use crate::entities::prelude::{Agreements, Challenges};
+    use crate::entities::prelude::Challenges;
+    use crate::testutils::{setup_in_memory_db, unique_storage_dir};
     use chrono::DateTime;
-    use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Schema, Set,
-    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use wiremock::MockServer;
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_storage_dir(prefix: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_compute_proofs_{prefix}_{id}"))
-    }
-
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-
-        let agreements_stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&agreements_stmt).await.unwrap();
-
-        let challenges_stmt = schema.create_table_from_entity(Challenges);
-        db.execute(&challenges_stmt).await.unwrap();
-
-        db
-    }
 
     fn sample_agreement(
         agreement_id: &str,

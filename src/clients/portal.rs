@@ -1,17 +1,14 @@
+use super::http_helpers::{build_http_client, check_response_status};
 use super::http_signature;
 use crate::bls::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs;
 use tokio::sync::OnceCell;
-
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Instruction names for BLS-signed Portal operations.
 const INSTRUCTION_JOIN_AGREEMENT: &str = "join_agreement";
@@ -57,37 +54,53 @@ impl std::fmt::Debug for PortalClient {
 
 impl PortalClient {
     /// Create an unauthenticated client for public endpoints only.
+    ///
+    /// # Panics
+    /// Panics if the HTTP client cannot be built (e.g., TLS initialization fails).
     pub fn new(base_url: impl Into<String>, storage_dir: impl Into<PathBuf>) -> Self {
-        let base_url = base_url.into();
-        let http = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .expect("building Portal HTTP client");
-        Self {
-            base_url,
+        Self::try_new(base_url, storage_dir).expect("building Portal HTTP client")
+    }
+
+    /// Create an unauthenticated client, returning an error if building fails.
+    pub fn try_new(base_url: impl Into<String>, storage_dir: impl Into<PathBuf>) -> Result<Self> {
+        let http = build_http_client().context("building Portal HTTP client")?;
+        // Normalize URL by trimming trailing slashes once at construction time
+        let normalized_url = base_url.into().trim_end_matches('/').to_string();
+        Ok(Self {
+            base_url: normalized_url,
             storage_dir: storage_dir.into(),
             http,
             auth: None,
             cached_portal_xpub: Arc::new(OnceCell::new()),
-        }
+        })
     }
 
     /// Create an authenticated client with BLS keypair for signed requests.
+    ///
+    /// # Panics
+    /// Panics if the HTTP client cannot be built (e.g., TLS initialization fails).
     pub fn with_auth(
         base_url: impl Into<String>,
         storage_dir: impl Into<PathBuf>,
         keypair: Arc<BlsKeyPair>,
         node_id: impl Into<String>,
     ) -> Self {
-        let base_url = base_url.into();
-        let http = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .expect("building Portal HTTP client");
-        Self {
-            base_url,
+        Self::try_with_auth(base_url, storage_dir, keypair, node_id)
+            .expect("building Portal HTTP client")
+    }
+
+    /// Create an authenticated client, returning an error if building fails.
+    pub fn try_with_auth(
+        base_url: impl Into<String>,
+        storage_dir: impl Into<PathBuf>,
+        keypair: Arc<BlsKeyPair>,
+        node_id: impl Into<String>,
+    ) -> Result<Self> {
+        let http = build_http_client().context("building Portal HTTP client")?;
+        // Normalize URL by trimming trailing slashes once at construction time
+        let normalized_url = base_url.into().trim_end_matches('/').to_string();
+        Ok(Self {
+            base_url: normalized_url,
             storage_dir: storage_dir.into(),
             http,
             auth: Some(PortalAuth {
@@ -95,7 +108,7 @@ impl PortalClient {
                 node_id: node_id.into(),
             }),
             cached_portal_xpub: Arc::new(OnceCell::new()),
-        }
+        })
     }
 
     /// Get the node ID if authenticated.
@@ -125,13 +138,81 @@ impl PortalClient {
         }
     }
 
+    /// Build a request with optional signature headers.
+    ///
+    /// This helper consolidates the common pattern of creating an HTTP request
+    /// and adding RFC 9421 signature headers when authentication is configured.
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method (GET, POST, etc.)
+    /// * `url` - Full URL for the request
+    /// * `path` - API path used for signing (without base URL)
+    /// * `body` - Optional tuple of (body bytes, content type) for POST requests
+    ///
+    /// # Returns
+    /// A `RequestBuilder` with signature headers added if authenticated
+    fn build_signed_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        path: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut request = self.http.request(method.clone(), url);
+
+        if let Some(headers) = self.sign_headers(method.as_str(), path, body)? {
+            for (name, value) in headers.iter() {
+                request = request.header(name, value);
+            }
+        }
+
+        Ok(request)
+    }
+
     /// Get the full URL for an API path (for signing).
     fn api_path(&self, path: &str) -> String {
-        format!("{}{}", self.base_url.trim_end_matches('/'), path)
+        format!("{}{}", self.base_url, path)
+    }
+
+    /// Fetches all pages using the provided page fetcher function.
+    ///
+    /// This generic helper handles the common pagination pattern used across
+    /// multiple API endpoints. It repeatedly calls the fetcher with increasing
+    /// offsets until all items have been retrieved.
+    ///
+    /// # Arguments
+    /// * `fetch_page` - An async function that takes an offset and returns a paginated response
+    ///
+    /// # Returns
+    /// A vector containing all items from all pages
+    async fn paginate<T, P, F, Fut>(&self, mut fetch_page: F) -> Result<Vec<T>>
+    where
+        P: PaginatedResponse<Item = T>,
+        F: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = Result<P>>,
+    {
+        let mut all_items = Vec::new();
+        let mut offset = 0u32;
+
+        loop {
+            let page = fetch_page(offset).await?;
+            let total = page.total();
+            let items = page.into_items();
+            let fetched = items.len() as u32;
+            all_items.extend(items);
+
+            // Check if we've fetched everything
+            if offset + fetched >= total {
+                break;
+            }
+            offset += fetched;
+        }
+
+        Ok(all_items)
     }
 
     pub async fn ping(&self) -> Result<String> {
-        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/health", self.base_url);
         let resp = self.http.get(url).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
@@ -139,18 +220,14 @@ impl PortalClient {
         if status.is_success() {
             Ok(body)
         } else {
-            Err(anyhow!("Portal ping failed with status {status}: {body}"))
+            Err(anyhow!("portal ping failed with status {status}: {body}"))
         }
     }
 
     /// Check if a node exists in the system. This is a public endpoint that
     /// does not require authentication.
     pub async fn check_node(&self, node_id: &str) -> Result<NodeCheckResult> {
-        let url = format!(
-            "{}/api/nodes/{}/check",
-            self.base_url.trim_end_matches('/'),
-            node_id
-        );
+        let url = format!("{}/api/nodes/{}/check", self.base_url, node_id);
         let resp = self.http.get(&url).send().await?;
         let status = resp.status();
 
@@ -167,7 +244,7 @@ impl PortalClient {
         } else {
             let body = resp.text().await.unwrap_or_default();
             Err(anyhow!(
-                "failed to check node {node_id} with status {status}: {body}"
+                "check node {node_id} failed with status {status}: {body}"
             ))
         }
     }
@@ -184,22 +261,14 @@ impl PortalClient {
     async fn get_or_fetch_portal_xpub(&self) -> Result<&String> {
         self.cached_portal_xpub
             .get_or_try_init(|| async {
-                let url = format!("{}/api/", self.base_url.trim_end_matches('/'));
+                let url = format!("{}/api/", self.base_url);
                 let resp = self.http.get(&url).send().await?;
-                let status = resp.status();
-
-                if status.is_success() {
-                    let body = resp
-                        .json::<PortalInfoResponse>()
-                        .await
-                        .context("failed to deserialize portal info")?;
-                    Ok(body.portal_signing_xpub)
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    Err(anyhow!(
-                        "failed to fetch portal signing xpub with status {status}: {body}"
-                    ))
-                }
+                let resp = check_response_status(resp, "fetch portal signing xpub").await?;
+                let body = resp
+                    .json::<PortalInfoResponse>()
+                    .await
+                    .context("failed to deserialize portal info")?;
+                Ok(body.portal_signing_xpub)
             })
             .await
     }
@@ -209,22 +278,8 @@ impl PortalClient {
     /// This method handles pagination automatically, fetching all pages.
     /// Requires authentication via RFC 9421 BLS signatures.
     pub async fn get_new_agreements(&self) -> Result<Vec<Agreement>> {
-        let mut all_agreements = Vec::new();
-        let mut offset = 0u32;
-
-        loop {
-            let page = self.get_agreements_page(offset).await?;
-            let fetched = page.agreements.len() as u32;
-            all_agreements.extend(page.agreements);
-
-            // Check if we've fetched everything
-            if offset + fetched >= page.total {
-                break;
-            }
-            offset += fetched;
-        }
-
-        Ok(all_agreements)
+        self.paginate(|offset| self.get_agreements_page(offset))
+            .await
     }
 
     /// Fetch a single page of agreements with the given offset.
@@ -232,30 +287,15 @@ impl PortalClient {
         let path = format!("/api/agreements?status=new|ready&offset={offset}");
         let url = self.api_path(&path);
 
-        let mut request = self.http.get(&url);
-
-        // Add signature headers if authenticated
-        if let Some(headers) = self.sign_headers("GET", &path, None)? {
-            for (name, value) in headers.iter() {
-                request = request.header(name, value);
-            }
-        }
+        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
 
         let resp = request.send().await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let page = resp
-                .json::<AgreementsPage>()
-                .await
-                .context("failed to deserialize agreements page")?;
-            Ok(page)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "failed to fetch new agreements with status {status}: {body}"
-            ))
-        }
+        let resp = check_response_status(resp, "fetch new agreements").await?;
+        let page = resp
+            .json::<AgreementsPage>()
+            .await
+            .context("failed to deserialize agreements page")?;
+        Ok(page)
     }
 
     /// Sign a Portal instruction with BLS.
@@ -308,31 +348,20 @@ impl PortalClient {
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize join request")?;
 
-        let mut request = self.http.post(&url);
-
-        if let Some(headers) =
-            self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
-        {
-            for (name, value) in headers.iter() {
-                request = request.header(name, value);
-            }
-        }
+        let request = self.build_signed_request(
+            Method::POST,
+            &url,
+            &path,
+            Some((&body_bytes, "application/json")),
+        )?;
 
         let resp = request.body(body_bytes).send().await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let body = resp
-                .json::<JoinAgreementResponse>()
-                .await
-                .context("failed to deserialize join response")?;
-            Ok(body)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "failed to join agreement {agreement_id} with status {status}: {body}"
-            ))
-        }
+        let resp = check_response_status(resp, &format!("join agreement {agreement_id}")).await?;
+        let body = resp
+            .json::<JoinAgreementResponse>()
+            .await
+            .context("failed to deserialize join response")?;
+        Ok(body)
     }
 
     /// Download an agreement file into the configured storage directory.
@@ -378,30 +407,19 @@ impl PortalClient {
         let path = format!("/api/agreements/{agreement_id}/download?no_redirect=true");
         let url = self.api_path(&path);
 
-        let mut request = self.http.get(&url);
-
-        // Add signature headers if authenticated
-        if let Some(headers) = self.sign_headers("GET", &path, None)? {
-            for (name, value) in headers.iter() {
-                request = request.header(name, value);
-            }
-        }
+        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
 
         let resp = request.send().await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let body = resp
-                .json::<DownloadUrlResponse>()
-                .await
-                .context("failed to parse download url response")?;
-            Ok(body.download_url)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "failed to request download url for agreement {agreement_id} with status {status}: {body}"
-            ))
-        }
+        let resp = check_response_status(
+            resp,
+            &format!("request download url for agreement {agreement_id}"),
+        )
+        .await?;
+        let body = resp
+            .json::<DownloadUrlResponse>()
+            .await
+            .context("failed to parse download url response")?;
+        Ok(body.download_url)
     }
 
     /// Fetch all active challenges for this node.
@@ -409,22 +427,8 @@ impl PortalClient {
     /// This method handles pagination automatically, fetching all pages.
     /// Requires authentication via RFC 9421 BLS signatures.
     pub async fn get_node_challenges(&self) -> Result<Vec<Challenge>> {
-        let mut all_challenges = Vec::new();
-        let mut offset = 0u32;
-
-        loop {
-            let page = self.get_challenges_page(offset).await?;
-            let fetched = page.challenges.len() as u32;
-            all_challenges.extend(page.challenges);
-
-            // Check if we've fetched everything
-            if offset + fetched >= page.total {
-                break;
-            }
-            offset += fetched;
-        }
-
-        Ok(all_challenges)
+        self.paginate(|offset| self.get_challenges_page(offset))
+            .await
     }
 
     /// Fetch a single page of challenges with the given offset.
@@ -439,31 +443,17 @@ impl PortalClient {
         );
         let url = self.api_path(&path);
 
-        let mut request = self.http.get(&url);
-
-        // Add signature headers if authenticated
-        if let Some(headers) = self.sign_headers("GET", &path, None)? {
-            for (name, value) in headers.iter() {
-                request = request.header(name, value);
-            }
-        }
+        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
 
         let resp = request.send().await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let page = resp
-                .json::<ChallengesPage>()
-                .await
-                .context("failed to deserialize challenges page")?;
-            Ok(page)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "failed to fetch challenges for node {} with status {status}: {body}",
-                auth.node_id
-            ))
-        }
+        let resp =
+            check_response_status(resp, &format!("fetch challenges for node {}", auth.node_id))
+                .await?;
+        let page = resp
+            .json::<ChallengesPage>()
+            .await
+            .context("failed to deserialize challenges page")?;
+        Ok(page)
     }
 
     /// Submit a storage proof for a challenge.
@@ -501,32 +491,37 @@ impl PortalClient {
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize submit proof request")?;
 
-        let mut request = self.http.post(&url);
-
-        if let Some(headers) =
-            self.sign_headers("POST", &path, Some((&body_bytes, "application/json")))?
-        {
-            for (name, value) in headers.iter() {
-                request = request.header(name, value);
-            }
-        }
+        let request = self.build_signed_request(
+            Method::POST,
+            &url,
+            &path,
+            Some((&body_bytes, "application/json")),
+        )?;
 
         let resp = request.body(body_bytes).send().await?;
-        let status = resp.status();
-
-        if status.is_success() {
-            let body = resp
-                .json::<SubmitProofResponse>()
-                .await
-                .context("failed to deserialize submit proof response")?;
-            Ok(body)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "failed to submit proof for challenge {challenge_id} with status {status}: {body}"
-            ))
-        }
+        let resp =
+            check_response_status(resp, &format!("submit proof for challenge {challenge_id}"))
+                .await?;
+        let body = resp
+            .json::<SubmitProofResponse>()
+            .await
+            .context("failed to deserialize submit proof response")?;
+        Ok(body)
     }
+}
+
+/// Trait for paginated API responses.
+///
+/// This trait allows the generic `paginate` helper to work with different
+/// paginated response types (agreements, challenges, etc.).
+trait PaginatedResponse {
+    type Item;
+
+    /// Returns the total number of items across all pages.
+    fn total(&self) -> u32;
+
+    /// Consumes the response and returns the items from this page.
+    fn into_items(self) -> Vec<Self::Item>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,10 +530,34 @@ struct AgreementsPage {
     agreements: Vec<Agreement>,
 }
 
+impl PaginatedResponse for AgreementsPage {
+    type Item = Agreement;
+
+    fn total(&self) -> u32 {
+        self.total
+    }
+
+    fn into_items(self) -> Vec<Self::Item> {
+        self.agreements
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ChallengesPage {
     total: u32,
     challenges: Vec<Challenge>,
+}
+
+impl PaginatedResponse for ChallengesPage {
+    type Item = Challenge;
+
+    fn total(&self) -> u32 {
+        self.total
+    }
+
+    fn into_items(self) -> Vec<Self::Item> {
+        self.challenges
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -678,10 +697,10 @@ mod tests {
     }
 
     #[test]
-    fn portal_client_new_trims_trailing_slash_in_ping() {
+    fn portal_client_new_normalizes_trailing_slash() {
         let client = PortalClient::new("https://example.com/api/", "/tmp/storage");
-        // The trailing slash trimming happens in ping(), not in new()
-        assert_eq!(client.base_url, "https://example.com/api/");
+        // The trailing slash is now trimmed at construction time
+        assert_eq!(client.base_url, "https://example.com/api");
     }
 
     #[tokio::test]

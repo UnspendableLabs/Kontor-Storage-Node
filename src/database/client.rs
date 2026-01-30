@@ -147,27 +147,13 @@ async fn connect(database_url: &str) -> Result<DatabaseConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutils::{unique_db_path, unique_test_path};
     use sea_orm_migration::SchemaManager;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join("database_client")
-    }
-
-    fn unique_db_path(prefix: &str) -> PathBuf {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        test_root().join(format!("kontor_storage_node_test_{prefix}_{id}.sqlite"))
-    }
 
     #[test]
     fn default_database_url_uses_data_dir_override() {
-        let dir = test_root().join("data_dir_override");
+        let dir = unique_test_path("data_dir_override");
         fs::create_dir_all(&dir).unwrap();
 
         let url = with_data_dir_override(Some(dir.clone()), default_database_url);
@@ -182,7 +168,7 @@ mod tests {
 
     #[test]
     fn default_storage_dir_uses_app_dir_override() {
-        let dir = test_root().join("storage_dir_override");
+        let dir = unique_test_path("storage_dir_override");
         fs::create_dir_all(&dir).unwrap();
 
         let storage_dir = with_data_dir_override(Some(dir.clone()), default_storage_dir);
