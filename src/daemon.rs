@@ -138,8 +138,8 @@ async fn downloaded_files_count(database: &DatabaseConnection) -> Result<u64> {
 #[derive(Debug)]
 struct LockFileGuard {
     path: PathBuf,
-    #[allow(dead_code)]
-    file: std::fs::File,
+    /// File handle kept open to hold the lock; dropped when guard is dropped.
+    _file: std::fs::File,
 }
 
 impl LockFileGuard {
@@ -162,7 +162,7 @@ impl LockFileGuard {
 
         writeln!(file, "pid={}", process::id()).ok();
 
-        Ok(Self { path, file })
+        Ok(Self { path, _file: file })
     }
 }
 

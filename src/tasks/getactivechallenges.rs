@@ -11,18 +11,17 @@ pub async fn sync_active_challenges(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
-    let page = portal_client
+    let challenges = portal_client
         .get_node_challenges()
         .await
         .context("fetching active challenges failed")?;
 
-    if page.challenges.is_empty() {
+    if challenges.is_empty() {
         info!("No active challenges found");
         return Ok(());
     }
 
-    let requested_ids: Vec<String> = page
-        .challenges
+    let requested_ids: Vec<String> = challenges
         .iter()
         .map(|challenge| challenge.challenge_id.clone())
         .collect();
@@ -35,15 +34,14 @@ pub async fn sync_active_challenges(
         .map(|model| model.challenge_id)
         .collect();
 
-    let new_models: Vec<challenges::ActiveModel> = page
-        .challenges
+    let new_models: Vec<challenges::ActiveModel> = challenges
         .iter()
         .filter(|challenge| !existing_ids.contains(&challenge.challenge_id))
         .map(challenge_to_active_model)
         .collect::<Result<Vec<_>>>()?;
 
     if new_models.is_empty() {
-        info!("All {} challenges already stored", page.challenges.len());
+        info!("All {} challenges already stored", challenges.len());
         return Ok(());
     }
 

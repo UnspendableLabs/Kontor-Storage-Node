@@ -12,18 +12,17 @@ pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
-    let page = portal_client
+    let agreements = portal_client
         .get_new_agreements()
         .await
         .context("fetching new agreements failed")?;
 
-    if page.agreements.is_empty() {
+    if agreements.is_empty() {
         info!("No new agreements found");
         return Ok(());
     }
 
-    let requested_ids: Vec<String> = page
-        .agreements
+    let requested_ids: Vec<String> = agreements
         .iter()
         .map(|agreement| agreement.agreement_id.clone())
         .collect();
@@ -36,8 +35,7 @@ pub async fn sync_ready_agreements(
         .map(|model| model.agreement_id)
         .collect();
 
-    let new_models: Vec<agreements::ActiveModel> = page
-        .agreements
+    let new_models: Vec<agreements::ActiveModel> = agreements
         .iter()
         .filter(|agreement| !existing_ids.contains(&agreement.agreement_id))
         .map(agreement_to_active_model)

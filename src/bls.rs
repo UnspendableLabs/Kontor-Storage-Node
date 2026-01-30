@@ -9,7 +9,9 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
-use blst::min_sig::{PublicKey, SecretKey, Signature};
+#[cfg(test)]
+use blst::min_sig::Signature;
+use blst::min_sig::{PublicKey, SecretKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -78,14 +80,13 @@ impl BlsKeyPair {
     }
 
     /// Get the raw public key bytes (48 bytes for BLS12-381 MinSig scheme).
-    #[allow(dead_code)]
-    pub fn public_key_bytes(&self) -> Vec<u8> {
+    #[cfg(test)]
+    fn public_key_bytes(&self) -> Vec<u8> {
         self.public_key.to_bytes().to_vec()
     }
 
     /// Get access to the secret key for signing operations.
-    #[allow(dead_code)]
-    pub fn secret_key(&self) -> Result<SecretKey> {
+    fn secret_key(&self) -> Result<SecretKey> {
         SecretKey::from_bytes(&self.secret_key)
             .map_err(|_| anyhow!("failed to deserialize secret key"))
     }
@@ -111,8 +112,8 @@ impl BlsKeyPair {
     }
 
     /// Verify a BLS signature against a message and public key.
-    #[allow(dead_code)]
-    pub fn verify_http_signature(
+    #[cfg(test)]
+    fn verify_http_signature(
         public_key_hex: &str,
         message: &[u8],
         signature_hex: &str,
@@ -121,7 +122,7 @@ impl BlsKeyPair {
     }
 
     /// Verify a BLS signature against a message, public key, and DST.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn verify_signature_with_dst(
         public_key_hex: &str,
         message: &[u8],

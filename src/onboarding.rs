@@ -130,10 +130,7 @@ pub fn get_password_reader() -> Box<dyn PasswordReader> {
 
 /// Result of the onboarding process.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OnboardingResult {
-    /// The verified node information.
-    pub node_info: NodeInfo,
     /// The BLS keypair for signing requests.
     pub keypair: BlsKeyPair,
 }
@@ -190,7 +187,7 @@ pub async fn perform_onboarding_with_reader(
             // Node has a BLS key configured on Horizon Market
             verify_bls_key_match(&local_public_key, remote_key)?;
             writeln!(writer, "✓ BLS public key verified")?;
-            Ok(OnboardingResult { node_info, keypair })
+            Ok(OnboardingResult { keypair })
         }
         None => {
             // Node exists but no BLS key configured yet
@@ -224,13 +221,10 @@ pub async fn perform_onboarding_with_reader(
 
             writeln!(writer, "Verifying BLS key registration...")?;
 
-            let updated_info = verify_bls_registration(client, node_id, &local_public_key).await?;
+            verify_bls_registration(client, node_id, &local_public_key).await?;
 
             writeln!(writer, "✓ BLS public key registered and verified")?;
-            Ok(OnboardingResult {
-                node_info: updated_info,
-                keypair,
-            })
+            Ok(OnboardingResult { keypair })
         }
     }
 }
@@ -603,7 +597,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(result.node_info.node_id, "NODE-test");
         assert_eq!(result.keypair.public_key_hex(), public_key);
 
         let output = String::from_utf8(buffer).unwrap();
@@ -706,7 +699,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(result.node_info.node_id, "NODE-newkey");
         assert_eq!(result.keypair.public_key_hex(), public_key);
 
         let output = String::from_utf8(buffer).unwrap();
@@ -808,12 +800,9 @@ mod tests {
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
 
-        let result =
-            perform_onboarding_with_reader(&client, "NODE-empty", &config, &mut buffer, &reader)
-                .await
-                .unwrap();
-
-        assert_eq!(result.node_info.node_id, "NODE-empty");
+        perform_onboarding_with_reader(&client, "NODE-empty", &config, &mut buffer, &reader)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
         // Should have gone through the "Press Enter" flow since empty string is treated as None
@@ -1125,14 +1114,8 @@ mod tests {
     #[test]
     fn onboarding_result_debug_impl() {
         // This just ensures the Debug derive is exercised
-        let node_info = NodeInfo {
-            node_id: "TEST".to_string(),
-            address: "addr".to_string(),
-            xpubkey: "xpub".to_string(),
-            bls_public_key: None,
-        };
         let keypair = BlsKeyPair::generate().unwrap();
-        let result = OnboardingResult { node_info, keypair };
+        let result = OnboardingResult { keypair };
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("OnboardingResult"));
     }

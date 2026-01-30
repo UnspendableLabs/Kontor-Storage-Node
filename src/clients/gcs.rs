@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures_util::Stream;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::thread_rng;
 use reqwest::Client;
@@ -9,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::encode as url_encode;
 
@@ -173,45 +171,7 @@ impl GcsClient {
         Ok(())
     }
 
-    /// Stream an object from GCS without loading it fully into memory.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
-    pub async fn download_stream(
-        &self,
-        object_name: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>> {
-        let token = self.fetch_access_token().await?;
-        let url = format!(
-            "{}/storage/v1/b/{}/o/{}?alt=media",
-            self.endpoint_url,
-            self.bucket,
-            url_encode(object_name)
-        );
-
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .timeout(HTTP_TIMEOUT)
-            .send()
-            .await
-            .context("downloading object from GCS")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "downloading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
-        Ok(Box::pin(resp.bytes_stream()))
-    }
-
     /// Download an object from GCS and return its bytes.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
     pub async fn download_to_bytes(&self, object_name: &str) -> Result<Bytes> {
         let token = self.fetch_access_token().await?;
         let url = format!(
@@ -244,31 +204,6 @@ impl GcsClient {
         resp.bytes()
             .await
             .context("reading object body from GCS response")
-    }
-
-    /// Build a direct download URL that can be used by clients without proxying through this service.
-    ///
-    /// The URL embeds a short-lived OAuth access token as a query parameter and optionally sets a
-    /// `Content-Disposition` header to preserve the filename when forcing downloads.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
-    pub async fn download_url(&self, object_name: &str, filename: Option<&str>) -> Result<String> {
-        let token = self.fetch_access_token().await?;
-        let mut url = format!(
-            "{}/storage/v1/b/{}/o/{}?alt=media&access_token={}",
-            self.endpoint_url,
-            self.bucket,
-            url_encode(object_name),
-            url_encode(&token)
-        );
-
-        if let Some(name) = filename {
-            let escaped = name.replace('"', "\\\"");
-            let disposition = format!("attachment; filename=\"{escaped}\"");
-            url.push_str("&response-content-disposition=");
-            url.push_str(&url_encode(&disposition));
-        }
-
-        Ok(url)
     }
 
     /// Create a V4 signed download URL, matching the Horizon-Portal behavior (direct redirect to GCS).
@@ -461,7 +396,6 @@ struct JwtClaims {
 mod tests {
     use super::{AccessTokenResponse, GcsClient, JwtClaims, ServiceAccountKey};
     use bytes::Bytes;
-    use futures_util::StreamExt;
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use reqwest::Client;
     use serde_json::json;
@@ -702,80 +636,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_stream_fetches_object_without_buffering() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "stream-token".to_string(),
-                }),
-            )
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/storage/v1/b/test-bucket/o/stream.bin"))
-            .and(query_param("alt", "media"))
-            .and(header("authorization", "Bearer stream-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("stream-body"))
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
-
-        let mut stream = client
-            .download_stream("stream.bin")
-            .await
-            .expect("download stream should succeed");
-
-        let mut collected = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            collected.extend_from_slice(&chunk.expect("chunk ok"));
-        }
-
-        assert_eq!(collected, b"stream-body");
-    }
-
-    #[tokio::test]
-    async fn download_stream_surfaces_http_errors() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "stream-token".to_string(),
-                }),
-            )
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/storage/v1/b/test-bucket/o/fail.bin"))
-            .and(query_param("alt", "media"))
-            .and(header("authorization", "Bearer stream-token"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
-
-        let err = client
-            .download_stream("fail.bin")
-            .await
-            .err()
-            .expect("non-200 should bubble up");
-
-        let msg = err.to_string();
-        assert!(msg.contains("failed with status 500"), "got {msg}");
-        assert!(msg.contains("boom"), "expected body to be included: {msg}");
-    }
-
-    #[tokio::test]
     async fn download_to_bytes_surfaces_http_errors() {
         let mock_server = MockServer::start().await;
 
@@ -852,44 +712,6 @@ mod tests {
         assert!(
             url.contains("X-Goog-Signature="),
             "signature must be included: {url}"
-        );
-    }
-
-    #[tokio::test]
-    async fn download_url_embeds_token_and_disposition() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "url-token".to_string(),
-                }),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
-
-        let url = client
-            .download_url("folder spaced/object.bin", Some("my file.bin"))
-            .await
-            .expect("url generation should succeed");
-
-        assert!(
-            url.contains("access_token=url-token"),
-            "token should be embedded: {url}"
-        );
-        assert!(
-            url.contains(
-                "response-content-disposition=attachment%3B%20filename%3D%22my%20file.bin%22"
-            ),
-            "disposition should preserve filename: {url}"
-        );
-        assert!(
-            url.contains("/storage/v1/b/test-bucket/o/folder%20spaced%2Fobject.bin"),
-            "object path should be encoded and include bucket/object: {url}"
         );
     }
 

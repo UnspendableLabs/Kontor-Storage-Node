@@ -46,7 +46,8 @@ pub struct StorageBackend {
 }
 
 impl StorageBackend {
-    #[allow(dead_code)]
+    /// Create a local storage backend (used in tests).
+    #[cfg(test)]
     pub fn local() -> Self {
         Self {
             method: StorageMethod::Local,

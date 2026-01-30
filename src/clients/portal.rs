@@ -174,7 +174,7 @@ impl PortalClient {
 
     /// Fetch the Portal signing xpub from the public API endpoint.
     /// This xpub is used to bind agreement signatures to this Portal.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn get_portal_signing_xpub(&self) -> Result<String> {
         self.get_or_fetch_portal_xpub().await.cloned()
     }
@@ -204,17 +204,38 @@ impl PortalClient {
             .await
     }
 
-    /// Fetch agreements that are marked as new or ready.
+    /// Fetch all agreements that are marked as new or ready.
     ///
-    /// This method requires authentication via RFC 9421 BLS signatures.
-    pub async fn get_new_agreements(&self) -> Result<AgreementsPage> {
-        let path = "/api/agreements?status=new|ready";
-        let url = self.api_path(path);
+    /// This method handles pagination automatically, fetching all pages.
+    /// Requires authentication via RFC 9421 BLS signatures.
+    pub async fn get_new_agreements(&self) -> Result<Vec<Agreement>> {
+        let mut all_agreements = Vec::new();
+        let mut offset = 0u32;
+
+        loop {
+            let page = self.get_agreements_page(offset).await?;
+            let fetched = page.agreements.len() as u32;
+            all_agreements.extend(page.agreements);
+
+            // Check if we've fetched everything
+            if offset + fetched >= page.total {
+                break;
+            }
+            offset += fetched;
+        }
+
+        Ok(all_agreements)
+    }
+
+    /// Fetch a single page of agreements with the given offset.
+    async fn get_agreements_page(&self, offset: u32) -> Result<AgreementsPage> {
+        let path = format!("/api/agreements?status=new|ready&offset={offset}");
+        let url = self.api_path(&path);
 
         let mut request = self.http.get(&url);
 
         // Add signature headers if authenticated
-        if let Some(headers) = self.sign_headers("GET", path, None)? {
+        if let Some(headers) = self.sign_headers("GET", &path, None)? {
             for (name, value) in headers.iter() {
                 request = request.header(name, value);
             }
@@ -383,15 +404,39 @@ impl PortalClient {
         }
     }
 
-    /// Fetch active challenges for this node.
+    /// Fetch all active challenges for this node.
     ///
-    /// This method requires authentication via RFC 9421 BLS signatures.
-    pub async fn get_node_challenges(&self) -> Result<ChallengesPage> {
+    /// This method handles pagination automatically, fetching all pages.
+    /// Requires authentication via RFC 9421 BLS signatures.
+    pub async fn get_node_challenges(&self) -> Result<Vec<Challenge>> {
+        let mut all_challenges = Vec::new();
+        let mut offset = 0u32;
+
+        loop {
+            let page = self.get_challenges_page(offset).await?;
+            let fetched = page.challenges.len() as u32;
+            all_challenges.extend(page.challenges);
+
+            // Check if we've fetched everything
+            if offset + fetched >= page.total {
+                break;
+            }
+            offset += fetched;
+        }
+
+        Ok(all_challenges)
+    }
+
+    /// Fetch a single page of challenges with the given offset.
+    async fn get_challenges_page(&self, offset: u32) -> Result<ChallengesPage> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow!("authentication required to fetch challenges: no keypair configured")
         })?;
 
-        let path = format!("/api/nodes/{}/challenges?status=active", auth.node_id);
+        let path = format!(
+            "/api/nodes/{}/challenges?status=active&offset={offset}",
+            auth.node_id
+        );
         let url = self.api_path(&path);
 
         let mut request = self.http.get(&url);
@@ -485,22 +530,15 @@ impl PortalClient {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct AgreementsPage {
-    pub offset: u32,
-    pub limit: u32,
-    pub total: u32,
-    pub agreements: Vec<Agreement>,
+struct AgreementsPage {
+    total: u32,
+    agreements: Vec<Agreement>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ChallengesPage {
-    pub offset: u32,
-    pub limit: u32,
-    pub total: u32,
-    pub node_id: String,
-    pub challenges: Vec<Challenge>,
+struct ChallengesPage {
+    total: u32,
+    challenges: Vec<Challenge>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -542,12 +580,8 @@ struct PortalInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct JoinAgreementResponse {
-    pub agreement_id: String,
     pub node_id: String,
-    pub bls_signature: String,
-    pub joined_at: String,
     pub created: bool,
 }
 
@@ -557,9 +591,7 @@ struct JoinAgreementRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SubmitProofResponse {
-    pub challenge_id: String,
     pub status: String,
     pub proof: Option<String>,
     pub bls_signature: Option<String>,
@@ -591,13 +623,8 @@ pub enum NodeCheckResult {
     Found(NodeInfo),
 }
 
-/// Information about a registered node.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct NodeInfo {
-    pub node_id: String,
-    pub address: String,
-    pub xpubkey: String,
     /// BLS public key, if configured. Hex-encoded (96 characters).
     pub bls_public_key: Option<String>,
 }
@@ -756,6 +783,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new|ready"))
+            .and(query_param("offset", "0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -778,11 +806,10 @@ mod tests {
             .await;
 
         let client = PortalClient::new(mock_server.uri(), storage_dir("agreements"));
-        let page = client.get_new_agreements().await.unwrap();
+        let agreements = client.get_new_agreements().await.unwrap();
 
-        assert_eq!(page.total, 1);
-        assert_eq!(page.agreements.len(), 1);
-        assert_eq!(page.agreements[0].agreement_id, "AGREEMENT-123");
+        assert_eq!(agreements.len(), 1);
+        assert_eq!(agreements[0].agreement_id, "AGREEMENT-123");
     }
 
     #[tokio::test]
@@ -792,6 +819,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new|ready"))
+            .and(query_param("offset", "0"))
             .and(header_exists("Signature-Input"))
             .and(header_exists("Signature"))
             .and(header_exists("X-Request-Timestamp"))
@@ -812,9 +840,9 @@ mod tests {
             keypair,
             "NODE-test",
         );
-        let page = client.get_new_agreements().await.unwrap();
+        let agreements = client.get_new_agreements().await.unwrap();
 
-        assert_eq!(page.total, 0);
+        assert!(agreements.is_empty());
     }
 
     #[tokio::test]
@@ -863,7 +891,6 @@ mod tests {
             PortalClient::with_auth(mock_server.uri(), storage_dir("join"), keypair, "NODE-test");
         let response = client.join_agreement(agreement_id).await.unwrap();
 
-        assert_eq!(response.agreement_id, agreement_id);
         assert!(response.created);
     }
 
@@ -1162,8 +1189,8 @@ mod tests {
         let resp1 = client.join_agreement("AGREEMENT-1").await.unwrap();
         let resp2 = client.join_agreement("AGREEMENT-2").await.unwrap();
 
-        assert_eq!(resp1.agreement_id, "AGREEMENT-1");
-        assert_eq!(resp2.agreement_id, "AGREEMENT-2");
+        assert!(resp1.created);
+        assert!(resp2.created);
 
         // The expect(1) on the mock will fail if xpub was fetched more than once
     }
@@ -1223,7 +1250,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.challenge_id, challenge_id);
         assert_eq!(response.status, "proved");
         assert_eq!(response.proof, Some("0102030405060708".to_string()));
     }
@@ -1351,8 +1377,8 @@ mod tests {
         let resp1 = client.submit_proof("CHALLENGE-1", "proof1").await.unwrap();
         let resp2 = client.submit_proof("CHALLENGE-2", "proof2").await.unwrap();
 
-        assert_eq!(resp1.challenge_id, "CHALLENGE-1");
-        assert_eq!(resp2.challenge_id, "CHALLENGE-2");
+        assert_eq!(resp1.status, "proved");
+        assert_eq!(resp2.status, "proved");
 
         // The expect(1) on the mock will fail if xpub was fetched more than once
     }
