@@ -4,7 +4,7 @@ use crate::daemon::StorageLimits;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
-use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
+use kontor_crypto::{api, FileDescriptor, FileLedger, FileMetadata as CryptoFileMetadata};
 #[cfg(test)]
 use sea_orm::DbErr;
 use sea_orm::{
@@ -326,8 +326,12 @@ async fn process_downloaded_file(
     agreement: &agreements::Model,
     transaction: &DatabaseTransaction,
 ) -> Result<(), PostProcessError> {
-    let metadata = prepare_file_metadata(file_bytes, &agreement.filename)
-        .map_err(PostProcessError::Prepare)?;
+    let metadata = prepare_file_metadata(
+        file_bytes,
+        &agreement.filename,
+        agreement.file_id.as_bytes(),
+    )
+    .map_err(PostProcessError::Prepare)?;
     let storage_root = saved_path
         .parent()
         .and_then(|parent| {
@@ -349,16 +353,16 @@ async fn process_downloaded_file(
         .await
         .map_err(PostProcessError::Metadata)?;
 
-    update_ledger(storage_root, &metadata)
+    update_ledger(storage_root, &agreement.file_id, &metadata)
         .await
         .map_err(PostProcessError::Ledger)?;
 
     Ok(())
 }
 
-fn prepare_file_metadata(bytes: &[u8], filename: &str) -> Result<CryptoFileMetadata> {
+fn prepare_file_metadata(bytes: &[u8], filename: &str, nonce: &[u8]) -> Result<CryptoFileMetadata> {
     let (_prepared, metadata) =
-        api::prepare_file(bytes, filename).context("preparing file with kontor_crypto")?;
+        api::prepare_file(bytes, filename, nonce).context("preparing file with kontor_crypto")?;
     Ok(metadata)
 }
 
@@ -394,7 +398,11 @@ async fn persist_file_metadata(
     Ok(())
 }
 
-async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Result<()> {
+async fn update_ledger(
+    storage_root: &Path,
+    agreement_file_id: &str,
+    metadata: &CryptoFileMetadata,
+) -> Result<()> {
     let ledger_path = ledger_path(storage_root);
     if let Some(parent) = ledger_path.parent() {
         fs::create_dir_all(parent)
@@ -409,9 +417,13 @@ async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Re
         FileLedger::new()
     };
 
-    if !ledger.files.contains_key(&metadata.file_id) {
+    if !ledger.files.contains_key(agreement_file_id) {
+        let descriptor = AgreementFileDescriptor {
+            agreement_file_id,
+            metadata,
+        };
         ledger
-            .add_file(metadata)
+            .add_file(&descriptor)
             .map_err(|err| anyhow!(err).context("adding file to ledger"))?;
     }
 
@@ -422,6 +434,25 @@ async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Re
 
 fn ledger_path(storage_root: &Path) -> PathBuf {
     storage_root.join("ledger.bin")
+}
+
+struct AgreementFileDescriptor<'a> {
+    agreement_file_id: &'a str,
+    metadata: &'a CryptoFileMetadata,
+}
+
+impl FileDescriptor for AgreementFileDescriptor<'_> {
+    fn file_id(&self) -> &str {
+        self.agreement_file_id
+    }
+
+    fn root(&self) -> kontor_crypto::FieldElement {
+        self.metadata.root
+    }
+
+    fn depth(&self) -> usize {
+        self.metadata.depth()
+    }
 }
 
 #[cfg(test)]
@@ -1646,7 +1677,9 @@ mod tests {
         let database = setup_in_memory_db().await;
         let metadata = CryptoFileMetadata {
             root: Fq::one(),
+            object_id: "OBJECT-overflow".into(),
             file_id: "FILE-overflow".into(),
+            nonce: vec![0u8; 1],
             padded_len: usize::MAX,
             original_size: usize::MAX,
             filename: "huge.bin".into(),
