@@ -132,7 +132,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -143,7 +143,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1675,7 +1675,7 @@ dependencies = [
 [[package]]
 name = "kontor-crypto"
 version = "0.2.0"
-source = "git+https://github.com/KontorProtocol/Kontor-Crypto?branch=adam%2Fconstant-size-proof#b1a1ae7b0215191a4f40cae1e78da60fcdd7d8f1"
+source = "git+https://github.com/KontorProtocol/Kontor-Crypto?branch=adam%2Fconstant-size-proof#028f9e6eec9eb8de38046d5de8e1326161251547"
 dependencies = [
  "bincode",
  "clap",
@@ -1883,7 +1883,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
