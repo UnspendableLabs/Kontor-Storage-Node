@@ -279,6 +279,8 @@ mod tests {
             agreement_id: Set("AGREEMENT-downloaded".into()),
             user_id: Set("user_1".into()),
             file_id: Set("FILE-downloaded".into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("downloaded.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),

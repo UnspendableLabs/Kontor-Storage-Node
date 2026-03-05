@@ -374,6 +374,8 @@ mod tests {
             agreement_id: Set(format!("AGREEMENT-{}", file_id)),
             user_id: Set("user".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set(filename.into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(size),
@@ -394,7 +396,9 @@ mod tests {
         agreements::Model {
             agreement_id: format!("AGREEMENT-{file_id}"),
             user_id: "user".into(),
+            object_id: None,
             file_id: file_id.into(),
+            nonce_hex: None,
             filename: filename.into(),
             mime_type: mime.into(),
             original_size: size,

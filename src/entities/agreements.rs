@@ -8,7 +8,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub agreement_id: String,
     pub user_id: String,
+    pub object_id: Option<String>,
     pub file_id: String,
+    pub nonce_hex: Option<String>,
     pub filename: String,
     pub mime_type: String,
     pub original_size: i64,

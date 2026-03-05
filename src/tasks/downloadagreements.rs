@@ -326,12 +326,8 @@ async fn process_downloaded_file(
     agreement: &agreements::Model,
     transaction: &DatabaseTransaction,
 ) -> Result<(), PostProcessError> {
-    let metadata = prepare_file_metadata(
-        file_bytes,
-        &agreement.filename,
-        agreement.file_id.as_bytes(),
-    )
-    .map_err(PostProcessError::Prepare)?;
+    let metadata = prepare_file_metadata(file_bytes, &agreement.filename, &agreement.file_id)
+        .map_err(PostProcessError::Prepare)?;
     let storage_root = saved_path
         .parent()
         .and_then(|parent| {
@@ -360,9 +356,15 @@ async fn process_downloaded_file(
     Ok(())
 }
 
-fn prepare_file_metadata(bytes: &[u8], filename: &str, nonce: &[u8]) -> Result<CryptoFileMetadata> {
-    let (_prepared, metadata) =
-        api::prepare_file(bytes, filename, nonce).context("preparing file with kontor_crypto")?;
+fn prepare_file_metadata(
+    bytes: &[u8],
+    filename: &str,
+    agreement_file_id: &str,
+) -> Result<CryptoFileMetadata> {
+    let (_prepared, mut metadata) =
+        api::prepare_file(bytes, filename, b"").context("preparing file with kontor_crypto")?;
+    metadata.file_id = agreement_file_id.to_string();
+    metadata.nonce = Vec::new();
     Ok(metadata)
 }
 
@@ -381,12 +383,15 @@ async fn persist_file_metadata(
         .context("file metadata padded_len exceeds i64")?;
 
     let root_hex = hex::encode(metadata.root.to_repr());
+    let nonce_hex = hex::encode(&metadata.nonce);
 
     let active = agreements::ActiveModel {
         agreement_id: Set(agreement.agreement_id.clone()),
         original_size: Set(original_size),
         root: Set(Some(root_hex)),
         padded_len: Set(Some(padded_len)),
+        object_id: Set(Some(metadata.object_id.clone())),
+        nonce_hex: Set(Some(nonce_hex)),
         ..Default::default()
     };
 
@@ -584,6 +589,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set(filename.into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
@@ -694,6 +701,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set(filename.into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -800,6 +809,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("gcs.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -912,6 +923,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("gcs.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -991,6 +1004,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set(filename.into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
@@ -1098,6 +1113,8 @@ mod tests {
             agreement_id: Set("AGREEMENT-downloaded".into()),
             user_id: Set("user_1".into()),
             file_id: Set("FILE-downloaded".into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("downloaded.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(900),
@@ -1116,6 +1133,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("pending.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
@@ -1184,6 +1203,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("pending.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(2_000),
@@ -1263,6 +1284,8 @@ mod tests {
             agreement_id: Set(agreements[0].0.into()),
             user_id: Set("user_1".into()),
             file_id: Set(agreements[0].1.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("one.txt".into()),
             mime_type: Set("text/plain".into()),
             original_size: Set(600),
@@ -1281,6 +1304,8 @@ mod tests {
             agreement_id: Set(agreements[1].0.into()),
             user_id: Set("user_1".into()),
             file_id: Set(agreements[1].1.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("two.txt".into()),
             mime_type: Set("text/plain".into()),
             original_size: Set(500),
@@ -1363,6 +1388,8 @@ mod tests {
             agreement_id: Set("AGREEMENT-downloaded".into()),
             user_id: Set("user_1".into()),
             file_id: Set("FILE-downloaded".into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("downloaded.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(100),
@@ -1381,6 +1408,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("pending.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(200),
@@ -1460,6 +1489,8 @@ mod tests {
             agreement_id: Set(agreements[0].0.into()),
             user_id: Set("user_1".into()),
             file_id: Set(agreements[0].1.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("one.txt".into()),
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
@@ -1478,6 +1509,8 @@ mod tests {
             agreement_id: Set(agreements[1].0.into()),
             user_id: Set("user_1".into()),
             file_id: Set(agreements[1].1.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("two.txt".into()),
             mime_type: Set("text/plain".into()),
             original_size: Set(10),
@@ -1566,6 +1599,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set(filename.into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
@@ -1621,7 +1656,9 @@ mod tests {
         let agreement = agreements::Model {
             agreement_id: "AGREEMENT-no-parent".into(),
             user_id: "user_1".into(),
+            object_id: None,
             file_id: "FILE-no-parent".into(),
+            nonce_hex: None,
             filename: "file.pdf".into(),
             mime_type: "application/pdf".into(),
             original_size: 10,
@@ -1688,7 +1725,9 @@ mod tests {
         let agreement = agreements::Model {
             agreement_id: "AGREEMENT-overflow".into(),
             user_id: "user_1".into(),
+            object_id: None,
             file_id: "FILE-overflow".into(),
+            nonce_hex: None,
             filename: "huge.bin".into(),
             mime_type: "application/octet-stream".into(),
             original_size: 1,
@@ -1782,6 +1821,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("error.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(100),
@@ -1870,6 +1911,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("postprocess.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -1984,6 +2027,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("delete-fail.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -2065,6 +2110,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("ledger.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
@@ -2166,6 +2213,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("commit-fail.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -2285,6 +2334,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("cleanup.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
@@ -2391,6 +2442,8 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             user_id: Set("user_1".into()),
             file_id: Set(file_id.into()),
+            object_id: Set(None),
+            nonce_hex: Set(None),
             filename: Set("gcs-remove.bin".into()),
             mime_type: Set("application/octet-stream".into()),
             original_size: Set(123),
