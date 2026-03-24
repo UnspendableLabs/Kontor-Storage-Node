@@ -25,8 +25,6 @@ async fn main_entry_runs_ping_with_cli_args() {
     let mut cmd = cargo_bin_cmd!(env!("CARGO_PKG_NAME"));
     cmd.current_dir(temp_dir.path())
         .env(APP_DIR_ENV_VAR, &app_dir)
-        .arg("--node-id")
-        .arg("NODE-test123")
         .arg("--portal-url")
         .arg(mock_server.uri())
         .arg("--database-url")
@@ -47,10 +45,6 @@ async fn main_entry_runs_ping_with_cli_args() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Node ID:"),
-        "expected node id info in stdout: {stdout}"
-    );
     assert!(
         stdout.contains("Portal URL:"),
         "expected cli info in stdout: {stdout}"

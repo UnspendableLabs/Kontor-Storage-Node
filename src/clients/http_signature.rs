@@ -1,33 +1,10 @@
-//! RFC 9421 HTTP Message Signatures with BLS cryptography.
+//! HTTP message digest utilities.
 //!
-//! Implements HTTP request signing for Portal API authentication.
+//! Provides `content_digest` for RFC 9530 Content-Digest headers (used for POST body integrity).
+//! The full RFC 9421 HTTP Message Signature functions are test-only since auth switched to JWT.
 
-use crate::crypto::BlsKeyPair;
-use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use reqwest::header::{HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
-
-/// Covered components for requests without body.
-const COVERED_COMPONENTS_NO_BODY: &[&str] = &[
-    "@method",
-    "@target-uri",
-    "x-request-timestamp",
-    "x-request-nonce",
-];
-
-/// Covered components for requests with body.
-const COVERED_COMPONENTS_WITH_BODY: &[&str] = &[
-    "@method",
-    "@target-uri",
-    "content-digest",
-    "content-length",
-    "content-type",
-    "x-request-timestamp",
-    "x-request-nonce",
-];
 
 /// Build a Content-Digest header value using SHA-256 (RFC 9530).
 pub fn content_digest(body: &[u8]) -> String {
@@ -36,151 +13,158 @@ pub fn content_digest(body: &[u8]) -> String {
     format!("sha-256=:{encoded}:")
 }
 
-/// Generate a unique nonce for request replay protection.
-pub fn generate_nonce() -> String {
-    format!("nonce-{}", Uuid::new_v4())
-}
-
-/// Get the current Unix timestamp in seconds.
-///
-/// # Panics
-/// Panics if system time is before Unix epoch (should never happen in practice).
-pub fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs()
-}
-
-/// Build the signing string for RFC 9421 HTTP Message Signatures.
-///
-/// The signing string is a newline-separated list of `component: value` pairs.
-fn build_signing_string(
-    method: &str,
-    target_uri: &str,
-    timestamp: u64,
-    nonce: &str,
-    body: Option<(&[u8], &str)>, // (body_bytes, content_type)
-) -> String {
-    let mut lines = Vec::new();
-
-    // Derived components (lowercase method)
-    lines.push(format!("@method: {}", method.to_lowercase()));
-    lines.push(format!("@target-uri: {target_uri}"));
-
-    // If body is present, add body-related headers
-    if let Some((body_bytes, content_type)) = body {
-        let digest = content_digest(body_bytes);
-        lines.push(format!("content-digest: {digest}"));
-        lines.push(format!("content-length: {}", body_bytes.len()));
-        lines.push(format!("content-type: {content_type}"));
-    }
-
-    // Always include timestamp and nonce
-    lines.push(format!("x-request-timestamp: {timestamp}"));
-    lines.push(format!("x-request-nonce: {nonce}"));
-
-    lines.join("\n")
-}
-
-/// Build the Signature-Input header value.
-fn build_signature_input(node_id: &str, has_body: bool) -> String {
-    let components = if has_body {
-        COVERED_COMPONENTS_WITH_BODY
-    } else {
-        COVERED_COMPONENTS_NO_BODY
-    };
-
-    let component_list: String = components
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    format!("sig1=({component_list});keyid=\"{node_id}\";alg=\"bls\"")
-}
-
-/// Sign an HTTP request and return the headers needed for authentication.
-pub fn sign_request(
-    keypair: &BlsKeyPair,
-    node_id: &str,
-    method: &str,
-    target_uri: &str,
-    body: Option<(&[u8], &str)>, // (body_bytes, content_type)
-) -> Result<HeaderMap> {
-    let timestamp = current_timestamp();
-    let nonce = generate_nonce();
-
-    sign_request_with_params(
-        keypair, node_id, method, target_uri, body, timestamp, &nonce,
-    )
-}
-
-/// Sign an HTTP request with explicit timestamp and nonce (useful for testing).
-pub fn sign_request_with_params(
-    keypair: &BlsKeyPair,
-    node_id: &str,
-    method: &str,
-    target_uri: &str,
-    body: Option<(&[u8], &str)>,
-    timestamp: u64,
-    nonce: &str,
-) -> Result<HeaderMap> {
-    let has_body = body.is_some();
-    let signing_string = build_signing_string(method, target_uri, timestamp, nonce, body);
-
-    // Sign the message
-    let signature = keypair.sign_http_message(signing_string.as_bytes())?;
-
-    // Build headers
-    let mut headers = HeaderMap::new();
-
-    let sig_input = build_signature_input(node_id, has_body);
-    headers.insert(
-        "Signature-Input",
-        HeaderValue::from_str(&sig_input)
-            .map_err(|e| anyhow::anyhow!("invalid signature-input header: {e}"))?,
-    );
-
-    let sig_header = format!("sig1=:{signature}:");
-    headers.insert(
-        "Signature",
-        HeaderValue::from_str(&sig_header)
-            .map_err(|e| anyhow::anyhow!("invalid signature header: {e}"))?,
-    );
-
-    headers.insert(
-        "X-Request-Timestamp",
-        HeaderValue::from_str(&timestamp.to_string())
-            .map_err(|e| anyhow::anyhow!("invalid timestamp header: {e}"))?,
-    );
-
-    headers.insert(
-        "X-Request-Nonce",
-        HeaderValue::from_str(nonce).map_err(|e| anyhow::anyhow!("invalid nonce header: {e}"))?,
-    );
-
-    if let Some((body_bytes, content_type)) = body {
-        let digest = content_digest(body_bytes);
-        headers.insert(
-            "Content-Digest",
-            HeaderValue::from_str(&digest)
-                .map_err(|e| anyhow::anyhow!("invalid content-digest header: {e}"))?,
-        );
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_str(content_type)
-                .map_err(|e| anyhow::anyhow!("invalid content-type header: {e}"))?,
-        );
-        headers.insert("Content-Length", HeaderValue::from(body_bytes.len()));
-    }
-
-    Ok(headers)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::BlsKeyPair;
+    use anyhow::Result;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    const COVERED_COMPONENTS_NO_BODY: &[&str] = &[
+        "@method",
+        "@target-uri",
+        "x-request-timestamp",
+        "x-request-nonce",
+    ];
+
+    const COVERED_COMPONENTS_WITH_BODY: &[&str] = &[
+        "@method",
+        "@target-uri",
+        "content-digest",
+        "content-length",
+        "content-type",
+        "x-request-timestamp",
+        "x-request-nonce",
+    ];
+
+    fn generate_nonce() -> String {
+        format!("nonce-{}", Uuid::new_v4())
+    }
+
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs()
+    }
+
+    fn build_signing_string(
+        method: &str,
+        target_uri: &str,
+        timestamp: u64,
+        nonce: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> String {
+        let mut lines = Vec::new();
+
+        lines.push(format!("@method: {}", method.to_lowercase()));
+        lines.push(format!("@target-uri: {target_uri}"));
+
+        if let Some((body_bytes, content_type)) = body {
+            let digest = content_digest(body_bytes);
+            lines.push(format!("content-digest: {digest}"));
+            lines.push(format!("content-length: {}", body_bytes.len()));
+            lines.push(format!("content-type: {content_type}"));
+        }
+
+        lines.push(format!("x-request-timestamp: {timestamp}"));
+        lines.push(format!("x-request-nonce: {nonce}"));
+
+        lines.join("\n")
+    }
+
+    fn build_signature_input(node_id: &str, has_body: bool) -> String {
+        let components = if has_body {
+            COVERED_COMPONENTS_WITH_BODY
+        } else {
+            COVERED_COMPONENTS_NO_BODY
+        };
+
+        let component_list: String = components
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        format!("sig1=({component_list});keyid=\"{node_id}\";alg=\"bls\"")
+    }
+
+    fn sign_request(
+        keypair: &BlsKeyPair,
+        node_id: &str,
+        method: &str,
+        target_uri: &str,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<HeaderMap> {
+        let timestamp = current_timestamp();
+        let nonce = generate_nonce();
+
+        sign_request_with_params(
+            keypair, node_id, method, target_uri, body, timestamp, &nonce,
+        )
+    }
+
+    fn sign_request_with_params(
+        keypair: &BlsKeyPair,
+        node_id: &str,
+        method: &str,
+        target_uri: &str,
+        body: Option<(&[u8], &str)>,
+        timestamp: u64,
+        nonce: &str,
+    ) -> Result<HeaderMap> {
+        let has_body = body.is_some();
+        let signing_string = build_signing_string(method, target_uri, timestamp, nonce, body);
+
+        let signature = keypair.sign_http_message(signing_string.as_bytes())?;
+
+        let mut headers = HeaderMap::new();
+
+        let sig_input = build_signature_input(node_id, has_body);
+        headers.insert(
+            "Signature-Input",
+            HeaderValue::from_str(&sig_input)
+                .map_err(|e| anyhow::anyhow!("invalid signature-input header: {e}"))?,
+        );
+
+        let sig_header = format!("sig1=:{signature}:");
+        headers.insert(
+            "Signature",
+            HeaderValue::from_str(&sig_header)
+                .map_err(|e| anyhow::anyhow!("invalid signature header: {e}"))?,
+        );
+
+        headers.insert(
+            "X-Request-Timestamp",
+            HeaderValue::from_str(&timestamp.to_string())
+                .map_err(|e| anyhow::anyhow!("invalid timestamp header: {e}"))?,
+        );
+
+        headers.insert(
+            "X-Request-Nonce",
+            HeaderValue::from_str(nonce)
+                .map_err(|e| anyhow::anyhow!("invalid nonce header: {e}"))?,
+        );
+
+        if let Some((body_bytes, content_type)) = body {
+            let digest = content_digest(body_bytes);
+            headers.insert(
+                "Content-Digest",
+                HeaderValue::from_str(&digest)
+                    .map_err(|e| anyhow::anyhow!("invalid content-digest header: {e}"))?,
+            );
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_str(content_type)
+                    .map_err(|e| anyhow::anyhow!("invalid content-type header: {e}"))?,
+            );
+            headers.insert("Content-Length", HeaderValue::from(body_bytes.len()));
+        }
+
+        Ok(headers)
+    }
 
     #[test]
     fn content_digest_produces_rfc9530_format() {
@@ -190,7 +174,6 @@ mod tests {
         assert!(digest.starts_with("sha-256=:"));
         assert!(digest.ends_with(":"));
 
-        // Verify the hash is correct
         let expected_hash = Sha256::digest(body);
         let expected = format!("sha-256=:{}:", BASE64.encode(expected_hash));
         assert_eq!(digest, expected);
@@ -209,9 +192,7 @@ mod tests {
     #[test]
     fn current_timestamp_is_reasonable() {
         let ts = current_timestamp();
-        // Should be after 2024-01-01
         assert!(ts > 1704067200);
-        // Should be before 2100-01-01
         assert!(ts < 4102444800);
     }
 
@@ -284,7 +265,6 @@ mod tests {
         assert!(headers.contains_key("X-Request-Timestamp"));
         assert!(headers.contains_key("X-Request-Nonce"));
 
-        // Should not have body headers
         assert!(!headers.contains_key("Content-Digest"));
     }
 
@@ -319,7 +299,6 @@ mod tests {
         assert!(signature.starts_with("sig1=:"));
         assert!(signature.ends_with(":"));
 
-        // Extract and verify signature length (should be 96 hex chars = 48 bytes)
         let sig_hex = signature.trim_start_matches("sig1=:").trim_end_matches(':');
         assert_eq!(sig_hex.len(), 96);
     }

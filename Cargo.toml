@@ -47,6 +47,8 @@ rand = "0.8"
 # BLS key management
 blst = "0.3"
 aes-gcm = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 argon2 = "0.5"
 zeroize = { version = "1.8", features = ["derive"] }
 rpassword = "7.3"

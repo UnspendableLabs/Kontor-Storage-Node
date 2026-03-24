@@ -40,7 +40,6 @@ pub async fn run(cli: Cli, writer: impl Write) -> Result<()> {
 
 /// Print configuration information to the writer.
 fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
-    writeln!(writer, "Node ID: {}", config.node_id)?;
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
@@ -91,6 +90,7 @@ fn setup_storage_directory(config: &Config) -> Result<()> {
 async fn build_daemon_config(
     config: &Config,
     authenticated_client: PortalClient,
+    node_id: String,
 ) -> Result<DaemonConfig> {
     let db = DBClient::new(&config.database_url).await?;
     let conn = db.connection().clone();
@@ -126,7 +126,7 @@ async fn build_daemon_config(
         storage_backend,
         storage_dir: config.storage_dir.clone(),
         download_addr,
-        node_id: config.node_id.clone(),
+        node_id,
     })
 }
 
@@ -149,27 +149,34 @@ pub async fn run_with_shutdown(
             writeln!(writer, "{body}")?;
         }
         Commands::Run => {
-            // Perform node onboarding (verify registration and BLS key)
+            // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
             let onboarding_config = node::OnboardingConfig {
                 bls_key_path: config.bls_key_path.clone(),
             };
             let onboarding_result =
-                node::perform_onboarding(&client, &config.node_id, &onboarding_config, &mut writer)
-                    .await?;
+                node::perform_onboarding(&client, &onboarding_config, &mut writer).await?;
+
+            tracing::debug!(
+                next_nonce = onboarding_result.next_nonce,
+                "onboarding registry nonce"
+            );
 
             writeln!(writer)?;
             writeln!(writer, "Node onboarding complete. Starting services...")?;
             writeln!(writer)?;
 
-            // Create authenticated client with the BLS keypair from onboarding
+            let node_id = onboarding_result.node_id;
+
             let authenticated_client = PortalClient::with_auth(
                 &config.portal_url,
                 &config.storage_dir,
                 Arc::new(onboarding_result.keypair),
-                &config.node_id,
+                &node_id,
+                onboarding_result.signer_id,
+                onboarding_result.token,
             );
 
-            let daemon_config = build_daemon_config(&config, authenticated_client).await?;
+            let daemon_config = build_daemon_config(&config, authenticated_client, node_id).await?;
             run_daemon_command(daemon_config, shutdown).await?;
         }
     }
@@ -179,28 +186,28 @@ pub async fn run_with_shutdown(
 
 /// Run the daemon with the download server.
 pub async fn run_daemon_command(
-    config: DaemonConfig,
+    daemon: DaemonConfig,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<()> {
-    let daemon_backend = config.storage_backend.clone();
+    let daemon_backend = daemon.storage_backend.clone();
     let handle = spawn_portal_daemon(
-        config.client,
-        config.conn.clone(),
-        config.interval,
-        config.lock_path,
-        config.storage_limits,
+        daemon.client,
+        daemon.conn.clone(),
+        daemon.interval,
+        daemon.lock_path,
+        daemon.storage_limits,
         daemon_backend,
-        config.storage_dir.clone(),
+        daemon.storage_dir.clone(),
     );
 
     let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
     let server = server::serve(
-        config.download_addr,
+        daemon.download_addr,
         server::DownloadServerState {
-            db: config.conn,
-            storage_dir: config.storage_dir,
-            storage_backend: config.storage_backend,
-            node_id: config.node_id,
+            db: daemon.conn,
+            storage_dir: daemon.storage_dir,
+            storage_backend: daemon.storage_backend,
+            node_id: daemon.node_id,
         },
         async move {
             let _ = server_shutdown_rx.await;
@@ -323,7 +330,6 @@ mod tests {
             .await;
 
         let cli = Cli {
-            node_id: Some("NODE-test123".to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
@@ -343,10 +349,6 @@ mod tests {
         run(cli, &mut buffer).await.unwrap();
         let output = String::from_utf8(buffer).unwrap();
 
-        assert!(
-            output.contains("Node ID:"),
-            "expected node id line in output"
-        );
         assert!(
             output.contains("Portal URL:"),
             "expected portal url line in output"
@@ -386,7 +388,6 @@ mod tests {
             .await;
 
         let cli = Cli {
-            node_id: Some("NODE-test456".to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
@@ -432,7 +433,6 @@ mod tests {
         .unwrap();
 
         let cli = Cli {
-            node_id: Some("NODE-gcs-test".to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/storage")),
@@ -482,7 +482,6 @@ mod tests {
 
         let storage_dir = unique_storage_dir("limits");
         let cli = Cli {
-            node_id: Some("NODE-limits".to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
@@ -535,7 +534,6 @@ mod tests {
         fs::write(&storage_file, "not a directory").unwrap();
 
         let cli = Cli {
-            node_id: Some("NODE-dirfile".to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_file.clone()),
@@ -564,7 +562,7 @@ mod tests {
     }
 
     /// Helper to set up onboarding fixtures for tests.
-    /// Creates a BLS key file and mocks the portal to return a matching node.
+    /// Creates a BLS key file and mocks Portal endpoints for the new onboarding flow.
     async fn setup_onboarding_fixtures(
         mock_server: &MockServer,
         node_id: &str,
@@ -573,23 +571,51 @@ mod tests {
         let password = "testpassword123";
         let key_path = storage_dir.join("bls_key.enc");
 
-        // Generate and save BLS keypair
         let keypair = BlsKeyPair::generate().unwrap();
         let public_key = keypair.public_key_hex();
         fs::create_dir_all(storage_dir).unwrap();
         keypair.save_encrypted(&key_path, password).await.unwrap();
 
-        // Set password in environment for non-interactive mode
         env::set_var(BLS_PASSWORD_ENV, password);
 
-        // Mock portal node check endpoint
         Mock::given(method("GET"))
-            .and(path(format!("/api/nodes/{}/check", node_id)))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", &public_key))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "node_id": node_id,
-                "address": "bc1qtest",
-                "xpubkey": "xpub123",
+                "signer_id": 42,
                 "bls_public_key": public_key
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/users/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge": hex::encode(b"test-challenge"),
+                "expires_in": 300
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "test-jwt-token",
+                "user_id": node_id,
+                "role": "node",
+                "expires_in": 86400
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/entry/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "abc123",
+                "bls_pubkey": public_key,
+                "next_nonce": 7
             })))
             .mount(mock_server)
             .await;
@@ -628,7 +654,6 @@ mod tests {
             .await;
 
         let cli = Cli {
-            node_id: Some(node_id.to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),
@@ -706,7 +731,6 @@ mod tests {
             .await;
 
         let cli = Cli {
-            node_id: Some(node_id.to_string()),
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
             storage_dir: Some(storage_dir.clone()),

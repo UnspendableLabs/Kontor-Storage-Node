@@ -3,7 +3,7 @@ use super::http_signature;
 use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,13 +19,17 @@ const INSTRUCTION_SEND_PROOF: &str = "send_proof";
 pub struct PortalAuth {
     keypair: Arc<BlsKeyPair>,
     node_id: String,
+    signer_id: u64,
+    token: String,
 }
 
 impl std::fmt::Debug for PortalAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortalAuth")
             .field("node_id", &self.node_id)
+            .field("signer_id", &self.signer_id)
             .field("keypair", &"<BlsKeyPair>")
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -84,8 +88,10 @@ impl PortalClient {
         storage_dir: impl Into<PathBuf>,
         keypair: Arc<BlsKeyPair>,
         node_id: impl Into<String>,
+        signer_id: u64,
+        token: impl Into<String>,
     ) -> Self {
-        Self::try_with_auth(base_url, storage_dir, keypair, node_id)
+        Self::try_with_auth(base_url, storage_dir, keypair, node_id, signer_id, token)
             .expect("building Portal HTTP client")
     }
 
@@ -95,6 +101,8 @@ impl PortalClient {
         storage_dir: impl Into<PathBuf>,
         keypair: Arc<BlsKeyPair>,
         node_id: impl Into<String>,
+        signer_id: u64,
+        token: impl Into<String>,
     ) -> Result<Self> {
         let http = build_http_client().context("building Portal HTTP client")?;
         // Normalize URL by trimming trailing slashes once at construction time
@@ -106,6 +114,8 @@ impl PortalClient {
             auth: Some(PortalAuth {
                 keypair,
                 node_id: node_id.into(),
+                signer_id,
+                token: token.into(),
             }),
             cached_portal_xpub: Arc::new(OnceCell::new()),
         })
@@ -116,41 +126,63 @@ impl PortalClient {
         self.auth.as_ref().map(|a| a.node_id.as_str())
     }
 
-    /// Sign a request if authentication is configured.
-    fn sign_headers(
+    /// Get the signer ID if authenticated.
+    #[allow(dead_code)]
+    pub fn signer_id(&self) -> Option<u64> {
+        self.auth.as_ref().map(|a| a.signer_id)
+    }
+
+    fn auth_headers(
         &self,
-        method: &str,
-        target_uri: &str,
+        _method: &str,
+        _target_uri: &str,
         body: Option<(&[u8], &str)>,
     ) -> Result<Option<reqwest::header::HeaderMap>> {
         match &self.auth {
             Some(auth) => {
-                let headers = http_signature::sign_request(
-                    &auth.keypair,
-                    &auth.node_id,
-                    method,
-                    target_uri,
-                    body,
-                )?;
+                let mut headers = reqwest::header::HeaderMap::new();
+                let bearer = format!("Bearer {}", auth.token);
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&bearer)
+                        .map_err(|e| anyhow!("invalid authorization header: {e}"))?,
+                );
+                if let Some((body_bytes, content_type)) = body {
+                    let digest = http_signature::content_digest(body_bytes);
+                    headers.insert(
+                        "Content-Digest",
+                        reqwest::header::HeaderValue::from_str(&digest)
+                            .map_err(|e| anyhow!("invalid content-digest header: {e}"))?,
+                    );
+                    headers.insert(
+                        "Content-Type",
+                        reqwest::header::HeaderValue::from_str(content_type)
+                            .map_err(|e| anyhow!("invalid content-type header: {e}"))?,
+                    );
+                    headers.insert(
+                        "Content-Length",
+                        reqwest::header::HeaderValue::from(body_bytes.len()),
+                    );
+                }
                 Ok(Some(headers))
             }
             None => Ok(None),
         }
     }
 
-    /// Build a request with optional signature headers.
+    /// Build a request with optional auth headers.
     ///
     /// This helper consolidates the common pattern of creating an HTTP request
-    /// and adding RFC 9421 signature headers when authentication is configured.
+    /// and adding JWT Bearer auth headers when authentication is configured.
     ///
     /// # Arguments
     /// * `method` - HTTP method (GET, POST, etc.)
     /// * `url` - Full URL for the request
-    /// * `path` - API path used for signing (without base URL)
+    /// * `path` - API path used for auth (without base URL)
     /// * `body` - Optional tuple of (body bytes, content type) for POST requests
     ///
     /// # Returns
-    /// A `RequestBuilder` with signature headers added if authenticated
+    /// A `RequestBuilder` with auth headers added if authenticated
     fn build_signed_request(
         &self,
         method: reqwest::Method,
@@ -160,7 +192,7 @@ impl PortalClient {
     ) -> Result<reqwest::RequestBuilder> {
         let mut request = self.http.request(method.clone(), url);
 
-        if let Some(headers) = self.sign_headers(method.as_str(), path, body)? {
+        if let Some(headers) = self.auth_headers(method.as_str(), path, body)? {
             for (name, value) in headers.iter() {
                 request = request.header(name, value);
             }
@@ -224,29 +256,64 @@ impl PortalClient {
         }
     }
 
-    /// Check if a node exists in the system. This is a public endpoint that
-    /// does not require authentication.
-    pub async fn check_node(&self, node_id: &str) -> Result<NodeCheckResult> {
-        let url = format!("{}/api/nodes/{}/check", self.base_url, node_id);
+    /// Look up a node by its BLS public key.
+    pub async fn lookup_node(&self, bls_pubkey: &str) -> Result<NodeLookupResult> {
+        let url = format!("{}/api/nodes/lookup", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("bls_pubkey", bls_pubkey)])
+            .send()
+            .await?;
+        let resp = check_response_status(resp, "lookup node by BLS pubkey").await?;
+        resp.json::<NodeLookupResult>()
+            .await
+            .context("failed to deserialize node lookup result")
+    }
+
+    /// Request a login challenge for the given user/node ID.
+    pub async fn login_challenge(&self, user_id: &str) -> Result<LoginChallenge> {
+        let url = format!("{}/api/users/login", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("user_id", user_id)])
+            .send()
+            .await?;
+        let resp = check_response_status(resp, "fetch login challenge").await?;
+        resp.json::<LoginChallenge>()
+            .await
+            .context("failed to deserialize login challenge")
+    }
+
+    /// Submit a signed login challenge to obtain a JWT.
+    pub async fn login_submit(
+        &self,
+        user_id: &str,
+        challenge: &str,
+        signature: &str,
+    ) -> Result<LoginResponse> {
+        let url = format!("{}/api/users/login", self.base_url);
+        let payload = LoginRequest {
+            user_id: user_id.to_string(),
+            challenge: challenge.to_string(),
+            signature: signature.to_string(),
+        };
+        let resp = self.http.post(&url).json(&payload).send().await?;
+        let resp = check_response_status(resp, "submit login").await?;
+        resp.json::<LoginResponse>()
+            .await
+            .context("failed to deserialize login response")
+    }
+
+    /// Fetch a registry entry by signer ID.
+    pub async fn get_registry_entry(&self, signer_id: u64) -> Result<RegistryEntry> {
+        let url = format!("{}/api/registry/entry/{}", self.base_url, signer_id);
         let resp = self.http.get(&url).send().await?;
-        let status = resp.status();
-
-        if status == StatusCode::NOT_FOUND {
-            return Ok(NodeCheckResult::NotFound);
-        }
-
-        if status.is_success() {
-            let info = resp
-                .json::<NodeInfo>()
-                .await
-                .context("failed to deserialize node info")?;
-            Ok(NodeCheckResult::Found(info))
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "check node {node_id} failed with status {status}: {body}"
-            ))
-        }
+        let resp = check_response_status(resp, "fetch registry entry").await?;
+        resp.json::<RegistryEntry>()
+            .await
+            .context("failed to deserialize registry entry")
     }
 
     /// Fetch the Portal signing xpub from the public API endpoint.
@@ -276,7 +343,7 @@ impl PortalClient {
     /// Fetch all agreements that are marked as new or ready.
     ///
     /// This method handles pagination automatically, fetching all pages.
-    /// Requires authentication via RFC 9421 BLS signatures.
+    /// Requires authentication via JWT Bearer token.
     pub async fn get_new_agreements(&self) -> Result<Vec<Agreement>> {
         self.paginate(|offset| self.get_agreements_page(offset))
             .await
@@ -325,9 +392,9 @@ impl PortalClient {
     /// This method:
     /// 1. Fetches the Portal signing xpub (cached after first fetch)
     /// 2. Creates a BLS signature over `(portal_signing_xpub, ["join_agreement", node_id, agreement_id])`
-    /// 3. Submits the join request with both HTTP signature and agreement signature
+    /// 3. Submits the join request with both JWT auth and agreement signature
     ///
-    /// Requires authentication via RFC 9421 BLS signatures.
+    /// Requires authentication via JWT Bearer token.
     pub async fn join_agreement(&self, agreement_id: &str) -> Result<JoinAgreementResponse> {
         let node_id = self
             .node_id()
@@ -425,7 +492,7 @@ impl PortalClient {
     /// Fetch all active challenges for this node.
     ///
     /// This method handles pagination automatically, fetching all pages.
-    /// Requires authentication via RFC 9421 BLS signatures.
+    /// Requires authentication via JWT Bearer token.
     pub async fn get_node_challenges(&self) -> Result<Vec<Challenge>> {
         self.paginate(|offset| self.get_challenges_page(offset))
             .await
@@ -461,7 +528,7 @@ impl PortalClient {
     /// This method:
     /// 1. Fetches the Portal signing xpub (cached)
     /// 2. Creates a BLS signature over `(portal_signing_xpub, ["send_proof", node_id, proof_hex])`
-    /// 3. Submits the proof with both HTTP signature and BLS signature
+    /// 3. Submits the proof with both JWT auth and BLS signature
     ///
     /// Requires authentication.
     pub async fn submit_proof(
@@ -633,19 +700,44 @@ pub struct DownloadedFile {
     pub bytes: Bytes,
 }
 
-/// Result of checking if a node exists.
-#[derive(Debug, Clone)]
-pub enum NodeCheckResult {
-    /// Node was not found (404).
-    NotFound,
-    /// Node exists with the given info.
-    Found(NodeInfo),
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeLookupResult {
+    pub node_id: String,
+    pub signer_id: u64,
+    pub bls_public_key: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
-pub struct NodeInfo {
-    /// BLS public key, if configured. Hex-encoded (96 characters).
-    pub bls_public_key: Option<String>,
+pub struct LoginChallenge {
+    pub challenge: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginRequest {
+    user_id: String,
+    challenge: String,
+    signature: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub user_id: String,
+    pub role: String,
+    pub expires_in: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistryEntry {
+    pub signer_id: u64,
+    pub x_only_pubkey: String,
+    pub bls_pubkey: String,
+    pub next_nonce: u64,
 }
 
 #[cfg(test)]
@@ -690,6 +782,8 @@ mod tests {
             "/tmp/storage",
             keypair,
             "NODE-test123",
+            42,
+            "test-jwt-token",
         );
         assert_eq!(client.base_url, "https://example.com/api");
         assert!(client.auth.is_some());
@@ -832,17 +926,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_new_agreements_includes_signature_headers_when_authenticated() {
+    async fn get_new_agreements_includes_auth_headers_when_authenticated() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "new|ready"))
             .and(query_param("offset", "0"))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
-            .and(header_exists("X-Request-Timestamp"))
-            .and(header_exists("X-Request-Nonce"))
+            .and(header_exists("Authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -858,6 +949,8 @@ mod tests {
             storage_dir("agreements_auth"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let agreements = client.get_new_agreements().await.unwrap();
 
@@ -889,11 +982,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Mock the join endpoint - verify it receives signature headers and bls_signature in body
+        // Mock the join endpoint - verify it receives auth headers and bls_signature in body
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
             .and(header_exists("Content-Digest"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "agreement_id": agreement_id,
@@ -906,8 +998,14 @@ mod tests {
             .await;
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir("join"), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("join"),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let response = client.join_agreement(agreement_id).await.unwrap();
 
         assert!(response.created);
@@ -938,6 +1036,8 @@ mod tests {
             storage_dir("join_error"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let err = client.join_agreement(agreement_id).await.unwrap_err();
 
@@ -1122,7 +1222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_includes_signature_headers_when_authenticated() {
+    async fn download_file_includes_auth_headers_when_authenticated() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-auth-download";
         let download_url_path = "/files/auth-sample.txt";
@@ -1131,8 +1231,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/api/agreements/{agreement_id}/download")))
             .and(query_param("no_redirect", "true"))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -1147,7 +1246,14 @@ mod tests {
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let dir = storage_dir("download_auth");
-        let client = PortalClient::with_auth(mock_server.uri(), dir.clone(), keypair, "NODE-auth");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            dir.clone(),
+            keypair,
+            "NODE-auth",
+            42,
+            "test-jwt-token",
+        );
         let downloaded = client
             .download_file(agreement_id, "auth-sample.txt")
             .await
@@ -1202,6 +1308,8 @@ mod tests {
             storage_dir("cache_test"),
             keypair,
             "NODE-cache-test",
+            42,
+            "test-jwt-token",
         );
 
         // Join two agreements - xpub should only be fetched once
@@ -1242,11 +1350,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Mock the submit proof endpoint - verify it receives signature headers
+        // Mock the submit proof endpoint - verify it receives auth headers
         Mock::given(method("POST"))
             .and(path(format!("/api/challenges/{challenge_id}")))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
             .and(header_exists("Content-Digest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "challenge_id": challenge_id,
@@ -1263,6 +1370,8 @@ mod tests {
             storage_dir("proof_submit"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let response = client
             .submit_proof(challenge_id, "0102030405060708")
@@ -1298,6 +1407,8 @@ mod tests {
             storage_dir("proof_error"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let err = client
             .submit_proof(challenge_id, "badproof")
@@ -1335,6 +1446,8 @@ mod tests {
             storage_dir("proof_notfound"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let err = client
             .submit_proof(challenge_id, "0102030405")
@@ -1390,6 +1503,8 @@ mod tests {
             storage_dir("proof_cache"),
             keypair,
             "NODE-cache-test",
+            42,
+            "test-jwt-token",
         );
 
         // Submit two proofs - xpub should only be fetched once

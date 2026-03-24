@@ -444,8 +444,14 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).ok();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
@@ -466,8 +472,14 @@ mod tests {
             .unwrap();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
@@ -596,8 +608,14 @@ mod tests {
             .unwrap();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
@@ -634,8 +652,14 @@ mod tests {
             .unwrap();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
@@ -666,7 +690,14 @@ mod tests {
             .await;
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        PortalClient::with_auth(mock_server.uri(), storage_dir, keypair, "NODE-test")
+        PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir,
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        )
     }
 
     /// Helper to create a mock agreement with fake metadata for testing.
@@ -740,8 +771,8 @@ mod tests {
         // Mock submit_proof endpoint
         Mock::given(method("POST"))
             .and(path("/api/challenges/chal_local"))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
+            .and(header_exists("Content-Digest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status": "proved",
                 "proof": "abc123",
@@ -842,8 +873,8 @@ mod tests {
         // Mock submit_proof endpoint
         Mock::given(method("POST"))
             .and(path("/api/challenges/chal_gcs"))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
+            .and(header_exists("Content-Digest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "status": "proved",
                 "proof": "gcs_proof",
@@ -1103,8 +1134,14 @@ mod tests {
             .unwrap();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
@@ -1153,8 +1190,14 @@ mod tests {
             .unwrap();
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client =
-            PortalClient::with_auth(mock_server.uri(), storage_dir.clone(), keypair, "NODE-test");
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir.clone(),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        );
         let backend = StorageBackend::local();
 
         let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;

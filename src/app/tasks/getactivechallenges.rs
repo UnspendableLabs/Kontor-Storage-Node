@@ -153,6 +153,8 @@ mod tests {
             unique_storage_dir("challenges_empty"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         let result = sync_active_challenges(&client, &db).await;
 
@@ -207,6 +209,8 @@ mod tests {
             unique_storage_dir("mixed"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         sync_active_challenges(&client, &db).await.unwrap();
 
@@ -269,6 +273,8 @@ mod tests {
             unique_storage_dir("all_existing"),
             keypair,
             "NODE-test",
+            42,
+            "test-jwt-token",
         );
         sync_active_challenges(&client, &db).await.unwrap();
 

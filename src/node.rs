@@ -1,6 +1,6 @@
 //! Node management module.
 //!
-//! Contains onboarding, registration verification, and key management.
+//! Contains onboarding and key management.
 
 pub mod onboarding;
 

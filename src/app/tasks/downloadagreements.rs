@@ -615,15 +615,22 @@ mod tests {
             .await;
 
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        PortalClient::with_auth(mock_server.uri(), storage_dir, keypair, "NODE-test")
+        PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir,
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+        )
     }
 
     /// Helper to mount the join_agreement mock for a specific agreement.
     async fn mount_join_agreement_mock(mock_server: &MockServer, agreement_id: &str) {
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
-            .and(header_exists("Signature-Input"))
-            .and(header_exists("Signature"))
+            .and(header_exists("Authorization"))
+            .and(header_exists("Content-Digest"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "agreement_id": agreement_id,
                 "node_id": "NODE-test",

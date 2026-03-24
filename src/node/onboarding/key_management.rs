@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 /// This is useful for automation, testing, and scripted deployments.
 pub const BLS_PASSWORD_ENV: &str = "BLS_PASSWORD";
 
+/// Environment variable name for providing the encrypted BLS blob non-interactively.
+pub const BLS_BLOB_ENV: &str = "BLS_ENCRYPTED_BLOB";
+
 /// Trait for reading passwords and interactive input from the user.
 /// This abstraction enables testing without interactive input.
 pub trait PasswordReader {
@@ -23,7 +26,11 @@ pub trait PasswordReader {
     /// Returns an error if passwords don't match or validation fails.
     fn read_new_password(&self, writer: &mut dyn Write) -> Result<String>;
 
+    /// Read the encrypted BLS key blob (copy-pasted from Horizon Wallet).
+    fn read_blob(&self) -> Result<String>;
+
     /// Wait for the user to press Enter.
+    #[allow(dead_code)]
     fn wait_for_enter(&self) -> Result<()>;
 }
 
@@ -68,6 +75,18 @@ impl PasswordReader for TerminalPasswordReader {
         }
     }
 
+    fn read_blob(&self) -> Result<String> {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| anyhow!("failed to read encrypted key blob: {e}"))?;
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(anyhow!("encrypted key blob cannot be empty"));
+        }
+        Ok(trimmed)
+    }
+
     fn wait_for_enter(&self) -> Result<()> {
         let mut input = String::new();
         std::io::stdin()
@@ -80,6 +99,10 @@ impl PasswordReader for TerminalPasswordReader {
 
 /// Password reader that reads from the BLS_PASSWORD environment variable.
 /// Useful for automation, CI/CD, and testing.
+///
+/// **Import caveat:** [`Self::read_password`] and [`Self::read_new_password`] both use
+/// `BLS_PASSWORD`. For a non-interactive Horizon Wallet import, the wallet export password
+/// and the new on-disk password must therefore be the same, or you must use interactive mode.
 pub struct EnvPasswordReader;
 
 impl PasswordReader for EnvPasswordReader {
@@ -111,6 +134,19 @@ impl PasswordReader for EnvPasswordReader {
         Ok(password)
     }
 
+    fn read_blob(&self) -> Result<String> {
+        let raw = std::env::var(BLS_BLOB_ENV).map_err(|_| {
+            anyhow!("{BLS_BLOB_ENV} environment variable is required in non-interactive mode")
+        })?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "{BLS_BLOB_ENV} is set but empty (after trimming); paste the full encrypted blob"
+            ));
+        }
+        Ok(trimmed)
+    }
+
     fn wait_for_enter(&self) -> Result<()> {
         // In non-interactive mode, we don't wait for user input
         Ok(())
@@ -118,7 +154,8 @@ impl PasswordReader for EnvPasswordReader {
 }
 
 /// Returns the appropriate password reader based on environment.
-/// Uses EnvPasswordReader if BLS_PASSWORD is set, otherwise TerminalPasswordReader.
+/// Uses [`EnvPasswordReader`] if `BLS_PASSWORD` is set, otherwise [`TerminalPasswordReader`].
+/// For non-interactive wallet import, set `BLS_ENCRYPTED_BLOB` as well (see [`EnvPasswordReader`]).
 pub fn get_password_reader() -> Box<dyn PasswordReader> {
     if std::env::var(BLS_PASSWORD_ENV).is_ok() {
         Box::new(EnvPasswordReader)
@@ -138,7 +175,7 @@ pub fn get_key_path(config: &OnboardingConfig) -> Result<PathBuf> {
     Ok(app_dir.join(BLS_KEY_FILENAME))
 }
 
-/// Ensure a BLS keypair exists, either by loading it or generating a new one.
+/// Ensure a BLS keypair exists, either by loading it or importing from Horizon Wallet.
 pub async fn ensure_bls_keypair(
     key_path: &Path,
     writer: &mut impl Write,
@@ -152,11 +189,30 @@ pub async fn ensure_bls_keypair(
         let password = password_reader.read_password()?;
         BlsKeyPair::load_encrypted(key_path, &password).await
     } else {
-        writeln!(writer, "No BLS key found. Generating a new keypair...")?;
+        writeln!(writer, "No BLS key found. Import from Horizon Wallet.")?;
         writeln!(writer)?;
         writeln!(
             writer,
-            "Please enter a password to protect your BLS private key."
+            "Please paste your encrypted BLS key blob from Horizon Wallet:"
+        )?;
+        writer.flush().ok();
+
+        let blob = password_reader.read_blob()?;
+
+        writeln!(
+            writer,
+            "Enter the password used to export the key from Horizon Wallet:"
+        )?;
+        let wallet_password = password_reader.read_password()?;
+
+        let secret_key_hex = crate::crypto::decrypt_wallet_blob(&blob, &wallet_password)?;
+        let keypair = BlsKeyPair::from_secret_key_hex(&secret_key_hex)?;
+
+        writeln!(writer, "✓ BLS key successfully decrypted")?;
+        writeln!(writer)?;
+        writeln!(
+            writer,
+            "Choose a password to protect the key on this machine."
         )?;
         writeln!(
             writer,
@@ -164,16 +220,10 @@ pub async fn ensure_bls_keypair(
         )?;
         writeln!(writer)?;
 
-        // We need a mutable writer for the password reader's validation messages
-        let password = password_reader.read_new_password(writer)?;
-        let keypair = BlsKeyPair::generate()?;
-        keypair.save_encrypted(key_path, &password).await?;
+        let local_password = password_reader.read_new_password(writer)?;
+        keypair.save_encrypted(key_path, &local_password).await?;
 
-        writeln!(
-            writer,
-            "✓ BLS keypair generated and saved to {}",
-            key_path.display()
-        )?;
+        writeln!(writer, "✓ BLS key saved to {}", key_path.display())?;
         Ok(keypair)
     }
 }
@@ -183,14 +233,22 @@ pub async fn ensure_bls_keypair(
 #[cfg(test)]
 pub struct MockPasswordReader {
     password: String,
+    blob: Option<String>,
 }
 
 #[cfg(test)]
 impl MockPasswordReader {
-    /// Create a new mock password reader with the given password.
     pub fn new(password: impl Into<String>) -> Self {
         Self {
             password: password.into(),
+            blob: None,
+        }
+    }
+
+    pub fn with_blob(password: impl Into<String>, blob: impl Into<String>) -> Self {
+        Self {
+            password: password.into(),
+            blob: Some(blob.into()),
         }
     }
 }
@@ -205,8 +263,13 @@ impl PasswordReader for MockPasswordReader {
         Ok(self.password.clone())
     }
 
+    fn read_blob(&self) -> Result<String> {
+        self.blob
+            .clone()
+            .ok_or_else(|| anyhow!("no blob configured in mock"))
+    }
+
     fn wait_for_enter(&self) -> Result<()> {
-        // In tests, we don't wait for user input
         Ok(())
     }
 }
@@ -330,6 +393,37 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_blob_trims_and_succeeds() {
+        std::env::remove_var(BLS_BLOB_ENV);
+        std::env::set_var(BLS_BLOB_ENV, "  ablobvalue  \n");
+        let reader = EnvPasswordReader;
+        assert_eq!(reader.read_blob().unwrap(), "ablobvalue");
+        std::env::remove_var(BLS_BLOB_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_blob_fails_when_unset() {
+        std::env::remove_var(BLS_BLOB_ENV);
+        let reader = EnvPasswordReader;
+        let err = reader.read_blob().unwrap_err();
+        assert!(err.to_string().contains(BLS_BLOB_ENV));
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_password_reader_read_blob_fails_when_empty_after_trim() {
+        std::env::remove_var(BLS_BLOB_ENV);
+        std::env::set_var(BLS_BLOB_ENV, "   \t  ");
+        let reader = EnvPasswordReader;
+        let err = reader.read_blob().unwrap_err();
+        assert!(err.to_string().contains("empty"));
+        std::env::remove_var(BLS_BLOB_ENV);
+    }
+
+    #[test]
     fn env_password_reader_wait_for_enter_succeeds() {
         let reader = EnvPasswordReader;
         let result = reader.wait_for_enter();
@@ -344,24 +438,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_bls_keypair_generates_new_key_when_none_exists() {
+    async fn ensure_bls_keypair_imports_from_wallet_blob() {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let key_path = dir.path().join("new_key.enc");
-        let password = "testpassword123";
-        let reader = MockPasswordReader::new(password);
+        let key_path = dir.path().join("imported_key.enc");
+
+        let bls_hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let wallet_password = "walletpass123";
+        let salt = [1u8; 16];
+        let iv = [2u8; 16];
+        let blob = crate::crypto::wallet_import::encrypt_test_blob(
+            bls_hex_key,
+            wallet_password,
+            &salt,
+            &iv,
+        );
+
+        let reader = MockPasswordReader::with_blob(wallet_password, blob);
         let mut buffer = Vec::new();
 
         let keypair = ensure_bls_keypair(&key_path, &mut buffer, &reader)
             .await
             .unwrap();
 
+        let expected = BlsKeyPair::from_secret_key_hex(bls_hex_key).unwrap();
+        assert_eq!(keypair.public_key_hex(), expected.public_key_hex());
+
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("No BLS key found"));
-        assert!(output.contains("BLS keypair generated and saved"));
+        assert!(output.contains("BLS key successfully decrypted"));
+        assert!(output.contains("BLS key saved to"));
         assert!(!keypair.public_key_hex().is_empty());
         assert!(BlsKeyPair::key_file_exists(&key_path).await);
+
+        let reloaded = BlsKeyPair::load_encrypted(&key_path, wallet_password)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.public_key_hex(), keypair.public_key_hex());
     }
 
     #[tokio::test]

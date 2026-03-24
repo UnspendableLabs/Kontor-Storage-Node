@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 pub const HTTP_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_HTTP_SIG";
 
 /// Domain Separation Tag for agreement instruction signatures.
-pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_BLS_DST";
+pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"KONTOR_BLS_DST";
 
 /// BLS key file name stored in app data directory.
 pub const BLS_KEY_FILENAME: &str = "bls_key.enc";
@@ -59,7 +59,8 @@ pub struct BlsKeyPair {
 }
 
 impl BlsKeyPair {
-    /// Generate a new random BLS keypair.
+    /// Generate a new random BLS keypair (test-only; production keys come from wallet import).
+    #[cfg(test)]
     pub fn generate() -> Result<Self> {
         let mut ikm = Zeroizing::new([0u8; 32]);
         rand::thread_rng().fill_bytes(ikm.as_mut());
@@ -70,6 +71,26 @@ impl BlsKeyPair {
 
         Ok(Self {
             secret_key: Zeroizing::new(sk.to_bytes().to_vec()),
+            public_key: pk,
+        })
+    }
+
+    /// Create a BLS keypair from a hex-encoded secret key (64 hex characters = 32 bytes).
+    ///
+    /// This is used when importing a key from Horizon Wallet after decryption.
+    pub fn from_secret_key_hex(hex_key: &str) -> Result<Self> {
+        let sk_bytes = hex::decode(hex_key).context("invalid hex in BLS secret key")?;
+        if sk_bytes.len() != 32 {
+            return Err(anyhow!(
+                "BLS secret key must be 32 bytes, got {}",
+                sk_bytes.len()
+            ));
+        }
+        let sk = SecretKey::from_bytes(&sk_bytes)
+            .map_err(|_| anyhow!("invalid BLS secret key bytes"))?;
+        let pk = sk.sk_to_pk();
+        Ok(Self {
+            secret_key: Zeroizing::new(sk_bytes),
             public_key: pk,
         })
     }
@@ -448,5 +469,28 @@ mod tests {
         let hex1 = keypair.public_key_hex();
         let hex2 = keypair.public_key_hex();
         assert_eq!(hex1, hex2);
+    }
+
+    #[test]
+    fn from_secret_key_hex_creates_valid_keypair() {
+        let original = BlsKeyPair::generate().unwrap();
+        let sk_hex = hex::encode(&*original.secret_key);
+        let restored = BlsKeyPair::from_secret_key_hex(&sk_hex).unwrap();
+        assert_eq!(restored.public_key_hex(), original.public_key_hex());
+    }
+
+    #[test]
+    fn from_secret_key_hex_rejects_invalid_hex() {
+        let result = BlsKeyPair::from_secret_key_hex("not-valid-hex");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid hex"));
+    }
+
+    #[test]
+    fn from_secret_key_hex_rejects_wrong_length() {
+        let short_hex = "aabbccdd"; // 4 bytes, not 32
+        let result = BlsKeyPair::from_secret_key_hex(short_hex);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("32 bytes"));
     }
 }

@@ -5,10 +5,6 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
 pub struct Cli {
-    /// Node ID provided by Horizon Market (e.g. NODE-abc123def456)
-    #[arg(long, env = "NODE_ID")]
-    pub node_id: Option<String>,
-
     /// Portal API base URL (e.g. https://portal.example.com/api)
     #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
     pub portal_url: String,
