@@ -48,7 +48,8 @@ rand = "0.8"
 blst = "0.3"
 aes-gcm = "0.10"
 aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["block-padding"] }
+ctr = "0.9"
 argon2 = "0.5"
 zeroize = { version = "1.8", features = ["derive"] }
 rpassword = "7.3"

@@ -704,7 +704,8 @@ pub struct DownloadedFile {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeLookupResult {
     pub node_id: String,
-    pub signer_id: u64,
+    /// `None` when the `RegisterBlsKey` transaction has not been confirmed yet.
+    pub signer_id: Option<u64>,
     pub bls_public_key: String,
 }
 

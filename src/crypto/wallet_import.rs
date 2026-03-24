@@ -1,20 +1,30 @@
 //! Wallet blob decryption module.
 //!
 //! Decrypts BLS private key blobs exported from the Horizon Wallet.
-//! The wallet export format uses Argon2id key derivation with AES-256-CBC encryption.
+//! The wallet export format uses Argon2id key derivation with AES-256 in **SIC/CTR** mode
+//! (Dart `encrypt` package default `AESMode.sic`), with PKCS#7 padding — **not** AES-CBC.
+//!
+//! **Salt handling:** the Argon2 salt is the UTF-8 encoding of the base64 *text* in segment 2
+//! (same as hash-wasm after `getUInt8Buffer` in Horizon's `encryption_worker.js`), not the
+//! base64-decoded bytes.
 
 use aes::Aes256;
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cipher::block_padding::{Pkcs7, RawPadding};
+use ctr::cipher::{KeyIvInit, StreamCipher};
+use ctr::Ctr128BE;
 use zeroize::Zeroizing;
 
 const ARGON2_M_COST: u32 = 65536; // 64 MiB
 const ARGON2_T_COST: u32 = 6;
 const ARGON2_P_COST: u32 = 4;
 const IV_BASE64_LEN: usize = 24;
-const EXPECTED_SALT_LEN: usize = 16;
+/// Horizon Wallet's web worker passes the salt segment as a base64 *string* into Argon2;
+/// hash-wasm UTF-8-encodes that string (see `getUInt8Buffer` in `encryption_worker.js`), it does
+/// not base64-decode it. We must match that behaviour.
+const EXPECTED_DECODED_SALT_BYTES: usize = 16;
 const EXPECTED_IV_LEN: usize = 16;
 const BLS_PRIVATE_KEY_HEX_LEN: usize = 64;
 
@@ -38,15 +48,19 @@ pub fn decrypt_wallet_blob(encrypted_hex: &str, password: &str) -> Result<String
         ));
     }
 
-    let salt = STANDARD
+    // Validate segment shape (16 random bytes, base64-encoded) — same blob as the wallet stores.
+    let decoded_salt = STANDARD
         .decode(segments[2])
         .context("invalid base64 in salt segment")?;
-    if salt.len() != EXPECTED_SALT_LEN {
+    if decoded_salt.len() != EXPECTED_DECODED_SALT_BYTES {
         return Err(anyhow!(
-            "expected {EXPECTED_SALT_LEN}-byte salt, got {}",
-            salt.len()
+            "expected base64 salt segment to decode to {EXPECTED_DECODED_SALT_BYTES} bytes, got {}",
+            decoded_salt.len()
         ));
     }
+
+    // Argon2 salt must be the UTF-8 bytes of the base64 *text* (not the decoded bytes).
+    let salt_for_argon2 = segments[2].as_bytes();
 
     let iv_ct = segments[3];
     if iv_ct.len() < IV_BASE64_LEN {
@@ -79,17 +93,18 @@ pub fn decrypt_wallet_blob(encrypted_hex: &str, password: &str) -> Result<String
 
     let mut key = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(password.as_bytes(), &salt, key.as_mut())
+        .hash_password_into(password.as_bytes(), salt_for_argon2, key.as_mut())
         .map_err(|e| anyhow!("Argon2 key derivation failed: {e}"))?;
 
-    let decryptor = cbc::Decryptor::<Aes256>::new_from_slices(key.as_ref(), &iv)
-        .map_err(|e| anyhow!("failed to initialise AES-256-CBC decryptor: {e}"))?;
+    // Horizon uses PointyCastle `AES/SIC/PKCS7` — AES-CTR with PKCS#7 (matches `Ctr128BE` + PointyCastle SIC).
+    let mut buf = ciphertext;
+    let mut cipher = Ctr128BE::<Aes256>::new_from_slices(key.as_ref(), &iv)
+        .map_err(|e| anyhow!("failed to initialise AES-256-CTR decryptor: {e}"))?;
+    cipher.apply_keystream(&mut buf);
 
-    let plaintext = Zeroizing::new(
-        decryptor
-            .decrypt_padded_vec_mut::<Pkcs7>(&ciphertext)
-            .map_err(|_| anyhow!("AES-CBC decryption failed (wrong password or corrupted data)"))?,
-    );
+    let unpadded = Pkcs7::raw_unpad(&buf)
+        .map_err(|_| anyhow!("AES-CTR decryption failed (wrong password or corrupted data)"))?;
+    let plaintext = Zeroizing::new(unpadded.to_vec());
 
     let hex_key =
         std::str::from_utf8(&plaintext).context("decrypted payload is not valid UTF-8")?;
@@ -114,19 +129,25 @@ pub(crate) fn encrypt_test_blob(
     salt: &[u8; 16],
     iv: &[u8; 16],
 ) -> String {
-    use cbc::cipher::BlockEncryptMut;
-
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32)).unwrap();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let salt_b64 = STANDARD.encode(salt);
     let mut key = [0u8; 32];
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt_b64.as_bytes(), &mut key)
         .unwrap();
 
-    let encryptor = cbc::Encryptor::<Aes256>::new_from_slices(&key, iv).unwrap();
-    let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(bls_hex_key.as_bytes());
+    const BS: usize = 16;
+    let pt = bls_hex_key.as_bytes();
+    let pad_len = BS - (pt.len() % BS);
+    let mut padded = vec![0u8; pt.len() + pad_len];
+    padded[..pt.len()].copy_from_slice(pt);
+    Pkcs7::raw_pad(&mut padded, pt.len());
 
-    let salt_b64 = STANDARD.encode(salt);
+    let mut cipher = Ctr128BE::<Aes256>::new_from_slices(&key, iv).unwrap();
+    cipher.apply_keystream(&mut padded);
+    let ciphertext = padded;
+
     let iv_b64 = STANDARD.encode(iv);
     let ct_b64 = STANDARD.encode(&ciphertext);
 

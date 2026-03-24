@@ -6,9 +6,10 @@
 pub mod key_management;
 
 use crate::clients::PortalClient;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub use key_management::{get_password_reader, PasswordReader};
 
@@ -17,6 +18,12 @@ pub use key_management::BLS_PASSWORD_ENV;
 
 #[cfg(test)]
 pub use key_management::MockPasswordReader;
+
+#[cfg(not(test))]
+const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Shorter interval in unit tests so polling scenarios finish quickly.
+#[cfg(test)]
+const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Result of the onboarding process.
 #[derive(Debug)]
@@ -74,32 +81,53 @@ pub async fn perform_onboarding_with_reader(
 
     // Step 2: Look up node by BLS public key
     writeln!(writer, "Looking up node identity...")?;
-    let lookup = client.lookup_node(&bls_pubkey).await?;
-    writeln!(
-        writer,
-        "✓ Node {} found (signer_id: {})",
-        lookup.node_id, lookup.signer_id
-    )?;
+    let mut waiting = false;
+    let (node_id, signer_id) = loop {
+        let lookup = client.lookup_node(&bls_pubkey).await?;
+        if let Some(sid) = lookup.signer_id {
+            if waiting {
+                writeln!(writer)?;
+            }
+            writeln!(
+                writer,
+                "✓ Node {} found (signer_id: {})",
+                lookup.node_id, sid
+            )?;
+            break (lookup.node_id, sid);
+        }
+        if !waiting {
+            writeln!(
+                writer,
+                "Node {} found but RegisterBlsKey transaction not yet confirmed.",
+                lookup.node_id
+            )?;
+            write!(writer, "Waiting for on-chain confirmation")?;
+            waiting = true;
+        } else {
+            write!(writer, ".")?;
+        }
+        writer.flush().ok();
+        tokio::time::sleep(REGISTRATION_POLL_INTERVAL).await;
+    };
 
     // Step 3: Login (challenge/response)
     writeln!(writer, "Authenticating with Portal...")?;
-    let challenge = client.login_challenge(&lookup.node_id).await?;
-    let challenge_bytes =
-        hex::decode(&challenge.challenge).context("invalid challenge hex from Portal")?;
-    let signature = keypair.sign_http_message(&challenge_bytes)?;
+    let challenge = client.login_challenge(&node_id).await?;
+    // Horizon Portal verifies with `request.challenge.as_bytes()` (hex string UTF-8), not decoded bytes.
+    let signature = keypair.sign_http_message(challenge.challenge.as_bytes())?;
     let login = client
-        .login_submit(&lookup.node_id, &challenge.challenge, &signature)
+        .login_submit(&node_id, &challenge.challenge, &signature)
         .await?;
     writeln!(writer, "✓ Authenticated as {}", login.user_id)?;
 
     // Step 4: Fetch current nonce
-    let registry = client.get_registry_entry(lookup.signer_id).await?;
+    let registry = client.get_registry_entry(signer_id).await?;
     writeln!(writer, "✓ Registry nonce: {}", registry.next_nonce)?;
 
     Ok(OnboardingResult {
         keypair,
-        node_id: lookup.node_id,
-        signer_id: lookup.signer_id,
+        node_id,
+        signer_id,
         token: login.token,
         next_nonce: registry.next_nonce,
     })
@@ -114,18 +142,7 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn mount_all_mocks(mock_server: &MockServer, node_id: &str, public_key: &str) {
-        Mock::given(method("GET"))
-            .and(path("/api/nodes/lookup"))
-            .and(query_param("bls_pubkey", public_key))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "node_id": node_id,
-                "signer_id": 42,
-                "bls_public_key": public_key
-            })))
-            .mount(mock_server)
-            .await;
-
+    async fn mount_all_mocks_except_lookup(mock_server: &MockServer, node_id: &str, public_key: &str) {
         Mock::given(method("GET"))
             .and(path("/api/users/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -156,6 +173,21 @@ mod tests {
             })))
             .mount(mock_server)
             .await;
+    }
+
+    async fn mount_all_mocks(mock_server: &MockServer, node_id: &str, public_key: &str) {
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(mock_server)
+            .await;
+
+        mount_all_mocks_except_lookup(mock_server, node_id, public_key).await;
     }
 
     #[tokio::test]
@@ -229,6 +261,70 @@ mod tests {
         assert!(
             err.to_string().contains("status 404"),
             "expected 404 error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn onboarding_succeeds_after_signer_id_pending() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("test_bls.enc");
+        let storage_dir = dir.path().join("storage");
+
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // First mounted mock wins for equal priority: two pending lookups, then the default mock.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", &public_key))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "node-pending",
+                "signer_id": null,
+                "bls_public_key": public_key
+            })))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", &public_key))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "node-pending",
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+
+        mount_all_mocks_except_lookup(&mock_server, "node-pending", &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let result = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert_eq!(result.node_id, "node-pending");
+        assert_eq!(result.signer_id, 42);
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(
+            output.contains("RegisterBlsKey transaction not yet confirmed"),
+            "expected pending message, got: {output}"
+        );
+        assert!(output.contains('.'), "expected progress dots while waiting");
+        assert!(
+            output.contains("Node node-pending found (signer_id: 42)"),
+            "expected success line after poll, got: {output}"
         );
     }
 
