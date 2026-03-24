@@ -600,20 +600,10 @@ mod tests {
     use wiremock::matchers::{body_bytes, header, header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    /// Helper to create an authenticated PortalClient and mount required mocks for join_agreement.
     async fn create_authenticated_client(
         mock_server: &MockServer,
         storage_dir: PathBuf,
     ) -> PortalClient {
-        // Mock the portal xpub endpoint
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(mock_server)
-            .await;
-
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         PortalClient::with_auth(
             mock_server.uri(),
@@ -622,6 +612,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         )
     }
 

@@ -142,7 +142,11 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn mount_all_mocks_except_lookup(mock_server: &MockServer, node_id: &str, public_key: &str) {
+    async fn mount_all_mocks_except_lookup(
+        mock_server: &MockServer,
+        node_id: &str,
+        public_key: &str,
+    ) {
         Mock::given(method("GET"))
             .and(path("/api/users/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

@@ -174,6 +174,7 @@ pub async fn run_with_shutdown(
                 &node_id,
                 onboarding_result.signer_id,
                 onboarding_result.token,
+                onboarding_result.next_nonce,
             );
 
             let daemon_config = build_daemon_config(&config, authenticated_client, node_id).await?;
@@ -643,7 +644,7 @@ mod tests {
         // Mock agreements endpoint
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -720,7 +721,7 @@ mod tests {
         // Mock agreements endpoint
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,

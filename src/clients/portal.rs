@@ -6,13 +6,56 @@ use bytes::Bytes;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::OnceCell;
 
-/// Instruction names for BLS-signed Portal operations.
-const INSTRUCTION_JOIN_AGREEMENT: &str = "join_agreement";
-const INSTRUCTION_SEND_PROOF: &str = "send_proof";
+/// Prefix for Kontor operation signing messages.
+const KONTOR_OP_PREFIX: &[u8] = b"KONTOR-OP-V1";
+
+/// Filestorage contract address in Kontor (native contract at genesis).
+const FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
+
+/// Default gas limit for filestorage contract calls.
+const DEFAULT_GAS_LIMIT: u64 = 50_000;
+
+/// Kontor BlsBulkOp::Call representation for signing.
+///
+/// This must serialize identically to Kontor's `BlsBulkOp::Call` variant via postcard.
+/// The `contract` field uses `String` because Kontor serializes `ContractAddress`
+/// as its Display string (`"{name}_{height}_{tx_index}"`) via `serde_as(as = "DisplayFromStr")`.
+#[derive(Serialize)]
+enum BlsBulkOp {
+    Call {
+        signer_id: u64,
+        nonce: u64,
+        gas_limit: u64,
+        contract: String,
+        expr: String,
+    },
+}
+
+impl BlsBulkOp {
+    /// Build the domain-separated signing message: `KONTOR-OP-V1 || postcard(self)`.
+    fn signing_message(&self) -> Result<Vec<u8>> {
+        let op_bytes = postcard::to_allocvec(self).context("failed to serialize BlsBulkOp")?;
+        let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
+        msg.extend_from_slice(KONTOR_OP_PREFIX);
+        msg.extend_from_slice(&op_bytes);
+        Ok(msg)
+    }
+}
+
+/// Build a WASM Wave expression for the `join-agreement` filestorage function.
+fn join_agreement_expr(agreement_id: &str, node_id: &str) -> String {
+    format!("join-agreement(\"{agreement_id}\", \"{node_id}\")")
+}
+
+/// Build a WASM Wave expression for the `verify-proof` filestorage function.
+fn verify_proof_expr(proof_bytes: &[u8]) -> String {
+    let items: Vec<String> = proof_bytes.iter().map(|b| b.to_string()).collect();
+    format!("verify-proof([{}])", items.join(", "))
+}
 
 /// Authentication credentials for Portal API requests.
 #[derive(Clone)]
@@ -21,6 +64,7 @@ pub struct PortalAuth {
     node_id: String,
     signer_id: u64,
     token: String,
+    next_nonce: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for PortalAuth {
@@ -28,6 +72,7 @@ impl std::fmt::Debug for PortalAuth {
         f.debug_struct("PortalAuth")
             .field("node_id", &self.node_id)
             .field("signer_id", &self.signer_id)
+            .field("next_nonce", &self.next_nonce.load(Ordering::Relaxed))
             .field("keypair", &"<BlsKeyPair>")
             .field("token", &"<redacted>")
             .finish()
@@ -41,8 +86,6 @@ pub struct PortalClient {
     http: Client,
     /// Optional authentication for signed requests.
     auth: Option<PortalAuth>,
-    /// Cached portal signing xpub (fetched lazily on first use).
-    cached_portal_xpub: Arc<OnceCell<String>>,
 }
 
 impl std::fmt::Debug for PortalClient {
@@ -51,7 +94,6 @@ impl std::fmt::Debug for PortalClient {
             .field("base_url", &self.base_url)
             .field("storage_dir", &self.storage_dir)
             .field("auth", &self.auth)
-            .field("cached_portal_xpub", &self.cached_portal_xpub.get())
             .finish()
     }
 }
@@ -75,7 +117,6 @@ impl PortalClient {
             storage_dir: storage_dir.into(),
             http,
             auth: None,
-            cached_portal_xpub: Arc::new(OnceCell::new()),
         })
     }
 
@@ -90,9 +131,18 @@ impl PortalClient {
         node_id: impl Into<String>,
         signer_id: u64,
         token: impl Into<String>,
+        initial_nonce: u64,
     ) -> Self {
-        Self::try_with_auth(base_url, storage_dir, keypair, node_id, signer_id, token)
-            .expect("building Portal HTTP client")
+        Self::try_with_auth(
+            base_url,
+            storage_dir,
+            keypair,
+            node_id,
+            signer_id,
+            token,
+            initial_nonce,
+        )
+        .expect("building Portal HTTP client")
     }
 
     /// Create an authenticated client, returning an error if building fails.
@@ -103,6 +153,7 @@ impl PortalClient {
         node_id: impl Into<String>,
         signer_id: u64,
         token: impl Into<String>,
+        initial_nonce: u64,
     ) -> Result<Self> {
         let http = build_http_client().context("building Portal HTTP client")?;
         // Normalize URL by trimming trailing slashes once at construction time
@@ -116,8 +167,8 @@ impl PortalClient {
                 node_id: node_id.into(),
                 signer_id,
                 token: token.into(),
+                next_nonce: Arc::new(AtomicU64::new(initial_nonce)),
             }),
-            cached_portal_xpub: Arc::new(OnceCell::new()),
         })
     }
 
@@ -316,31 +367,7 @@ impl PortalClient {
             .context("failed to deserialize registry entry")
     }
 
-    /// Fetch the Portal signing xpub from the public API endpoint.
-    /// This xpub is used to bind agreement signatures to this Portal.
-    #[cfg(test)]
-    pub async fn get_portal_signing_xpub(&self) -> Result<String> {
-        self.get_or_fetch_portal_xpub().await.cloned()
-    }
-
-    /// Get the cached portal signing xpub, or fetch it if not yet cached.
-    /// The xpub is cached for the lifetime of the client.
-    async fn get_or_fetch_portal_xpub(&self) -> Result<&String> {
-        self.cached_portal_xpub
-            .get_or_try_init(|| async {
-                let url = format!("{}/api/", self.base_url);
-                let resp = self.http.get(&url).send().await?;
-                let resp = check_response_status(resp, "fetch portal signing xpub").await?;
-                let body = resp
-                    .json::<PortalInfoResponse>()
-                    .await
-                    .context("failed to deserialize portal info")?;
-                Ok(body.portal_signing_xpub)
-            })
-            .await
-    }
-
-    /// Fetch all agreements that are marked as new or ready.
+    /// Fetch all agreements that are marked as ready.
     ///
     /// This method handles pagination automatically, fetching all pages.
     /// Requires authentication via JWT Bearer token.
@@ -351,13 +378,13 @@ impl PortalClient {
 
     /// Fetch a single page of agreements with the given offset.
     async fn get_agreements_page(&self, offset: u32) -> Result<AgreementsPage> {
-        let path = format!("/api/agreements?status=new|ready&offset={offset}");
+        let path = format!("/api/agreements?status=ready&offset={offset}");
         let url = self.api_path(&path);
 
         let request = self.build_signed_request(Method::GET, &url, &path, None)?;
 
         let resp = request.send().await?;
-        let resp = check_response_status(resp, "fetch new agreements").await?;
+        let resp = check_response_status(resp, "fetch ready agreements").await?;
         let page = resp
             .json::<AgreementsPage>()
             .await
@@ -365,35 +392,38 @@ impl PortalClient {
         Ok(page)
     }
 
-    /// Sign a Portal instruction with BLS.
+    /// Sign a Kontor operation with BLS using the BlsBulkOp::Call protocol.
     ///
-    /// This helper:
-    /// 1. Fetches the Portal signing xpub (cached)
-    /// 2. Serializes `(portal_signing_xpub, instruction)` with postcard
-    /// 3. Signs with the BLS keypair using the agreement DST
+    /// This method:
+    /// 1. Atomically reads and increments the nonce
+    /// 2. Builds a `BlsBulkOp::Call` with the given Wave expression
+    /// 3. Signs `KONTOR-OP-V1 || postcard(op)` with the BLS keypair
     ///
-    /// Returns the hex-encoded BLS signature.
-    async fn sign_instruction(&self, instruction: Vec<String>) -> Result<String> {
+    /// Returns `(hex_signature, nonce_used)`.
+    fn sign_kontor_op(&self, expr: String) -> Result<(String, u64)> {
         let auth = self
             .auth
             .as_ref()
             .ok_or_else(|| anyhow!("authentication required: no keypair configured"))?;
 
-        let portal_xpub = self.get_or_fetch_portal_xpub().await?;
+        let nonce = auth.next_nonce.fetch_add(1, Ordering::Relaxed);
 
-        let message = postcard::to_allocvec(&(portal_xpub, instruction))
-            .context("failed to serialize instruction")?;
+        let op = BlsBulkOp::Call {
+            signer_id: auth.signer_id,
+            nonce,
+            gas_limit: DEFAULT_GAS_LIMIT,
+            contract: FILESTORAGE_CONTRACT.to_string(),
+            expr,
+        };
 
-        auth.keypair.sign_agreement_instruction(&message)
+        let msg = op.signing_message()?;
+        let sig = auth.keypair.sign_agreement_instruction(&msg)?;
+        Ok((sig, nonce))
     }
 
     /// Join an agreement as a storage node.
     ///
-    /// This method:
-    /// 1. Fetches the Portal signing xpub (cached after first fetch)
-    /// 2. Creates a BLS signature over `(portal_signing_xpub, ["join_agreement", node_id, agreement_id])`
-    /// 3. Submits the join request with both JWT auth and agreement signature
-    ///
+    /// Signs a `join-agreement` Kontor operation with BLS and submits it.
     /// Requires authentication via JWT Bearer token.
     pub async fn join_agreement(&self, agreement_id: &str) -> Result<JoinAgreementResponse> {
         let node_id = self
@@ -401,17 +431,16 @@ impl PortalClient {
             .ok_or_else(|| anyhow!("authentication required to join agreement"))?
             .to_string();
 
-        let instruction = vec![
-            INSTRUCTION_JOIN_AGREEMENT.to_string(),
-            node_id,
-            agreement_id.to_string(),
-        ];
-        let bls_signature = self.sign_instruction(instruction).await?;
+        let expr = join_agreement_expr(agreement_id, &node_id);
+        let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
         let path = format!("/api/agreements/{agreement_id}/join");
         let url = self.api_path(&path);
 
-        let payload = JoinAgreementRequest { bls_signature };
+        let payload = JoinAgreementRequest {
+            bls_signature,
+            nonce,
+        };
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize join request")?;
 
@@ -525,10 +554,9 @@ impl PortalClient {
 
     /// Submit a storage proof for a challenge.
     ///
-    /// This method:
-    /// 1. Fetches the Portal signing xpub (cached)
-    /// 2. Creates a BLS signature over `(portal_signing_xpub, ["send_proof", node_id, proof_hex])`
-    /// 3. Submits the proof with both JWT auth and BLS signature
+    /// Signs a `verify-proof` Kontor operation with BLS and submits it.
+    /// The proof_hex is decoded to bytes for the Wave expression, then
+    /// re-encoded as hex in the request body.
     ///
     /// Requires authentication.
     pub async fn submit_proof(
@@ -536,17 +564,9 @@ impl PortalClient {
         challenge_id: &str,
         proof_hex: &str,
     ) -> Result<SubmitProofResponse> {
-        let node_id = self
-            .node_id()
-            .ok_or_else(|| anyhow!("authentication required to submit proof"))?
-            .to_string();
-
-        let instruction = vec![
-            INSTRUCTION_SEND_PROOF.to_string(),
-            node_id,
-            proof_hex.to_string(),
-        ];
-        let bls_signature = self.sign_instruction(instruction).await?;
+        let proof_bytes = hex::decode(proof_hex).context("invalid hex in proof for BLS signing")?;
+        let expr = verify_proof_expr(&proof_bytes);
+        let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
         let path = format!("/api/challenges/{challenge_id}");
         let url = self.api_path(&path);
@@ -554,6 +574,7 @@ impl PortalClient {
         let payload = SubmitProofRequest {
             proof: proof_hex.to_string(),
             bls_signature,
+            nonce,
         };
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize submit proof request")?;
@@ -657,12 +678,18 @@ pub struct Agreement {
     pub curation: serde_json::Value,
     pub status: String,
     pub created_at: String,
-}
-
-/// Response from the Portal API root endpoint.
-#[derive(Debug, Deserialize)]
-struct PortalInfoResponse {
-    portal_signing_xpub: String,
+    #[allow(dead_code)]
+    pub merkle_root: Option<String>,
+    #[allow(dead_code)]
+    pub data_symbols: Option<u64>,
+    #[allow(dead_code)]
+    pub parity_symbols: Option<u64>,
+    #[allow(dead_code)]
+    pub padded_len: Option<u64>,
+    #[allow(dead_code)]
+    pub blob_size: Option<u64>,
+    #[allow(dead_code)]
+    pub file_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -674,6 +701,7 @@ pub struct JoinAgreementResponse {
 #[derive(Debug, Serialize)]
 struct JoinAgreementRequest {
     bls_signature: String,
+    nonce: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,6 +715,7 @@ pub struct SubmitProofResponse {
 struct SubmitProofRequest {
     proof: String,
     bls_signature: String,
+    nonce: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -785,6 +814,7 @@ mod tests {
             "NODE-test123",
             42,
             "test-jwt-token",
+            0,
         );
         assert_eq!(client.base_url, "https://example.com/api");
         assert!(client.auth.is_some());
@@ -873,30 +903,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_portal_signing_xpub_fetches_from_api_root() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        let client = PortalClient::new(mock_server.uri(), storage_dir("portal_xpub"));
-        let xpub = client.get_portal_signing_xpub().await.unwrap();
-
-        assert_eq!(xpub, "xpub661MyMwAqRbctest");
-    }
-
-    #[tokio::test]
-    async fn get_new_agreements_requests_new_ready_status() {
+    async fn get_new_agreements_requests_ready_status() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .and(query_param("offset", "0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
@@ -912,7 +924,7 @@ mod tests {
                     "nodes": ["NODE-1"],
                     "transaction_id": null,
                     "curation": {},
-                    "status": "new",
+                    "status": "ready",
                     "created_at": "2024-01-15T10:30:00Z"
                 }]
             })))
@@ -932,7 +944,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .and(query_param("offset", "0"))
             .and(header_exists("Authorization"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -952,6 +964,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let agreements = client.get_new_agreements().await.unwrap();
 
@@ -974,16 +987,6 @@ mod tests {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-join";
 
-        // Mock the portal xpub endpoint
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        // Mock the join endpoint - verify it receives auth headers and bls_signature in body
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
             .and(header_exists("Authorization"))
@@ -1006,6 +1009,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let response = client.join_agreement(agreement_id).await.unwrap();
 
@@ -1016,14 +1020,6 @@ mod tests {
     async fn join_agreement_returns_error_on_failure() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-error";
-
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
 
         Mock::given(method("POST"))
             .and(path(format!("/api/agreements/{agreement_id}/join")))
@@ -1039,6 +1035,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let err = client.join_agreement(agreement_id).await.unwrap_err();
 
@@ -1254,6 +1251,7 @@ mod tests {
             "NODE-auth",
             42,
             "test-jwt-token",
+            0,
         );
         let downloaded = client
             .download_file(agreement_id, "auth-sample.txt")
@@ -1265,20 +1263,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_signing_xpub_is_cached_across_multiple_join_calls() {
+    async fn join_agreement_works_for_multiple_agreements() {
         let mock_server = MockServer::start().await;
 
-        // Mock the portal xpub endpoint - expect exactly 1 call due to caching
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbcCached"
-            })))
-            .expect(1) // Should only be called once due to caching
-            .mount(&mock_server)
-            .await;
-
-        // Mock the join endpoint for multiple agreements
         Mock::given(method("POST"))
             .and(path("/api/agreements/AGREEMENT-1/join"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
@@ -1306,21 +1293,19 @@ mod tests {
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = PortalClient::with_auth(
             mock_server.uri(),
-            storage_dir("cache_test"),
+            storage_dir("join_multi"),
             keypair,
             "NODE-cache-test",
             42,
             "test-jwt-token",
+            0,
         );
 
-        // Join two agreements - xpub should only be fetched once
         let resp1 = client.join_agreement("AGREEMENT-1").await.unwrap();
         let resp2 = client.join_agreement("AGREEMENT-2").await.unwrap();
 
         assert!(resp1.created);
         assert!(resp2.created);
-
-        // The expect(1) on the mock will fail if xpub was fetched more than once
     }
 
     #[tokio::test]
@@ -1342,16 +1327,6 @@ mod tests {
         let mock_server = MockServer::start().await;
         let challenge_id = "CHALLENGE-proof";
 
-        // Mock the portal xpub endpoint
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        // Mock the submit proof endpoint - verify it receives auth headers
         Mock::given(method("POST"))
             .and(path(format!("/api/challenges/{challenge_id}")))
             .and(header_exists("Authorization"))
@@ -1373,6 +1348,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let response = client
             .submit_proof(challenge_id, "0102030405060708")
@@ -1388,14 +1364,6 @@ mod tests {
         let mock_server = MockServer::start().await;
         let challenge_id = "CHALLENGE-error";
 
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
-
         Mock::given(method("POST"))
             .and(path(format!("/api/challenges/{challenge_id}")))
             .respond_with(ResponseTemplate::new(400).set_body_string("invalid proof"))
@@ -1410,9 +1378,10 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let err = client
-            .submit_proof(challenge_id, "badproof")
+            .submit_proof(challenge_id, "0102030405")
             .await
             .unwrap_err();
 
@@ -1426,14 +1395,6 @@ mod tests {
     async fn submit_proof_returns_error_on_not_found() {
         let mock_server = MockServer::start().await;
         let challenge_id = "CHALLENGE-notfound";
-
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(&mock_server)
-            .await;
 
         Mock::given(method("POST"))
             .and(path(format!("/api/challenges/{challenge_id}")))
@@ -1449,6 +1410,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let err = client
             .submit_proof(challenge_id, "0102030405")
@@ -1459,62 +1421,5 @@ mod tests {
             err.to_string().contains("status 404"),
             "expected error to include status, got {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn submit_proof_uses_cached_portal_xpub() {
-        let mock_server = MockServer::start().await;
-
-        // Mock the portal xpub endpoint - expect exactly 1 call due to caching
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbcCached"
-            })))
-            .expect(1) // Should only be called once due to caching
-            .mount(&mock_server)
-            .await;
-
-        // Mock the submit proof endpoint for multiple challenges
-        Mock::given(method("POST"))
-            .and(path("/api/challenges/CHALLENGE-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "challenge_id": "CHALLENGE-1",
-                "status": "proved",
-                "proof": "proof1",
-                "bls_signature": "sig1"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/api/challenges/CHALLENGE-2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "challenge_id": "CHALLENGE-2",
-                "status": "proved",
-                "proof": "proof2",
-                "bls_signature": "sig2"
-            })))
-            .mount(&mock_server)
-            .await;
-
-        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client = PortalClient::with_auth(
-            mock_server.uri(),
-            storage_dir("proof_cache"),
-            keypair,
-            "NODE-cache-test",
-            42,
-            "test-jwt-token",
-        );
-
-        // Submit two proofs - xpub should only be fetched once
-        let resp1 = client.submit_proof("CHALLENGE-1", "proof1").await.unwrap();
-        let resp2 = client.submit_proof("CHALLENGE-2", "proof2").await.unwrap();
-
-        assert_eq!(resp1.status, "proved");
-        assert_eq!(resp2.status, "proved");
-
-        // The expect(1) on the mock will fail if xpub was fetched more than once
     }
 }

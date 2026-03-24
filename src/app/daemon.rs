@@ -258,7 +258,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock_server)
             .await;
@@ -295,7 +295,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&mock_server)
@@ -371,7 +371,7 @@ mod tests {
                 "nodes": ["NODE-1"],
                 "transaction_id": null,
                 "curation": {},
-                "status": "new",
+                "status": "ready",
                 "created_at": "2024-01-15T10:30:00Z"
             }]
         });
@@ -379,7 +379,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
             .mount(&mock_server)
             .await;

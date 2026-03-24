@@ -451,6 +451,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 
@@ -479,6 +480,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 
@@ -615,6 +617,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 
@@ -659,6 +662,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 
@@ -675,20 +679,10 @@ mod tests {
         assert_eq!(challenge.status, "active");
     }
 
-    /// Helper to create authenticated PortalClient and mount required mocks.
     async fn create_authenticated_client(
         mock_server: &MockServer,
         storage_dir: std::path::PathBuf,
     ) -> PortalClient {
-        // Mock the portal xpub endpoint
-        Mock::given(method("GET"))
-            .and(path("/api/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "portal_signing_xpub": "xpub661MyMwAqRbctest"
-            })))
-            .mount(mock_server)
-            .await;
-
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         PortalClient::with_auth(
             mock_server.uri(),
@@ -697,6 +691,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         )
     }
 
@@ -1141,6 +1136,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 
@@ -1197,6 +1193,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let backend = StorageBackend::local();
 

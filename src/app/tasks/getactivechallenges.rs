@@ -155,6 +155,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         let result = sync_active_challenges(&client, &db).await;
 
@@ -211,6 +212,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         sync_active_challenges(&client, &db).await.unwrap();
 
@@ -275,6 +277,7 @@ mod tests {
             "NODE-test",
             42,
             "test-jwt-token",
+            0,
         );
         sync_active_challenges(&client, &db).await.unwrap();
 

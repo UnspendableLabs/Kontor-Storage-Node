@@ -103,8 +103,14 @@ mod tests {
             nodes: vec!["NODE-1".to_string()],
             transaction_id: None,
             curation: json!({"notes": "ok"}),
-            status: "new".to_string(),
+            status: "ready".to_string(),
             created_at: "2024-01-15T10:30:00Z".to_string(),
+            merkle_root: None,
+            data_symbols: None,
+            parity_symbols: None,
+            padded_len: None,
+            blob_size: None,
+            file_hash: None,
         }
     }
 
@@ -129,7 +135,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -159,7 +165,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -214,7 +220,7 @@ mod tests {
         assert_eq!(inserted.nodes, json!(["NODE-1"]));
         assert!(inserted.transaction_id.is_none());
         assert_eq!(inserted.curation, json!({"notes": "ok"}));
-        assert_eq!(inserted.status, "new");
+        assert_eq!(inserted.status, "ready");
         assert!(
             !inserted.downloaded,
             "new agreements should start as not downloaded"
@@ -232,7 +238,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new|ready"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,

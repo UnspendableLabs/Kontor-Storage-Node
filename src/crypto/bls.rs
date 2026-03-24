@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 pub const HTTP_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_HTTP_SIG";
 
 /// Domain Separation Tag for agreement instruction signatures.
-pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"KONTOR_BLS_DST";
+pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// BLS key file name stored in app data directory.
 pub const BLS_KEY_FILENAME: &str = "bls_key.enc";
