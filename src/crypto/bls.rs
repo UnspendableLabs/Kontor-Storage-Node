@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 /// Domain Separation Tag for HTTP Message Signatures (RFC 9421).
 pub const HTTP_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_HTTP_SIG";
 
-/// Domain Separation Tag for agreement instruction signatures.
-pub const AGREEMENT_SIGNATURE_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
+/// Domain Separation Tag for Kontor operation signatures (KONTOR_BLS_DST).
+pub const KONTOR_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// BLS key file name stored in app data directory.
 pub const BLS_KEY_FILENAME: &str = "bls_key.enc";
@@ -118,10 +118,10 @@ impl BlsKeyPair {
         self.sign_with_dst(message, HTTP_SIGNATURE_DST)
     }
 
-    /// Sign a message with the BLS private key using the agreement signature DST.
+    /// Sign a message with the BLS private key using the Kontor operation DST.
     /// Returns the signature as a hex-encoded string (96 characters).
-    pub fn sign_agreement_instruction(&self, message: &[u8]) -> Result<String> {
-        self.sign_with_dst(message, AGREEMENT_SIGNATURE_DST)
+    pub fn sign_kontor_op_message(&self, message: &[u8]) -> Result<String> {
+        self.sign_with_dst(message, KONTOR_BLS_DST)
     }
 
     /// Sign a message with the BLS private key using a specific DST.
@@ -341,24 +341,24 @@ mod tests {
     }
 
     #[test]
-    fn sign_agreement_instruction_produces_valid_signature() {
+    fn sign_kontor_op_message_produces_valid_signature() {
         let keypair = BlsKeyPair::generate().unwrap();
         let message = b"agreement instruction data";
 
-        let signature = keypair.sign_agreement_instruction(message).unwrap();
+        let signature = keypair.sign_kontor_op_message(message).unwrap();
 
         // BLS12-381 MinSig signature is 48 bytes = 96 hex characters
         assert_eq!(signature.len(), 96);
 
-        // Verify with the agreement DST
+        // Verify with the Kontor operation DST
         let is_valid = BlsKeyPair::verify_signature_with_dst(
             &keypair.public_key_hex(),
             message,
             &signature,
-            AGREEMENT_SIGNATURE_DST,
+            KONTOR_BLS_DST,
         )
         .unwrap();
-        assert!(is_valid, "agreement signature should be valid");
+        assert!(is_valid, "kontor op signature should be valid");
     }
 
     #[test]
@@ -383,12 +383,12 @@ mod tests {
         // Sign with HTTP DST
         let signature = keypair.sign_http_message(message).unwrap();
 
-        // Try to verify with agreement DST
+        // Try to verify with Kontor operation DST
         let is_valid = BlsKeyPair::verify_signature_with_dst(
             &keypair.public_key_hex(),
             message,
             &signature,
-            AGREEMENT_SIGNATURE_DST,
+            KONTOR_BLS_DST,
         )
         .unwrap();
         assert!(!is_valid, "signature should not verify with wrong DST");

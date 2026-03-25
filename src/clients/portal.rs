@@ -17,7 +17,7 @@ const KONTOR_OP_PREFIX: &[u8] = b"KONTOR-OP-V1";
 const FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
 
 /// Default gas limit for filestorage contract calls.
-const DEFAULT_GAS_LIMIT: u64 = 50_000;
+const DEFAULT_GAS_LIMIT: u64 = 100_000;
 
 /// Kontor BlsBulkOp::Call representation for signing.
 ///
@@ -343,12 +343,14 @@ impl PortalClient {
         user_id: &str,
         challenge: &str,
         signature: &str,
+        expiration: Option<u64>,
     ) -> Result<LoginResponse> {
         let url = format!("{}/api/users/login", self.base_url);
         let payload = LoginRequest {
             user_id: user_id.to_string(),
             challenge: challenge.to_string(),
             signature: signature.to_string(),
+            expiration,
         };
         let resp = self.http.post(&url).json(&payload).send().await?;
         let resp = check_response_status(resp, "submit login").await?;
@@ -417,7 +419,7 @@ impl PortalClient {
         };
 
         let msg = op.signing_message()?;
-        let sig = auth.keypair.sign_agreement_instruction(&msg)?;
+        let sig = auth.keypair.sign_kontor_op_message(&msg)?;
         Ok((sig, nonce))
     }
 
@@ -750,6 +752,8 @@ struct LoginRequest {
     user_id: String,
     challenge: String,
     signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiration: Option<u64>,
 }
 
 #[allow(dead_code)]

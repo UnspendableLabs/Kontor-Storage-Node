@@ -116,7 +116,7 @@ pub async fn perform_onboarding_with_reader(
     // Horizon Portal verifies with `request.challenge.as_bytes()` (hex string UTF-8), not decoded bytes.
     let signature = keypair.sign_http_message(challenge.challenge.as_bytes())?;
     let login = client
-        .login_submit(&node_id, &challenge.challenge, &signature)
+        .login_submit(&node_id, &challenge.challenge, &signature, Some(0))
         .await?;
     writeln!(writer, "✓ Authenticated as {}", login.user_id)?;
 
