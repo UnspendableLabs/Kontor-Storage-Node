@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
     pub server_address: String,
 
+    /// Public URL where this node is reachable for file downloads (e.g. https://node1.example.com)
+    #[arg(long, env = "PUBLIC_URL", default_value = "http://localhost:8081")]
+    pub public_url: String,
+
     /// Path to the BLS key file (default: app data dir/bls_key.enc)
     /// For non-interactive mode, also set BLS_PASSWORD environment variable.
     #[arg(long, env = "BLS_KEY_PATH")]

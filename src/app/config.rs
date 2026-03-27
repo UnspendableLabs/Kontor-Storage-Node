@@ -49,6 +49,7 @@ pub struct Config {
     pub storage_gcs_bucket_name: Option<String>,
     pub storage_gcs_service_account_json: Option<String>,
     pub server_address: String,
+    pub public_url: String,
     pub bls_key_path: Option<PathBuf>,
 }
 
@@ -90,6 +91,7 @@ impl Config {
             storage_gcs_bucket_name: cli.storage_gcs_bucket_name.clone(),
             storage_gcs_service_account_json: cli.storage_gcs_service_account_json.clone(),
             server_address: cli.server_address.clone(),
+            public_url: cli.public_url.clone(),
             bls_key_path: cli.bls_key_path.clone(),
         })
     }
@@ -138,6 +140,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         }

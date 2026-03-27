@@ -177,6 +177,12 @@ pub async fn run_with_shutdown(
                 onboarding_result.next_nonce,
             );
 
+            if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
+                tracing::warn!("Failed to announce node URL: {e}");
+            } else {
+                writeln!(writer, "✓ Announced public URL: {}", config.public_url)?;
+            }
+
             let daemon_config = build_daemon_config(&config, authenticated_client, node_id).await?;
             run_daemon_command(daemon_config, shutdown).await?;
         }
@@ -342,6 +348,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         };
@@ -400,6 +407,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         };
@@ -447,6 +455,7 @@ mod tests {
                 service_account_path.to_string_lossy().to_string(),
             ),
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         };
@@ -494,6 +503,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         };
@@ -546,6 +556,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
             command: Commands::Ping,
         };
@@ -621,6 +632,12 @@ mod tests {
             .mount(mock_server)
             .await;
 
+        Mock::given(method("PUT"))
+            .and(path("/api/nodes/announce"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(mock_server)
+            .await;
+
         key_path
     }
 
@@ -666,6 +683,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
             command: Commands::Run,
         };
@@ -743,6 +761,7 @@ mod tests {
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
             command: Commands::Run,
         };

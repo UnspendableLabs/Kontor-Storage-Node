@@ -257,6 +257,29 @@ impl PortalClient {
         format!("{}{}", self.base_url, path)
     }
 
+    /// Announce this node's public URL to the Portal.
+    ///
+    /// Requires authentication via JWT Bearer token.
+    pub async fn announce_node(&self, public_url: &str) -> Result<()> {
+        let path = "/api/nodes/announce";
+        let url = self.api_path(path);
+
+        let body = serde_json::json!({ "public_url": public_url });
+        let body_bytes =
+            serde_json::to_vec(&body).context("failed to serialize announce request")?;
+
+        let request = self.build_signed_request(
+            Method::PUT,
+            &url,
+            path,
+            Some((&body_bytes, "application/json")),
+        )?;
+
+        let resp = request.body(body_bytes).send().await?;
+        check_response_status(resp, "announce node URL").await?;
+        Ok(())
+    }
+
     /// Fetches all pages using the provided page fetcher function.
     ///
     /// This generic helper handles the common pagination pattern used across
