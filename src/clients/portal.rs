@@ -793,7 +793,7 @@ pub struct LoginResponse {
 pub struct RegistryEntry {
     pub signer_id: u64,
     pub x_only_pubkey: String,
-    pub bls_pubkey: String,
+    pub bls_pubkey: Option<String>,
     pub next_nonce: u64,
 }
 
