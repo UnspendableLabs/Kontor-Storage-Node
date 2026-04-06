@@ -33,9 +33,27 @@ pub struct DaemonConfig {
     pub node_id: String,
 }
 
-/// Run the application with the default shutdown signal (Ctrl+C).
+/// Wait for a shutdown signal (SIGINT or SIGTERM).
+/// On Unix, this handles both signals; on other platforms, only SIGINT.
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal as unix_signal, SignalKind};
+        let mut sigterm = unix_signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = signal::ctrl_c() => result,
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await
+    }
+}
+
+/// Run the application with the default shutdown signal (SIGINT/SIGTERM).
 pub async fn run(cli: Cli, writer: impl Write) -> Result<()> {
-    run_with_shutdown(cli, writer, signal::ctrl_c()).await
+    run_with_shutdown(cli, writer, shutdown_signal()).await
 }
 
 /// Print configuration information to the writer.
