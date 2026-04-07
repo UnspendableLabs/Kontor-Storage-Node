@@ -1449,4 +1449,236 @@ mod tests {
             "expected error to include status, got {err}"
         );
     }
+
+    #[test]
+    fn portal_auth_debug_redacts_token_and_keypair() {
+        use super::PortalAuth;
+        use std::sync::atomic::AtomicU64;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let auth = PortalAuth {
+            keypair,
+            node_id: "NODE-debug".to_string(),
+            signer_id: 42,
+            token: "secret-token".to_string(),
+            next_nonce: Arc::new(AtomicU64::new(7)),
+        };
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("NODE-debug"));
+        assert!(debug.contains("42"));
+        assert!(debug.contains("<redacted>"), "token should be redacted");
+        assert!(
+            debug.contains("<BlsKeyPair>"),
+            "keypair should be placeholder"
+        );
+        assert!(
+            !debug.contains("secret-token"),
+            "raw token should not appear"
+        );
+    }
+
+    #[test]
+    fn portal_client_debug_shows_base_url() {
+        let client = PortalClient::new("https://example.com/api", "/tmp/storage");
+        let debug = format!("{client:?}");
+        assert!(debug.contains("PortalClient"));
+        assert!(debug.contains("https://example.com/api"));
+    }
+
+    #[test]
+    fn signer_id_returns_none_when_unauthenticated() {
+        let client = PortalClient::new("https://example.com/api", "/tmp/storage");
+        assert!(client.signer_id().is_none());
+    }
+
+    #[test]
+    fn signer_id_returns_some_when_authenticated() {
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            "https://example.com/api",
+            "/tmp/storage",
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+        assert_eq!(client.signer_id(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn announce_node_sends_authenticated_request() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/nodes/announce"))
+            .and(header_exists("Authorization"))
+            .and(header_exists("Content-Digest"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("announce"),
+            keypair,
+            "NODE-announce",
+            42,
+            "test-jwt-token",
+            0,
+        );
+
+        let result = client.announce_node("https://my-node.example.com").await;
+        assert!(result.is_ok(), "announce should succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn announce_node_returns_error_on_failure() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/nodes/announce"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("announce_fail"),
+            keypair,
+            "NODE-announce",
+            42,
+            "test-jwt-token",
+            0,
+        );
+
+        let err = client
+            .announce_node("https://bad.example.com")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("status 403"),
+            "expected 403 error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_fetches_all_pages_for_agreements() {
+        let mock_server = MockServer::start().await;
+
+        // Page 1: offset=0, returns 2 of 3 total
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 2,
+                "total": 3,
+                "agreements": [
+                    {
+                        "agreement_id": "AGR-1", "user_id": "u1", "file_id": "F-1",
+                        "filename": "a.pdf", "mime_type": "application/pdf", "original_size": 10,
+                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "status": "ready", "created_at": "2024-01-01T00:00:00Z"
+                    },
+                    {
+                        "agreement_id": "AGR-2", "user_id": "u1", "file_id": "F-2",
+                        "filename": "b.pdf", "mime_type": "application/pdf", "original_size": 20,
+                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "status": "ready", "created_at": "2024-01-02T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Page 2: offset=2, returns 1 of 3 total
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .and(query_param("offset", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 2,
+                "limit": 2,
+                "total": 3,
+                "agreements": [
+                    {
+                        "agreement_id": "AGR-3", "user_id": "u1", "file_id": "F-3",
+                        "filename": "c.pdf", "mime_type": "application/pdf", "original_size": 30,
+                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "status": "ready", "created_at": "2024-01-03T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("pagination"));
+        let agreements = client.get_new_agreements().await.unwrap();
+
+        assert_eq!(agreements.len(), 3, "should fetch all 3 agreements");
+        assert_eq!(agreements[0].agreement_id, "AGR-1");
+        assert_eq!(agreements[2].agreement_id, "AGR-3");
+    }
+
+    #[tokio::test]
+    async fn get_node_challenges_fetches_challenges() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-chal/challenges"))
+            .and(query_param("status", "active"))
+            .and(query_param("offset", "0"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 1,
+                "challenges": [{
+                    "challenge_id": "CHAL-1",
+                    "agreement_id": "AGR-1",
+                    "block_height": 100,
+                    "challenge_count": 5,
+                    "seed": "abc123",
+                    "prover_id": "NODE-chal",
+                    "deadline_height": 200,
+                    "status": "active",
+                    "proof": null,
+                    "bls_signature": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2024-01-01T00:00:00Z"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("challenges"),
+            keypair,
+            "NODE-chal",
+            42,
+            "jwt-token",
+            0,
+        );
+        let challenges = client.get_node_challenges().await.unwrap();
+
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].challenge_id, "CHAL-1");
+    }
+
+    #[tokio::test]
+    async fn get_node_challenges_requires_authentication() {
+        let client = PortalClient::new("http://localhost:1234", storage_dir("chal_no_auth"));
+        let err = client.get_node_challenges().await.unwrap_err();
+        assert!(
+            err.to_string().contains("authentication required"),
+            "expected auth error, got {err}"
+        );
+    }
 }

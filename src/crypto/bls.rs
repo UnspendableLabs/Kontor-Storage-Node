@@ -493,4 +493,80 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("32 bytes"));
     }
+
+    #[tokio::test]
+    async fn load_encrypted_rejects_unsupported_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(unique_filename());
+
+        let key_file = serde_json::json!({
+            "version": 99,
+            "salt": vec![0u8; 16],
+            "nonce": vec![0u8; 12],
+            "ciphertext": vec![0u8; 32],
+        });
+        tokio::fs::write(&path, serde_json::to_string_pretty(&key_file).unwrap())
+            .await
+            .unwrap();
+
+        let result = BlsKeyPair::load_encrypted(&path, "password").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported key file version"),
+            "error should mention unsupported version"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_encrypted_rejects_corrupted_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(unique_filename());
+
+        tokio::fs::write(&path, "not valid json").await.unwrap();
+
+        let result = BlsKeyPair::load_encrypted(&path, "password").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("parse encrypted key file"),
+            "error should mention parsing"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_encrypted_rejects_missing_file() {
+        let path = std::path::Path::new("/nonexistent/path/key.enc");
+        let result = BlsKeyPair::load_encrypted(path, "password").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("read encrypted key file"),
+            "error should mention reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_encrypted_creates_parent_directory() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("sub").join("dir").join(unique_filename());
+
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair
+            .save_encrypted(&nested, "password123")
+            .await
+            .unwrap();
+
+        assert!(nested.exists(), "key file should be created in nested dir");
+        let loaded = BlsKeyPair::load_encrypted(&nested, "password123")
+            .await
+            .unwrap();
+        assert_eq!(loaded.public_key_hex(), keypair.public_key_hex());
+    }
 }

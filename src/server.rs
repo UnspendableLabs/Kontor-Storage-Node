@@ -524,4 +524,80 @@ mod tests {
         let resp = ListFilesError::Internal("boom".into()).into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[tokio::test]
+    async fn node_info_returns_node_id() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-info-test".to_string(),
+        };
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["node_id"], "NODE-info-test");
+    }
+
+    #[tokio::test]
+    async fn dashboard_returns_html() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-dash".to_string(),
+        };
+
+        let app = router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ct.contains("text/html"),
+            "expected text/html content type, got {ct}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.is_empty(), "dashboard HTML should not be empty");
+    }
+
+    #[test]
+    fn download_error_not_ready_returns_conflict() {
+        let resp = DownloadError::NotReady.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn list_files_error_bad_request_returns_400() {
+        let resp = ListFilesError::BadRequest("bad".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

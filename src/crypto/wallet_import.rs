@@ -237,4 +237,134 @@ mod tests {
         let result = decrypt_wallet_blob(&blob, "password");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn wrong_salt_length_is_rejected() {
+        // Salt decodes to 8 bytes instead of the expected 16
+        let short_salt_b64 = STANDARD.encode([7u8; 8]);
+        let iv_b64 = STANDARD.encode([8u8; 16]);
+        let ct_b64 = STANDARD.encode(b"fake_ciphertext_data");
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{short_salt_b64}::{iv_b64}{ct_b64}");
+        let blob = hex::encode(payload.as_bytes());
+        let result = decrypt_wallet_blob(&blob, "password");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{EXPECTED_DECODED_SALT_BYTES} bytes")),
+            "error should mention expected salt size"
+        );
+    }
+
+    #[test]
+    fn segment_3_too_short_for_iv() {
+        let salt_b64 = STANDARD.encode([9u8; 16]);
+        // segment 3 is shorter than IV_BASE64_LEN (24 chars)
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{salt_b64}::short");
+        let blob = hex::encode(payload.as_bytes());
+        let result = decrypt_wallet_blob(&blob, "password");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("too short to contain IV"),
+            "error should mention IV"
+        );
+    }
+
+    #[test]
+    fn empty_ciphertext_is_rejected() {
+        let salt_b64 = STANDARD.encode([10u8; 16]);
+        let iv_b64 = STANDARD.encode([11u8; 16]);
+        // IV is present (24 base64 chars) but no ciphertext follows
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{salt_b64}::{iv_b64}");
+        let blob = hex::encode(payload.as_bytes());
+        let result = decrypt_wallet_blob(&blob, "password");
+        assert!(result.is_err());
+        // Either "ciphertext is empty" or "invalid base64" depending on empty decode
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_utf8_decrypted_payload_is_rejected() {
+        // Craft a blob that decrypts to non-UTF-8 bytes.
+        // We do this by encrypting non-UTF-8 plaintext using the test helper logic.
+        let password = "testpass12345678";
+        let salt = [12u8; 16];
+        let iv = [13u8; 16];
+
+        // Manually encrypt non-UTF-8 data
+        let params =
+            argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32)).unwrap();
+        let argon2 =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let salt_b64 = STANDARD.encode(salt);
+        let mut key = [0u8; 32];
+        argon2
+            .hash_password_into(password.as_bytes(), salt_b64.as_bytes(), &mut key)
+            .unwrap();
+
+        // 64 bytes of 0xFF followed by PKCS7 padding (16 bytes of 0x10)
+        let mut plaintext = vec![0xFFu8; 64];
+        let pad_len = 16 - (plaintext.len() % 16);
+        plaintext.resize(plaintext.len() + pad_len, pad_len as u8);
+
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&key, &iv).unwrap();
+        cipher.apply_keystream(&mut plaintext);
+
+        let iv_b64 = STANDARD.encode(iv);
+        let ct_b64 = STANDARD.encode(&plaintext);
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{salt_b64}::{iv_b64}{ct_b64}");
+        let blob = hex::encode(payload.as_bytes());
+
+        let result = decrypt_wallet_blob(&blob, password);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wrong_length_decrypted_key_is_rejected() {
+        // Encrypt a short hex key (only 32 chars instead of 64)
+        let short_key = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+        let password = "password12345678";
+        let salt = [14u8; 16];
+        let iv = [15u8; 16];
+
+        let params =
+            argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32)).unwrap();
+        let argon2 =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let salt_b64 = STANDARD.encode(salt);
+        let mut key = [0u8; 32];
+        argon2
+            .hash_password_into(password.as_bytes(), salt_b64.as_bytes(), &mut key)
+            .unwrap();
+
+        let pt = short_key.as_bytes();
+        let pad_len = 16 - (pt.len() % 16);
+        let mut padded = vec![0u8; pt.len() + pad_len];
+        padded[..pt.len()].copy_from_slice(pt);
+        cipher::block_padding::Pkcs7::raw_pad(&mut padded, pt.len());
+
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&key, &iv).unwrap();
+        cipher.apply_keystream(&mut padded);
+
+        let iv_b64 = STANDARD.encode(iv);
+        let ct_b64 = STANDARD.encode(&padded);
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{salt_b64}::{iv_b64}{ct_b64}");
+        let blob = hex::encode(payload.as_bytes());
+
+        let result = decrypt_wallet_blob(&blob, password);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{BLS_PRIVATE_KEY_HEX_LEN}-char")),
+            "error should mention expected key length"
+        );
+    }
 }

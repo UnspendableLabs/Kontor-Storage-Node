@@ -119,4 +119,85 @@ mod tests {
             "error should include body: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn execute_request_deserializes_json_on_success() {
+        use serde::Deserialize;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Payload {
+            name: String,
+            count: u32,
+        }
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "test", "count": 42})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = build_http_client().unwrap();
+        let resp = client.get(mock_server.uri()).send().await.unwrap();
+        let result: Payload = execute_request(resp, "fetch payload").await.unwrap();
+
+        assert_eq!(
+            result,
+            Payload {
+                name: "test".into(),
+                count: 42
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_request_returns_error_on_non_success_status() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&mock_server)
+            .await;
+
+        let client = build_http_client().unwrap();
+        let resp = client.get(mock_server.uri()).send().await.unwrap();
+        let result: Result<serde_json::Value> = execute_request(resp, "forbidden op").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("forbidden op failed with status 403"),
+            "error should include context: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_request_returns_error_on_invalid_json() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&mock_server)
+            .await;
+
+        let client = build_http_client().unwrap();
+        let resp = client.get(mock_server.uri()).send().await.unwrap();
+        let result: Result<serde_json::Value> = execute_request(resp, "parse test").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("deserialize"),
+            "error should mention deserialization: {err}"
+        );
+    }
 }
