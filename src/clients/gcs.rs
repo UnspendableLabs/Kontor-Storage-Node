@@ -114,7 +114,13 @@ impl GcsClient {
     }
 
     /// Upload raw bytes as an object named `object_name` into the configured bucket.
-    pub async fn upload_bytes(&self, object_name: &str, bytes: &[u8]) -> Result<()> {
+    /// When `content_type` is None or empty, uses `application/octet-stream`.
+    pub async fn upload_bytes(
+        &self,
+        object_name: &str,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<()> {
         let token = self.fetch_access_token().await?;
         let url = format!(
             "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
@@ -123,11 +129,16 @@ impl GcsClient {
             url_encode(object_name)
         );
 
+        let ct = content_type
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/octet-stream");
+
         let resp = self
             .http
             .post(url)
             .bearer_auth(token)
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", ct)
             .body(bytes.to_vec())
             .send()
             .await
@@ -489,7 +500,7 @@ mod tests {
             .and(query_param("uploadType", "media"))
             .and(query_param("name", "file.txt"))
             .and(header("authorization", "Bearer token-123"))
-            .and(header("content-type", "application/octet-stream"))
+            .and(header("content-type", "text/plain"))
             .and(body_bytes("hello"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&mock_server)
@@ -499,7 +510,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         client
-            .upload_bytes("file.txt", b"hello")
+            .upload_bytes("file.txt", b"hello", Some("text/plain"))
             .await
             .expect("upload should succeed");
     }
@@ -528,7 +539,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         let err = client
-            .upload_bytes("fail.bin", b"bytes")
+            .upload_bytes("fail.bin", b"bytes", None)
             .await
             .expect_err("upload should fail");
 

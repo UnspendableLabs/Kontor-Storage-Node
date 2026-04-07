@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     Json,
 };
 use http::response::Builder;
@@ -41,9 +41,17 @@ pub async fn dashboard() -> Response {
         .unwrap()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DownloadFileQuery {
+    /// When true, serve with `Content-Disposition: inline` and do not force attachment on GCS.
+    #[serde(default)]
+    pub inline: bool,
+}
+
 pub async fn download_file(
     State(state): State<DownloadServerState>,
     Path(file_id): Path<String>,
+    Query(query): Query<DownloadFileQuery>,
 ) -> Result<Response, DownloadError> {
     let agreement = Agreements::find()
         .filter(agreements::Column::FileId.eq(file_id.clone()))
@@ -57,8 +65,8 @@ pub async fn download_file(
     }
 
     match state.storage_backend.method {
-        StorageMethod::Local => serve_local(&state, &agreement, &file_id).await,
-        StorageMethod::Gcs => serve_gcs(&state, &agreement, &file_id).await,
+        StorageMethod::Local => serve_local(&state, &agreement, &file_id, query.inline).await,
+        StorageMethod::Gcs => serve_gcs(&state, &agreement, &file_id, query.inline).await,
     }
 }
 
@@ -150,6 +158,7 @@ async fn serve_local(
     state: &DownloadServerState,
     agreement: &agreements::Model,
     file_id: &str,
+    inline: bool,
 ) -> Result<Response, DownloadError> {
     let path = state.storage_dir.join(file_id);
     let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
@@ -182,7 +191,7 @@ async fn serve_local(
     })?;
 
     let stream = ReaderStream::new(file);
-    let builder = response_builder(agreement)?;
+    let builder = response_builder(agreement, inline)?;
     builder
         .body(Body::from_stream(stream))
         .map_err(|err| DownloadError::Internal(err.to_string()))
@@ -192,28 +201,46 @@ async fn serve_gcs(
     state: &DownloadServerState,
     agreement: &agreements::Model,
     file_id: &str,
+    inline: bool,
 ) -> Result<Response, DownloadError> {
     let client = state
         .storage_backend
         .gcs_client()
         .ok_or(DownloadError::StorageUnavailable)?;
 
+    let force_download = !inline;
     let download_url = client
-        .create_signed_download_url(file_id, true, Some(&agreement.filename))
+        .create_signed_download_url(file_id, force_download, Some(&agreement.filename))
         .map_err(|err| DownloadError::Upstream(format!("gcs signed url failed: {err}")))?;
 
-    Ok(Redirect::temporary(&download_url).into_response())
+    let location = HeaderValue::from_str(&download_url)
+        .map_err(|err| DownloadError::Internal(format!("invalid redirect URL: {err}")))?;
+
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, location)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, HEAD, OPTIONS"),
+        )
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+        .body(Body::empty())
+        .map_err(|err| DownloadError::Internal(err.to_string()))
 }
 
 /// Build the response headers for a file download.
-pub fn response_builder(agreement: &agreements::Model) -> Result<Builder, DownloadError> {
+pub fn response_builder(
+    agreement: &agreements::Model,
+    inline: bool,
+) -> Result<Builder, DownloadError> {
     let mut builder: Builder = Response::builder().status(StatusCode::OK);
 
     let mime = header_value_or_default(&agreement.mime_type, "application/octet-stream")
         .map_err(DownloadError::Internal)?;
     builder = builder.header(header::CONTENT_TYPE, mime);
 
-    if let Some(value) = content_disposition(&agreement.filename)? {
+    if let Some(value) = content_disposition(&agreement.filename, inline)? {
         builder = builder.header(header::CONTENT_DISPOSITION, value);
     }
 
@@ -240,12 +267,17 @@ fn header_value_or_default(value: &str, default: &str) -> Result<HeaderValue, St
     HeaderValue::from_str(chosen).map_err(|err| err.to_string())
 }
 
-fn content_disposition(filename: &str) -> Result<Option<HeaderValue>, DownloadError> {
+fn content_disposition(filename: &str, inline: bool) -> Result<Option<HeaderValue>, DownloadError> {
     if filename.trim().is_empty() {
         return Ok(None);
     }
     let escaped = filename.replace('"', "\\\"");
-    HeaderValue::from_str(&format!("attachment; filename=\"{}\"", escaped))
+    let disposition = if inline {
+        format!("inline; filename=\"{}\"", escaped)
+    } else {
+        format!("attachment; filename=\"{}\"", escaped)
+    };
+    HeaderValue::from_str(&disposition)
         .map(Some)
         .map_err(|err| DownloadError::Internal(format!("invalid filename: {err}")))
 }
@@ -318,5 +350,5 @@ impl IntoResponse for ListFilesError {
 /// Test helper to access response_builder from tests.
 #[cfg(test)]
 pub fn response_builder_test(agreement: &agreements::Model) -> Result<Builder, DownloadError> {
-    response_builder(agreement)
+    response_builder(agreement, false)
 }

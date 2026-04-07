@@ -57,7 +57,7 @@ rpassword = "7.3"
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 postcard = { version = "1.1", features = ["alloc"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 [dev-dependencies]
 wiremock = "0.6"

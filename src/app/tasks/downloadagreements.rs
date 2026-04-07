@@ -290,7 +290,11 @@ async fn store_agreement_file(
 
     if let Some(gcs) = gcs_client {
         if let Err(err) = gcs
-            .upload_bytes(&agreement.file_id, downloaded.bytes.as_ref())
+            .upload_bytes(
+                &agreement.file_id,
+                downloaded.bytes.as_ref(),
+                Some(agreement.mime_type.as_str()),
+            )
             .await
         {
             cleanup_guard.cleanup().await;
