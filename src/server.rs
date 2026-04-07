@@ -595,6 +595,41 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_local_returns_internal_when_file_not_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        let file_path = storage_dir.join("FILE-noperm");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        tokio::fs::write(&file_path, b"data").await.unwrap();
+
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        insert_agreement(&db, "FILE-noperm", "noperm.bin", 4, true).await;
+
+        let response = router(DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/files/FILE-noperm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).ok();
+    }
+
     #[test]
     fn list_files_error_bad_request_returns_400() {
         let resp = ListFilesError::BadRequest("bad".into()).into_response();

@@ -250,6 +250,60 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn default_app_dir_uses_kontor_app_dir_env_var() {
+        let prev = std::env::var(APP_DIR_ENV_VAR).ok();
+        std::env::set_var(APP_DIR_ENV_VAR, "/custom/kontor/dir");
+
+        let result = default_app_dir();
+        assert_eq!(result, Some(PathBuf::from("/custom/kontor/dir")));
+
+        match prev {
+            Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+            None => std::env::remove_var(APP_DIR_ENV_VAR),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_app_dir_ignores_empty_kontor_app_dir_env_var() {
+        let prev = std::env::var(APP_DIR_ENV_VAR).ok();
+        std::env::set_var(APP_DIR_ENV_VAR, "");
+
+        let result = default_app_dir();
+        // Should fall through to dirs::data_dir(), not return Some("")
+        assert_ne!(result, Some(PathBuf::from("")));
+
+        match prev {
+            Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+            None => std::env::remove_var(APP_DIR_ENV_VAR),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn with_data_dir_override_restores_previous_env_var() {
+        std::env::set_var(APP_DIR_ENV_VAR, "/previous/value");
+
+        let dir = unique_test_path("restore_env");
+        let result = with_data_dir_override(Some(dir), || {
+            assert!(
+                std::env::var(APP_DIR_ENV_VAR).is_err(),
+                "env var should be cleared during override"
+            );
+            42
+        });
+
+        assert_eq!(result, 42);
+        assert_eq!(
+            std::env::var(APP_DIR_ENV_VAR).unwrap(),
+            "/previous/value",
+            "env var should be restored after override"
+        );
+        std::env::remove_var(APP_DIR_ENV_VAR);
+    }
+
+    #[test]
     fn default_storage_dir_falls_back_when_no_dir_available() {
         let dir = with_data_dir_override(None, default_storage_dir);
         assert_eq!(dir, PathBuf::from(DEFAULT_FILES_DIR));

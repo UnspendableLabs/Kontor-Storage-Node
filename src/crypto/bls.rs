@@ -420,6 +420,16 @@ mod tests {
             .contains("invalid signature"));
     }
 
+    #[test]
+    fn derive_key_with_existing_salt_uses_provided_salt() {
+        let salt = vec![42u8; SALT_SIZE];
+        let result = derive_key("test-password", Some(&salt)).unwrap();
+        assert_eq!(result.salt, salt, "should use the provided salt");
+
+        let result2 = derive_key("test-password", Some(&salt)).unwrap();
+        assert_eq!(*result.key, *result2.key, "same salt + password → same key");
+    }
+
     #[tokio::test]
     async fn save_and_load_encrypted_roundtrip() {
         let dir = tempdir().unwrap();

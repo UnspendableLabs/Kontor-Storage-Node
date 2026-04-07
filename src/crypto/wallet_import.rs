@@ -275,6 +275,25 @@ mod tests {
     }
 
     #[test]
+    fn wrong_iv_length_is_rejected() {
+        let salt_b64 = STANDARD.encode([9u8; 16]);
+        // 24 base64 chars without padding decodes to 18 bytes, not the expected 16
+        let iv_b64_wrong = "AAAAAAAAAAAAAAAAAAAAAAAA";
+        let ct_b64 = STANDARD.encode(b"some_fake_ciphertext");
+        let payload = format!("A2::v=19::m=65536,t=6,p=4::{salt_b64}::{iv_b64_wrong}{ct_b64}");
+        let blob = hex::encode(payload.as_bytes());
+        let result = decrypt_wallet_blob(&blob, "password");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{EXPECTED_IV_LEN}-byte IV")),
+            "error should mention expected IV size"
+        );
+    }
+
+    #[test]
     fn empty_ciphertext_is_rejected() {
         let salt_b64 = STANDARD.encode([10u8; 16]);
         let iv_b64 = STANDARD.encode([11u8; 16]);
