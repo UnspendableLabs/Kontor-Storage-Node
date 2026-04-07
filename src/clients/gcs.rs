@@ -196,11 +196,15 @@ impl GcsClient {
     }
 
     /// Create a V4 signed download URL, matching the Horizon-Portal behavior (direct redirect to GCS).
+    ///
+    /// When `force_download` is false, `inline_content_type` may supply `response-content-type` on
+    /// the signed URL so browsers render images instead of GCS default `application/octet-stream`.
     pub fn create_signed_download_url(
         &self,
         object_name: &str,
         force_download: bool,
         filename: Option<&str>,
+        inline_content_type: Option<&str>,
     ) -> Result<String> {
         let private_key = self.parse_private_key()?;
         let (x_goog_date, short_date) = Self::timestamp_strings();
@@ -228,11 +232,28 @@ impl GcsClient {
         ];
 
         if force_download {
-            let disposition = Self::content_disposition(filename);
+            let disposition = Self::content_disposition_attachment(filename);
             query_params.push((
                 "response-content-disposition".to_string(),
                 url_encode(&disposition).to_string(),
             ));
+        } else {
+            // Without this, GCS uses object metadata; uploads are often octet-stream + attachment,
+            // which forces download in browsers even when our app passed inline=true.
+            let disposition = Self::content_disposition_inline(filename);
+            query_params.push((
+                "response-content-disposition".to_string(),
+                url_encode(&disposition).to_string(),
+            ));
+            if let Some(ct) = inline_content_type {
+                let trimmed = ct.trim();
+                if !trimmed.is_empty() && trimmed != "application/octet-stream" {
+                    query_params.push((
+                        "response-content-type".to_string(),
+                        url_encode(trimmed).to_string(),
+                    ));
+                }
+            }
         }
 
         query_params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -311,10 +332,17 @@ impl GcsClient {
             .join("&")
     }
 
-    fn content_disposition(filename: Option<&str>) -> String {
+    fn content_disposition_attachment(filename: Option<&str>) -> String {
         filename.map_or_else(
             || "attachment".to_string(),
             |fname| format!("attachment; filename=\"{}\"", fname.replace('"', "\\\"")),
+        )
+    }
+
+    fn content_disposition_inline(filename: Option<&str>) -> String {
+        filename.map_or_else(
+            || "inline".to_string(),
+            |fname| format!("inline; filename=\"{}\"", fname.replace('"', "\\\"")),
         )
     }
 
@@ -694,7 +722,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         let url = client
-            .create_signed_download_url("folder/file name.pdf", true, Some("file name.pdf"))
+            .create_signed_download_url("folder/file name.pdf", true, Some("file name.pdf"), None)
             .expect("signed url should be generated");
 
         assert!(
@@ -723,14 +751,55 @@ mod tests {
 
     #[test]
     fn content_disposition_encodes_filenames() {
-        let with_name = GcsClient::content_disposition(Some("a \"weird\" name.txt"));
+        let with_name = GcsClient::content_disposition_attachment(Some("a \"weird\" name.txt"));
         assert_eq!(
             with_name, "attachment; filename=\"a \\\"weird\\\" name.txt\"",
             "quotes should be escaped"
         );
 
-        let defaulted = GcsClient::content_disposition(None);
+        let defaulted = GcsClient::content_disposition_attachment(None);
         assert_eq!(defaulted, "attachment");
+
+        assert_eq!(
+            GcsClient::content_disposition_inline(Some("x.png")),
+            "inline; filename=\"x.png\""
+        );
+        assert_eq!(GcsClient::content_disposition_inline(None), "inline");
+    }
+
+    #[tokio::test]
+    async fn create_signed_download_url_inline_sets_disposition_and_content_type() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "redirect-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let url = client
+            .create_signed_download_url("photo.png", false, Some("photo.png"), Some("image/png"))
+            .expect("signed url should be generated");
+
+        assert!(
+            url.contains("response-content-disposition="),
+            "inline disposition should be signed: {url}"
+        );
+        assert!(
+            url.contains("response-content-type="),
+            "content-type override should be signed: {url}"
+        );
+        assert!(
+            url.contains("image%2Fpng") || url.contains("image/png"),
+            "image/png should appear in query: {url}"
+        );
     }
 
     #[tokio::test]

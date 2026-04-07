@@ -210,7 +210,16 @@ async fn serve_gcs(
 
     let force_download = !inline;
     let download_url = client
-        .create_signed_download_url(file_id, force_download, Some(&agreement.filename))
+        .create_signed_download_url(
+            file_id,
+            force_download,
+            Some(&agreement.filename),
+            if inline {
+                Some(agreement.mime_type.as_str())
+            } else {
+                None
+            },
+        )
         .map_err(|err| DownloadError::Upstream(format!("gcs signed url failed: {err}")))?;
 
     let location = HeaderValue::from_str(&download_url)
