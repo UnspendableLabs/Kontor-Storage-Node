@@ -2,6 +2,7 @@ use crate::app::tasks::computeproofs::compute_and_submit_proofs;
 use crate::app::tasks::downloadagreements::{download_agreements, StorageBackend};
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::sync_ready_agreements;
+use crate::app::tasks::reconcile;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
@@ -65,6 +66,18 @@ async fn run_portal_daemon(
     // Ensure only a single daemon instance runs at a time.
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
+
+    if let Some(node_id) = portal_client.node_id() {
+        reconcile::reconcile_from_portal(
+            &portal_client,
+            &database,
+            node_id,
+            &storage_backend,
+            &storage_dir,
+        )
+        .await
+        .context("startup reconciliation failed")?;
+    }
 
     // Run immediately, then on each tick.
     sync_portal_once(

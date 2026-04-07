@@ -41,7 +41,7 @@ pub async fn sync_ready_agreements(
     .await
 }
 
-fn agreement_to_active_model(
+pub(crate) fn agreement_to_active_model(
     agreement: &crate::clients::portal::Agreement,
 ) -> Result<agreements::ActiveModel> {
     let nodes_json = JsonValue::Array(

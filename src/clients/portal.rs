@@ -417,6 +417,31 @@ impl PortalClient {
         Ok(page)
     }
 
+    /// Fetch all agreements assigned to a specific node (across all statuses).
+    ///
+    /// This method handles pagination automatically, fetching all pages.
+    /// Requires authentication via JWT Bearer token.
+    pub async fn get_node_agreements(&self, node_id: &str) -> Result<Vec<Agreement>> {
+        let node_id = node_id.to_string();
+        self.paginate(|offset| self.get_node_agreements_page(&node_id, offset))
+            .await
+    }
+
+    async fn get_node_agreements_page(&self, node_id: &str, offset: u32) -> Result<AgreementsPage> {
+        let path = format!("/api/agreements?nodes={node_id}&offset={offset}");
+        let url = self.api_path(&path);
+
+        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
+
+        let resp = request.send().await?;
+        let resp = check_response_status(resp, "fetch node agreements").await?;
+        let page = resp
+            .json::<AgreementsPage>()
+            .await
+            .context("failed to deserialize node agreements page")?;
+        Ok(page)
+    }
+
     /// Sign a Kontor operation with BLS using the BlsBulkOp::Call protocol.
     ///
     /// This method:

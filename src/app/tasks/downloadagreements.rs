@@ -84,7 +84,7 @@ impl<'a> CleanupGuard<'a> {
 }
 
 #[derive(Debug)]
-enum PostProcessError {
+pub(crate) enum PostProcessError {
     Prepare(anyhow::Error),
     Metadata(anyhow::Error),
     Ledger(anyhow::Error),
@@ -480,7 +480,7 @@ async fn current_downloaded_count(database: &DatabaseConnection) -> Result<u64> 
     Ok(count)
 }
 
-async fn process_downloaded_file(
+pub(crate) async fn process_downloaded_file(
     saved_path: &Path,
     file_bytes: &[u8],
     agreement: &agreements::Model,
