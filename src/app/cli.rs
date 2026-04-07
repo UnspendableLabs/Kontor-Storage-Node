@@ -45,7 +45,7 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_GCS_BUCKET_NAME")]
     pub storage_gcs_bucket_name: Option<String>,
 
-    /// Path to GCS service account JSON file (required when storage_method is "gcs")
+    /// Path to GCS service account JSON file, or inline JSON (same as Portal: `[n]` = newline in env)
     #[arg(long, env = "STORAGE_GCS_SERVICE_ACCOUNT_JSON")]
     pub storage_gcs_service_account_json: Option<String>,
 

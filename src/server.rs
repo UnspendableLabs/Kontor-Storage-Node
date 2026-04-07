@@ -130,8 +130,7 @@ mod tests {
     async fn gcs_backend_with_key(key: &str) -> StorageBackend {
         let dir = unique_storage_dir("server").join("gcs");
         let sa = write_service_account_json(&dir, key);
-        let client = GcsClient::from_service_account_file("bucket", sa)
-            .await
+        let client = GcsClient::from_path_or_inline_json("bucket", &sa.to_string_lossy())
             .expect("service account should parse");
         StorageBackend {
             method: StorageMethod::Gcs,

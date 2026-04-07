@@ -116,12 +116,8 @@ async fn build_daemon_config(
     let storage_backend = StorageBackend::new(
         config.storage_method.clone(),
         config.storage_gcs_bucket_name.clone(),
-        config
-            .storage_gcs_service_account_json
-            .as_ref()
-            .map(PathBuf::from),
-    )
-    .await?;
+        config.storage_gcs_service_account_json.clone(),
+    )?;
 
     let lock_path = config.storage_dir.join(".portal-daemon.lock");
     let download_addr: SocketAddr = config

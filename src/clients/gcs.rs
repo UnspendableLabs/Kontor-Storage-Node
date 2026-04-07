@@ -36,6 +36,11 @@ struct AccessTokenResponse {
     access_token: String,
 }
 
+/// Replaces `[n]` with `\n` so multi-line secrets can be stored in env vars (same convention as Horizon Portal).
+fn unescape_json_string(input: &str) -> String {
+    input.replace("[n]", "\\n")
+}
+
 impl GcsClient {
     /// Normalize PEM strings that may contain escaped newlines (e.g. `\n` in env vars)
     /// or Windows-style CRLF escapes. Returns a PEM string with real `\n` line breaks.
@@ -48,15 +53,12 @@ impl GcsClient {
         unescaped.lines().collect::<Vec<_>>().join("\n")
     }
 
-    /// Build a client from a service account JSON file path.
-    pub async fn from_service_account_file(
+    fn from_service_account_json_contents(
         bucket: impl Into<String>,
-        service_account_json: impl AsRef<Path>,
+        contents: &str,
     ) -> Result<Self> {
-        let contents = fs::read_to_string(service_account_json.as_ref())
-            .with_context(|| "loading GCS service account json")?;
         let service_account: ServiceAccountKey =
-            serde_json::from_str(&contents).context("parsing GCS service account json")?;
+            serde_json::from_str(contents).context("parsing GCS service account json")?;
 
         let auth_url = service_account
             .token_uri
@@ -72,6 +74,19 @@ impl GcsClient {
             auth_url,
             endpoint_url: "https://storage.googleapis.com".to_string(),
         })
+    }
+
+    /// `raw` is either a filesystem path to service account JSON, or inline JSON (trimmed value
+    /// starting with `{`). Inline JSON uses Portal-style `[n]` → `\n` unescaping for newlines.
+    pub fn from_path_or_inline_json(bucket: impl Into<String>, raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let contents = if trimmed.starts_with('{') {
+            unescape_json_string(trimmed)
+        } else {
+            fs::read_to_string(Path::new(trimmed))
+                .with_context(|| format!("loading GCS service account json from {trimmed}"))?
+        };
+        Self::from_service_account_json_contents(bucket, &contents)
     }
 
     /// Test-only helper that allows overriding endpoints for mocking.
@@ -350,7 +365,9 @@ struct JwtClaims {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessTokenResponse, GcsClient, JwtClaims, ServiceAccountKey};
+    use super::{
+        unescape_json_string, AccessTokenResponse, GcsClient, JwtClaims, ServiceAccountKey,
+    };
     use bytes::Bytes;
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use reqwest::Client;
@@ -412,26 +429,45 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn from_service_account_file_reads_bucket_and_token_uri() {
+    #[test]
+    fn unescape_json_string_replaces_portal_newline_markers() {
+        assert_eq!(unescape_json_string("hello[n]world"), "hello\\nworld");
+        assert_eq!(unescape_json_string("no escapes"), "no escapes");
+        assert_eq!(unescape_json_string("[n][n]"), "\\n\\n");
+    }
+
+    #[test]
+    fn from_path_or_inline_json_reads_file_path() {
         let path = write_service_account_file(Some("https://auth.example/token"), true);
-        let client = GcsClient::from_service_account_file("bucket-1", &path)
-            .await
+        let client = GcsClient::from_path_or_inline_json("bucket-1", &path.to_string_lossy())
             .expect("should parse service account");
 
         assert_eq!(client.bucket, "bucket-1");
         assert_eq!(client.auth_url, "https://auth.example/token");
     }
 
-    #[tokio::test]
-    async fn from_service_account_file_uses_default_auth_url_when_missing() {
+    #[test]
+    fn from_path_or_inline_json_uses_default_auth_url_when_missing_in_file() {
         let path = write_service_account_file(None, true);
-        let client = GcsClient::from_service_account_file("bucket-2", &path)
-            .await
+        let client = GcsClient::from_path_or_inline_json("bucket-2", &path.to_string_lossy())
             .expect("should parse service account");
 
         assert_eq!(client.bucket, "bucket-2");
         assert_eq!(client.auth_url, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn from_path_or_inline_json_accepts_inline_json_with_n_escapes() {
+        let pem_line1 = "-----BEGIN PRIVATE KEY-----";
+        let pem_line2 = "LINE2";
+        let json = format!(
+            r#"{{"private_key":"{pem_line1}[n]{pem_line2}","client_email":"svc@example.com","token_uri":"https://oauth2.googleapis.com/token"}}"#
+        );
+        let client = GcsClient::from_path_or_inline_json("bucket-inline", &json)
+            .expect("inline json should parse");
+        assert_eq!(client.bucket, "bucket-inline");
+        assert!(client.service_account.private_key.contains('\n'));
+        assert!(client.service_account.private_key.contains(pem_line1));
     }
 
     #[tokio::test]

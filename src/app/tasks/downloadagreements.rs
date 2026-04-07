@@ -124,10 +124,13 @@ impl StorageBackend {
     }
 
     /// Build a storage backend, initializing the GCS client once when needed.
-    pub async fn new(
+    ///
+    /// When `STORAGE_METHOD=gcs`, `gcs_service_account_json` is either a path to a JSON key file,
+    /// or inline JSON (same as Horizon Portal: value trimmed to start with `{`, with `[n]` as newline escapes).
+    pub fn new(
         method: StorageMethod,
         gcs_bucket_name: Option<String>,
-        gcs_service_account_json: Option<PathBuf>,
+        gcs_service_account_json: Option<String>,
     ) -> Result<Self> {
         let gcs_client = match method {
             StorageMethod::Local => None,
@@ -135,15 +138,14 @@ impl StorageBackend {
                 let bucket = gcs_bucket_name.clone().ok_or_else(|| {
                     anyhow!("STORAGE_GCS_BUCKET_NAME is required when STORAGE_METHOD is gcs")
                 })?;
-                let service_account = gcs_service_account_json.clone().ok_or_else(|| {
+                let raw = gcs_service_account_json.clone().ok_or_else(|| {
                     anyhow!(
                         "STORAGE_GCS_SERVICE_ACCOUNT_JSON is required when STORAGE_METHOD is gcs"
                     )
                 })?;
 
                 Some(Arc::new(
-                    GcsClient::from_service_account_file(bucket, service_account)
-                        .await
+                    GcsClient::from_path_or_inline_json(bucket, &raw)
                         .context("initializing GCS client")?,
                 ))
             }
@@ -670,13 +672,8 @@ mod tests {
 
     #[tokio::test]
     async fn storage_backend_new_requires_bucket_for_gcs() {
-        let err = StorageBackend::new(
-            StorageMethod::Gcs,
-            None,
-            Some(PathBuf::from("/tmp/sa.json")),
-        )
-        .await
-        .unwrap_err();
+        let err = StorageBackend::new(StorageMethod::Gcs, None, Some("/tmp/sa.json".to_string()))
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("STORAGE_GCS_BUCKET_NAME"),
@@ -686,9 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_backend_new_requires_service_account_for_gcs() {
-        let err = StorageBackend::new(StorageMethod::Gcs, Some("bucket".into()), None)
-            .await
-            .unwrap_err();
+        let err = StorageBackend::new(StorageMethod::Gcs, Some("bucket".into()), None).unwrap_err();
 
         assert!(
             err.to_string().contains("STORAGE_GCS_SERVICE_ACCOUNT_JSON"),
@@ -1866,9 +1861,8 @@ mod tests {
         let backend = StorageBackend::new(
             StorageMethod::Gcs,
             Some("my-bucket".into()),
-            Some(sa_path.clone()),
+            Some(sa_path.to_string_lossy().to_string()),
         )
-        .await
         .expect("should initialize GCS backend");
 
         assert_eq!(backend.method, StorageMethod::Gcs);
@@ -1876,6 +1870,23 @@ mod tests {
             backend.gcs_client.is_some(),
             "gcs_client should be initialized"
         );
+    }
+
+    #[test]
+    fn storage_backend_new_initializes_gcs_client_with_inline_json() {
+        let inline = serde_json::json!({
+            "private_key": TEST_PRIVATE_KEY.replace('\n', "[n]"),
+            "client_email": "svc@example.com",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        })
+        .to_string();
+
+        let backend =
+            StorageBackend::new(StorageMethod::Gcs, Some("my-bucket".into()), Some(inline))
+                .expect("inline GCS backend should initialize");
+
+        assert_eq!(backend.method, StorageMethod::Gcs);
+        assert!(backend.gcs_client.is_some());
     }
 
     #[tokio::test]
@@ -2566,7 +2577,6 @@ mod tests {
     #[tokio::test]
     async fn storage_backend_local_does_not_initialize_gcs() {
         let backend = StorageBackend::new(StorageMethod::Local, None, None)
-            .await
             .expect("local backend should succeed without GCS params");
 
         assert_eq!(backend.method, StorageMethod::Local);
