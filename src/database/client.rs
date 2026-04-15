@@ -12,33 +12,69 @@ const DEFAULT_DB_DIR: &str = "Kontor-Storage-Node";
 const DEFAULT_DB_FILE: &str = "storage.db";
 const DEFAULT_FILES_DIR: &str = "files";
 
+/// Environment variable to override the application data directory.
+/// This is primarily intended for testing to avoid writing to the real app directory.
+const APP_DIR_ENV_VAR: &str = "KONTOR_APP_DIR";
+
+// Thread-local override for testing scenarios where we need to simulate
+// the absence of a data directory (when `dirs::data_dir()` returns None).
 #[cfg(test)]
 thread_local! {
     static DATA_DIR_OVERRIDE: RefCell<Option<Option<PathBuf>>> = const { RefCell::new(None) };
 }
 
-fn data_dir() -> Option<PathBuf> {
+/// Returns the default application data directory.
+///
+/// Priority:
+/// 1. Thread-local override (test-only, for simulating None)
+/// 2. `KONTOR_APP_DIR` environment variable (for testing/custom deployments)
+/// 3. Platform-specific data directory (e.g. `~/.local/share/Kontor-Storage-Node`)
+#[must_use]
+pub fn default_app_dir() -> Option<PathBuf> {
+    // In tests, check thread-local override first (used to simulate None)
     #[cfg(test)]
     {
         if let Some(overridden) = DATA_DIR_OVERRIDE.with(|cell| cell.borrow().clone()) {
-            return overridden;
+            return overridden.map(|dir| dir.join(DEFAULT_DB_DIR));
         }
     }
 
-    dirs::data_dir()
+    // Check environment variable (useful for tests and custom deployments)
+    if let Ok(dir) = std::env::var(APP_DIR_ENV_VAR) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+
+    dirs::data_dir().map(|dir| dir.join(DEFAULT_DB_DIR))
 }
 
+/// Runs a closure with the data directory overridden.
+/// Pass `Some(path)` to override to a specific path, or `None` to simulate no data directory.
+/// This also temporarily clears the environment variable to prevent interference.
 #[cfg(test)]
 fn with_data_dir_override<F, T>(value: Option<PathBuf>, f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    DATA_DIR_OVERRIDE.with(|cell| {
+    // Save and clear env var to prevent interference
+    let prev_env = std::env::var(APP_DIR_ENV_VAR).ok();
+    std::env::remove_var(APP_DIR_ENV_VAR);
+
+    let result = DATA_DIR_OVERRIDE.with(|cell| {
         let previous = cell.replace(Some(value));
         let result = f();
         cell.replace(previous);
         result
-    })
+    });
+
+    // Restore env var
+    match prev_env {
+        Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+        None => std::env::remove_var(APP_DIR_ENV_VAR),
+    }
+
+    result
 }
 
 /// Convenience wrapper around a SeaORM database connection that ensures
@@ -82,12 +118,6 @@ pub fn default_database_url() -> String {
     "sqlite::memory:".to_string()
 }
 
-/// Returns the default application data directory (e.g. `~/.local/share/Kontor-Storage-Node`).
-#[must_use]
-pub fn default_app_dir() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join(DEFAULT_DB_DIR))
-}
-
 /// Returns the default directory used to store downloaded files.
 #[must_use]
 pub fn default_storage_dir() -> PathBuf {
@@ -117,27 +147,13 @@ async fn connect(database_url: &str) -> Result<DatabaseConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutils::{unique_db_path, unique_test_path};
     use sea_orm_migration::SchemaManager;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join("database_client")
-    }
-
-    fn unique_db_path(prefix: &str) -> PathBuf {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        test_root().join(format!("kontor_storage_node_test_{prefix}_{id}.sqlite"))
-    }
 
     #[test]
     fn default_database_url_uses_data_dir_override() {
-        let dir = test_root().join("data_dir_override");
+        let dir = unique_test_path("data_dir_override");
         fs::create_dir_all(&dir).unwrap();
 
         let url = with_data_dir_override(Some(dir.clone()), default_database_url);
@@ -152,7 +168,7 @@ mod tests {
 
     #[test]
     fn default_storage_dir_uses_app_dir_override() {
-        let dir = test_root().join("storage_dir_override");
+        let dir = unique_test_path("storage_dir_override");
         fs::create_dir_all(&dir).unwrap();
 
         let storage_dir = with_data_dir_override(Some(dir.clone()), default_storage_dir);
@@ -231,6 +247,60 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_app_dir_uses_kontor_app_dir_env_var() {
+        let prev = std::env::var(APP_DIR_ENV_VAR).ok();
+        std::env::set_var(APP_DIR_ENV_VAR, "/custom/kontor/dir");
+
+        let result = default_app_dir();
+        assert_eq!(result, Some(PathBuf::from("/custom/kontor/dir")));
+
+        match prev {
+            Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+            None => std::env::remove_var(APP_DIR_ENV_VAR),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_app_dir_ignores_empty_kontor_app_dir_env_var() {
+        let prev = std::env::var(APP_DIR_ENV_VAR).ok();
+        std::env::set_var(APP_DIR_ENV_VAR, "");
+
+        let result = default_app_dir();
+        // Should fall through to dirs::data_dir(), not return Some("")
+        assert_ne!(result, Some(PathBuf::from("")));
+
+        match prev {
+            Some(val) => std::env::set_var(APP_DIR_ENV_VAR, val),
+            None => std::env::remove_var(APP_DIR_ENV_VAR),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn with_data_dir_override_restores_previous_env_var() {
+        std::env::set_var(APP_DIR_ENV_VAR, "/previous/value");
+
+        let dir = unique_test_path("restore_env");
+        let result = with_data_dir_override(Some(dir), || {
+            assert!(
+                std::env::var(APP_DIR_ENV_VAR).is_err(),
+                "env var should be cleared during override"
+            );
+            42
+        });
+
+        assert_eq!(result, 42);
+        assert_eq!(
+            std::env::var(APP_DIR_ENV_VAR).unwrap(),
+            "/previous/value",
+            "env var should be restored after override"
+        );
+        std::env::remove_var(APP_DIR_ENV_VAR);
     }
 
     #[test]

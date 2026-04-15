@@ -1,6 +1,6 @@
+use super::http_helpers::{build_http_client, check_response_status, HTTP_TIMEOUT};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures_util::Stream;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::thread_rng;
 use reqwest::Client;
@@ -9,12 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
-use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::encode as url_encode;
-
-const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimal Google Cloud Storage client for uploading agreement files using
 /// service-account JWT flow and direct HTTP requests.
@@ -40,6 +36,11 @@ struct AccessTokenResponse {
     access_token: String,
 }
 
+/// Replaces `[n]` with `\n` so multi-line secrets can be stored in env vars (same convention as Horizon Portal).
+fn unescape_json_string(input: &str) -> String {
+    input.replace("[n]", "\\n")
+}
+
 impl GcsClient {
     /// Normalize PEM strings that may contain escaped newlines (e.g. `\n` in env vars)
     /// or Windows-style CRLF escapes. Returns a PEM string with real `\n` line breaks.
@@ -52,32 +53,40 @@ impl GcsClient {
         unescaped.lines().collect::<Vec<_>>().join("\n")
     }
 
-    /// Build a client from a service account JSON file path.
-    pub async fn from_service_account_file(
+    fn from_service_account_json_contents(
         bucket: impl Into<String>,
-        service_account_json: impl AsRef<Path>,
+        contents: &str,
     ) -> Result<Self> {
-        let contents = fs::read_to_string(service_account_json.as_ref())
-            .with_context(|| "loading GCS service account json")?;
         let service_account: ServiceAccountKey =
-            serde_json::from_str(&contents).context("parsing GCS service account json")?;
+            serde_json::from_str(contents).context("parsing GCS service account json")?;
 
         let auth_url = service_account
             .token_uri
             .clone()
             .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
 
+        let http = build_http_client().context("building GCS HTTP client")?;
+
         Ok(Self {
-            http: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .expect("building GCS HTTP client"),
+            http,
             bucket: bucket.into(),
             service_account,
             auth_url,
             endpoint_url: "https://storage.googleapis.com".to_string(),
         })
+    }
+
+    /// `raw` is either a filesystem path to service account JSON, or inline JSON (trimmed value
+    /// starting with `{`). Inline JSON uses Portal-style `[n]` → `\n` unescaping for newlines.
+    pub fn from_path_or_inline_json(bucket: impl Into<String>, raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let contents = if trimmed.starts_with('{') {
+            unescape_json_string(trimmed)
+        } else {
+            fs::read_to_string(Path::new(trimmed))
+                .with_context(|| format!("loading GCS service account json from {trimmed}"))?
+        };
+        Self::from_service_account_json_contents(bucket, &contents)
     }
 
     /// Test-only helper that allows overriding endpoints for mocking.
@@ -90,12 +99,9 @@ impl GcsClient {
         endpoint_url: impl Into<String>,
     ) -> Self {
         let auth_url = auth_url.into();
+        let http = build_http_client().expect("building test GCS HTTP client");
         Self {
-            http: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .expect("building test GCS HTTP client"),
+            http,
             bucket: bucket.into(),
             service_account: ServiceAccountKey {
                 private_key: private_key.into(),
@@ -108,7 +114,13 @@ impl GcsClient {
     }
 
     /// Upload raw bytes as an object named `object_name` into the configured bucket.
-    pub async fn upload_bytes(&self, object_name: &str, bytes: &[u8]) -> Result<()> {
+    /// When `content_type` is None or empty, uses `application/octet-stream`.
+    pub async fn upload_bytes(
+        &self,
+        object_name: &str,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<()> {
         let token = self.fetch_access_token().await?;
         let url = format!(
             "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
@@ -117,27 +129,22 @@ impl GcsClient {
             url_encode(object_name)
         );
 
+        let ct = content_type
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/octet-stream");
+
         let resp = self
             .http
             .post(url)
             .bearer_auth(token)
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", ct)
             .body(bytes.to_vec())
             .send()
             .await
             .context("sending upload request to GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "uploading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        check_response_status(resp, &format!("upload object {object_name}")).await?;
         Ok(())
     }
 
@@ -159,59 +166,11 @@ impl GcsClient {
             .await
             .context("sending delete request to GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "deleting object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        check_response_status(resp, &format!("delete object {object_name}")).await?;
         Ok(())
     }
 
-    /// Stream an object from GCS without loading it fully into memory.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
-    pub async fn download_stream(
-        &self,
-        object_name: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>> {
-        let token = self.fetch_access_token().await?;
-        let url = format!(
-            "{}/storage/v1/b/{}/o/{}?alt=media",
-            self.endpoint_url,
-            self.bucket,
-            url_encode(object_name)
-        );
-
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .timeout(HTTP_TIMEOUT)
-            .send()
-            .await
-            .context("downloading object from GCS")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "downloading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
-        Ok(Box::pin(resp.bytes_stream()))
-    }
-
     /// Download an object from GCS and return its bytes.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
     pub async fn download_to_bytes(&self, object_name: &str) -> Result<Bytes> {
         let token = self.fetch_access_token().await?;
         let url = format!(
@@ -230,53 +189,22 @@ impl GcsClient {
             .await
             .context("downloading object from GCS")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "downloading object {} failed with status {}: {}",
-                object_name,
-                status,
-                body
-            ));
-        }
-
+        let resp = check_response_status(resp, &format!("download object {object_name}")).await?;
         resp.bytes()
             .await
             .context("reading object body from GCS response")
     }
 
-    /// Build a direct download URL that can be used by clients without proxying through this service.
-    ///
-    /// The URL embeds a short-lived OAuth access token as a query parameter and optionally sets a
-    /// `Content-Disposition` header to preserve the filename when forcing downloads.
-    #[allow(dead_code)] // Exposed for future direct-download use; not yet used in production paths.
-    pub async fn download_url(&self, object_name: &str, filename: Option<&str>) -> Result<String> {
-        let token = self.fetch_access_token().await?;
-        let mut url = format!(
-            "{}/storage/v1/b/{}/o/{}?alt=media&access_token={}",
-            self.endpoint_url,
-            self.bucket,
-            url_encode(object_name),
-            url_encode(&token)
-        );
-
-        if let Some(name) = filename {
-            let escaped = name.replace('"', "\\\"");
-            let disposition = format!("attachment; filename=\"{escaped}\"");
-            url.push_str("&response-content-disposition=");
-            url.push_str(&url_encode(&disposition));
-        }
-
-        Ok(url)
-    }
-
     /// Create a V4 signed download URL, matching the Horizon-Portal behavior (direct redirect to GCS).
+    ///
+    /// When `force_download` is false, `inline_content_type` may supply `response-content-type` on
+    /// the signed URL so browsers render images instead of GCS default `application/octet-stream`.
     pub fn create_signed_download_url(
         &self,
         object_name: &str,
         force_download: bool,
         filename: Option<&str>,
+        inline_content_type: Option<&str>,
     ) -> Result<String> {
         let private_key = self.parse_private_key()?;
         let (x_goog_date, short_date) = Self::timestamp_strings();
@@ -304,11 +232,28 @@ impl GcsClient {
         ];
 
         if force_download {
-            let disposition = Self::content_disposition(filename);
+            let disposition = Self::content_disposition_attachment(filename);
             query_params.push((
                 "response-content-disposition".to_string(),
                 url_encode(&disposition).to_string(),
             ));
+        } else {
+            // Without this, GCS uses object metadata; uploads are often octet-stream + attachment,
+            // which forces download in browsers even when our app passed inline=true.
+            let disposition = Self::content_disposition_inline(filename);
+            query_params.push((
+                "response-content-disposition".to_string(),
+                url_encode(&disposition).to_string(),
+            ));
+            if let Some(ct) = inline_content_type {
+                let trimmed = ct.trim();
+                if !trimmed.is_empty() && trimmed != "application/octet-stream" {
+                    query_params.push((
+                        "response-content-type".to_string(),
+                        url_encode(trimmed).to_string(),
+                    ));
+                }
+            }
         }
 
         query_params.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -387,10 +332,17 @@ impl GcsClient {
             .join("&")
     }
 
-    fn content_disposition(filename: Option<&str>) -> String {
+    fn content_disposition_attachment(filename: Option<&str>) -> String {
         filename.map_or_else(
             || "attachment".to_string(),
             |fname| format!("attachment; filename=\"{}\"", fname.replace('"', "\\\"")),
+        )
+    }
+
+    fn content_disposition_inline(filename: Option<&str>) -> String {
+        filename.map_or_else(
+            || "inline".to_string(),
+            |fname| format!("inline; filename=\"{}\"", fname.replace('"', "\\\"")),
         )
     }
 
@@ -413,14 +365,7 @@ impl GcsClient {
             .await
             .context("exchanging JWT for access token")?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "token exchange failed with status {status}: {body}"
-            ));
-        }
-
+        let resp = check_response_status(resp, "token exchange").await?;
         let token: AccessTokenResponse =
             resp.json().await.context("parsing access token response")?;
         Ok(token.access_token)
@@ -459,9 +404,10 @@ struct JwtClaims {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessTokenResponse, GcsClient, JwtClaims, ServiceAccountKey};
+    use super::{
+        unescape_json_string, AccessTokenResponse, GcsClient, JwtClaims, ServiceAccountKey,
+    };
     use bytes::Bytes;
-    use futures_util::StreamExt;
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use reqwest::Client;
     use serde_json::json;
@@ -522,26 +468,45 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn from_service_account_file_reads_bucket_and_token_uri() {
+    #[test]
+    fn unescape_json_string_replaces_portal_newline_markers() {
+        assert_eq!(unescape_json_string("hello[n]world"), "hello\\nworld");
+        assert_eq!(unescape_json_string("no escapes"), "no escapes");
+        assert_eq!(unescape_json_string("[n][n]"), "\\n\\n");
+    }
+
+    #[test]
+    fn from_path_or_inline_json_reads_file_path() {
         let path = write_service_account_file(Some("https://auth.example/token"), true);
-        let client = GcsClient::from_service_account_file("bucket-1", &path)
-            .await
+        let client = GcsClient::from_path_or_inline_json("bucket-1", &path.to_string_lossy())
             .expect("should parse service account");
 
         assert_eq!(client.bucket, "bucket-1");
         assert_eq!(client.auth_url, "https://auth.example/token");
     }
 
-    #[tokio::test]
-    async fn from_service_account_file_uses_default_auth_url_when_missing() {
+    #[test]
+    fn from_path_or_inline_json_uses_default_auth_url_when_missing_in_file() {
         let path = write_service_account_file(None, true);
-        let client = GcsClient::from_service_account_file("bucket-2", &path)
-            .await
+        let client = GcsClient::from_path_or_inline_json("bucket-2", &path.to_string_lossy())
             .expect("should parse service account");
 
         assert_eq!(client.bucket, "bucket-2");
         assert_eq!(client.auth_url, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn from_path_or_inline_json_accepts_inline_json_with_n_escapes() {
+        let pem_line1 = "-----BEGIN PRIVATE KEY-----";
+        let pem_line2 = "LINE2";
+        let json = format!(
+            r#"{{"private_key":"{pem_line1}[n]{pem_line2}","client_email":"svc@example.com","token_uri":"https://oauth2.googleapis.com/token"}}"#
+        );
+        let client = GcsClient::from_path_or_inline_json("bucket-inline", &json)
+            .expect("inline json should parse");
+        assert_eq!(client.bucket, "bucket-inline");
+        assert!(client.service_account.private_key.contains('\n'));
+        assert!(client.service_account.private_key.contains(pem_line1));
     }
 
     #[tokio::test]
@@ -563,7 +528,7 @@ mod tests {
             .and(query_param("uploadType", "media"))
             .and(query_param("name", "file.txt"))
             .and(header("authorization", "Bearer token-123"))
-            .and(header("content-type", "application/octet-stream"))
+            .and(header("content-type", "text/plain"))
             .and(body_bytes("hello"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&mock_server)
@@ -573,7 +538,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         client
-            .upload_bytes("file.txt", b"hello")
+            .upload_bytes("file.txt", b"hello", Some("text/plain"))
             .await
             .expect("upload should succeed");
     }
@@ -602,7 +567,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         let err = client
-            .upload_bytes("fail.bin", b"bytes")
+            .upload_bytes("fail.bin", b"bytes", None)
             .await
             .expect_err("upload should fail");
 
@@ -702,80 +667,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_stream_fetches_object_without_buffering() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "stream-token".to_string(),
-                }),
-            )
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/storage/v1/b/test-bucket/o/stream.bin"))
-            .and(query_param("alt", "media"))
-            .and(header("authorization", "Bearer stream-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("stream-body"))
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
-
-        let mut stream = client
-            .download_stream("stream.bin")
-            .await
-            .expect("download stream should succeed");
-
-        let mut collected = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            collected.extend_from_slice(&chunk.expect("chunk ok"));
-        }
-
-        assert_eq!(collected, b"stream-body");
-    }
-
-    #[tokio::test]
-    async fn download_stream_surfaces_http_errors() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "stream-token".to_string(),
-                }),
-            )
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/storage/v1/b/test-bucket/o/fail.bin"))
-            .and(query_param("alt", "media"))
-            .and(header("authorization", "Bearer stream-token"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-            .mount(&mock_server)
-            .await;
-
-        let client =
-            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
-
-        let err = client
-            .download_stream("fail.bin")
-            .await
-            .err()
-            .expect("non-200 should bubble up");
-
-        let msg = err.to_string();
-        assert!(msg.contains("failed with status 500"), "got {msg}");
-        assert!(msg.contains("boom"), "expected body to be included: {msg}");
-    }
-
-    #[tokio::test]
     async fn download_to_bytes_surfaces_http_errors() {
         let mock_server = MockServer::start().await;
 
@@ -806,7 +697,10 @@ mod tests {
             .expect_err("non-success should error");
 
         let msg = err.to_string();
-        assert!(msg.contains("status 503"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("download object") && msg.contains("failed with status 503"),
+            "unexpected message: {msg}"
+        );
         assert!(msg.contains("nope"), "expected body text: {msg}");
     }
 
@@ -828,7 +722,7 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         let url = client
-            .create_signed_download_url("folder/file name.pdf", true, Some("file name.pdf"))
+            .create_signed_download_url("folder/file name.pdf", true, Some("file name.pdf"), None)
             .expect("signed url should be generated");
 
         assert!(
@@ -855,15 +749,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn content_disposition_encodes_filenames() {
+        let with_name = GcsClient::content_disposition_attachment(Some("a \"weird\" name.txt"));
+        assert_eq!(
+            with_name, "attachment; filename=\"a \\\"weird\\\" name.txt\"",
+            "quotes should be escaped"
+        );
+
+        let defaulted = GcsClient::content_disposition_attachment(None);
+        assert_eq!(defaulted, "attachment");
+
+        assert_eq!(
+            GcsClient::content_disposition_inline(Some("x.png")),
+            "inline; filename=\"x.png\""
+        );
+        assert_eq!(GcsClient::content_disposition_inline(None), "inline");
+    }
+
     #[tokio::test]
-    async fn download_url_embeds_token_and_disposition() {
+    async fn create_signed_download_url_inline_sets_disposition_and_content_type() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
             .and(path("/token"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
-                    access_token: "url-token".to_string(),
+                    access_token: "redirect-token".to_string(),
                 }),
             )
             .mount(&mock_server)
@@ -873,36 +785,21 @@ mod tests {
             client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
 
         let url = client
-            .download_url("folder spaced/object.bin", Some("my file.bin"))
-            .await
-            .expect("url generation should succeed");
+            .create_signed_download_url("photo.png", false, Some("photo.png"), Some("image/png"))
+            .expect("signed url should be generated");
 
         assert!(
-            url.contains("access_token=url-token"),
-            "token should be embedded: {url}"
+            url.contains("response-content-disposition="),
+            "inline disposition should be signed: {url}"
         );
         assert!(
-            url.contains(
-                "response-content-disposition=attachment%3B%20filename%3D%22my%20file.bin%22"
-            ),
-            "disposition should preserve filename: {url}"
+            url.contains("response-content-type="),
+            "content-type override should be signed: {url}"
         );
         assert!(
-            url.contains("/storage/v1/b/test-bucket/o/folder%20spaced%2Fobject.bin"),
-            "object path should be encoded and include bucket/object: {url}"
+            url.contains("image%2Fpng") || url.contains("image/png"),
+            "image/png should appear in query: {url}"
         );
-    }
-
-    #[test]
-    fn content_disposition_encodes_filenames() {
-        let with_name = GcsClient::content_disposition(Some("a \"weird\" name.txt"));
-        assert_eq!(
-            with_name, "attachment; filename=\"a \\\"weird\\\" name.txt\"",
-            "quotes should be escaped"
-        );
-
-        let defaulted = GcsClient::content_disposition(None);
-        assert_eq!(defaulted, "attachment");
     }
 
     #[tokio::test]

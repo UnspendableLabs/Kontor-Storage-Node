@@ -1,7 +1,10 @@
+use crate::app::tasks::computeproofs::compute_and_submit_proofs;
+use crate::app::tasks::downloadagreements::{download_agreements, StorageBackend};
+use crate::app::tasks::getactivechallenges::sync_active_challenges;
+use crate::app::tasks::getnewagreements::sync_ready_agreements;
+use crate::app::tasks::reconcile;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
-use crate::tasks::downloadagreements::{download_agreements, StorageBackend};
-use crate::tasks::getnewagreements::sync_ready_agreements;
 use anyhow::{Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::fs::{self, OpenOptions};
@@ -11,7 +14,10 @@ use std::process;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Maximum backoff duration (5 minutes).
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StorageLimits {
@@ -29,6 +35,7 @@ pub fn spawn_portal_daemon(
     lock_path: PathBuf,
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
+    storage_dir: PathBuf,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = run_portal_daemon(
@@ -38,6 +45,7 @@ pub fn spawn_portal_daemon(
             lock_path,
             storage_limits,
             storage_backend,
+            storage_dir,
         )
         .await
         {
@@ -53,23 +61,66 @@ async fn run_portal_daemon(
     lock_path: PathBuf,
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
+    storage_dir: PathBuf,
 ) -> Result<()> {
     // Ensure only a single daemon instance runs at a time.
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
 
-    // Run immediately, then on each tick.
-    sync_portal_once(&portal_client, &database, storage_limits, &storage_backend)
+    if let Some(node_id) = portal_client.node_id() {
+        reconcile::reconcile_from_portal(
+            &portal_client,
+            &database,
+            node_id,
+            &storage_backend,
+            &storage_dir,
+        )
         .await
-        .context("initial portal sync failed")?;
+        .context("startup reconciliation failed")?;
+    }
 
-    let mut ticker = time::interval(interval);
+    // Run immediately, then on each tick.
+    sync_portal_once(
+        &portal_client,
+        &database,
+        storage_limits,
+        &storage_backend,
+        &storage_dir,
+    )
+    .await
+    .context("initial portal sync failed")?;
+
+    let mut current_backoff = interval;
     loop {
-        ticker.tick().await;
-        if let Err(err) =
-            sync_portal_once(&portal_client, &database, storage_limits, &storage_backend).await
+        time::sleep(current_backoff).await;
+        match sync_portal_once(
+            &portal_client,
+            &database,
+            storage_limits,
+            &storage_backend,
+            &storage_dir,
+        )
+        .await
         {
-            error!("portal sync failed: {err:#}");
+            Ok(()) => {
+                // Reset backoff on success
+                if current_backoff != interval {
+                    info!("portal sync succeeded, resetting backoff to {:?}", interval);
+                }
+                current_backoff = interval;
+            }
+            Err(err) => {
+                error!("portal sync failed: {err:#}");
+                // Apply exponential backoff, capped at MAX_BACKOFF
+                let next_backoff = (current_backoff * 2).min(MAX_BACKOFF);
+                if next_backoff != current_backoff {
+                    warn!(
+                        "applying exponential backoff: next retry in {:?}",
+                        next_backoff
+                    );
+                }
+                current_backoff = next_backoff;
+            }
         }
     }
 }
@@ -79,6 +130,7 @@ async fn sync_portal_once(
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
     storage_backend: &StorageBackend,
+    storage_dir: &std::path::Path,
 ) -> Result<()> {
     if let Some(max_files) = storage_limits.max_files {
         let downloaded = downloaded_files_count(database).await?;
@@ -97,6 +149,14 @@ async fn sync_portal_once(
         .await
         .context("downloading agreements failed")?;
 
+    sync_active_challenges(portal_client, database)
+        .await
+        .context("syncing active challenges failed")?;
+
+    compute_and_submit_proofs(portal_client, database, storage_backend, storage_dir)
+        .await
+        .context("computing and submitting proofs failed")?;
+
     Ok(())
 }
 
@@ -112,8 +172,8 @@ async fn downloaded_files_count(database: &DatabaseConnection) -> Result<u64> {
 #[derive(Debug)]
 struct LockFileGuard {
     path: PathBuf,
-    #[allow(dead_code)]
-    file: std::fs::File,
+    /// File handle kept open to hold the lock; dropped when guard is dropped.
+    _file: std::fs::File,
 }
 
 impl LockFileGuard {
@@ -134,9 +194,11 @@ impl LockFileGuard {
                 )
             })?;
 
-        writeln!(file, "pid={}", process::id()).ok();
+        if let Err(e) = writeln!(file, "pid={}", process::id()) {
+            warn!("failed to write pid to lock file: {e}");
+        }
 
-        Ok(Self { path, file })
+        Ok(Self { path, _file: file })
     }
 }
 
@@ -151,36 +213,18 @@ mod tests {
     use super::*;
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
+    use crate::testutils::{setup_in_memory_db, unique_test_path};
     use chrono::DateTime;
-    use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
-        Schema, Set,
-    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
     use serial_test::serial;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_path(prefix: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_daemon_test_{prefix}_{id}"))
-    }
-
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-        let agreements_stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&agreements_stmt).await.unwrap();
-        db
-    }
 
     #[test]
     fn lock_file_guard_creates_and_cleans_lock_file() {
-        let lock_path = unique_path("lock_basic");
+        let lock_path = unique_test_path("lock_basic");
         let _ = fs::remove_file(&lock_path);
 
         {
@@ -202,7 +246,7 @@ mod tests {
 
     #[test]
     fn lock_file_guard_prevents_double_acquire() {
-        let lock_path = unique_path("lock_conflict");
+        let lock_path = unique_test_path("lock_conflict");
         let _ = fs::remove_file(&lock_path);
 
         let guard = LockFileGuard::acquire(lock_path.clone()).unwrap();
@@ -227,23 +271,23 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock_server)
             .await;
 
         let database = setup_in_memory_db().await;
-        let lock_path = unique_path("lock_error");
-        let storage_dir = unique_path("storage_error");
+        let lock_path = unique_test_path("lock_error");
+        let storage_dir = unique_test_path("storage_error");
 
         let error = run_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database,
             Duration::from_millis(5),
             lock_path.clone(),
             StorageLimits::default(),
             StorageBackend::local(),
+            storage_dir,
         )
         .await
         .unwrap_err();
@@ -264,15 +308,15 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
             .mount(&mock_server)
             .await;
 
         let database = setup_in_memory_db().await;
-        let lock_path = unique_path("lock_max_files");
-        let storage_dir = unique_path("storage_max_files");
+        let lock_path = unique_test_path("lock_max_files");
+        let storage_dir = unique_test_path("storage_max_files");
         fs::remove_dir_all(&storage_dir).ok();
 
         let already_downloaded = agreements::ActiveModel {
@@ -294,7 +338,7 @@ mod tests {
         already_downloaded.insert(&database).await.unwrap();
 
         let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
@@ -304,6 +348,7 @@ mod tests {
                 max_files: Some(1),
             },
             StorageBackend::local(),
+            storage_dir.clone(),
         );
 
         time::sleep(Duration::from_millis(30)).await;
@@ -339,7 +384,7 @@ mod tests {
                 "nodes": ["NODE-1"],
                 "transaction_id": null,
                 "curation": {},
-                "status": "new",
+                "status": "ready",
                 "created_at": "2024-01-15T10:30:00Z"
             }]
         });
@@ -347,8 +392,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
             .mount(&mock_server)
             .await;
@@ -356,7 +400,6 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/agreements/AGREEMENT-test/download"))
             .and(query_param("no_redirect", "true"))
-            .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "download_url": download_url
             })))
@@ -370,18 +413,19 @@ mod tests {
             .await;
 
         let database = setup_in_memory_db().await;
-        let lock_path = unique_path("lock_loop");
-        let storage_dir = unique_path("storage_loop");
+        let lock_path = unique_test_path("lock_loop");
+        let storage_dir = unique_test_path("storage_loop");
         fs::remove_file(&lock_path).ok();
         fs::remove_dir_all(&storage_dir).ok();
 
         let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), "secret", storage_dir.clone()),
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database.clone(),
             Duration::from_millis(10),
             lock_path.clone(),
             StorageLimits::default(),
             StorageBackend::local(),
+            storage_dir.clone(),
         );
 
         // Wait for the daemon to download the agreement at least once. Give it

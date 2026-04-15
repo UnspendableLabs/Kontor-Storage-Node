@@ -38,7 +38,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--storage-max-file-size` | `STORAGE_MAX_FILE_SIZE` | _unlimited_ | Max size for a single downloaded file (bytes, supports M/G/T suffix) |
 | `--storage-method` | `STORAGE_METHOD` | `local` | Storage backend: `local` for local filesystem or `gcs` for Google Cloud Storage |
 | `--storage-gcs-bucket-name` | `STORAGE_GCS_BUCKET_NAME` | _required if gcs_ | GCS bucket name (required when `STORAGE_METHOD=gcs`) |
-| `--storage-gcs-service-account-json` | `STORAGE_GCS_SERVICE_ACCOUNT_JSON` | _required if gcs_ | Path to GCS service account JSON file (required when `STORAGE_METHOD=gcs`) |
+| `--storage-gcs-service-account-json` | `STORAGE_GCS_SERVICE_ACCOUNT_JSON` | _required if gcs_ | Path to GCS service account JSON file, or inline JSON (Horizon Portal: `[n]` newline escapes; required when `STORAGE_METHOD=gcs`) |
 
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
@@ -61,6 +61,8 @@ For Google Cloud Storage backend:
 STORAGE_METHOD=gcs
 STORAGE_GCS_BUCKET_NAME=my-kontor-bucket
 STORAGE_GCS_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
+# or inline JSON (e.g. from a secret manager), with `[n]` for newlines in `private_key`:
+# STORAGE_GCS_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
 ```
 
 The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits apply in both `local` and `gcs` modes to respect quotas (for example, free tiers) even when files are stored remotely (uploaded to GCS).

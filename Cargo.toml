@@ -3,6 +3,9 @@ name = "Kontor-Storage-Node"
 version = "0.1.0"
 edition = "2021"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [workspace]
 members = [".", "migration"]
 
@@ -41,6 +44,20 @@ http = "1.1"
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
 rand = "0.8"
+# BLS key management
+blst = "0.3"
+aes-gcm = "0.10"
+aes = "0.8"
+cipher = { version = "0.4", features = ["block-padding"] }
+ctr = "0.9"
+argon2 = "0.5"
+zeroize = { version = "1.8", features = ["derive"] }
+rpassword = "7.3"
+# HTTP signature (RFC 9421)
+base64 = "0.22"
+uuid = { version = "1.11", features = ["v4"] }
+postcard = { version = "1.1", features = ["alloc"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 [dev-dependencies]
 wiremock = "0.6"

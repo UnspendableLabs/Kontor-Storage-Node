@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kontor Storage Node</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/storage.css">
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <header class="mb-8">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-4">
+                    <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABwAAAAcCAMAAABF0y+mAAAAY1BMVEUYHCMOFB0AAAkWGiIUGSAAAABISEvCvrsAChYSFx8fIiirqKbr5uKVkpEAAAybmZjp5OC7uLXi3dknKi8xMzfa1dJZWVoABhT07upiYmPTz8t/fX1zcnLMx8Q6PD9MTE83OT2KNKp/AAAA6klEQVR4AbSRRWLEMAwAA5ZRmxqX6f+vrJRFNYVTJyiPUer+m34Y+aOGfqEUaGPJKmc0qC/OB8TV1HXDR8TgpZ0S5hyLcpW+mCYh58aYBkiZOzkhebqcG6y5D08vUJuM2x3sMyGdIqze7eBAw/G44fgpC+OLtZk4wRw/NnPeIrENwOviBTJHZ3eTV8xMf+bdBFhFCvD6LuNhYJmFfEzboCynZTzRQzsPtw05jrsHI7E5oIEDzkfhWBzVUvMjCWz+TJ9M/AQpztWRAw03eudqXJZMlfdi80hh4WIsf3tzAemYfvgcAyyB0RgAAD5qExklf1z3AAAAAElFTkSuQmCC" alt="Kontor Logo" class="w-10 h-10">
+                    <div>
+                        <h1 class="text-3xl font-bold text-white">Kontor Storage Node</h1>
+                        <p id="node-id" class="text-gray-400 mt-1 font-mono">Loading...</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="status-indicator status-online"></span>
+                        <span class="text-sm text-gray-400">Node Online</span>
+                    </div>
+                    <button onclick="loadFiles()" class="btn-icon" title="Refresh">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            <div class="card">
+                <div class="flex items-center gap-4">
+                    <div class="p-3 bg-blue-500/20 rounded-lg">
+                        <svg class="w-8 h-8 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-gray-400 text-sm uppercase tracking-wide">Total Files</p>
+                        <p id="stat-total" class="text-3xl font-bold text-white mt-1">-</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="flex items-center gap-4">
+                    <div class="p-3 bg-green-500/20 rounded-lg">
+                        <svg class="w-8 h-8 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-gray-400 text-sm uppercase tracking-wide">Total Size</p>
+                        <p id="stat-size" class="text-3xl font-bold text-white mt-1">-</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Files Table -->
+        <div class="card">
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold text-white">Files</h2>
+            </div>
+
+            <!-- Loading State -->
+            <div id="loading" class="text-center py-12">
+                <div class="spinner mx-auto mb-4"></div>
+                <p class="text-gray-400">Loading files...</p>
+            </div>
+
+            <!-- Error State -->
+            <div id="error" class="hidden text-center py-12">
+                <svg class="w-16 h-16 text-red-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                </svg>
+                <p class="text-red-400 font-medium">Failed to load files</p>
+                <p id="error-message" class="text-gray-500 mt-1"></p>
+                <button onclick="loadFiles()" class="btn-primary mt-4">Try Again</button>
+            </div>
+
+            <!-- Empty State -->
+            <div id="empty" class="hidden text-center py-12">
+                <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z"></path>
+                </svg>
+                <p class="text-gray-400">No files available</p>
+            </div>
+
+            <!-- Table -->
+            <div id="table-container" class="hidden overflow-x-auto">
+                <table class="w-full">
+                    <thead>
+                        <tr class="text-left text-gray-400 text-sm uppercase tracking-wide border-b border-gray-700">
+                            <th class="pb-3 font-medium">Filename</th>
+                            <th class="pb-3 font-medium">Type</th>
+                            <th class="pb-3 font-medium">Size</th>
+                            <th class="pb-3 font-medium">Status</th>
+                            <th class="pb-3 font-medium">Created</th>
+                            <th class="pb-3 font-medium text-right">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="files-tbody">
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Pagination -->
+            <div id="pagination" class="hidden mt-6 pt-6 border-t border-gray-700">
+                <div class="flex flex-wrap items-center justify-between gap-4">
+                    <div class="text-sm text-gray-400">
+                        Showing <span id="showing-start">0</span> to <span id="showing-end">0</span> of <span id="showing-total">0</span> files
+                    </div>
+                    <div class="flex space-x-2">
+                        <button id="btn-prev" onclick="prevPage()" class="btn-pagination" disabled title="Previous">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+                            </svg>
+                        </button>
+                        <button id="btn-next" onclick="nextPage()" class="btn-pagination" disabled title="Next">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="mt-8 text-left text-gray-500 text-sm">
+            <p>&copy; 2026 Unspendable Labs. All rights reserved.</p>
+        </footer>
+    </div>
+
+    <script src="/static/storage.js"></script>
+</body>
+</html>

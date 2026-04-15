@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::app::cli::Cli;
 use crate::database::default_storage_dir;
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
@@ -39,7 +39,6 @@ impl fmt::Display for StorageMethod {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub portal_url: String,
-    pub portal_api_key: String,
     pub database_url: String,
     pub storage_dir: PathBuf,
     pub portal_polling_interval: Duration,
@@ -50,6 +49,8 @@ pub struct Config {
     pub storage_gcs_bucket_name: Option<String>,
     pub storage_gcs_service_account_json: Option<String>,
     pub server_address: String,
+    pub public_url: String,
+    pub bls_key_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -65,7 +66,6 @@ impl Config {
 
         let storage_method = StorageMethod::from_str(&cli.storage_method)?;
 
-        // Validate GCS configuration when storage method is GCS
         if storage_method == StorageMethod::Gcs {
             if cli.storage_gcs_bucket_name.is_none() {
                 return Err(anyhow!(
@@ -81,7 +81,6 @@ impl Config {
 
         Ok(Self {
             portal_url: cli.portal_url.clone(),
-            portal_api_key: cli.portal_api_key.clone(),
             database_url: cli.database_url.clone(),
             storage_dir: cli.storage_dir.clone().unwrap_or_else(default_storage_dir),
             portal_polling_interval: Duration::from_secs(cli.portal_polling_interval_secs),
@@ -92,13 +91,17 @@ impl Config {
             storage_gcs_bucket_name: cli.storage_gcs_bucket_name.clone(),
             storage_gcs_service_account_json: cli.storage_gcs_service_account_json.clone(),
             server_address: cli.server_address.clone(),
+            public_url: cli.public_url.clone(),
+            bls_key_path: cli.bls_key_path.clone(),
         })
     }
 }
 
-impl From<&Cli> for Config {
-    fn from(cli: &Cli) -> Self {
-        Config::from_cli(cli).expect("invalid CLI values")
+impl TryFrom<&Cli> for Config {
+    type Error = anyhow::Error;
+
+    fn try_from(cli: &Cli) -> Result<Self> {
+        Config::from_cli(cli)
     }
 }
 
@@ -122,37 +125,46 @@ fn parse_storage_capacity(raw: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Commands};
+    use crate::app::cli::{Cli, Commands};
 
-    #[test]
-    fn config_from_cli_clones_fields() {
-        let mut cli = Cli {
+    fn make_cli() -> Cli {
+        Cli {
             portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
             storage_dir: Some(PathBuf::from("/tmp/files")),
-            portal_polling_interval_secs: 42,
-            storage_capacity: Some("15GB".into()),
-            storage_max_files: Some(10),
-            storage_max_file_size: Some("1GB".into()),
+            portal_polling_interval_secs: 10,
+            storage_capacity: None,
+            storage_max_files: None,
+            storage_max_file_size: None,
             storage_method: "local".to_string(),
             storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: None,
             server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
+            bls_key_path: None,
             command: Commands::Ping,
+        }
+    }
+
+    #[test]
+    fn config_from_cli_clones_fields() {
+        let mut cli = Cli {
+            storage_capacity: Some("15GB".into()),
+            storage_max_files: Some(10),
+            storage_max_file_size: Some("1GB".into()),
+            portal_polling_interval_secs: 42,
+            ..make_cli()
         };
 
         let config = Config::from_cli(&cli).unwrap();
 
         cli.portal_url.push_str("/extra");
-        cli.portal_api_key.push_str("123");
         cli.database_url.push_str("?mode=ro");
         cli.storage_dir = Some(PathBuf::from("/other"));
         cli.storage_capacity = Some("20GB".into());
         cli.storage_max_files = Some(20);
 
         assert_eq!(config.portal_url, "https://portal.example/api");
-        assert_eq!(config.portal_api_key, "secret");
         assert_eq!(config.database_url, "sqlite://localhost/mydb");
         assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
         assert_eq!(config.portal_polling_interval, Duration::from_secs(42));
@@ -179,26 +191,11 @@ mod tests {
     }
 
     #[test]
-    fn from_trait_invokes_from_cli() {
-        let cli = Cli {
-            portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
-            database_url: "sqlite://localhost/mydb".to_string(),
-            storage_dir: Some(PathBuf::from("/tmp/files")),
-            portal_polling_interval_secs: 10,
-            storage_capacity: None,
-            storage_max_files: None,
-            storage_max_file_size: None,
-            storage_method: "local".to_string(),
-            storage_gcs_bucket_name: None,
-            storage_gcs_service_account_json: None,
-            server_address: "127.0.0.1:0".to_string(),
-            command: Commands::Ping,
-        };
+    fn try_from_trait_invokes_from_cli() {
+        let cli = make_cli();
 
-        let config: Config = (&cli).into();
+        let config: Config = Config::try_from(&cli).unwrap();
         assert_eq!(config.portal_url, cli.portal_url);
-        assert_eq!(config.portal_api_key, cli.portal_api_key);
         assert_eq!(config.database_url, cli.database_url);
         assert_eq!(config.storage_dir, PathBuf::from("/tmp/files"));
         assert_eq!(
@@ -234,19 +231,9 @@ mod tests {
     #[test]
     fn config_from_cli_validates_gcs_bucket_required() {
         let cli = Cli {
-            portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
-            database_url: "sqlite://localhost/mydb".to_string(),
-            storage_dir: Some(PathBuf::from("/tmp/files")),
-            portal_polling_interval_secs: 10,
-            storage_capacity: None,
-            storage_max_files: None,
-            storage_max_file_size: None,
             storage_method: "gcs".to_string(),
-            storage_gcs_bucket_name: None,
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
-            server_address: "127.0.0.1:0".to_string(),
-            command: Commands::Ping,
+            ..make_cli()
         };
 
         let err = Config::from_cli(&cli).unwrap_err();
@@ -256,19 +243,9 @@ mod tests {
     #[test]
     fn config_from_cli_validates_gcs_service_account_required() {
         let cli = Cli {
-            portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
-            database_url: "sqlite://localhost/mydb".to_string(),
-            storage_dir: Some(PathBuf::from("/tmp/files")),
-            portal_polling_interval_secs: 10,
-            storage_capacity: None,
-            storage_max_files: None,
-            storage_max_file_size: None,
             storage_method: "gcs".to_string(),
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
-            storage_gcs_service_account_json: None,
-            server_address: "127.0.0.1:0".to_string(),
-            command: Commands::Ping,
+            ..make_cli()
         };
 
         let err = Config::from_cli(&cli).unwrap_err();
@@ -278,19 +255,10 @@ mod tests {
     #[test]
     fn config_from_cli_accepts_valid_gcs_config() {
         let cli = Cli {
-            portal_url: "https://portal.example/api".to_string(),
-            portal_api_key: "secret".to_string(),
-            database_url: "sqlite://localhost/mydb".to_string(),
-            storage_dir: Some(PathBuf::from("/tmp/files")),
-            portal_polling_interval_secs: 10,
-            storage_capacity: None,
-            storage_max_files: None,
-            storage_max_file_size: None,
             storage_method: "gcs".to_string(),
             storage_gcs_bucket_name: Some("my-bucket".to_string()),
             storage_gcs_service_account_json: Some("/path/to/sa.json".to_string()),
-            server_address: "127.0.0.1:0".to_string(),
-            command: Commands::Ping,
+            ..make_cli()
         };
 
         let config = Config::from_cli(&cli).unwrap();
@@ -303,5 +271,86 @@ mod tests {
             config.storage_gcs_service_account_json,
             Some("/path/to/sa.json".to_string())
         );
+    }
+
+    #[test]
+    fn storage_method_display_local() {
+        assert_eq!(StorageMethod::Local.to_string(), "local");
+    }
+
+    #[test]
+    fn storage_method_display_gcs() {
+        assert_eq!(StorageMethod::Gcs.to_string(), "gcs");
+    }
+
+    #[test]
+    fn config_from_cli_uses_default_storage_dir_when_none() {
+        let cli = Cli {
+            storage_dir: None,
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.storage_dir, crate::database::default_storage_dir());
+    }
+
+    #[test]
+    fn config_from_cli_clones_bls_key_path() {
+        let cli = Cli {
+            bls_key_path: Some(PathBuf::from("/path/to/bls_key.enc")),
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(
+            config.bls_key_path,
+            Some(PathBuf::from("/path/to/bls_key.enc"))
+        );
+    }
+
+    #[test]
+    fn parse_storage_capacity_supports_pure_bytes() {
+        assert_eq!(parse_storage_capacity("1024").unwrap(), 1024);
+        assert_eq!(parse_storage_capacity("  500  ").unwrap(), 500);
+    }
+
+    #[test]
+    fn config_from_cli_rejects_invalid_storage_method() {
+        let cli = Cli {
+            storage_method: "invalid_method".to_string(),
+            ..make_cli()
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("invalid storage method"));
+    }
+
+    #[test]
+    fn config_from_cli_rejects_invalid_storage_capacity() {
+        let cli = Cli {
+            storage_capacity: Some("not_a_number".to_string()),
+            ..make_cli()
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("invalid storage capacity"));
+    }
+
+    #[test]
+    fn config_from_cli_rejects_invalid_storage_max_file_size() {
+        let cli = Cli {
+            storage_max_file_size: Some("bad_value".to_string()),
+            ..make_cli()
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("invalid storage capacity"));
+    }
+
+    #[test]
+    fn parse_storage_capacity_rejects_overflow() {
+        let result = parse_storage_capacity("1 ZB");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds u64"));
     }
 }

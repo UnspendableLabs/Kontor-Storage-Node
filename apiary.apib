@@ -1,0 +1,172 @@
+FORMAT: 1A
+HOST: http://localhost:3000
+
+# Kontor Storage Node API
+
+REST API for the Kontor Storage Node, a storage node for the Kontor distributed storage network.
+
+This API allows clients to retrieve node information and access stored files.
+
+## Group Node
+
+Resources related to the storage node itself.
+
+### Node Information [GET /api/info]
+
+Retrieve information about the storage node.
+
++ Response 200 (application/json)
+
+    + Attributes
+        + node_id: `abc123def456` (string, required) - Unique identifier of the storage node
+
+    + Body
+
+            {
+                "node_id": "abc123def456"
+            }
+
+## Group Files
+
+Resources related to file storage and retrieval.
+
+### List Files [GET /files{?offset,limit}]
+
+Retrieve a paginated list of available files on this node. Only files that have been fully downloaded are included.
+
++ Parameters
+    + offset: `0` (number, optional) - Number of files to skip
+        + Default: `0`
+    + limit: `20` (number, optional) - Maximum number of files to return (max: 100)
+        + Default: `20`
+
++ Response 200 (application/json)
+
+    + Attributes
+        + offset: 0 (number, required) - Current offset
+        + limit: 20 (number, required) - Applied limit
+        + total: 42 (number, required) - Total number of available files
+        + files (array[FileEntry], required) - List of file entries
+
+    + Body
+
+            {
+                "offset": 0,
+                "limit": 20,
+                "total": 42,
+                "files": [
+                    {
+                        "file_id": "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco",
+                        "filename": "document.pdf",
+                        "mime_type": "application/pdf",
+                        "original_size": 1048576,
+                        "status": "active",
+                        "downloaded": true,
+                        "created_at": "2025-01-15T10:30:00Z",
+                        "download_path": "/files/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco"
+                    }
+                ]
+            }
+
++ Response 400 (text/plain)
+
+    Returned when the request parameters are invalid (e.g., limit is 0).
+
+    + Body
+
+            limit must be greater than 0
+
++ Response 500 (text/plain)
+
+    Returned when an internal server error occurs.
+
+    + Body
+
+            internal server error
+
+### Download File [GET /files/{file_id}]
+
+Download a specific file by its ID.
+
+For local storage, the file content is streamed directly. For GCS storage, a temporary redirect to a signed URL is returned.
+
++ Parameters
+    + file_id: `QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco` (string, required) - Unique identifier of the file
+
++ Response 200
+
+    File content is streamed with appropriate headers.
+
+    + Headers
+
+            Content-Type: application/pdf
+            Content-Disposition: attachment; filename="document.pdf"
+            Content-Length: 1048576
+            Cache-Control: public, max-age=31536000, immutable
+            Access-Control-Allow-Origin: *
+            Access-Control-Allow-Methods: GET, HEAD, OPTIONS
+
+    + Body
+
+            (binary file content)
+
++ Response 307
+
+    Returned when the file is stored on GCS. The client should follow the redirect to download the file.
+
+    + Headers
+
+            Location: https://storage.googleapis.com/bucket/file?signature=...
+
++ Response 404 (text/plain)
+
+    Returned when the file does not exist.
+
+    + Body
+
+            file not found
+
++ Response 409 (text/plain)
+
+    Returned when the file exists but is not yet available (still being downloaded).
+
+    + Body
+
+            file is not yet available on this node
+
++ Response 502 (text/plain)
+
+    Returned when there is an error communicating with the upstream storage (GCS).
+
+    + Body
+
+            gcs signed url failed: ...
+
++ Response 503 (text/plain)
+
+    Returned when the storage backend is unavailable.
+
+    + Body
+
+            storage backend unavailable
+
++ Response 500 (text/plain)
+
+    Returned when an internal server error occurs.
+
+    + Body
+
+            (error details)
+
+## Data Structures
+
+### FileEntry (object)
+
++ file_id: `QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco` (string, required) - Unique identifier of the file (content-addressed hash)
++ filename: `document.pdf` (string, required) - Original filename
++ mime_type: `application/pdf` (string, required) - MIME type of the file
++ original_size: 1048576 (number, optional) - Size of the file in bytes
++ status: `active` (string, required) - Status of the agreement
++ downloaded: true (boolean, required) - Whether the file has been fully downloaded
++ created_at: `2025-01-15T10:30:00Z` (string, required) - ISO 8601 timestamp of when the agreement was created
++ download_path: `/files/QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco` (string, required) - Relative path to download the file

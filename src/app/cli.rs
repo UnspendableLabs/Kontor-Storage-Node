@@ -9,10 +9,6 @@ pub struct Cli {
     #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
     pub portal_url: String,
 
-    /// Portal API key used for Bearer authentication
-    #[arg(long, env = "PORTAL_API_KEY")]
-    pub portal_api_key: String,
-
     /// Database connection string (default: local SQLite file)
     #[arg(
         long,
@@ -49,13 +45,22 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_GCS_BUCKET_NAME")]
     pub storage_gcs_bucket_name: Option<String>,
 
-    /// Path to GCS service account JSON file (required when storage_method is "gcs")
+    /// Path to GCS service account JSON file, or inline JSON (same as Portal: `[n]` = newline in env)
     #[arg(long, env = "STORAGE_GCS_SERVICE_ACCOUNT_JSON")]
     pub storage_gcs_service_account_json: Option<String>,
 
     /// Address the server binds to (e.g. 0.0.0.0:8081)
     #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
     pub server_address: String,
+
+    /// Public URL where this node is reachable for file downloads (e.g. https://node1.example.com)
+    #[arg(long, env = "PUBLIC_URL", default_value = "http://localhost:8081")]
+    pub public_url: String,
+
+    /// Path to the BLS key file (default: app data dir/bls_key.enc)
+    /// For non-interactive mode, also set BLS_PASSWORD environment variable.
+    #[arg(long, env = "BLS_KEY_PATH")]
+    pub bls_key_path: Option<PathBuf>,
 
     /// Command to run
     #[command(subcommand)]

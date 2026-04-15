@@ -1,0 +1,9 @@
+target/
+.git/
+.env.local
+secrets/
+.DS_Store
+.github/
+docs/
+tests/
+*.md

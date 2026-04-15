@@ -58,24 +58,10 @@ fn ensure_sqlite_file_exists(file_path: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutils::unique_test_path;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join("database_sqlite")
-    }
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        test_root().join(format!("kontor_storage_node_{name}_{id}"))
-    }
+    use std::path::Path;
 
     fn cleanup_path(path: &Path) {
         if path.is_file() {
@@ -113,7 +99,7 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_exists_returns_true_when_file_is_present() {
-        let path = unique_temp_path("existing_file").with_extension("sqlite");
+        let path = unique_test_path("existing_file").with_extension("sqlite");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -125,7 +111,7 @@ mod tests {
 
     #[test]
     fn prepare_sqlite_creates_file_and_signals_migrations() {
-        let db_path = unique_temp_path("create_and_signal").join("db.sqlite");
+        let db_path = unique_test_path("create_and_signal").join("db.sqlite");
         let db_url = format!("sqlite://{}", db_path.display());
 
         if let Some(parent) = db_path.parent() {
@@ -141,7 +127,7 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_exists_errors_when_parent_is_file() {
-        let parent_file = unique_temp_path("parent_file");
+        let parent_file = unique_test_path("parent_file");
         if let Some(parent) = parent_file.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -159,7 +145,7 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_exists_errors_when_parent_is_read_only() {
-        let dir_path = unique_temp_path("parent_read_only");
+        let dir_path = unique_test_path("parent_read_only");
         if let Some(parent) = dir_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }

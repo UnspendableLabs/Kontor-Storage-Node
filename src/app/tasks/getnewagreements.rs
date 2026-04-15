@@ -1,3 +1,4 @@
+use super::{sync_new_items, ITEM_TYPE_AGREEMENTS};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
@@ -6,24 +7,17 @@ use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::JsonValue;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::collections::HashSet;
-use tracing::info;
 
 pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
-    let page = portal_client
+    let agreements = portal_client
         .get_new_agreements()
         .await
         .context("fetching new agreements failed")?;
 
-    if page.agreements.is_empty() {
-        info!("No new agreements found");
-        return Ok(());
-    }
-
-    let requested_ids: Vec<String> = page
-        .agreements
+    let requested_ids: Vec<String> = agreements
         .iter()
         .map(|agreement| agreement.agreement_id.clone())
         .collect();
@@ -36,28 +30,18 @@ pub async fn sync_ready_agreements(
         .map(|model| model.agreement_id)
         .collect();
 
-    let new_models: Vec<agreements::ActiveModel> = page
-        .agreements
-        .iter()
-        .filter(|agreement| !existing_ids.contains(&agreement.agreement_id))
-        .map(agreement_to_active_model)
-        .collect::<Result<Vec<_>>>()?;
-
-    if new_models.is_empty() {
-        return Ok(());
-    }
-
-    Agreements::insert_many(new_models.clone())
-        .exec(database)
-        .await
-        .context("failed to insert new agreements")?;
-
-    info!("Inserted {} new agreements", new_models.len());
-
-    Ok(())
+    sync_new_items(
+        agreements,
+        existing_ids,
+        ITEM_TYPE_AGREEMENTS,
+        |a| a.agreement_id.clone(),
+        agreement_to_active_model,
+        database,
+    )
+    .await
 }
 
-fn agreement_to_active_model(
+pub(crate) fn agreement_to_active_model(
     agreement: &crate::clients::portal::Agreement,
 ) -> Result<agreements::ActiveModel> {
     let nodes_json = JsonValue::Array(
@@ -101,31 +85,12 @@ mod tests {
     use super::*;
     use crate::clients::portal::Agreement;
     use crate::entities::prelude::Agreements;
+    use crate::testutils::{setup_agreements_db, unique_storage_dir};
     use chrono::DateTime;
-    use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
-        Schema, Set,
-    };
+    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_storage_dir(name: &str) -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("kontor_sync_ready_agreements_{name}_{id}"))
-    }
-
-    async fn setup_in_memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        let schema = Schema::new(DatabaseBackend::Sqlite);
-        let stmt = schema.create_table_from_entity(Agreements);
-        db.execute(&stmt).await.unwrap();
-        db
-    }
 
     fn sample_agreement(id: &str) -> Agreement {
         Agreement {
@@ -138,8 +103,14 @@ mod tests {
             nodes: vec!["NODE-1".to_string()],
             transaction_id: None,
             curation: json!({"notes": "ok"}),
-            status: "new".to_string(),
+            status: "ready".to_string(),
             created_at: "2024-01-15T10:30:00Z".to_string(),
+            merkle_root: None,
+            data_symbols: None,
+            parity_symbols: None,
+            padded_len: None,
+            blob_size: None,
+            file_hash: None,
         }
     }
 
@@ -164,8 +135,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -175,9 +145,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         let result = sync_ready_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", unique_storage_dir("empty")),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("empty")),
             &db,
         )
         .await;
@@ -195,8 +165,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -209,7 +178,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         // Seed an existing agreement that should not be duplicated.
         let seeded = agreements::ActiveModel {
             agreement_id: Set("AGREEMENT-existing".into()),
@@ -230,7 +199,7 @@ mod tests {
         seeded.insert(&db).await.unwrap();
 
         sync_ready_agreements(
-            &PortalClient::new(mock_server.uri(), "secret", unique_storage_dir("mixed")),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("mixed")),
             &db,
         )
         .await
@@ -251,7 +220,7 @@ mod tests {
         assert_eq!(inserted.nodes, json!(["NODE-1"]));
         assert!(inserted.transaction_id.is_none());
         assert_eq!(inserted.curation, json!({"notes": "ok"}));
-        assert_eq!(inserted.status, "new");
+        assert_eq!(inserted.status, "ready");
         assert!(
             !inserted.downloaded,
             "new agreements should start as not downloaded"
@@ -269,8 +238,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
-            .and(query_param("status", "new"))
-            .and(header("authorization", "Bearer secret"))
+            .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -280,7 +248,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let db = setup_in_memory_db().await;
+        let db = setup_agreements_db().await;
         let existing = agreements::ActiveModel {
             agreement_id: Set(agreement.agreement_id.clone()),
             user_id: Set(agreement.user_id.clone()),
@@ -300,11 +268,7 @@ mod tests {
         existing.insert(&db).await.unwrap();
 
         sync_ready_agreements(
-            &PortalClient::new(
-                mock_server.uri(),
-                "secret",
-                unique_storage_dir("all_existing"),
-            ),
+            &PortalClient::new(mock_server.uri(), unique_storage_dir("all_existing")),
             &db,
         )
         .await
