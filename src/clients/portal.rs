@@ -46,12 +46,43 @@ impl BlsBulkOp {
     }
 }
 
+/// Encode `s` as a Wave string literal, validating it contains only safe
+/// characters.
+///
+/// Kontor identifiers (agreement IDs, node IDs, etc.) follow the pattern
+/// `[A-Za-z0-9_-]+`. Restricting the allowlist to this character set means
+/// the result can be embedded in a Wave expression without any escaping and
+/// without risk of injecting code into the on-chain program.
+///
+/// Returns `Err` if `s` contains any character outside `[A-Za-z0-9_-]`
+/// (notably `"`, `\`, `(`, `)`, whitespace, control characters, etc.).
+fn wave_string_literal(s: &str) -> Result<String> {
+    if s.is_empty()
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(anyhow!(
+            "invalid character in identifier {s:?}: only [A-Za-z0-9_-] allowed"
+        ));
+    }
+    Ok(format!("\"{s}\""))
+}
+
 /// Build a WASM Wave expression for the `join-agreement` filestorage function.
-fn join_agreement_expr(agreement_id: &str, node_id: &str) -> String {
-    format!("join-agreement(\"{agreement_id}\", \"{node_id}\")")
+///
+/// Both `agreement_id` and `node_id` MUST consist of only `[A-Za-z0-9_-]`;
+/// otherwise an error is returned to avoid Wave expression injection.
+fn join_agreement_expr(agreement_id: &str, node_id: &str) -> Result<String> {
+    let agreement_lit = wave_string_literal(agreement_id)?;
+    let node_lit = wave_string_literal(node_id)?;
+    Ok(format!("join-agreement({agreement_lit}, {node_lit})"))
 }
 
 /// Build a WASM Wave expression for the `verify-proof` filestorage function.
+///
+/// Each byte serializes as its decimal representation, so the input bytes
+/// cannot affect the structure of the expression.
 fn verify_proof_expr(proof_bytes: &[u8]) -> String {
     let items: Vec<String> = proof_bytes.iter().map(|b| b.to_string()).collect();
     format!("verify-proof([{}])", items.join(", "))
@@ -103,6 +134,8 @@ impl PortalClient {
     ///
     /// # Panics
     /// Panics if the HTTP client cannot be built (e.g., TLS initialization fails).
+    #[deprecated(since = "0.2.0", note = "use try_new")]
+    #[allow(dead_code)]
     pub fn new(base_url: impl Into<String>, storage_dir: impl Into<PathBuf>) -> Self {
         Self::try_new(base_url, storage_dir).expect("building Portal HTTP client")
     }
@@ -124,6 +157,8 @@ impl PortalClient {
     ///
     /// # Panics
     /// Panics if the HTTP client cannot be built (e.g., TLS initialization fails).
+    #[deprecated(since = "0.2.0", note = "use try_with_auth")]
+    #[allow(dead_code)]
     pub fn with_auth(
         base_url: impl Into<String>,
         storage_dir: impl Into<PathBuf>,
@@ -183,10 +218,8 @@ impl PortalClient {
         self.auth.as_ref().map(|a| a.signer_id)
     }
 
-    fn auth_headers(
+    fn jwt_and_digest_headers(
         &self,
-        _method: &str,
-        _target_uri: &str,
         body: Option<(&[u8], &str)>,
     ) -> Result<Option<reqwest::header::HeaderMap>> {
         match &self.auth {
@@ -229,7 +262,6 @@ impl PortalClient {
     /// # Arguments
     /// * `method` - HTTP method (GET, POST, etc.)
     /// * `url` - Full URL for the request
-    /// * `path` - API path used for auth (without base URL)
     /// * `body` - Optional tuple of (body bytes, content type) for POST requests
     ///
     /// # Returns
@@ -238,12 +270,11 @@ impl PortalClient {
         &self,
         method: reqwest::Method,
         url: &str,
-        path: &str,
         body: Option<(&[u8], &str)>,
     ) -> Result<reqwest::RequestBuilder> {
-        let mut request = self.http.request(method.clone(), url);
+        let mut request = self.http.request(method, url);
 
-        if let Some(headers) = self.auth_headers(method.as_str(), path, body)? {
+        if let Some(headers) = self.jwt_and_digest_headers(body)? {
             for (name, value) in headers.iter() {
                 request = request.header(name, value);
             }
@@ -261,19 +292,14 @@ impl PortalClient {
     ///
     /// Requires authentication via JWT Bearer token.
     pub async fn announce_node(&self, public_url: &str) -> Result<()> {
-        let path = "/api/nodes/announce";
-        let url = self.api_path(path);
+        let url = self.api_path("/api/nodes/announce");
 
         let body = serde_json::json!({ "public_url": public_url });
         let body_bytes =
             serde_json::to_vec(&body).context("failed to serialize announce request")?;
 
-        let request = self.build_signed_request(
-            Method::PUT,
-            &url,
-            path,
-            Some((&body_bytes, "application/json")),
-        )?;
+        let request =
+            self.build_signed_request(Method::PUT, &url, Some((&body_bytes, "application/json")))?;
 
         let resp = request.body(body_bytes).send().await?;
         check_response_status(resp, "announce node URL").await?;
@@ -305,9 +331,13 @@ impl PortalClient {
             let total = page.total();
             let items = page.into_items();
             let fetched = items.len() as u32;
+            // Guard against servers that report `total > 0` but return an empty `items` array,
+            // which would otherwise spin forever because `offset` never advances.
+            if fetched == 0 {
+                break;
+            }
             all_items.extend(items);
 
-            // Check if we've fetched everything
             if offset + fetched >= total {
                 break;
             }
@@ -320,14 +350,8 @@ impl PortalClient {
     pub async fn ping(&self) -> Result<String> {
         let url = format!("{}/health", self.base_url);
         let resp = self.http.get(url).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(anyhow!("portal ping failed with status {status}: {body}"))
-        }
+        let resp = check_response_status(resp, "portal ping").await?;
+        resp.text().await.context("reading portal ping body")
     }
 
     /// Look up a node by its BLS public key.
@@ -403,10 +427,9 @@ impl PortalClient {
 
     /// Fetch a single page of agreements with the given offset.
     async fn get_agreements_page(&self, offset: u32) -> Result<AgreementsPage> {
-        let path = format!("/api/agreements?status=ready&offset={offset}");
-        let url = self.api_path(&path);
+        let url = self.api_path(&format!("/api/agreements?status=ready&offset={offset}"));
 
-        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
+        let request = self.build_signed_request(Method::GET, &url, None)?;
 
         let resp = request.send().await?;
         let resp = check_response_status(resp, "fetch ready agreements").await?;
@@ -428,10 +451,9 @@ impl PortalClient {
     }
 
     async fn get_node_agreements_page(&self, node_id: &str, offset: u32) -> Result<AgreementsPage> {
-        let path = format!("/api/agreements?nodes={node_id}&offset={offset}");
-        let url = self.api_path(&path);
+        let url = self.api_path(&format!("/api/agreements?nodes={node_id}&offset={offset}"));
 
-        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
+        let request = self.build_signed_request(Method::GET, &url, None)?;
 
         let resp = request.send().await?;
         let resp = check_response_status(resp, "fetch node agreements").await?;
@@ -481,11 +503,10 @@ impl PortalClient {
             .ok_or_else(|| anyhow!("authentication required to join agreement"))?
             .to_string();
 
-        let expr = join_agreement_expr(agreement_id, &node_id);
+        let expr = join_agreement_expr(agreement_id, &node_id)?;
         let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
-        let path = format!("/api/agreements/{agreement_id}/join");
-        let url = self.api_path(&path);
+        let url = self.api_path(&format!("/api/agreements/{agreement_id}/join"));
 
         let payload = JoinAgreementRequest {
             bls_signature,
@@ -494,12 +515,8 @@ impl PortalClient {
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize join request")?;
 
-        let request = self.build_signed_request(
-            Method::POST,
-            &url,
-            &path,
-            Some((&body_bytes, "application/json")),
-        )?;
+        let request =
+            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
 
         let resp = request.body(body_bytes).send().await?;
         let resp = check_response_status(resp, &format!("join agreement {agreement_id}")).await?;
@@ -550,10 +567,11 @@ impl PortalClient {
     }
 
     async fn fetch_download_url(&self, agreement_id: &str) -> Result<String> {
-        let path = format!("/api/agreements/{agreement_id}/download?no_redirect=true");
-        let url = self.api_path(&path);
+        let url = self.api_path(&format!(
+            "/api/agreements/{agreement_id}/download?no_redirect=true"
+        ));
 
-        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
+        let request = self.build_signed_request(Method::GET, &url, None)?;
 
         let resp = request.send().await?;
         let resp = check_response_status(
@@ -583,13 +601,12 @@ impl PortalClient {
             anyhow!("authentication required to fetch challenges: no keypair configured")
         })?;
 
-        let path = format!(
+        let url = self.api_path(&format!(
             "/api/nodes/{}/challenges?status=active&offset={offset}",
             auth.node_id
-        );
-        let url = self.api_path(&path);
+        ));
 
-        let request = self.build_signed_request(Method::GET, &url, &path, None)?;
+        let request = self.build_signed_request(Method::GET, &url, None)?;
 
         let resp = request.send().await?;
         let resp =
@@ -618,8 +635,7 @@ impl PortalClient {
         let expr = verify_proof_expr(&proof_bytes);
         let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
-        let path = format!("/api/challenges/{challenge_id}");
-        let url = self.api_path(&path);
+        let url = self.api_path(&format!("/api/challenges/{challenge_id}"));
 
         let payload = SubmitProofRequest {
             proof: proof_hex.to_string(),
@@ -629,12 +645,8 @@ impl PortalClient {
         let body_bytes =
             serde_json::to_vec(&payload).context("failed to serialize submit proof request")?;
 
-        let request = self.build_signed_request(
-            Method::POST,
-            &url,
-            &path,
-            Some((&body_bytes, "application/json")),
-        )?;
+        let request =
+            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
 
         let resp = request.body(body_bytes).send().await?;
         let resp =
@@ -824,7 +836,8 @@ pub struct RegistryEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::PortalClient;
+    #![allow(deprecated)]
+    use super::{join_agreement_expr, wave_string_literal, PortalClient};
     use crate::crypto::BlsKeyPair;
     use bytes::Bytes;
     use serde_json::json;
@@ -837,6 +850,78 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn wave_string_literal_accepts_alphanumeric_and_underscore_dash() {
+        assert_eq!(
+            wave_string_literal("AGREEMENT-test_123").unwrap(),
+            "\"AGREEMENT-test_123\""
+        );
+        assert_eq!(wave_string_literal("a").unwrap(), "\"a\"");
+        assert_eq!(wave_string_literal("NODE-x").unwrap(), "\"NODE-x\"");
+        assert_eq!(
+            wave_string_literal("chal_existing").unwrap(),
+            "\"chal_existing\""
+        );
+    }
+
+    #[test]
+    fn wave_string_literal_rejects_quote() {
+        let err = wave_string_literal("foo\"bar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid character"),
+            "expected 'invalid character' in error, got {msg}"
+        );
+    }
+
+    #[test]
+    fn wave_string_literal_rejects_backslash() {
+        assert!(wave_string_literal("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn wave_string_literal_rejects_parenthesis() {
+        assert!(wave_string_literal("foo(bar").is_err());
+        assert!(wave_string_literal("foo)bar").is_err());
+    }
+
+    #[test]
+    fn wave_string_literal_rejects_empty() {
+        assert!(wave_string_literal("").is_err());
+    }
+
+    #[test]
+    fn wave_string_literal_rejects_other_special_chars() {
+        for bad in [" ", ",", ".", "\n", "\t", "\0", "/", ";", "[", "]", "*"] {
+            assert!(
+                wave_string_literal(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn join_agreement_expr_accepts_valid_ids() {
+        let expr = join_agreement_expr("AGREEMENT-test123", "NODE-test").unwrap();
+        assert_eq!(expr, "join-agreement(\"AGREEMENT-test123\", \"NODE-test\")");
+    }
+
+    #[test]
+    fn join_agreement_expr_rejects_injection() {
+        // Attempt to break out of the string literal and append extra calls.
+        let injection = "AGREEMENT-1\", \"evil\"); drop-table(\"";
+        let err = join_agreement_expr(injection, "NODE-test").unwrap_err();
+        assert!(err.to_string().contains("invalid character"));
+
+        // Same check for the node_id position.
+        let err2 = join_agreement_expr("AGREEMENT-1", "NODE\"-evil").unwrap_err();
+        assert!(err2.to_string().contains("invalid character"));
+
+        // Backslash-based injection.
+        let err3 = join_agreement_expr("AGREEMENT-1", "NODE\\evil").unwrap_err();
+        assert!(err3.to_string().contains("invalid character"));
+    }
 
     fn storage_dir(name: &str) -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1648,6 +1733,55 @@ mod tests {
         assert_eq!(agreements.len(), 3, "should fetch all 3 agreements");
         assert_eq!(agreements[0].agreement_id, "AGR-1");
         assert_eq!(agreements[2].agreement_id, "AGR-3");
+    }
+
+    #[tokio::test]
+    async fn pagination_terminates_when_total_positive_but_items_empty() {
+        // Regression test for an infinite-loop bug: if the API reports
+        // `total > 0` but returns an empty `agreements` array (e.g. because
+        // status filtering happens after the count), the pagination loop must
+        // bail out instead of spinning forever.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .and(query_param("offset", "0"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 5,
+                "agreements": []
+            })))
+            // Expect exactly one call: if the loop spins, this would be hit many times.
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("pagination_empty_items"),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_new_agreements(),
+        )
+        .await
+        .expect("paginate should not hang when items array is empty")
+        .expect("paginate should succeed");
+
+        assert!(
+            result.is_empty(),
+            "expected empty result when API returns no items, got {result:?}"
+        );
     }
 
     #[tokio::test]

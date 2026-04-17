@@ -42,14 +42,14 @@ mod tests {
     use crate::clients::gcs::GcsClient;
     use crate::entities::agreements;
     use crate::server::handlers::{DownloadError, FilesResponse, ListFilesError};
-    use crate::testutils::unique_storage_dir;
+    use crate::testutils::{unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY};
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection};
     use std::fs;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -74,24 +74,18 @@ mod tests {
         size: i64,
         downloaded: bool,
     ) {
-        let active = agreements::ActiveModel {
-            agreement_id: Set(format!("AGREEMENT-{}", file_id)),
-            user_id: Set("user".into()),
-            file_id: Set(file_id.into()),
-            filename: Set(filename.into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(size),
-            nodes: Set(serde_json::json!([])),
-            root: Set(None),
-            padded_len: Set(Some(size)),
-            downloaded: Set(downloaded),
-            transaction_id: Set(None),
-            curation: Set(serde_json::json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::Utc::now().fixed_offset()),
-        };
-
-        active.insert(db).await.expect("insert agreement");
+        let mut fx = AgreementFixture::new(format!("AGREEMENT-{file_id}"), file_id);
+        fx.user_id = "user".into();
+        fx.filename = filename.into();
+        fx.original_size = size;
+        fx.nodes = serde_json::json!([]);
+        fx.padded_len = Some(size);
+        fx.downloaded = downloaded;
+        fx.created_at = chrono::Utc::now().fixed_offset();
+        fx.into_active_model()
+            .insert(db)
+            .await
+            .expect("insert agreement");
     }
 
     fn dummy_agreement(file_id: &str, filename: &str, mime: &str, size: i64) -> agreements::Model {
@@ -112,8 +106,6 @@ mod tests {
             created_at: chrono::Utc::now().fixed_offset(),
         }
     }
-
-    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
     fn write_service_account_json(dir: &Path, key: &str) -> PathBuf {
         let path = dir.join("service_account.json");
@@ -593,6 +585,102 @@ mod tests {
     fn download_error_not_ready_returns_conflict() {
         let resp = DownloadError::NotReady.into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cors_layer_injects_access_control_allow_origin_for_file_download() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let file_id = "FILE-cors";
+        let content = Bytes::from_static(b"cors body");
+        let path = storage_dir.join(file_id);
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        insert_agreement(&db, file_id, "cors.bin", content.len() as i64, true).await;
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/files/{file_id}"))
+                    // Provide an Origin header so the CorsLayer is exercised
+                    // in the same way a browser would.
+                    .header(header::ORIGIN, "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "CorsLayer should set Access-Control-Allow-Origin: *"
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|v| v.to_str().ok()),
+            Some("content-disposition"),
+            "CorsLayer should expose Content-Disposition for browser downloads"
+        );
+        // Sanity: the handler must NOT inject CORS headers itself anymore;
+        // this means there should only be one Allow-Origin value.
+        assert_eq!(
+            headers
+                .get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .iter()
+                .count(),
+            1,
+            "Allow-Origin must be set exactly once (by the layer, not the handler)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_layer_injects_access_control_allow_origin_for_gcs_redirect() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        insert_agreement(&db, "FILE-gcs-cors", "gcs.bin", 12, true).await;
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
+            node_id: "NODE-TEST".to_string(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/FILE-gcs-cors")
+                    .header(header::ORIGIN, "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "CorsLayer should also cover redirect responses"
+        );
     }
 
     #[cfg(unix)]

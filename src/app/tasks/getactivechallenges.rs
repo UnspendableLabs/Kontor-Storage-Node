@@ -1,11 +1,10 @@
-use super::{sync_new_items, ITEM_TYPE_CHALLENGES};
+use super::{load_existing_ids, sync_new_items, ITEM_TYPE_CHALLENGES};
 use crate::clients::PortalClient;
 use crate::entities::{challenges, prelude::Challenges};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
-use std::collections::HashSet;
+use sea_orm::{DatabaseConnection, Set};
 
 pub async fn sync_active_challenges(
     portal_client: &PortalClient,
@@ -21,13 +20,13 @@ pub async fn sync_active_challenges(
         .map(|challenge| challenge.challenge_id.clone())
         .collect();
 
-    let existing_ids: HashSet<String> = Challenges::find()
-        .filter(challenges::Column::ChallengeId.is_in(requested_ids.clone()))
-        .all(database)
-        .await?
-        .into_iter()
-        .map(|model| model.challenge_id)
-        .collect();
+    let existing_ids = load_existing_ids::<Challenges, _>(
+        database,
+        challenges::Column::ChallengeId,
+        &requested_ids,
+        |model| model.challenge_id,
+    )
+    .await?;
 
     sync_new_items(
         challenges,
@@ -84,6 +83,7 @@ fn challenge_to_active_model(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::portal::Challenge;
     use crate::crypto::BlsKeyPair;

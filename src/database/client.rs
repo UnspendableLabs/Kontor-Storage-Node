@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dbclient_skips_migrations_when_file_exists() -> Result<()> {
+    async fn dbclient_works_with_pre_existing_sqlite_file() -> Result<()> {
         let db_path = unique_db_path("skip_migrations");
         let db_url = format!("sqlite://{}", db_path.display());
 

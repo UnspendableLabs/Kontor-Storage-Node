@@ -3,10 +3,36 @@
 //! Centralizes HTTP client configuration and request execution
 //! to avoid duplication across client modules.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use reqwest::Client;
-use serde::de::DeserializeOwned;
 use std::time::Duration;
+
+/// Typed error returned by `check_response_status` when an HTTP response is
+/// non-success.
+///
+/// This wraps the status code so callers can match on it (e.g. to detect 404)
+/// without resorting to fragile substring matching on the error's `Display` text.
+/// `Display` intentionally produces the same `"{context} failed with status {status}: {body}"`
+/// text the helper used to emit via `anyhow!`, so existing callers and tests
+/// that inspect the error message continue to work unchanged.
+#[derive(Debug)]
+pub struct HttpStatusError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+    pub context: String,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed with status {}: {}",
+            self.context, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
 
 /// Default timeout for HTTP requests (30 seconds).
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,7 +54,10 @@ pub fn build_http_client() -> Result<Client> {
 /// Check HTTP response status and return error with context if not successful.
 ///
 /// On success, returns the response unchanged for further processing.
-/// On failure, extracts the error body and returns a descriptive error.
+/// On failure, extracts the error body and returns an [`HttpStatusError`] wrapped in
+/// `anyhow::Error`. Callers that need to react to a specific status (e.g. 404)
+/// can `downcast_ref::<HttpStatusError>()` instead of substring-matching the
+/// error message. The `Display` text is preserved verbatim for backwards compatibility.
 pub async fn check_response_status(
     resp: reqwest::Response,
     context: &str,
@@ -36,24 +65,13 @@ pub async fn check_response_status(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("{context} failed with status {status}: {body}"));
+        return Err(anyhow::Error::new(HttpStatusError {
+            status,
+            body,
+            context: context.to_string(),
+        }));
     }
     Ok(resp)
-}
-
-/// Execute a request and parse the JSON response.
-///
-/// On success, deserializes the response body as JSON into type `T`.
-/// On failure, extracts the error body and returns a descriptive error.
-#[allow(dead_code)]
-pub async fn execute_request<T: DeserializeOwned>(
-    response: reqwest::Response,
-    context: &str,
-) -> Result<T> {
-    let resp = check_response_status(response, context).await?;
-    resp.json::<T>()
-        .await
-        .with_context(|| format!("failed to deserialize {context}"))
 }
 
 #[cfg(test)]
@@ -121,83 +139,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_request_deserializes_json_on_success() {
-        use serde::Deserialize;
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Payload {
-            name: String,
-            count: u32,
-        }
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"name": "test", "count": 42})),
-            )
-            .mount(&mock_server)
-            .await;
-
-        let client = build_http_client().unwrap();
-        let resp = client.get(mock_server.uri()).send().await.unwrap();
-        let result: Payload = execute_request(resp, "fetch payload").await.unwrap();
-
-        assert_eq!(
-            result,
-            Payload {
-                name: "test".into(),
-                count: 42
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_request_returns_error_on_non_success_status() {
+    async fn check_response_status_error_is_downcastable_to_http_status_error() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
             .mount(&mock_server)
             .await;
 
         let client = build_http_client().unwrap();
         let resp = client.get(mock_server.uri()).send().await.unwrap();
-        let result: Result<serde_json::Value> = execute_request(resp, "forbidden op").await;
+        let err = check_response_status(resp, "lookup")
+            .await
+            .expect_err("non-success should be an error");
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let typed = err
+            .downcast_ref::<HttpStatusError>()
+            .expect("error should be downcastable to HttpStatusError");
+        assert_eq!(typed.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(typed.context, "lookup");
+        assert_eq!(typed.body, "missing");
         assert!(
-            err.to_string()
-                .contains("forbidden op failed with status 403"),
-            "error should include context: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_request_returns_error_on_invalid_json() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-            .mount(&mock_server)
-            .await;
-
-        let client = build_http_client().unwrap();
-        let resp = client.get(mock_server.uri()).send().await.unwrap();
-        let result: Result<serde_json::Value> = execute_request(resp, "parse test").await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("deserialize"),
-            "error should mention deserialization: {err}"
+            err.to_string().contains("lookup failed with status 404"),
+            "Display text should be preserved verbatim: {err}"
         );
     }
 }

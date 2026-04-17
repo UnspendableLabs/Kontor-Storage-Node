@@ -155,7 +155,7 @@ pub async fn run_with_shutdown(
     print_config_info(&config, &mut writer)?;
     setup_storage_directory(&config)?;
 
-    let client = PortalClient::new(&config.portal_url, &config.storage_dir);
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?;
 
     match cli.command {
         Commands::Ping => {
@@ -181,7 +181,7 @@ pub async fn run_with_shutdown(
 
             let node_id = onboarding_result.node_id;
 
-            let authenticated_client = PortalClient::with_auth(
+            let authenticated_client = PortalClient::try_with_auth(
                 &config.portal_url,
                 &config.storage_dir,
                 Arc::new(onboarding_result.keypair),
@@ -189,7 +189,7 @@ pub async fn run_with_shutdown(
                 onboarding_result.signer_id,
                 onboarding_result.token,
                 onboarding_result.next_nonce,
-            );
+            )?;
 
             if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
                 tracing::warn!("Failed to announce node URL: {e}");
@@ -263,6 +263,7 @@ pub async fn run_daemon_command(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::app::cli::{Cli, Commands};
     use crate::crypto::BlsKeyPair;

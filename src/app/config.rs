@@ -15,13 +15,14 @@ pub enum StorageMethod {
 
 impl StorageMethod {
     pub fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "local" => Ok(StorageMethod::Local),
-            "gcs" => Ok(StorageMethod::Gcs),
-            other => Err(anyhow!(
-                "invalid storage method '{}': expected 'local' or 'gcs'",
-                other
-            )),
+        if s.eq_ignore_ascii_case("local") {
+            Ok(StorageMethod::Local)
+        } else if s.eq_ignore_ascii_case("gcs") {
+            Ok(StorageMethod::Gcs)
+        } else {
+            Err(anyhow!(
+                "invalid storage method '{s}': expected 'local' or 'gcs'"
+            ))
         }
     }
 }
@@ -55,14 +56,16 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
-        let storage_capacity = match &cli.storage_capacity {
-            Some(raw) => Some(parse_storage_capacity(raw)?),
-            None => None,
-        };
-        let storage_max_file_size = match &cli.storage_max_file_size {
-            Some(raw) => Some(parse_storage_capacity(raw)?),
-            None => None,
-        };
+        let storage_capacity = cli
+            .storage_capacity
+            .as_deref()
+            .map(|s| parse_storage_capacity(s, "STORAGE_CAPACITY"))
+            .transpose()?;
+        let storage_max_file_size = cli
+            .storage_max_file_size
+            .as_deref()
+            .map(|s| parse_storage_capacity(s, "STORAGE_MAX_FILE_SIZE"))
+            .transpose()?;
 
         let storage_method = StorageMethod::from_str(&cli.storage_method)?;
 
@@ -105,19 +108,19 @@ impl TryFrom<&Cli> for Config {
     }
 }
 
-fn parse_storage_capacity(raw: &str) -> Result<u64> {
+fn parse_storage_capacity(raw: &str, field_name: &str) -> Result<u64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(anyhow!("storage capacity cannot be empty"));
+        return Err(anyhow!("{field_name} cannot be empty"));
     }
 
     let bytes = Byte::from_str(trimmed)
-        .map_err(|err| anyhow!("invalid storage capacity '{trimmed}': {err}"))?
+        .map_err(|err| anyhow!("invalid {field_name} '{trimmed}': {err}"))?
         .get_bytes();
 
     let bytes: u64 = bytes
         .try_into()
-        .map_err(|_| anyhow!("storage capacity '{trimmed}' exceeds u64"))?;
+        .map_err(|_| anyhow!("{field_name} '{trimmed}' exceeds u64"))?;
 
     Ok(bytes)
 }
@@ -177,17 +180,29 @@ mod tests {
 
     #[test]
     fn parse_storage_capacity_supports_units() {
-        assert_eq!(parse_storage_capacity("10M").unwrap(), 10_000_000);
-        assert_eq!(parse_storage_capacity("2GB").unwrap(), 2_000_000_000);
-        assert_eq!(parse_storage_capacity("1 tb").unwrap(), 1_000_000_000_000);
-        assert_eq!(parse_storage_capacity("1GiB").unwrap(), 1_073_741_824);
+        assert_eq!(
+            parse_storage_capacity("10M", "STORAGE_CAPACITY").unwrap(),
+            10_000_000
+        );
+        assert_eq!(
+            parse_storage_capacity("2GB", "STORAGE_CAPACITY").unwrap(),
+            2_000_000_000
+        );
+        assert_eq!(
+            parse_storage_capacity("1 tb", "STORAGE_CAPACITY").unwrap(),
+            1_000_000_000_000
+        );
+        assert_eq!(
+            parse_storage_capacity("1GiB", "STORAGE_CAPACITY").unwrap(),
+            1_073_741_824
+        );
     }
 
     #[test]
     fn parse_storage_capacity_rejects_invalid_values() {
-        assert!(parse_storage_capacity("").is_err());
-        assert!(parse_storage_capacity("abc").is_err());
-        assert!(parse_storage_capacity("10 XB").is_err());
+        assert!(parse_storage_capacity("", "STORAGE_CAPACITY").is_err());
+        assert!(parse_storage_capacity("abc", "STORAGE_CAPACITY").is_err());
+        assert!(parse_storage_capacity("10 XB", "STORAGE_CAPACITY").is_err());
     }
 
     #[test]
@@ -310,8 +325,14 @@ mod tests {
 
     #[test]
     fn parse_storage_capacity_supports_pure_bytes() {
-        assert_eq!(parse_storage_capacity("1024").unwrap(), 1024);
-        assert_eq!(parse_storage_capacity("  500  ").unwrap(), 500);
+        assert_eq!(
+            parse_storage_capacity("1024", "STORAGE_CAPACITY").unwrap(),
+            1024
+        );
+        assert_eq!(
+            parse_storage_capacity("  500  ", "STORAGE_CAPACITY").unwrap(),
+            500
+        );
     }
 
     #[test]
@@ -333,7 +354,7 @@ mod tests {
         };
 
         let err = Config::from_cli(&cli).unwrap_err();
-        assert!(err.to_string().contains("invalid storage capacity"));
+        assert!(err.to_string().contains("invalid STORAGE_CAPACITY"));
     }
 
     #[test]
@@ -344,12 +365,12 @@ mod tests {
         };
 
         let err = Config::from_cli(&cli).unwrap_err();
-        assert!(err.to_string().contains("invalid storage capacity"));
+        assert!(err.to_string().contains("invalid STORAGE_MAX_FILE_SIZE"));
     }
 
     #[test]
     fn parse_storage_capacity_rejects_overflow() {
-        let result = parse_storage_capacity("1 ZB");
+        let result = parse_storage_capacity("1 ZB", "STORAGE_CAPACITY");
         let err = result.unwrap_err();
         assert!(err.to_string().contains("exceeds u64"));
     }

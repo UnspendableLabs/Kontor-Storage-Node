@@ -1,12 +1,11 @@
-use super::{sync_new_items, ITEM_TYPE_AGREEMENTS};
+use super::{load_existing_ids, sync_new_items, ITEM_TYPE_AGREEMENTS};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::JsonValue;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
-use std::collections::HashSet;
+use sea_orm::{DatabaseConnection, Set};
 
 pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
@@ -22,13 +21,13 @@ pub async fn sync_ready_agreements(
         .map(|agreement| agreement.agreement_id.clone())
         .collect();
 
-    let existing_ids: HashSet<String> = Agreements::find()
-        .filter(agreements::Column::AgreementId.is_in(requested_ids.clone()))
-        .all(database)
-        .await?
-        .into_iter()
-        .map(|model| model.agreement_id)
-        .collect();
+    let existing_ids = load_existing_ids::<Agreements, _>(
+        database,
+        agreements::Column::AgreementId,
+        &requested_ids,
+        |model| model.agreement_id,
+    )
+    .await?;
 
     sync_new_items(
         agreements,
@@ -82,10 +81,11 @@ pub(crate) fn agreement_to_active_model(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::portal::Agreement;
     use crate::entities::prelude::Agreements;
-    use crate::testutils::{setup_agreements_db, unique_storage_dir};
+    use crate::testutils::{setup_agreements_db, unique_storage_dir, AgreementFixture};
     use chrono::DateTime;
     use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
@@ -180,23 +180,16 @@ mod tests {
 
         let db = setup_agreements_db().await;
         // Seed an existing agreement that should not be duplicated.
-        let seeded = agreements::ActiveModel {
-            agreement_id: Set("AGREEMENT-existing".into()),
-            user_id: Set("user_existing".into()),
-            file_id: Set("FILE-existing".into()),
-            filename: Set("existing.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(555),
-            nodes: Set(json!(["NODE-existing"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(Some("TX-existing".into())),
-            curation: Set(json!({"curated": true})),
-            status: Set("ready".into()),
-            created_at: Set(DateTime::parse_from_rfc3339("2024-02-01T12:00:00Z").unwrap()),
-        };
-        seeded.insert(&db).await.unwrap();
+        let mut seeded = AgreementFixture::new("AGREEMENT-existing", "FILE-existing");
+        seeded.user_id = "user_existing".into();
+        seeded.filename = "existing.pdf".into();
+        seeded.mime_type = "application/pdf".into();
+        seeded.original_size = 555;
+        seeded.nodes = json!(["NODE-existing"]);
+        seeded.transaction_id = Some("TX-existing".into());
+        seeded.curation = json!({"curated": true});
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-02-01T12:00:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
 
         sync_ready_agreements(
             &PortalClient::new(mock_server.uri(), unique_storage_dir("mixed")),

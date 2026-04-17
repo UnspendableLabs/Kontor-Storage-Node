@@ -31,8 +31,9 @@ const BLS_PRIVATE_KEY_HEX_LEN: usize = 64;
 /// Decrypt an encrypted BLS private key blob exported from Horizon Wallet.
 ///
 /// The input is a hex string (as displayed by the wallet export).
-/// Returns the 64-character hex string of the raw 32-byte BLS private key.
-pub fn decrypt_wallet_blob(encrypted_hex: &str, password: &str) -> Result<String> {
+/// Returns the 64-character hex string of the raw 32-byte BLS private key
+/// wrapped in [`Zeroizing`] so the heap buffer is scrubbed on drop.
+pub fn decrypt_wallet_blob(encrypted_hex: &str, password: &str) -> Result<Zeroizing<String>> {
     let raw_bytes = hex::decode(encrypted_hex).context("invalid hex encoding in wallet blob")?;
     let payload = String::from_utf8(raw_bytes).context("hex-decoded bytes are not valid UTF-8")?;
 
@@ -118,7 +119,7 @@ pub fn decrypt_wallet_blob(encrypted_hex: &str, password: &str) -> Result<String
 
     hex::decode(hex_key).context("decrypted key is not valid hex")?;
 
-    Ok(hex_key.to_owned())
+    Ok(Zeroizing::new(hex_key.to_owned()))
 }
 
 /// Build an encrypted wallet blob for testing purposes.
@@ -168,7 +169,7 @@ mod tests {
 
         let blob = encrypt_test_blob(bls_key, password, &salt, &iv);
         let result = decrypt_wallet_blob(&blob, password).unwrap();
-        assert_eq!(result, bls_key);
+        assert_eq!(result.as_str(), bls_key);
     }
 
     #[test]

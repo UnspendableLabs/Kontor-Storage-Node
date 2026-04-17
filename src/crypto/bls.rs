@@ -39,7 +39,7 @@ const ARGON2_T_COST: u32 = 3; // 3 iterations
 const ARGON2_P_COST: u32 = 4; // 4 lanes
 
 /// Encrypted BLS key file format.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct EncryptedKeyFile {
     /// Version of the key file format.
     version: u32,
@@ -51,11 +51,37 @@ struct EncryptedKeyFile {
     ciphertext: Vec<u8>,
 }
 
+// Manual Debug impl: avoid printing any of the encrypted material (salt, nonce,
+// ciphertext). Only the sizes are safe to log.
+impl std::fmt::Debug for EncryptedKeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedKeyFile")
+            .field("salt", &format_args!("<{} bytes>", self.salt.len()))
+            .field("nonce", &format_args!("<{} bytes>", self.nonce.len()))
+            .field(
+                "ciphertext",
+                &format_args!("<{} bytes>", self.ciphertext.len()),
+            )
+            .finish()
+    }
+}
+
 /// A BLS keypair with the private key stored securely.
-#[derive(Debug)]
 pub struct BlsKeyPair {
     secret_key: Zeroizing<Vec<u8>>,
     public_key: PublicKey,
+}
+
+// Manual Debug impl: the derived impl forwarded to `Vec<u8>`'s Debug which
+// prints the raw secret-key bytes. Show only a short public-key fingerprint.
+impl std::fmt::Debug for BlsKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pk_hex = self.public_key_hex();
+        let fingerprint = pk_hex.get(..8).unwrap_or(pk_hex.as_str());
+        f.debug_struct("BlsKeyPair")
+            .field("public_key", &format_args!("{fingerprint}..."))
+            .finish()
+    }
 }
 
 impl BlsKeyPair {
@@ -236,8 +262,15 @@ impl BlsKeyPair {
     }
 
     /// Check if a key file exists at the given path.
-    pub async fn key_file_exists(path: &Path) -> bool {
-        fs::metadata(path).await.is_ok()
+    pub async fn key_file_exists(path: &Path) -> Result<bool> {
+        match fs::metadata(path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => {
+                Err(anyhow::Error::new(e)
+                    .context(format!("checking key file at {}", path.display())))
+            }
+        }
     }
 }
 
@@ -441,7 +474,7 @@ mod tests {
 
         original.save_encrypted(&path, password).await.unwrap();
 
-        assert!(BlsKeyPair::key_file_exists(&path).await);
+        assert!(BlsKeyPair::key_file_exists(&path).await.unwrap());
 
         let loaded = BlsKeyPair::load_encrypted(&path, password).await.unwrap();
 
@@ -470,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn key_file_exists_returns_false_for_missing_file() {
         let path = Path::new("/nonexistent/path/to/key.enc");
-        assert!(!BlsKeyPair::key_file_exists(path).await);
+        assert!(!BlsKeyPair::key_file_exists(path).await.unwrap());
     }
 
     #[test]
@@ -560,6 +593,49 @@ mod tests {
                 .contains("read encrypted key file"),
             "error should mention reading"
         );
+    }
+
+    #[test]
+    fn debug_redacts_secret_key() {
+        let keypair = BlsKeyPair::generate().unwrap();
+        let sk_hex = hex::encode(&*keypair.secret_key);
+        let pk_hex = keypair.public_key_hex();
+        let debug_str = format!("{:?}", keypair);
+
+        assert!(
+            !debug_str.contains(&sk_hex),
+            "Debug output must not contain the raw secret key hex; got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("secret_key"),
+            "Debug output must not mention the secret_key field; got: {debug_str}"
+        );
+
+        let fingerprint = &pk_hex[..8];
+        assert!(
+            debug_str.contains(fingerprint),
+            "Debug output should include the first 8 chars of the public key hex as a fingerprint; got: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn encrypted_key_file_debug_redacts_byte_contents() {
+        let key_file = EncryptedKeyFile {
+            version: 1,
+            salt: vec![0xAB; 16],
+            nonce: vec![0xCD; 12],
+            ciphertext: vec![0xEF; 48],
+        };
+        let debug_str = format!("{:?}", key_file);
+
+        assert!(debug_str.contains("EncryptedKeyFile"));
+        assert!(debug_str.contains("<16 bytes>"));
+        assert!(debug_str.contains("<12 bytes>"));
+        assert!(debug_str.contains("<48 bytes>"));
+        // None of the raw byte values should appear.
+        assert!(!debug_str.contains("171"), "salt byte 0xAB leaked");
+        assert!(!debug_str.contains("205"), "nonce byte 0xCD leaked");
+        assert!(!debug_str.contains("239"), "ciphertext byte 0xEF leaked");
     }
 
     #[tokio::test]

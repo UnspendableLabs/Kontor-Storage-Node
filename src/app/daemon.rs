@@ -210,6 +210,7 @@ impl Drop for LockFileGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;

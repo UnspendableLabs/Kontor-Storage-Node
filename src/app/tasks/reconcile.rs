@@ -1,15 +1,11 @@
 use super::downloadagreements::StorageBackend;
 use super::getnewagreements::agreement_to_active_model;
-use super::{sync_new_items, ITEM_TYPE_AGREEMENTS};
+use super::{load_existing_ids, sync_new_items, ITEM_TYPE_AGREEMENTS};
 use crate::app::config::StorageMethod;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
-use anyhow::{anyhow, Context, Result};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
-};
-use std::collections::HashSet;
+use anyhow::{Context, Result};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -37,13 +33,13 @@ pub(crate) async fn reconcile_from_portal(
         .map(|a| a.agreement_id.clone())
         .collect();
 
-    let existing_ids: HashSet<String> = Agreements::find()
-        .filter(agreements::Column::AgreementId.is_in(requested_ids.clone()))
-        .all(database)
-        .await?
-        .into_iter()
-        .map(|m| m.agreement_id)
-        .collect();
+    let existing_ids = load_existing_ids::<Agreements, _>(
+        database,
+        agreements::Column::AgreementId,
+        &requested_ids,
+        |m| m.agreement_id,
+    )
+    .await?;
 
     let already_in_db = existing_ids.len();
     let total_remote = remote_agreements.len();
@@ -117,39 +113,8 @@ async fn redownload_from_gcs(
         .await
         .with_context(|| format!("writing temp file {}", temp_path.display()))?;
 
-    let txn = database.begin().await?;
-
-    if let Err(err) = super::downloadagreements::process_downloaded_file(
-        temp_path.as_path(),
-        &bytes,
-        agreement,
-        &txn,
-    )
-    .await
-    {
-        txn.rollback().await.ok();
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(anyhow!(err).context(format!(
-            "processing re-downloaded file for agreement {}",
-            agreement.agreement_id
-        )));
-    }
-
-    let model = agreements::ActiveModel {
-        agreement_id: Set(agreement.agreement_id.clone()),
-        downloaded: Set(true),
-        ..Default::default()
-    };
-    if let Err(err) = model.update(&txn).await {
-        txn.rollback().await.ok();
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(anyhow!(err).context("marking reconciled agreement as downloaded"));
-    }
-
-    if let Err(err) = txn.commit().await {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(err.into());
-    }
+    super::downloadagreements::finalize_downloaded_bytes(database, agreement, &temp_path, &bytes)
+        .await?;
 
     if let Err(err) = fs::remove_file(&temp_path).await {
         warn!(
@@ -163,20 +128,21 @@ async fn redownload_from_gcs(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::portal::Agreement;
     use crate::clients::{GcsClient, PortalClient};
-    use crate::testutils::{setup_agreements_db, unique_storage_dir};
+    use crate::testutils::{
+        setup_agreements_db, unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY,
+    };
     use chrono::DateTime;
-    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
+    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait};
     use serde_json::json;
     use std::fs as stdfs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
     fn sample_agreement(id: &str, status: &str) -> Agreement {
         Agreement {
@@ -282,23 +248,14 @@ mod tests {
         mount_node_agreements(&mock_server, &agreements).await;
 
         let db = setup_agreements_db().await;
-        let seeded = agreements::ActiveModel {
-            agreement_id: Set("AGR-existing".into()),
-            user_id: Set("user_1".into()),
-            file_id: Set("FILE-AGR-existing".into()),
-            filename: Set("existing.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(555),
-            nodes: Set(json!(["NODE-test"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(true),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("confirmed".into()),
-            created_at: Set(DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap()),
-        };
-        seeded.insert(&db).await.unwrap();
+        let mut seeded = AgreementFixture::new("AGR-existing", "FILE-AGR-existing");
+        seeded.filename = "existing.pdf".into();
+        seeded.mime_type = "application/pdf".into();
+        seeded.original_size = 555;
+        seeded.downloaded = true;
+        seeded.status = "confirmed".into();
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
 
         let storage_dir = unique_storage_dir("reconcile_dedup");
         stdfs::create_dir_all(&storage_dir).ok();
@@ -393,23 +350,16 @@ mod tests {
         mount_node_agreements(&mock_server, &agreements).await;
 
         let db = setup_agreements_db().await;
-        let seeded = agreements::ActiveModel {
-            agreement_id: Set("AGR-noop".into()),
-            user_id: Set("user_1".into()),
-            file_id: Set("FILE-AGR-noop".into()),
-            filename: Set("noop.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(1024),
-            nodes: Set(json!(["NODE-test"])),
-            root: Set(Some("abc123".into())),
-            padded_len: Set(Some(2048)),
-            downloaded: Set(true),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("confirmed".into()),
-            created_at: Set(DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap()),
-        };
-        seeded.insert(&db).await.unwrap();
+        let mut seeded = AgreementFixture::new("AGR-noop", "FILE-AGR-noop");
+        seeded.filename = "noop.pdf".into();
+        seeded.mime_type = "application/pdf".into();
+        seeded.original_size = 1024;
+        seeded.root = Some("abc123".into());
+        seeded.padded_len = Some(2048);
+        seeded.downloaded = true;
+        seeded.status = "confirmed".into();
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
 
         let storage_dir = unique_storage_dir("reconcile_noop");
         stdfs::create_dir_all(&storage_dir).ok();

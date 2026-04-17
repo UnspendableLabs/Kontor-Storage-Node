@@ -1,15 +1,13 @@
 # Kontor Storage Node
 
-[![Tests](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/tests.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/tests.yml)
-[![Clippy](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/clippy.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/clippy.yml)
-[![Format](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/fmt.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/fmt.yml)
+[![CI](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node/graph/badge.svg?token=Rwusewkjbh)](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node)
 
 A storage node CLI for the Kontor distributed storage network. This node communicates with the Kontor Portal API to participate in the storage network.
 
 ## Prerequisites
 
-- Rust 1.70+ (edition 2021)
+- Rust stable (managed via [rust-toolchain.toml](rust-toolchain.toml))
 - A running Kontor Portal instance
 
 ## Installation
@@ -29,8 +27,7 @@ The node can be configured via command-line arguments or environment variables:
 | Option | Environment Variable | Default | Description |
 |--------|---------------------|---------|-------------|
 | `--portal-url` | `PORTAL_API_URL` | `http://localhost:8080` | Portal API base URL |
-| `--portal-api-key` | `PORTAL_API_KEY` | _required_ | Portal API key used for Bearer authentication |
-| `--portal-polling-interval-secs` | `PORTAL_POOLING_INTERVAL` | `30` | Interval in seconds between portal polling runs |
+| `--portal-polling-interval-secs` | `PORTAL_POLLING_INTERVAL` | `30` | Interval in seconds between portal polling runs (env: `PORTAL_POOLING_INTERVAL` is also accepted for backward compatibility but deprecated.) |
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
 | `--storage-capacity` | `STORAGE_CAPACITY` | _unlimited_ | Max storage for downloads (bytes, supports M/G/T suffix) |
@@ -39,20 +36,24 @@ The node can be configured via command-line arguments or environment variables:
 | `--storage-method` | `STORAGE_METHOD` | `local` | Storage backend: `local` for local filesystem or `gcs` for Google Cloud Storage |
 | `--storage-gcs-bucket-name` | `STORAGE_GCS_BUCKET_NAME` | _required if gcs_ | GCS bucket name (required when `STORAGE_METHOD=gcs`) |
 | `--storage-gcs-service-account-json` | `STORAGE_GCS_SERVICE_ACCOUNT_JSON` | _required if gcs_ | Path to GCS service account JSON file, or inline JSON (Horizon Portal: `[n]` newline escapes; required when `STORAGE_METHOD=gcs`) |
+| `--server-address` | `SERVER_ADDRESS` | `0.0.0.0:8081` | Address the public HTTP server binds to |
+| `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
+| `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. |
 
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
 
 ```
 PORTAL_API_URL=https://portal.example.com/api
-PORTAL_API_KEY=super-secret
-PORTAL_POOLING_INTERVAL=45
+PORTAL_POLLING_INTERVAL=45
 DATABASE_URL=sqlite:///tmp/kontor.db
 STORAGE_DIR=/tmp/kontor-files
 STORAGE_CAPACITY=10GB
 STORAGE_MAX_FILES=100
 STORAGE_MAX_FILE_SIZE=500MB
 STORAGE_METHOD=local
+SERVER_ADDRESS=0.0.0.0:8081
+PUBLIC_URL=http://localhost:8081
 ```
 
 For Google Cloud Storage backend:
@@ -116,6 +117,22 @@ export PORTAL_API_URL=https://portal.example.com/api
 ./Kontor-Storage-Node ping
 ```
 
+### HTTP Server
+
+When the daemon runs (`./Kontor-Storage-Node run`), it exposes a public HTTP server on `0.0.0.0:8081` by default (override via `--server-address` or `SERVER_ADDRESS`) for serving downloaded files and a dashboard.
+
+Endpoints:
+
+| Path | Description |
+|------|-------------|
+| `GET /` | HTML dashboard listing stored files |
+| `GET /api/info` | JSON: `{ "node_id": "..." }` |
+| `GET /files?offset=&limit=` | JSON: paginated list of stored files |
+| `GET /files/:file_id` | Download (local backend) or 307 redirect to a GCS signed URL |
+| `GET /static/*` | Static assets (logo, dashboard CSS/JS) |
+
+CORS is permissive (`Access-Control-Allow-Origin: *`). All routes are public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. See [`apiary.apib`](apiary.apib) for the full API specification.
+
 ## Development
 
 ```bash
@@ -135,5 +152,5 @@ See `docs/workflow.typ` for the complete system workflow diagram.
 
 ## License
 
-TBD
+To be defined. See `LICENSE` (file pending) for terms.
 

@@ -225,15 +225,10 @@ async fn serve_gcs(
     let location = HeaderValue::from_str(&download_url)
         .map_err(|err| DownloadError::Internal(format!("invalid redirect URL: {err}")))?;
 
+    // CORS headers are added uniformly by the CorsLayer in routes::router.
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, location)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, HEAD, OPTIONS"),
-        )
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
         .body(Body::empty())
         .map_err(|err| DownloadError::Internal(err.to_string()))
 }
@@ -260,9 +255,7 @@ pub fn response_builder(
     // Files are immutable (content-addressed by hash), cache for 1 year
     builder = builder.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
 
-    // CORS headers to allow cross-origin access
-    builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-    builder = builder.header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS");
+    // CORS headers are added uniformly by the CorsLayer in routes::router.
 
     Ok(builder)
 }
@@ -327,12 +320,12 @@ impl IntoResponse for DownloadError {
             )
                 .into_response(),
             DownloadError::Upstream(reason) => {
-                error!("GCS download failed: {}", reason);
-                (StatusCode::BAD_GATEWAY, reason).into_response()
+                tracing::error!("download upstream error: {reason}");
+                (StatusCode::BAD_GATEWAY, "bad gateway").into_response()
             }
             DownloadError::Internal(reason) => {
-                error!("Download failed: {}", reason);
-                (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response()
+                tracing::error!("download internal error: {reason}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
         }
     }

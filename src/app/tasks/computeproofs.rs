@@ -360,6 +360,7 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::GcsClient;
     use crate::crypto::BlsKeyPair;
