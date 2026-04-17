@@ -2380,4 +2380,126 @@ mod tests {
             "gcs_client should be None for local backend"
         );
     }
+
+    #[tokio::test]
+    async fn finalize_downloaded_bytes_succeeds_for_normal_path() {
+        // Cover the happy path of finalize_downloaded_bytes (no error branches)
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("finalize_happy");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+
+        let agreement_id = "AGREEMENT-finalize-ok";
+        let file_id = "FILE-finalize-ok";
+        let file_path = storage_dir.join(file_id);
+        let bytes = b"finalize happy path bytes";
+        stdfs::write(&file_path, bytes).unwrap();
+
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "finalize.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
+
+        let agreement = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+
+        finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
+            .await
+            .expect("finalize should succeed");
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.downloaded);
+        assert!(stored.root.is_some());
+        assert!(stored.padded_len.is_some());
+    }
+
+    #[tokio::test]
+    async fn finalize_downloaded_bytes_handles_post_processing_error() {
+        // Cover the post_processing error rollback branch (lines 547-552):
+        // force prepare_file_metadata path failure by putting a directory at ledger.bin
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("finalize_postproc_err");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+        // Pre-create the ledger.bin path as a directory so update_ledger fails.
+        stdfs::create_dir_all(storage_dir.join("ledger.bin")).unwrap();
+
+        let agreement_id = "AGREEMENT-finalize-pp-err";
+        let file_id = "FILE-finalize-pp-err";
+        let file_path = storage_dir.join(file_id);
+        let bytes = b"finalize pp err bytes";
+        stdfs::write(&file_path, bytes).unwrap();
+
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "pp.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
+
+        let agreement = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
+            .await
+            .expect_err("finalize should fail on ledger update");
+
+        assert!(
+            err.to_string().contains("post-processing downloaded file"),
+            "error should be wrapped with post-processing context: {err}"
+        );
+        assert!(
+            !file_path.exists(),
+            "local file should be cleaned up on post-processing error"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_ledger_errors_when_parent_dir_cannot_be_created() {
+        // Cover line 618 (creating ledger directory error) by passing a path
+        // where parent creation fails. We use a regular file as the storage root.
+        let storage_dir = unique_storage_dir("update_ledger_bad_parent");
+        let parent_dir = storage_dir.parent().unwrap().to_path_buf();
+        stdfs::create_dir_all(&parent_dir).unwrap();
+        // Create a file where the storage_dir should be — fs::create_dir_all on
+        // a path under a regular file should fail.
+        stdfs::write(&storage_dir, b"not a directory").unwrap();
+
+        let metadata = CryptoFileMetadata {
+            root: Fq::one(),
+            file_id: "FILE-bad-parent".into(),
+            padded_len: 64,
+            original_size: 32,
+            filename: "bad_parent.bin".into(),
+        };
+
+        // storage_dir is now a file, so storage_dir.join("ledger.bin").parent()
+        // is the file path — fs::create_dir_all will fail.
+        let result = update_ledger(&storage_dir, &metadata).await;
+        // Using a directory as a parent for ledger.bin fails — expect error.
+        assert!(result.is_err(), "should fail to create ledger directory");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("creating ledger directory") || msg.contains("loading ledger"),
+            "expected ledger error message, got: {msg}"
+        );
+    }
 }

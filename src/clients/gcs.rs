@@ -768,6 +768,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_signed_download_url_inline_skips_octet_stream_content_type() {
+        // Cover the branch where inline_content_type is application/octet-stream
+        // (and thus skipped) — line 250 in gcs.rs.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "redirect-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let url = client
+            .create_signed_download_url(
+                "blob.bin",
+                false,
+                Some("blob.bin"),
+                Some("application/octet-stream"),
+            )
+            .expect("signed url should be generated");
+
+        // Must include disposition but NOT response-content-type when ct is octet-stream
+        assert!(
+            url.contains("response-content-disposition="),
+            "inline disposition should be signed: {url}"
+        );
+        assert!(
+            !url.contains("response-content-type="),
+            "octet-stream content-type should NOT be signed: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_signed_download_url_inline_skips_empty_content_type() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "redirect-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let url = client
+            .create_signed_download_url("file.bin", false, Some("file.bin"), Some("   "))
+            .expect("signed url should be generated");
+
+        assert!(
+            !url.contains("response-content-type="),
+            "blank content-type should NOT be signed: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_signed_download_url_inline_without_content_type() {
+        // Cover the branch where inline_content_type is None
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(AccessTokenResponse {
+                    access_token: "redirect-token".to_string(),
+                }),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            client_with_endpoints(format!("{}/token", mock_server.uri()), mock_server.uri());
+
+        let url = client
+            .create_signed_download_url("file.bin", false, None, None)
+            .expect("signed url should be generated");
+
+        // Without filename or content-type override, only the bare inline disposition is signed
+        assert!(
+            url.contains("response-content-disposition="),
+            "inline disposition (without filename) should be signed: {url}"
+        );
+        assert!(
+            !url.contains("response-content-type="),
+            "no content-type override should be signed when None passed: {url}"
+        );
+    }
+
+    #[tokio::test]
     async fn create_signed_download_url_inline_sets_disposition_and_content_type() {
         let mock_server = MockServer::start().await;
 

@@ -723,4 +723,102 @@ mod tests {
         let resp = ListFilesError::BadRequest("bad".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn serves_local_file_with_inline_disposition_when_inline_query() {
+        // Cover the inline content-disposition branch (line 278 in handlers.rs).
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let file_id = "FILE-inline";
+        let filename = "image.png";
+        let content = Bytes::from_static(b"PNGdata");
+        tokio::fs::write(storage_dir.join(file_id), &content)
+            .await
+            .unwrap();
+
+        insert_agreement(&db, file_id, filename, content.len() as i64, true).await;
+
+        let response = router(DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
+        })
+        .oneshot(
+            Request::builder()
+                .uri(format!("/files/{file_id}?inline=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            disposition.starts_with("inline;"),
+            "expected inline disposition, got: {disposition}"
+        );
+        assert!(
+            disposition.contains(filename),
+            "filename should be included: {disposition}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_download_uses_mime_type_when_inline_query() {
+        // Cover the inline=true branch on serve_gcs (line 218 in handlers.rs)
+        // by including ?inline=true so mime_type is forwarded to the signed URL.
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+
+        let mut fx = AgreementFixture::new("AGREEMENT-FILE-gcs-inline", "FILE-gcs-inline");
+        fx.user_id = "user".into();
+        fx.filename = "photo.png".into();
+        fx.mime_type = "image/png".into();
+        fx.original_size = 12;
+        fx.nodes = serde_json::json!([]);
+        fx.padded_len = Some(12);
+        fx.downloaded = true;
+        fx.created_at = chrono::Utc::now().fixed_offset();
+        fx.into_active_model().insert(&db).await.unwrap();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
+            node_id: "NODE-TEST".to_string(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/FILE-gcs-inline?inline=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            location.contains("response-content-type=image%2Fpng"),
+            "expected image/png mime in signed URL when inline=true, got {location}"
+        );
+        assert!(
+            location.contains("inline"),
+            "expected inline disposition in signed URL, got {location}"
+        );
+    }
 }

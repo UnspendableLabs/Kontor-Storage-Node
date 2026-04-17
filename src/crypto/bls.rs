@@ -655,4 +655,66 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.public_key_hex(), keypair.public_key_hex());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_file_exists_propagates_permission_errors() {
+        // Cover the Err arm (lines 269-272) of key_file_exists
+        // by attempting to stat a file inside a directory we lack permissions for.
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let restricted = dir.path().join("restricted");
+        fs::create_dir_all(&restricted).unwrap();
+        let target = restricted.join(unique_filename());
+
+        // Create the file then drop permissions on the parent dir
+        fs::write(&target, b"placeholder").unwrap();
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = BlsKeyPair::key_file_exists(&target).await;
+
+        // Restore permissions so tempdir can clean up
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o755)).ok();
+
+        assert!(
+            result.is_err(),
+            "permission errors should be propagated, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("checking key file at"),
+            "error should include context: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_encrypted_works_with_relative_filename_having_no_parent() {
+        // Cover the path.parent() == None branch (line 213/217) of save_encrypted
+        // by saving to a bare filename in the current working directory.
+        use tokio::sync::Mutex;
+        // Serialize to avoid current_dir races between tests.
+        static CWD_LOCK: Mutex<()> = Mutex::const_new(());
+        let _guard = CWD_LOCK.lock().await;
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        let tmp = tempdir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let bare_name = format!("relative_{}.enc", unique_filename());
+        let path = std::path::PathBuf::from(&bare_name);
+
+        let keypair = BlsKeyPair::generate().unwrap();
+        let result = keypair.save_encrypted(&path, "password123").await;
+
+        // Restore CWD before any panics
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        result.expect("saving to bare filename should succeed");
+        assert!(
+            tmp.path().join(&bare_name).exists(),
+            "bare filename should resolve relative to CWD"
+        );
+    }
 }
