@@ -1,6 +1,7 @@
 use sea_orm_migration::{
     prelude::{
-        DbErr, DeriveIden, DeriveMigrationName, Expr, Index, MigrationTrait, SchemaManager, Table,
+        DbErr, DeriveIden, DeriveMigrationName, Expr, ForeignKey, ForeignKeyAction, Index,
+        MigrationTrait, SchemaManager, Table,
     },
     schema::{big_integer, string, string_len, timestamp_with_time_zone},
     sea_orm,
@@ -41,6 +42,13 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone(Challenges::UpdatedAt)
                             .not_null()
                             .default(Expr::current_timestamp()),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_challenges_agreement")
+                            .from(Challenges::Table, Challenges::AgreementId)
+                            .to(Agreements::Table, Agreements::AgreementId)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -114,4 +122,13 @@ enum Challenges {
     BlsSignature,
     CreatedAt,
     UpdatedAt,
+}
+
+/// Identifier mirror for the agreements table so we can reference it as the FK
+/// target without making the agreements migration's private `Agreements` enum
+/// pub. Only the column needed for the FK target is declared.
+#[derive(DeriveIden)]
+enum Agreements {
+    Table,
+    AgreementId,
 }

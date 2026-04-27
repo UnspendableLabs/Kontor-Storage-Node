@@ -5,6 +5,7 @@
 
 pub mod key_management;
 
+use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::PortalClient;
 use anyhow::Result;
 use std::io::Write;
@@ -26,7 +27,6 @@ const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Result of the onboarding process.
-#[derive(Debug)]
 pub struct OnboardingResult {
     /// The BLS keypair for signing requests.
     pub keypair: crate::crypto::BlsKeyPair,
@@ -38,6 +38,20 @@ pub struct OnboardingResult {
     pub token: String,
     /// Next nonce for registry transactions.
     pub next_nonce: u64,
+}
+
+// Manual Debug impl: the keypair and JWT token are secrets and must never be
+// printed. We redact both while still surfacing the non-sensitive identifiers.
+impl std::fmt::Debug for OnboardingResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnboardingResult")
+            .field("node_id", &self.node_id)
+            .field("signer_id", &self.signer_id)
+            .field("next_nonce", &self.next_nonce)
+            .field("token", &"<redacted>")
+            .field("keypair", &"<BlsKeyPair>")
+            .finish()
+    }
 }
 
 /// Configuration for the onboarding process.
@@ -83,7 +97,23 @@ pub async fn perform_onboarding_with_reader(
     writeln!(writer, "Looking up node identity...")?;
     let mut waiting = false;
     let (node_id, signer_id) = loop {
-        let lookup = client.lookup_node(&bls_pubkey).await?;
+        let lookup = match client.lookup_node(&bls_pubkey).await {
+            Ok(l) => l,
+            Err(e) => {
+                let is_not_found = e
+                    .downcast_ref::<HttpStatusError>()
+                    .map(|s| s.status == reqwest::StatusCode::NOT_FOUND)
+                    .unwrap_or(false);
+                if is_not_found {
+                    anyhow::bail!(
+                        "No node registered with this BLS public key.\n  \
+                         BLS public key: {bls_pubkey}\n  \
+                         Register this key on the Portal before starting the node."
+                    );
+                }
+                return Err(e);
+            }
+        };
         if let Some(sid) = lookup.signer_id {
             if waiting {
                 writeln!(writer)?;
@@ -106,7 +136,7 @@ pub async fn perform_onboarding_with_reader(
         } else {
             write!(writer, ".")?;
         }
-        writer.flush().ok();
+        writer.flush()?;
         tokio::time::sleep(REGISTRATION_POLL_INTERVAL).await;
     };
 
@@ -135,6 +165,7 @@ pub async fn perform_onboarding_with_reader(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::crypto::BlsKeyPair;
     use serde_json::json;
@@ -263,8 +294,9 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("status 404"),
-            "expected 404 error, got: {err}"
+            err.to_string()
+                .contains("No node registered with this BLS public key"),
+            "expected registration error with BLS pubkey, got: {err}"
         );
     }
 
@@ -410,5 +442,27 @@ mod tests {
         };
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("OnboardingResult"));
+        assert!(
+            debug_str.contains("<redacted>"),
+            "Debug output must redact the JWT token, got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("test-token"),
+            "Debug output must not contain the raw JWT token, got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("<BlsKeyPair>"),
+            "Debug output must use the <BlsKeyPair> placeholder, got: {debug_str}"
+        );
+        // Safety net: the old derive(Debug) would have printed this prefix,
+        // leaking the secret_key bytes. Make sure we never do that again.
+        assert!(
+            !debug_str.contains("BlsKeyPair { sk:"),
+            "Debug output must not expose BlsKeyPair internals, got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("secret_key"),
+            "Debug output must not mention the secret_key field, got: {debug_str}"
+        );
     }
 }

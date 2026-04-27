@@ -74,6 +74,7 @@ async fn run_portal_daemon(
             node_id,
             &storage_backend,
             &storage_dir,
+            true,
         )
         .await
         .context("startup reconciliation failed")?;
@@ -140,6 +141,19 @@ async fn sync_portal_once(
             );
             return Ok(());
         }
+    }
+
+    if let Some(node_id) = portal_client.node_id() {
+        reconcile::reconcile_from_portal(
+            portal_client,
+            database,
+            node_id,
+            storage_backend,
+            storage_dir,
+            false,
+        )
+        .await
+        .context("reconciling agreements with Portal")?;
     }
 
     sync_ready_agreements(portal_client, database)
@@ -210,6 +224,7 @@ impl Drop for LockFileGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
@@ -367,6 +382,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_portal_daemon_logs_when_daemon_task_fails() {
+        // Force the daemon spawned via spawn_portal_daemon to hit the error
+        // logging branch (line 52) by making the initial sync fail.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let lock_path = unique_test_path("lock_spawn_error");
+        let storage_dir = unique_test_path("storage_spawn_error");
+        fs::remove_file(&lock_path).ok();
+
+        let handle = spawn_portal_daemon(
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
+            database,
+            Duration::from_millis(5),
+            lock_path.clone(),
+            StorageLimits::default(),
+            StorageBackend::local(),
+            storage_dir,
+        );
+
+        // Wait for the daemon to fail and exit on its own. The spawned task
+        // should complete because run_portal_daemon returns Err on initial sync failure.
+        let res = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            res.is_ok(),
+            "daemon task should exit after logging the error"
+        );
+        assert!(
+            !lock_path.exists(),
+            "lock file should be cleaned up after daemon exits"
+        );
+    }
+
+    fn create_authenticated_portal_client(
+        mock_server_uri: &str,
+        storage_dir: PathBuf,
+    ) -> PortalClient {
+        use crate::crypto::BlsKeyPair;
+        let keypair = std::sync::Arc::new(BlsKeyPair::generate().unwrap());
+        PortalClient::with_auth(
+            mock_server_uri,
+            storage_dir,
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn spawn_portal_daemon_recovers_from_transient_sync_failure() {
+        // Exercise both backoff branches (lines 108, 113, 115-122) by
+        // having the initial sync succeed, then a subsequent sync fail (triggers
+        // backoff), then succeed again (triggers backoff reset).
+        let mock_server = MockServer::start().await;
+
+        // First call (initial sync) succeeds with empty list.
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second call (after first sleep) fails to trigger backoff (lines 113, 115-122).
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Subsequent calls succeed to trigger the reset-backoff branch (line 108).
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Get node challenges endpoint always returns empty (paginated).
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "challenges": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // For auth-enabled clients, reconcile is invoked on startup and
+        // fetches /api/agreements?nodes=NODE-test which we serve as empty.
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let lock_path = unique_test_path("lock_backoff_recover");
+        let storage_dir = unique_test_path("storage_backoff_recover");
+        fs::remove_file(&lock_path).ok();
+        fs::remove_dir_all(&storage_dir).ok();
+        fs::create_dir_all(&storage_dir).ok();
+
+        let handle = spawn_portal_daemon(
+            create_authenticated_portal_client(&mock_server.uri(), storage_dir.clone()),
+            database,
+            Duration::from_millis(10),
+            lock_path.clone(),
+            StorageLimits::default(),
+            StorageBackend::local(),
+            storage_dir.clone(),
+        );
+
+        // Wait long enough for the daemon to: 1) initial sync (success),
+        // 2) sleep, 3) fail sync (backoff applied), 4) sleep, 5) success (backoff reset).
+        // The expected /api/agreements call count is at least 3.
+        let start = time::Instant::now();
+        let mut req_count = 0usize;
+        while start.elapsed() < Duration::from_secs(10) {
+            time::sleep(Duration::from_millis(100)).await;
+            req_count = mock_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/api/agreements")
+                .count();
+            if req_count >= 3 {
+                break;
+            }
+        }
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            req_count >= 3,
+            "expected initial+fail+retry path to make at least 3 attempts, got {req_count}"
+        );
+    }
+
+    #[tokio::test]
     #[serial]
     async fn spawn_portal_daemon_syncs_initially_and_on_interval() {
         let mock_server = MockServer::start().await;
@@ -381,7 +568,7 @@ mod tests {
                 "filename": "contract.pdf",
                 "mime_type": "application/pdf",
                 "original_size": 1024,
-                "nodes": ["NODE-1"],
+                "nodes": [{"node_id": "NODE-1", "status": "valid"}],
                 "transaction_id": null,
                 "curation": {},
                 "status": "ready",

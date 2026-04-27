@@ -9,13 +9,56 @@ use anyhow::{Context, Result};
 /// Status constants for challenges and agreements.
 pub const STATUS_ACTIVE: &str = "active";
 pub const STATUS_PROVED: &str = "proved";
+pub const STATUS_FAILED: &str = "failed";
+#[allow(dead_code)]
+pub const STATUS_RESOLVED: &str = "resolved";
+#[allow(dead_code)]
+pub const STATUS_SUBMITTED: &str = "submitted";
+#[allow(dead_code)]
+pub const STATUS_CONFIRMED: &str = "confirmed";
+#[allow(dead_code)]
+pub const STATUS_READY: &str = "ready";
+#[allow(dead_code)]
+pub const STATUS_PENDING: &str = "pending";
 
 /// Item type names for logging and sync operations.
 pub const ITEM_TYPE_CHALLENGES: &str = "challenges";
 pub const ITEM_TYPE_AGREEMENTS: &str = "agreements";
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, InsertResult, TryInsertResult};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, InsertResult, QueryFilter,
+    TryInsertResult,
+};
 use std::collections::HashSet;
 use tracing::info;
+
+/// Load the subset of `ids` that already exist in the database for entity `E`,
+/// using `column` as the column to filter against and `extract` to pull the
+/// string identifier out of each loaded model.
+///
+/// Short-circuits to an empty set when `ids` is empty; this avoids issuing a
+/// `WHERE col IN ()` query, which is invalid on some SQL backends.
+pub async fn load_existing_ids<E, C>(
+    database: &DatabaseConnection,
+    column: C,
+    ids: &[String],
+    extract: impl Fn(<E as EntityTrait>::Model) -> String,
+) -> Result<HashSet<String>>
+where
+    E: EntityTrait,
+    C: ColumnTrait + Copy,
+{
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    Ok(E::find()
+        .filter(column.is_in(ids.to_vec()))
+        .all(database)
+        .await
+        .context("loading existing IDs")?
+        .into_iter()
+        .map(extract)
+        .collect())
+}
 
 /// Helper for syncing items from an API to the database.
 ///

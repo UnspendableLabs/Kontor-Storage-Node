@@ -360,6 +360,7 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::GcsClient;
     use crate::crypto::BlsKeyPair;
@@ -1403,6 +1404,164 @@ mod tests {
             chal.bls_signature,
             Some("portal_sig".to_string()),
             "should store Portal's signature"
+        );
+    }
+
+    #[test]
+    fn real_proof_generator_produces_postcard_serialized_proof() {
+        // Exercise the production proof generator end-to-end with a real
+        // ledger entry so the postcard serialization path is covered.
+        let file_bytes = b"real proof generator coverage";
+        let filename = "real.bin";
+
+        let (_prepared, metadata) = api::prepare_file(file_bytes, filename).unwrap();
+
+        let mut ledger = FileLedger::new();
+        ledger.add_file(&metadata).unwrap();
+
+        let seed_field = seed_to_field_element(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let challenge = CryptoChallenge::new(
+            metadata.clone(),
+            850000,
+            5,
+            seed_field,
+            "NODE-test".to_string(),
+        );
+
+        let proof_bytes = RealProofGenerator
+            .generate_proof(file_bytes, filename, &ledger, metadata, challenge)
+            .expect("real proof generator should succeed");
+
+        assert!(
+            !proof_bytes.is_empty(),
+            "real proof generator should produce non-empty bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_block_height_overflow() {
+        let mock_server = MockServer::start().await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("block_height_overflow");
+        stdfs::create_dir_all(&storage_dir).ok();
+
+        let file_id = "file_overflow";
+        mock_agreement("agr_overflow", file_id)
+            .insert(&db)
+            .await
+            .unwrap();
+        stdfs::write(storage_dir.join(file_id), b"content").unwrap();
+
+        let ledger = FileLedger::new();
+        ledger.save(&storage_dir.join("ledger.bin")).unwrap();
+
+        // Negative block_height (i64) cannot be converted to u64.
+        challenges::ActiveModel {
+            challenge_id: Set("chal_overflow".into()),
+            agreement_id: Set("agr_overflow".into()),
+            block_height: Set(-1),
+            challenge_count: Set(5),
+            seed: Set("0000000000000000000000000000000000000000000000000000000000000001".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(850100),
+            status: Set("active".into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+            updated_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let backend = StorageBackend::local();
+
+        let result = compute_and_submit_proofs_with_generator(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &MockProofGenerator,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "overall function should succeed even with one bad challenge"
+        );
+
+        // Challenge should still be active because block_height conversion failed
+        let chal = Challenges::find()
+            .filter(challenges::Column::ChallengeId.eq("chal_overflow"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chal.status, "active");
+    }
+
+    #[tokio::test]
+    async fn rejects_challenge_count_overflow() {
+        let mock_server = MockServer::start().await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("challenge_count_overflow");
+        stdfs::create_dir_all(&storage_dir).ok();
+
+        let file_id = "file_count_overflow";
+        mock_agreement("agr_count_overflow", file_id)
+            .insert(&db)
+            .await
+            .unwrap();
+        stdfs::write(storage_dir.join(file_id), b"content").unwrap();
+
+        let ledger = FileLedger::new();
+        ledger.save(&storage_dir.join("ledger.bin")).unwrap();
+
+        // Negative challenge_count (i64) cannot be converted to usize.
+        challenges::ActiveModel {
+            challenge_id: Set("chal_count_overflow".into()),
+            agreement_id: Set("agr_count_overflow".into()),
+            block_height: Set(850000),
+            challenge_count: Set(-5),
+            seed: Set("0000000000000000000000000000000000000000000000000000000000000001".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(850100),
+            status: Set("active".into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+            updated_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let backend = StorageBackend::local();
+
+        let result = compute_and_submit_proofs_with_generator(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &MockProofGenerator,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let chal = Challenges::find()
+            .filter(challenges::Column::ChallengeId.eq("chal_count_overflow"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chal.status, "active",
+            "challenge should remain active when conversion fails"
         );
     }
 

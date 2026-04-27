@@ -33,7 +33,16 @@ impl MigrationTrait for Migration {
                     .col(big_integer(Agreements::PaddedLen).null())
                     .col(boolean(Agreements::Downloaded).not_null().default(false))
                     .col(string_len(Agreements::TransactionId, 64).null())
-                    .col(json(Agreements::Curation))
+                    .col(
+                        json(Agreements::Curation)
+                            .not_null()
+                            // The entity declares `pub curation: Json` (non-Option), so the
+                            // column must be NOT NULL with a default. We parse the empty-object
+                            // literal here because `serde_json` is not a direct dep of this crate
+                            // (would require a Cargo.lock change), and `JsonValue::default()`
+                            // returns `Null` instead of an empty object.
+                            .default(empty_json_object()),
+                    )
                     .col(
                         string_len(Agreements::Status, 20)
                             .not_null()
@@ -99,6 +108,15 @@ impl MigrationTrait for Migration {
             .drop_table(Table::drop().table(Agreements::Table).to_owned())
             .await
     }
+}
+
+/// Build the JSON value `{}` without depending on `serde_json` directly.
+///
+/// `JsonValue` is `serde_json::Value`, which implements `FromStr`, so parsing
+/// the static literal `"{}"` produces a `JsonValue::Object(...)`. The literal is
+/// trivially valid JSON, making the `expect` unreachable in practice.
+fn empty_json_object() -> JsonValue {
+    "{}".parse().expect("'{}' is a valid JSON object literal")
 }
 
 #[derive(DeriveIden)]
