@@ -4,7 +4,6 @@ use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
-use sea_orm::JsonValue;
 use sea_orm::{DatabaseConnection, Set};
 
 pub async fn sync_ready_agreements(
@@ -43,14 +42,8 @@ pub async fn sync_ready_agreements(
 pub(crate) fn agreement_to_active_model(
     agreement: &crate::clients::portal::Agreement,
 ) -> Result<agreements::ActiveModel> {
-    let nodes_json = JsonValue::Array(
-        agreement
-            .nodes
-            .iter()
-            .cloned()
-            .map(JsonValue::String)
-            .collect(),
-    );
+    let nodes_json =
+        serde_json::to_value(&agreement.nodes).context("serializing agreement nodes")?;
 
     let created_at: DateTimeWithTimeZone =
         DateTime::<FixedOffset>::parse_from_rfc3339(&agreement.created_at)
@@ -83,7 +76,7 @@ pub(crate) fn agreement_to_active_model(
 mod tests {
     #![allow(deprecated)]
     use super::*;
-    use crate::clients::portal::Agreement;
+    use crate::clients::portal::{Agreement, AgreementNode};
     use crate::entities::prelude::Agreements;
     use crate::testutils::{setup_agreements_db, unique_storage_dir, AgreementFixture};
     use chrono::DateTime;
@@ -100,7 +93,10 @@ mod tests {
             filename: "contract.pdf".to_string(),
             mime_type: "application/pdf".to_string(),
             original_size: 1_024,
-            nodes: vec!["NODE-1".to_string()],
+            nodes: vec![AgreementNode {
+                node_id: "NODE-1".to_string(),
+                status: "valid".to_string(),
+            }],
             transaction_id: None,
             curation: json!({"notes": "ok"}),
             status: "ready".to_string(),
@@ -210,7 +206,10 @@ mod tests {
         assert_eq!(inserted.filename, new_agreement.filename);
         assert_eq!(inserted.mime_type, new_agreement.mime_type);
         assert_eq!(inserted.original_size, 1_024);
-        assert_eq!(inserted.nodes, json!(["NODE-1"]));
+        assert_eq!(
+            inserted.nodes,
+            json!([{"node_id": "NODE-1", "status": "valid"}])
+        );
         assert!(inserted.transaction_id.is_none());
         assert_eq!(inserted.curation, json!({"notes": "ok"}));
         assert_eq!(inserted.status, "ready");

@@ -590,12 +590,14 @@ impl PortalClient {
     ///
     /// This method handles pagination automatically, fetching all pages.
     /// Requires authentication via JWT Bearer token.
+    #[allow(dead_code)]
     pub async fn get_node_challenges(&self) -> Result<Vec<Challenge>> {
         self.paginate(|offset| self.get_challenges_page(offset))
             .await
     }
 
     /// Fetch a single page of challenges with the given offset.
+    #[allow(dead_code)]
     async fn get_challenges_page(&self, offset: u32) -> Result<ChallengesPage> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow!("authentication required to fetch challenges: no keypair configured")
@@ -616,6 +618,41 @@ impl PortalClient {
             .json::<ChallengesPage>()
             .await
             .context("failed to deserialize challenges page")?;
+        Ok(page)
+    }
+
+    /// Fetch all challenges for this node, regardless of status.
+    ///
+    /// Used to reconcile local challenge statuses with Portal (e.g. picking up
+    /// transitions to `failed`, `resolved`, etc.). Requires authentication.
+    pub async fn get_all_node_challenges(&self) -> Result<Vec<Challenge>> {
+        self.paginate(|offset| self.get_all_challenges_page(offset))
+            .await
+    }
+
+    /// Fetch a single page of all challenges (no status filter).
+    async fn get_all_challenges_page(&self, offset: u32) -> Result<ChallengesPage> {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow!("authentication required to fetch challenges: no keypair configured")
+        })?;
+
+        let url = self.api_path(&format!(
+            "/api/nodes/{}/challenges?offset={offset}",
+            auth.node_id
+        ));
+
+        let request = self.build_signed_request(Method::GET, &url, None)?;
+
+        let resp = request.send().await?;
+        let resp = check_response_status(
+            resp,
+            &format!("fetch all challenges for node {}", auth.node_id),
+        )
+        .await?;
+        let page = resp
+            .json::<ChallengesPage>()
+            .await
+            .context("failed to deserialize all challenges page")?;
         Ok(page)
     }
 
@@ -710,7 +747,7 @@ impl PaginatedResponse for ChallengesPage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Challenge {
     pub challenge_id: String,
     pub agreement_id: String,
@@ -726,7 +763,13 @@ pub struct Challenge {
     pub updated_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgreementNode {
+    pub node_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Agreement {
     pub agreement_id: String,
     pub user_id: String,
@@ -734,7 +777,7 @@ pub struct Agreement {
     pub filename: String,
     pub mime_type: String,
     pub original_size: u64,
-    pub nodes: Vec<String>,
+    pub nodes: Vec<AgreementNode>,
     pub transaction_id: Option<String>,
     #[serde(default)]
     pub curation: serde_json::Value,
@@ -1058,7 +1101,7 @@ mod tests {
                     "filename": "contract.pdf",
                     "mime_type": "application/pdf",
                     "original_size": 1024,
-                    "nodes": ["NODE-1"],
+                    "nodes": [{"node_id": "NODE-1", "status": "valid"}],
                     "transaction_id": null,
                     "curation": {},
                     "status": "ready",
@@ -1073,6 +1116,50 @@ mod tests {
 
         assert_eq!(agreements.len(), 1);
         assert_eq!(agreements[0].agreement_id, "AGREEMENT-123");
+    }
+
+    #[tokio::test]
+    async fn get_new_agreements_deserializes_new_nodes_format() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 1,
+                "agreements": [{
+                    "agreement_id": "AGREEMENT-NEW",
+                    "user_id": "user_1",
+                    "file_id": "FILE-abc",
+                    "filename": "contract.pdf",
+                    "mime_type": "application/pdf",
+                    "original_size": 1024,
+                    "nodes": [
+                        {"node_id": "NODE-1", "status": "valid"},
+                        {"node_id": "NODE-2", "status": "failed"}
+                    ],
+                    "transaction_id": null,
+                    "curation": {},
+                    "status": "ready",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("agreements_nodes_format"));
+        let agreements = client.get_new_agreements().await.unwrap();
+
+        assert_eq!(agreements.len(), 1);
+        let nodes = &agreements[0].nodes;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].node_id, "NODE-1");
+        assert_eq!(nodes[0].status, "valid");
+        assert_eq!(nodes[1].node_id, "NODE-2");
+        assert_eq!(nodes[1].status, "failed");
     }
 
     #[tokio::test]
@@ -1692,13 +1779,15 @@ mod tests {
                     {
                         "agreement_id": "AGR-1", "user_id": "u1", "file_id": "F-1",
                         "filename": "a.pdf", "mime_type": "application/pdf", "original_size": 10,
-                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "nodes": [{"node_id": "N1", "status": "valid"}],
+                        "transaction_id": null, "curation": {},
                         "status": "ready", "created_at": "2024-01-01T00:00:00Z"
                     },
                     {
                         "agreement_id": "AGR-2", "user_id": "u1", "file_id": "F-2",
                         "filename": "b.pdf", "mime_type": "application/pdf", "original_size": 20,
-                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "nodes": [{"node_id": "N1", "status": "valid"}],
+                        "transaction_id": null, "curation": {},
                         "status": "ready", "created_at": "2024-01-02T00:00:00Z"
                     }
                 ]
@@ -1719,7 +1808,8 @@ mod tests {
                     {
                         "agreement_id": "AGR-3", "user_id": "u1", "file_id": "F-3",
                         "filename": "c.pdf", "mime_type": "application/pdf", "original_size": 30,
-                        "nodes": ["N1"], "transaction_id": null, "curation": {},
+                        "nodes": [{"node_id": "N1", "status": "valid"}],
+                        "transaction_id": null, "curation": {},
                         "status": "ready", "created_at": "2024-01-03T00:00:00Z"
                     }
                 ]

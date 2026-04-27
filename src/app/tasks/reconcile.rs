@@ -1,22 +1,28 @@
 use super::downloadagreements::StorageBackend;
 use super::getnewagreements::agreement_to_active_model;
-use super::{load_existing_ids, sync_new_items, ITEM_TYPE_AGREEMENTS};
+use super::{load_existing_ids, sync_new_items, ITEM_TYPE_AGREEMENTS, STATUS_FAILED};
 use crate::app::config::StorageMethod;
+use crate::clients::portal::Agreement;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{Context, Result};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tracing::{info, warn};
 
+/// Reconcile local DB with Portal:
+/// - inserts agreements that are remote but missing locally,
+/// - updates `status` and `nodes` of existing agreements when they diverge,
+/// - optionally re-downloads undownloaded files from GCS (startup only).
 pub(crate) async fn reconcile_from_portal(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     node_id: &str,
     storage_backend: &StorageBackend,
     storage_dir: &Path,
+    redownload_from_gcs: bool,
 ) -> Result<()> {
     let remote_agreements = portal_client
         .get_node_agreements(node_id)
@@ -44,6 +50,12 @@ pub(crate) async fn reconcile_from_portal(
     let already_in_db = existing_ids.len();
     let total_remote = remote_agreements.len();
 
+    let to_update: Vec<Agreement> = remote_agreements
+        .iter()
+        .filter(|a| existing_ids.contains(&a.agreement_id))
+        .cloned()
+        .collect();
+
     sync_new_items(
         remote_agreements,
         existing_ids,
@@ -57,8 +69,12 @@ pub(crate) async fn reconcile_from_portal(
 
     let newly_inserted = total_remote - already_in_db;
 
+    let updated = update_existing_agreement_metadata(&to_update, database)
+        .await
+        .context("updating existing agreement statuses")?;
+
     let mut redownloaded = 0usize;
-    if storage_backend.method == StorageMethod::Gcs {
+    if redownload_from_gcs && storage_backend.method == StorageMethod::Gcs {
         if let Some(gcs_client) = &storage_backend.gcs_client {
             let undownloaded = Agreements::find()
                 .filter(agreements::Column::Downloaded.eq(false))
@@ -67,7 +83,7 @@ pub(crate) async fn reconcile_from_portal(
                 .context("querying undownloaded agreements for reconciliation")?;
 
             for agreement in undownloaded {
-                match redownload_from_gcs(&agreement, gcs_client, database, storage_dir).await {
+                match redownload_one_from_gcs(&agreement, gcs_client, database, storage_dir).await {
                     Ok(()) => redownloaded += 1,
                     Err(err) => {
                         warn!(
@@ -82,13 +98,91 @@ pub(crate) async fn reconcile_from_portal(
 
     info!(
         "Reconciled {total_remote} agreements ({already_in_db} already in DB, \
-         {newly_inserted} inserted, {redownloaded} re-downloaded from GCS)"
+         {newly_inserted} inserted, {updated} updated, {redownloaded} re-downloaded from GCS)"
     );
 
     Ok(())
 }
 
-async fn redownload_from_gcs(
+/// Update `status` and `nodes` of agreements already present in DB whose
+/// remote representation has changed. Only those two columns are touched.
+async fn update_existing_agreement_metadata(
+    remote_agreements: &[Agreement],
+    database: &DatabaseConnection,
+) -> Result<usize> {
+    if remote_agreements.is_empty() {
+        return Ok(0);
+    }
+
+    let ids: Vec<String> = remote_agreements
+        .iter()
+        .map(|a| a.agreement_id.clone())
+        .collect();
+    let local_models = Agreements::find()
+        .filter(agreements::Column::AgreementId.is_in(ids))
+        .all(database)
+        .await
+        .context("loading existing agreements for status reconciliation")?;
+
+    let mut updated = 0usize;
+    for local in local_models {
+        let Some(remote) = remote_agreements
+            .iter()
+            .find(|a| a.agreement_id == local.agreement_id)
+        else {
+            continue;
+        };
+
+        let remote_nodes =
+            serde_json::to_value(&remote.nodes).context("serializing remote agreement nodes")?;
+
+        let status_changed = remote.status != local.status;
+        let nodes_changed = remote_nodes != local.nodes;
+
+        if !status_changed && !nodes_changed {
+            continue;
+        }
+
+        if status_changed {
+            if remote.status == STATUS_FAILED {
+                warn!(
+                    "agreement {} status: {} -> {}",
+                    local.agreement_id, local.status, remote.status
+                );
+            } else {
+                info!(
+                    "agreement {} status: {} -> {}",
+                    local.agreement_id, local.status, remote.status
+                );
+            }
+        }
+
+        let mut active = agreements::ActiveModel {
+            agreement_id: Set(local.agreement_id.clone()),
+            ..Default::default()
+        };
+        if status_changed {
+            active.status = Set(remote.status.clone());
+        }
+        if nodes_changed {
+            active.nodes = Set(remote_nodes);
+        }
+
+        // Mark the primary key as Unchanged so SeaORM issues an UPDATE on it
+        // rather than treating the row as new.
+        active.agreement_id = ActiveValue::Unchanged(local.agreement_id);
+
+        Agreements::update(active)
+            .exec(database)
+            .await
+            .context("updating agreement metadata")?;
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+async fn redownload_one_from_gcs(
     agreement: &agreements::Model,
     gcs_client: &Arc<crate::clients::GcsClient>,
     database: &DatabaseConnection,
@@ -130,7 +224,7 @@ async fn redownload_from_gcs(
 mod tests {
     #![allow(deprecated)]
     use super::*;
-    use crate::clients::portal::Agreement;
+    use crate::clients::portal::{Agreement, AgreementNode};
     use crate::clients::{GcsClient, PortalClient};
     use crate::testutils::{
         setup_agreements_db, unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY,
@@ -152,7 +246,10 @@ mod tests {
             filename: "contract.pdf".to_string(),
             mime_type: "application/pdf".to_string(),
             original_size: 1_024,
-            nodes: vec!["NODE-test".to_string()],
+            nodes: vec![AgreementNode {
+                node_id: "NODE-test".to_string(),
+                status: "valid".to_string(),
+            }],
             transaction_id: None,
             curation: json!({}),
             status: status.to_string(),
@@ -226,7 +323,7 @@ mod tests {
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
         let backend = StorageBackend::local();
 
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -262,7 +359,7 @@ mod tests {
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
         let backend = StorageBackend::local();
 
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -324,7 +421,7 @@ mod tests {
         };
 
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -366,7 +463,7 @@ mod tests {
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
         let backend = StorageBackend::local();
 
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -389,7 +486,7 @@ mod tests {
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
         let backend = StorageBackend::local();
 
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -409,7 +506,7 @@ mod tests {
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
         let backend = StorageBackend::local();
 
-        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir)
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true)
             .await
             .unwrap();
 
@@ -460,7 +557,8 @@ mod tests {
         };
 
         let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
-        let result = reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir).await;
+        let result =
+            reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, true).await;
 
         assert!(
             result.is_ok(),
@@ -471,6 +569,70 @@ mod tests {
         assert!(
             !stored.downloaded,
             "agreement should remain undownloaded after GCS failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn updates_status_of_existing_agreement_when_portal_marks_failed() {
+        let mock_server = MockServer::start().await;
+        let agreements = vec![sample_agreement("AGR-fail", "failed")];
+        mount_node_agreements(&mock_server, &agreements).await;
+
+        let db = setup_agreements_db().await;
+
+        let mut seeded = AgreementFixture::new("AGR-fail", "FILE-AGR-fail");
+        seeded.status = "ready".into();
+        seeded.downloaded = true;
+        seeded.root = Some("seeded-root".into());
+        seeded.padded_len = Some(4096);
+        seeded.original_size = 2048;
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
+
+        let storage_dir = unique_storage_dir("reconcile_status_failed");
+        stdfs::create_dir_all(&storage_dir).ok();
+
+        let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
+        let backend = StorageBackend::local();
+
+        reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, false)
+            .await
+            .unwrap();
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq("AGR-fail"))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("agreement should still exist");
+        assert_eq!(stored.status, "failed");
+        assert!(
+            stored.downloaded,
+            "downloaded flag should be preserved on status update"
+        );
+        assert_eq!(
+            stored.root.as_deref(),
+            Some("seeded-root"),
+            "root must be preserved on status reconcile"
+        );
+        assert_eq!(
+            stored.padded_len,
+            Some(4096),
+            "padded_len must be preserved on status reconcile"
+        );
+        assert_eq!(
+            stored.original_size, 2048,
+            "original_size must be preserved on status reconcile"
+        );
+        assert_eq!(
+            stored.created_at,
+            DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap(),
+            "created_at must be preserved on status reconcile"
+        );
+        assert_eq!(
+            stored.nodes,
+            json!([{"node_id": "NODE-test", "status": "valid"}]),
+            "nodes should reflect the latest portal payload"
         );
     }
 }

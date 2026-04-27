@@ -74,6 +74,7 @@ async fn run_portal_daemon(
             node_id,
             &storage_backend,
             &storage_dir,
+            true,
         )
         .await
         .context("startup reconciliation failed")?;
@@ -140,6 +141,19 @@ async fn sync_portal_once(
             );
             return Ok(());
         }
+    }
+
+    if let Some(node_id) = portal_client.node_id() {
+        reconcile::reconcile_from_portal(
+            portal_client,
+            database,
+            node_id,
+            storage_backend,
+            storage_dir,
+            false,
+        )
+        .await
+        .context("reconciling agreements with Portal")?;
     }
 
     sync_ready_agreements(portal_client, database)
@@ -554,7 +568,7 @@ mod tests {
                 "filename": "contract.pdf",
                 "mime_type": "application/pdf",
                 "original_size": 1024,
-                "nodes": ["NODE-1"],
+                "nodes": [{"node_id": "NODE-1", "status": "valid"}],
                 "transaction_id": null,
                 "curation": {},
                 "status": "ready",

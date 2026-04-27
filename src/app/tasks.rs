@@ -9,6 +9,17 @@ use anyhow::{Context, Result};
 /// Status constants for challenges and agreements.
 pub const STATUS_ACTIVE: &str = "active";
 pub const STATUS_PROVED: &str = "proved";
+pub const STATUS_FAILED: &str = "failed";
+#[allow(dead_code)]
+pub const STATUS_RESOLVED: &str = "resolved";
+#[allow(dead_code)]
+pub const STATUS_SUBMITTED: &str = "submitted";
+#[allow(dead_code)]
+pub const STATUS_CONFIRMED: &str = "confirmed";
+#[allow(dead_code)]
+pub const STATUS_READY: &str = "ready";
+#[allow(dead_code)]
+pub const STATUS_PENDING: &str = "pending";
 
 /// Item type names for logging and sync operations.
 pub const ITEM_TYPE_CHALLENGES: &str = "challenges";
