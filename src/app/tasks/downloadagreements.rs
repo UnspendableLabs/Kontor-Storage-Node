@@ -5,11 +5,12 @@ use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
+use sea_orm::sea_query::Expr;
 #[cfg(test)]
 use sea_orm::DbErr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+    EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -457,22 +458,24 @@ pub async fn download_agreements(
 }
 
 async fn current_used_capacity(database: &DatabaseConnection) -> Result<u64> {
-    let downloaded = Agreements::find()
+    // Compute the sum at the database level rather than streaming every downloaded row
+    // into memory. `SELECT SUM(original_size) ... ` always returns one row, but the
+    // value is NULL when no rows match (empty result set), which surfaces here as
+    // `Some(None)` from `into_tuple::<Option<i64>>().one(...)`. `.flatten()` collapses
+    // that to a single `Option<i64>`, and `unwrap_or(0)` handles the empty-table case.
+    let total: Option<i64> = Agreements::find()
         .filter(agreements::Column::Downloaded.eq(true))
-        .all(database)
+        .select_only()
+        .column_as(Expr::col(agreements::Column::OriginalSize).sum(), "total")
+        .into_tuple::<Option<i64>>()
+        .one(database)
         .await
-        .context("failed to load downloaded agreements for capacity tracking")?;
-
-    let mut total: u64 = 0;
-    for agreement in downloaded {
-        let size: u64 = agreement
-            .original_size
-            .try_into()
-            .context("original_size does not fit into u64")?;
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| anyhow!("stored agreements exceed trackable capacity"))?;
-    }
+        .context("failed to compute total used capacity")?
+        .flatten();
+    let total = total.unwrap_or(0);
+    let total: u64 = total
+        .try_into()
+        .context("total used capacity overflowed u64")?;
     Ok(total)
 }
 
@@ -516,6 +519,54 @@ pub(crate) async fn process_downloaded_file(
     update_ledger(storage_root, &metadata)
         .await
         .map_err(PostProcessError::Ledger)?;
+
+    Ok(())
+}
+
+/// Persist post-download metadata for an agreement, mark it as downloaded, and
+/// commit in a single transaction.
+///
+/// On any error the transaction is rolled back, `local_path` is removed if it
+/// exists, and the original error is returned wrapped with context. On success
+/// the local file is preserved so the caller can decide what to do with it
+/// (e.g. delete after a successful GCS upload, or keep for local storage).
+///
+/// The caller is responsible for any non-DB cleanup such as rolling back a
+/// previously uploaded GCS object. This helper is also intended for
+/// `store_agreement_file` once its `CleanupGuard`/GCS-rollback wiring can be
+/// refactored to interleave with the helper cleanly.
+pub(crate) async fn finalize_downloaded_bytes(
+    database: &DatabaseConnection,
+    agreement: &agreements::Model,
+    local_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let txn = database.begin().await?;
+
+    if let Err(err) = process_downloaded_file(local_path, bytes, agreement, &txn).await {
+        txn.rollback().await.ok();
+        let _ = fs::remove_file(local_path).await;
+        return Err(anyhow!(err).context(format!(
+            "post-processing downloaded file for agreement {}",
+            agreement.agreement_id
+        )));
+    }
+
+    let model = agreements::ActiveModel {
+        agreement_id: Set(agreement.agreement_id.clone()),
+        downloaded: Set(true),
+        ..Default::default()
+    };
+    if let Err(err) = model.update(&txn).await {
+        txn.rollback().await.ok();
+        let _ = fs::remove_file(local_path).await;
+        return Err(anyhow!(err).context("marking agreement as downloaded"));
+    }
+
+    if let Err(err) = txn.commit().await {
+        let _ = fs::remove_file(local_path).await;
+        return Err(err.into());
+    }
 
     Ok(())
 }
@@ -590,10 +641,13 @@ fn ledger_path(storage_root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Agreements;
-    use crate::testutils::{setup_agreements_db, unique_storage_dir};
+    use crate::testutils::{
+        setup_agreements_db, unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY,
+    };
     use halo2curves::pasta::Fq;
     use sea_orm::{EntityTrait, PaginatorTrait};
     use serde_json::json;
@@ -640,7 +694,6 @@ mod tests {
     }
 
     static FAIL_COMMIT_THREAD: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
-    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
     pub(crate) struct CommitFailGuard;
 
@@ -725,23 +778,10 @@ mod tests {
         let storage_dir = unique_storage_dir("download");
         stdfs::remove_dir_all(&storage_dir).ok();
         let backend = StorageBackend::local();
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set(filename.into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = filename.into();
+        fx.mime_type = "application/pdf".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
         download_agreements(&client, &database, StorageLimits::default(), &backend)
@@ -830,23 +870,9 @@ mod tests {
         let storage_dir = unique_storage_dir("gcs_backend");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set(filename.into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = filename.into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         mount_join_agreement_mock(&mock_server, agreement_id).await;
 
@@ -933,23 +959,9 @@ mod tests {
         let storage_dir = unique_storage_dir("gcs_upload_error");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("gcs.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "gcs.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -1044,23 +1056,9 @@ mod tests {
             .await;
 
         let database = setup_agreements_db().await;
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("gcs.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "gcs.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -1122,23 +1120,10 @@ mod tests {
         let storage_dir = unique_storage_dir("idempotent");
         stdfs::remove_dir_all(&storage_dir).ok();
         let backend = StorageBackend::local();
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set(filename.into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = filename.into();
+        fx.mime_type = "application/pdf".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let client = PortalClient::new(mock_server.uri(), storage_dir.clone());
 
@@ -1228,41 +1213,26 @@ mod tests {
         let storage_dir = unique_storage_dir("capacity_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let already_downloaded = agreements::ActiveModel {
-            agreement_id: Set("AGREEMENT-downloaded".into()),
-            user_id: Set("user_1".into()),
-            file_id: Set("FILE-downloaded".into()),
-            filename: Set("downloaded.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(900),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(true),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z").unwrap()),
-        };
-        already_downloaded.insert(&database).await.unwrap();
+        let mut already_downloaded =
+            AgreementFixture::new("AGREEMENT-downloaded", "FILE-downloaded");
+        already_downloaded.filename = "downloaded.pdf".into();
+        already_downloaded.mime_type = "application/pdf".into();
+        already_downloaded.original_size = 900;
+        already_downloaded.downloaded = true;
+        already_downloaded.created_at =
+            chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z").unwrap();
+        already_downloaded
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
 
-        let pending = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("pending.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(200),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap()),
-        };
-        pending.insert(&database).await.unwrap();
+        let mut pending = AgreementFixture::new(agreement_id, file_id);
+        pending.filename = "pending.pdf".into();
+        pending.mime_type = "application/pdf".into();
+        pending.original_size = 200;
+        pending.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap();
+        pending.into_active_model().insert(&database).await.unwrap();
 
         // Capacity is below the sum of downloaded (900) + pending (200).
         download_agreements(
@@ -1313,23 +1283,12 @@ mod tests {
         let storage_dir = unique_storage_dir("max_file_size_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let pending = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("pending.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(2_000),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap()),
-        };
-        pending.insert(&database).await.unwrap();
+        let mut pending = AgreementFixture::new(agreement_id, file_id);
+        pending.filename = "pending.pdf".into();
+        pending.mime_type = "application/pdf".into();
+        pending.original_size = 2_000;
+        pending.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap();
+        pending.into_active_model().insert(&database).await.unwrap();
 
         download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -1391,41 +1350,19 @@ mod tests {
         let storage_dir = unique_storage_dir("capacity_mid_batch");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let first = agreements::ActiveModel {
-            agreement_id: Set(agreements[0].0.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(agreements[0].1.into()),
-            filename: Set("one.txt".into()),
-            mime_type: Set("text/plain".into()),
-            original_size: Set(600),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-04T00:00:00Z").unwrap()),
-        };
-        first.insert(&database).await.unwrap();
+        let mut first = AgreementFixture::new(agreements[0].0, agreements[0].1);
+        first.filename = "one.txt".into();
+        first.mime_type = "text/plain".into();
+        first.original_size = 600;
+        first.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-04T00:00:00Z").unwrap();
+        first.into_active_model().insert(&database).await.unwrap();
 
-        let second = agreements::ActiveModel {
-            agreement_id: Set(agreements[1].0.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(agreements[1].1.into()),
-            filename: Set("two.txt".into()),
-            mime_type: Set("text/plain".into()),
-            original_size: Set(500),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-05T00:00:00Z").unwrap()),
-        };
-        second.insert(&database).await.unwrap();
+        let mut second = AgreementFixture::new(agreements[1].0, agreements[1].1);
+        second.filename = "two.txt".into();
+        second.mime_type = "text/plain".into();
+        second.original_size = 500;
+        second.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-05T00:00:00Z").unwrap();
+        second.into_active_model().insert(&database).await.unwrap();
 
         download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -1490,41 +1427,26 @@ mod tests {
         let storage_dir = unique_storage_dir("max_files_skip");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let already_downloaded = agreements::ActiveModel {
-            agreement_id: Set("AGREEMENT-downloaded".into()),
-            user_id: Set("user_1".into()),
-            file_id: Set("FILE-downloaded".into()),
-            filename: Set("downloaded.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(100),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(true),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z").unwrap()),
-        };
-        already_downloaded.insert(&database).await.unwrap();
+        let mut already_downloaded =
+            AgreementFixture::new("AGREEMENT-downloaded", "FILE-downloaded");
+        already_downloaded.filename = "downloaded.pdf".into();
+        already_downloaded.mime_type = "application/pdf".into();
+        already_downloaded.original_size = 100;
+        already_downloaded.downloaded = true;
+        already_downloaded.created_at =
+            chrono::DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z").unwrap();
+        already_downloaded
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
 
-        let pending = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("pending.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(200),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap()),
-        };
-        pending.insert(&database).await.unwrap();
+        let mut pending = AgreementFixture::new(agreement_id, file_id);
+        pending.filename = "pending.pdf".into();
+        pending.mime_type = "application/pdf".into();
+        pending.original_size = 200;
+        pending.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-03T00:00:00Z").unwrap();
+        pending.into_active_model().insert(&database).await.unwrap();
 
         download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -1586,41 +1508,19 @@ mod tests {
         let storage_dir = unique_storage_dir("max_files_mid_batch");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let first = agreements::ActiveModel {
-            agreement_id: Set(agreements[0].0.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(agreements[0].1.into()),
-            filename: Set("one.txt".into()),
-            mime_type: Set("text/plain".into()),
-            original_size: Set(10),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-04T00:00:00Z").unwrap()),
-        };
-        first.insert(&database).await.unwrap();
+        let mut first = AgreementFixture::new(agreements[0].0, agreements[0].1);
+        first.filename = "one.txt".into();
+        first.mime_type = "text/plain".into();
+        first.original_size = 10;
+        first.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-04T00:00:00Z").unwrap();
+        first.into_active_model().insert(&database).await.unwrap();
 
-        let second = agreements::ActiveModel {
-            agreement_id: Set(agreements[1].0.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(agreements[1].1.into()),
-            filename: Set("two.txt".into()),
-            mime_type: Set("text/plain".into()),
-            original_size: Set(10),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-05T00:00:00Z").unwrap()),
-        };
-        second.insert(&database).await.unwrap();
+        let mut second = AgreementFixture::new(agreements[1].0, agreements[1].1);
+        second.filename = "two.txt".into();
+        second.mime_type = "text/plain".into();
+        second.original_size = 10;
+        second.created_at = chrono::DateTime::parse_from_rfc3339("2024-01-05T00:00:00Z").unwrap();
+        second.into_active_model().insert(&database).await.unwrap();
 
         download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -1691,23 +1591,10 @@ mod tests {
         let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("ledger_error");
         stdfs::remove_dir_all(&storage_dir).ok();
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set(filename.into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = filename.into();
+        fx.mime_type = "application/pdf".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         // Create a directory where the ledger file should be written to force a failure.
         let ledger_dir = storage_dir.join("ledger.bin");
@@ -1920,23 +1807,10 @@ mod tests {
         let storage_dir = unique_storage_dir("download_error");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("error.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(100),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "error.bin".into();
+        fx.original_size = 100;
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let err = download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir),
@@ -2007,23 +1881,9 @@ mod tests {
         let storage_dir = unique_storage_dir("gcs_postprocess_fail");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("postprocess.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "postprocess.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         // Create a directory where the ledger should be to force post-processing failure
         let ledger_dir = storage_dir.join("ledger.bin");
@@ -2120,23 +1980,9 @@ mod tests {
         let storage_dir = unique_storage_dir("gcs_delete_fail");
         stdfs::remove_dir_all(&storage_dir).ok();
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("delete-fail.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "delete-fail.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         // Create a directory where the ledger should be to force post-processing failure
         let ledger_dir = storage_dir.join("ledger.bin");
@@ -2200,23 +2046,10 @@ mod tests {
         stdfs::remove_dir_all(&storage_dir).ok();
         // Don't pre-create the directory - let the code create it
 
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("ledger.pdf".into()),
-            mime_type: Set("application/pdf".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "ledger.pdf".into();
+        fx.mime_type = "application/pdf".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -2300,23 +2133,9 @@ mod tests {
             .await;
 
         let database = setup_agreements_db().await;
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("commit-fail.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "commit-fail.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -2418,23 +2237,9 @@ mod tests {
             .await;
 
         let database = setup_agreements_db().await;
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("cleanup.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "cleanup.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -2523,23 +2328,9 @@ mod tests {
             .await;
 
         let database = setup_agreements_db().await;
-        let agreement = agreements::ActiveModel {
-            agreement_id: Set(agreement_id.into()),
-            user_id: Set("user_1".into()),
-            file_id: Set(file_id.into()),
-            filename: Set("gcs-remove.bin".into()),
-            mime_type: Set("application/octet-stream".into()),
-            original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
-            root: Set(None),
-            padded_len: Set(None),
-            downloaded: Set(false),
-            transaction_id: Set(None),
-            curation: Set(json!({})),
-            status: Set("ready".into()),
-            created_at: Set(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
-        };
-        agreement.insert(&database).await.unwrap();
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "gcs-remove.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -2587,6 +2378,128 @@ mod tests {
         assert!(
             backend.gcs_client.is_none(),
             "gcs_client should be None for local backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_downloaded_bytes_succeeds_for_normal_path() {
+        // Cover the happy path of finalize_downloaded_bytes (no error branches)
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("finalize_happy");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+
+        let agreement_id = "AGREEMENT-finalize-ok";
+        let file_id = "FILE-finalize-ok";
+        let file_path = storage_dir.join(file_id);
+        let bytes = b"finalize happy path bytes";
+        stdfs::write(&file_path, bytes).unwrap();
+
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "finalize.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
+
+        let agreement = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+
+        finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
+            .await
+            .expect("finalize should succeed");
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.downloaded);
+        assert!(stored.root.is_some());
+        assert!(stored.padded_len.is_some());
+    }
+
+    #[tokio::test]
+    async fn finalize_downloaded_bytes_handles_post_processing_error() {
+        // Cover the post_processing error rollback branch (lines 547-552):
+        // force prepare_file_metadata path failure by putting a directory at ledger.bin
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("finalize_postproc_err");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+        // Pre-create the ledger.bin path as a directory so update_ledger fails.
+        stdfs::create_dir_all(storage_dir.join("ledger.bin")).unwrap();
+
+        let agreement_id = "AGREEMENT-finalize-pp-err";
+        let file_id = "FILE-finalize-pp-err";
+        let file_path = storage_dir.join(file_id);
+        let bytes = b"finalize pp err bytes";
+        stdfs::write(&file_path, bytes).unwrap();
+
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "pp.bin".into();
+        fx.into_active_model().insert(&database).await.unwrap();
+
+        let agreement = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
+            .await
+            .expect_err("finalize should fail on ledger update");
+
+        assert!(
+            err.to_string().contains("post-processing downloaded file"),
+            "error should be wrapped with post-processing context: {err}"
+        );
+        assert!(
+            !file_path.exists(),
+            "local file should be cleaned up on post-processing error"
+        );
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.downloaded,
+            "agreement should remain undownloaded after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_ledger_errors_when_parent_dir_cannot_be_created() {
+        // Cover line 618 (creating ledger directory error) by passing a path
+        // where parent creation fails. We use a regular file as the storage root.
+        let storage_dir = unique_storage_dir("update_ledger_bad_parent");
+        let parent_dir = storage_dir.parent().unwrap().to_path_buf();
+        stdfs::create_dir_all(&parent_dir).unwrap();
+        // Create a file where the storage_dir should be — fs::create_dir_all on
+        // a path under a regular file should fail.
+        stdfs::write(&storage_dir, b"not a directory").unwrap();
+
+        let metadata = CryptoFileMetadata {
+            root: Fq::one(),
+            file_id: "FILE-bad-parent".into(),
+            padded_len: 64,
+            original_size: 32,
+            filename: "bad_parent.bin".into(),
+        };
+
+        // storage_dir is now a file, so storage_dir.join("ledger.bin").parent()
+        // is the file path — fs::create_dir_all will fail.
+        let result = update_ledger(&storage_dir, &metadata).await;
+        // Using a directory as a parent for ledger.bin fails — expect error.
+        assert!(result.is_err(), "should fail to create ledger directory");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("creating ledger directory") || msg.contains("loading ledger"),
+            "expected ledger error message, got: {msg}"
         );
     }
 }

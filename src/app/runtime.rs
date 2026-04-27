@@ -155,7 +155,7 @@ pub async fn run_with_shutdown(
     print_config_info(&config, &mut writer)?;
     setup_storage_directory(&config)?;
 
-    let client = PortalClient::new(&config.portal_url, &config.storage_dir);
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?;
 
     match cli.command {
         Commands::Ping => {
@@ -181,7 +181,7 @@ pub async fn run_with_shutdown(
 
             let node_id = onboarding_result.node_id;
 
-            let authenticated_client = PortalClient::with_auth(
+            let authenticated_client = PortalClient::try_with_auth(
                 &config.portal_url,
                 &config.storage_dir,
                 Arc::new(onboarding_result.keypair),
@@ -189,7 +189,7 @@ pub async fn run_with_shutdown(
                 onboarding_result.signer_id,
                 onboarding_result.token,
                 onboarding_result.next_nonce,
-            );
+            )?;
 
             if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
                 tracing::warn!("Failed to announce node URL: {e}");
@@ -263,6 +263,7 @@ pub async fn run_daemon_command(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::app::cli::{Cli, Commands};
     use crate::crypto::BlsKeyPair;
@@ -799,6 +800,140 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "lock file should be cleaned even when shutdown fails"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Inline version of setup_onboarding_fixtures that does NOT mount the
+    /// /api/nodes/announce mock so callers can provide their own.
+    async fn setup_onboarding_fixtures_no_announce(
+        mock_server: &MockServer,
+        node_id: &str,
+        storage_dir: &PathBuf,
+    ) -> PathBuf {
+        let password = "testpassword123";
+        let key_path = storage_dir.join("bls_key.enc");
+
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        fs::create_dir_all(storage_dir).unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        env::set_var(BLS_PASSWORD_ENV, password);
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", &public_key))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/users/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "challenge": hex::encode(b"test-challenge"),
+                "expires_in": 300
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "test-jwt-token",
+                "user_id": node_id,
+                "role": "node",
+                "expires_in": 86400
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/entry/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "abc123",
+                "bls_pubkey": public_key,
+                "next_nonce": 7
+            })))
+            .mount(mock_server)
+            .await;
+
+        key_path
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_continues_when_announce_node_fails() {
+        // Cover the announce_node failure branch (line 195) by returning 500
+        // from /api/nodes/announce. The daemon should still start and run.
+        let _guard = TempAppDirGuard::new("announce_fail");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("announce_fail");
+        let node_id = "NODE-announce-fail";
+
+        // Mount the announce-fail mock FIRST so it matches before any later mock.
+        Mock::given(method("PUT"))
+            .and(path("/api/nodes/announce"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("announce failed"))
+            .mount(&mock_server)
+            .await;
+
+        let bls_key_path =
+            setup_onboarding_fixtures_no_announce(&mock_server, node_id, &storage_dir).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let cli = Cli {
+            portal_url: mock_server.uri(),
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_dir.clone()),
+            portal_polling_interval_secs: 1,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
+            bls_key_path: Some(bls_key_path),
+            command: Commands::Run,
+        };
+
+        let shutdown = async {
+            sleep(Duration::from_millis(50)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let result = run_with_shutdown(cli, &mut buffer, shutdown).await;
+        cleanup_onboarding_env();
+        let output = String::from_utf8(buffer).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "daemon should not fail when announce fails, got: {result:?}"
+        );
+        assert!(
+            !output.contains("✓ Announced"),
+            "should not show announced message when announce fails: {output}"
         );
 
         std::fs::remove_dir_all(&storage_dir).ok();

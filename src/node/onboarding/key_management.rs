@@ -181,7 +181,7 @@ pub async fn ensure_bls_keypair(
     writer: &mut impl Write,
     password_reader: &dyn PasswordReader,
 ) -> Result<BlsKeyPair> {
-    if BlsKeyPair::key_file_exists(key_path).await {
+    if BlsKeyPair::key_file_exists(key_path).await? {
         writeln!(
             writer,
             "Found existing BLS key, please enter your password:"
@@ -470,7 +470,7 @@ mod tests {
         assert!(output.contains("BLS key successfully decrypted"));
         assert!(output.contains("BLS key saved to"));
         assert!(!keypair.public_key_hex().is_empty());
-        assert!(BlsKeyPair::key_file_exists(&key_path).await);
+        assert!(BlsKeyPair::key_file_exists(&key_path).await.unwrap());
 
         let reloaded = BlsKeyPair::load_encrypted(&key_path, wallet_password)
             .await

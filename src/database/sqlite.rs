@@ -1,22 +1,28 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Ensures SQLite databases have a file created and signals whether migrations should run.
-pub(crate) fn prepare_sqlite(database_url: &str) -> Result<bool> {
+/// Ensures the SQLite database file exists, creating it (and parent directories) if needed.
+/// No-op for non-SQLite URLs and for `sqlite::memory:` (which lives in RAM).
+///
+/// This used to also return a `bool` signalling whether the file was newly created so the
+/// caller could decide to run migrations. That signal was always discarded since the
+/// caller now runs migrations unconditionally to handle schema upgrades on existing
+/// databases, so the return type was simplified to `Result<()>`.
+pub(crate) fn prepare_sqlite(database_url: &str) -> Result<()> {
     if !is_sqlite_url(database_url) {
-        return Ok(false);
+        return Ok(());
     }
 
     let Some(file_path) = extract_sqlite_file_path(database_url) else {
-        return Ok(false);
+        return Ok(());
     };
 
     if file_path == ":memory:" {
-        return Ok(true);
+        return Ok(());
     }
 
-    let file_existed = ensure_sqlite_file_exists(&file_path)?;
-    Ok(!file_existed)
+    ensure_sqlite_file_exists(&file_path)?;
+    Ok(())
 }
 
 fn is_sqlite_url(url: &str) -> bool {
@@ -29,11 +35,11 @@ fn extract_sqlite_file_path(url: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn ensure_sqlite_file_exists(file_path: &str) -> Result<bool> {
+fn ensure_sqlite_file_exists(file_path: &str) -> Result<()> {
     let path = Path::new(file_path);
 
     if path.exists() {
-        return Ok(true);
+        return Ok(());
     }
 
     if let Some(parent) = path.parent() {
@@ -52,7 +58,7 @@ fn ensure_sqlite_file_exists(file_path: &str) -> Result<bool> {
         )
     })?;
 
-    Ok(false)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -88,29 +94,30 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sqlite_returns_false_for_non_sqlite_url() {
-        assert!(!prepare_sqlite("postgres://db").unwrap());
+    fn prepare_sqlite_succeeds_for_non_sqlite_url() {
+        assert!(prepare_sqlite("postgres://db").is_ok());
     }
 
     #[test]
-    fn prepare_sqlite_memory_url_returns_true() {
-        assert!(prepare_sqlite("sqlite::memory:").unwrap());
+    fn prepare_sqlite_succeeds_for_memory_url() {
+        assert!(prepare_sqlite("sqlite::memory:").is_ok());
     }
 
     #[test]
-    fn ensure_sqlite_file_exists_returns_true_when_file_is_present() {
+    fn ensure_sqlite_file_exists_succeeds_when_file_is_present() {
         let path = unique_test_path("existing_file").with_extension("sqlite");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::File::create(&path).unwrap();
 
-        assert!(ensure_sqlite_file_exists(path.to_str().unwrap()).unwrap());
+        ensure_sqlite_file_exists(path.to_str().unwrap()).unwrap();
+        assert!(path.exists(), "file should remain after no-op call");
         cleanup_path(&path);
     }
 
     #[test]
-    fn prepare_sqlite_creates_file_and_signals_migrations() {
+    fn prepare_sqlite_creates_file_when_missing() {
         let db_path = unique_test_path("create_and_signal").join("db.sqlite");
         let db_url = format!("sqlite://{}", db_path.display());
 
@@ -118,9 +125,11 @@ mod tests {
             fs::remove_dir_all(parent).ok();
         }
 
-        assert!(prepare_sqlite(&db_url).unwrap());
+        prepare_sqlite(&db_url).unwrap();
         assert!(db_path.exists());
-        assert!(!prepare_sqlite(&db_url).unwrap());
+        // Calling again when the file already exists must remain a no-op.
+        prepare_sqlite(&db_url).unwrap();
+        assert!(db_path.exists());
 
         cleanup_path(db_path.parent().unwrap());
     }

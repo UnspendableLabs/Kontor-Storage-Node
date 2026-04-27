@@ -10,7 +10,7 @@ mod server;
 pub mod testutils;
 
 use anyhow::{anyhow, Context, Result};
-use app::{run, Cli};
+use app::{cli::migrate_legacy_env_vars, run, Cli};
 use clap::Parser;
 use std::io;
 use std::sync::Once;
@@ -20,6 +20,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 async fn main() -> Result<()> {
     init_logging();
     load_local_env()?;
+    migrate_legacy_env_vars();
     let cli = Cli::parse();
     let mut stdout = io::stdout();
     run(cli, &mut stdout).await
@@ -45,15 +46,16 @@ pub fn load_local_env() -> Result<()> {
 fn init_logging() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new("info"))
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-        let _ = fmt()
+        if let Err(e) = fmt()
             .with_env_filter(filter)
             .with_target(true)
             .compact()
-            .try_init();
+            .try_init()
+        {
+            eprintln!("warning: failed to initialize tracing subscriber: {e}");
+        }
     });
 }
 

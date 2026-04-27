@@ -1,32 +1,39 @@
-use super::{sync_new_items, ITEM_TYPE_CHALLENGES};
+use super::{load_existing_ids, sync_new_items, ITEM_TYPE_CHALLENGES, STATUS_FAILED};
+use crate::clients::portal::Challenge;
 use crate::clients::PortalClient;
 use crate::entities::{challenges, prelude::Challenges};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
-use std::collections::HashSet;
+use sea_orm::{ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use tracing::{info, warn};
 
 pub async fn sync_active_challenges(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
 ) -> Result<()> {
     let challenges = portal_client
-        .get_node_challenges()
+        .get_all_node_challenges()
         .await
-        .context("fetching active challenges failed")?;
+        .context("fetching node challenges failed")?;
 
     let requested_ids: Vec<String> = challenges
         .iter()
         .map(|challenge| challenge.challenge_id.clone())
         .collect();
 
-    let existing_ids: HashSet<String> = Challenges::find()
-        .filter(challenges::Column::ChallengeId.is_in(requested_ids.clone()))
-        .all(database)
-        .await?
-        .into_iter()
-        .map(|model| model.challenge_id)
+    let existing_ids = load_existing_ids::<Challenges, _>(
+        database,
+        challenges::Column::ChallengeId,
+        &requested_ids,
+        |model| model.challenge_id,
+    )
+    .await?;
+
+    let to_update: Vec<Challenge> = challenges
+        .iter()
+        .filter(|c| existing_ids.contains(&c.challenge_id))
+        .cloned()
         .collect();
 
     sync_new_items(
@@ -37,7 +44,96 @@ pub async fn sync_active_challenges(
         challenge_to_active_model,
         database,
     )
-    .await
+    .await?;
+
+    update_existing_challenge_metadata(&to_update, database)
+        .await
+        .context("updating existing challenge statuses")?;
+
+    Ok(())
+}
+
+/// Update mutable fields (`status`, `proof`, `bls_signature`, `updated_at`) of
+/// challenges already present locally whose remote representation has changed.
+async fn update_existing_challenge_metadata(
+    remote_challenges: &[Challenge],
+    database: &DatabaseConnection,
+) -> Result<usize> {
+    if remote_challenges.is_empty() {
+        return Ok(0);
+    }
+
+    let ids: Vec<String> = remote_challenges
+        .iter()
+        .map(|c| c.challenge_id.clone())
+        .collect();
+    let local_models = Challenges::find()
+        .filter(challenges::Column::ChallengeId.is_in(ids))
+        .all(database)
+        .await
+        .context("loading existing challenges for status reconciliation")?;
+
+    let mut updated = 0usize;
+    for local in local_models {
+        let Some(remote) = remote_challenges
+            .iter()
+            .find(|c| c.challenge_id == local.challenge_id)
+        else {
+            continue;
+        };
+
+        let remote_updated_at: DateTimeWithTimeZone =
+            DateTime::<FixedOffset>::parse_from_rfc3339(&remote.updated_at)
+                .with_context(|| format!("invalid updated_at timestamp {}", remote.updated_at))?;
+
+        let status_changed = remote.status != local.status;
+        let proof_changed = remote.proof != local.proof;
+        let signature_changed = remote.bls_signature != local.bls_signature;
+        let updated_at_changed = remote_updated_at != local.updated_at;
+
+        if !status_changed && !proof_changed && !signature_changed && !updated_at_changed {
+            continue;
+        }
+
+        if status_changed {
+            if remote.status == STATUS_FAILED {
+                warn!(
+                    "challenge {} status: {} -> {}",
+                    local.challenge_id, local.status, remote.status
+                );
+            } else {
+                info!(
+                    "challenge {} status: {} -> {}",
+                    local.challenge_id, local.status, remote.status
+                );
+            }
+        }
+
+        let mut active = challenges::ActiveModel {
+            challenge_id: ActiveValue::Unchanged(local.challenge_id.clone()),
+            ..Default::default()
+        };
+        if status_changed {
+            active.status = Set(remote.status.clone());
+        }
+        if proof_changed {
+            active.proof = Set(remote.proof.clone());
+        }
+        if signature_changed {
+            active.bls_signature = Set(remote.bls_signature.clone());
+        }
+        if updated_at_changed {
+            active.updated_at = Set(remote_updated_at);
+        }
+
+        Challenges::update(active)
+            .exec(database)
+            .await
+            .context("updating challenge metadata")?;
+        updated += 1;
+    }
+
+    Ok(updated)
 }
 
 fn challenge_to_active_model(
@@ -84,6 +180,7 @@ fn challenge_to_active_model(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::clients::portal::Challenge;
     use crate::crypto::BlsKeyPair;
@@ -93,7 +190,7 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_challenge(id: &str) -> Challenge {
@@ -135,7 +232,6 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/challenges"))
-            .and(query_param("status", "active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -172,7 +268,6 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/challenges"))
-            .and(query_param("status", "active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -241,7 +336,6 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/challenges"))
-            .and(query_param("status", "active"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0,
                 "limit": 20,
@@ -310,6 +404,84 @@ mod tests {
         assert!(
             err.to_string().contains("invalid updated_at timestamp"),
             "should surface timestamp parsing failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn updates_existing_challenge_status_when_portal_marks_failed() {
+        let mock_server = MockServer::start().await;
+        let mut remote = sample_challenge("chal_fail");
+        remote.status = "failed".into();
+        remote.updated_at = "2025-01-16T11:00:00Z".into();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 1,
+                "challenges": [challenge_json(&remote)]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let db = setup_challenges_db().await;
+        let seeded = challenges::ActiveModel {
+            challenge_id: Set("chal_fail".into()),
+            agreement_id: Set("AGREEMENT-123".into()),
+            block_height: Set(850000),
+            challenge_count: Set(5),
+            seed: Set("0102030405060708".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(850100),
+            status: Set("active".into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+            updated_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+        };
+        seeded.insert(&db).await.unwrap();
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            unique_storage_dir("challenges_status_failed"),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+
+        sync_active_challenges(&client, &db).await.unwrap();
+
+        let stored = Challenges::find()
+            .filter(challenges::Column::ChallengeId.eq("chal_fail"))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("challenge should exist");
+        assert_eq!(
+            stored.status, "failed",
+            "challenge status must transition from active to failed after reconcile"
+        );
+        assert_eq!(
+            stored.proof, None,
+            "proof should remain None when remote does not provide one"
+        );
+        assert_eq!(
+            stored.bls_signature, None,
+            "bls_signature should remain None when remote does not provide one"
+        );
+        assert_eq!(
+            stored.block_height, 850000,
+            "block_height must be preserved"
+        );
+        assert_eq!(stored.seed, "0102030405060708", "seed must be preserved");
+        assert_eq!(
+            stored.created_at,
+            DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap(),
+            "created_at must not be touched by reconcile"
         );
     }
 }

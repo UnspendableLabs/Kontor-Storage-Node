@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --all-features --locked
+
+  coverage:
+    name: cargo llvm-cov
+    runs-on: ubuntu-latest
+    environment: default
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info --show-missing-lines
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true

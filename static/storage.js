@@ -10,12 +10,27 @@ let totalSize = 0;
 document.addEventListener('DOMContentLoaded', () => {
     loadNodeInfo();
     loadFiles();
+    document.getElementById('btn-refresh')?.addEventListener('click', loadFiles);
+    document.getElementById('btn-retry')?.addEventListener('click', loadFiles);
+    document.getElementById('btn-prev')?.addEventListener('click', prevPage);
+    document.getElementById('btn-next')?.addEventListener('click', nextPage);
 });
+
+// Fetch with timeout via AbortController; rejects on AbortError after timeoutMs.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
 
 // Fetch node info from API
 async function loadNodeInfo() {
     try {
-        const response = await fetch('/api/info');
+        const response = await fetchWithTimeout('/api/info');
         if (response.ok) {
             const data = await response.json();
             document.getElementById('node-id').textContent = data.node_id;
@@ -31,7 +46,7 @@ async function loadFiles() {
     showLoading();
 
     try {
-        const response = await fetch(`/files?offset=${currentOffset}&limit=${ITEMS_PER_PAGE}`);
+        const response = await fetchWithTimeout(`/files?offset=${currentOffset}&limit=${ITEMS_PER_PAGE}`);
         
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -69,6 +84,13 @@ function renderFiles(data) {
         const size = file.original_size || 0;
         batchSize += size;
 
+        const downloadIconSvg = `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                        </svg>`;
+        const downloadElement = file.downloaded
+            ? `<a href="${escapeHtml(file.download_path ?? '')}" class="btn-download" title="Download">${downloadIconSvg}</a>`
+            : `<span class="btn-download" aria-disabled="true" title="Not yet downloaded" style="opacity:0.4;cursor:not-allowed">${downloadIconSvg}</span>`;
+
         row.innerHTML = `
             <td>
                 <div class="flex items-center gap-3">
@@ -79,7 +101,7 @@ function renderFiles(data) {
                         <p class="font-medium text-white truncate max-w-xs" title="${escapeHtml(file.filename)}">
                             ${escapeHtml(file.filename)}
                         </p>
-                        <p class="text-xs text-gray-500 font-mono">${file.file_id}</p>
+                        <p class="text-xs text-gray-500 font-mono">${escapeHtml(file.file_id)}</p>
                     </div>
                 </div>
             </td>
@@ -87,17 +109,13 @@ function renderFiles(data) {
             <td class="text-gray-300">${formatSize(size)}</td>
             <td>
                 <span class="badge ${getStatusBadgeClass(file.status)}">
-                    ${file.status}
+                    ${escapeHtml(file.status ?? '')}
                 </span>
             </td>
             <td class="text-gray-400 text-sm">${formatDate(file.created_at)}</td>
             <td>
                 <div class="flex justify-end">
-                    <a href="${file.download_path}" class="btn-download" ${file.downloaded ? '' : 'disabled'} title="Download">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                        </svg>
-                    </a>
+                    ${downloadElement}
                 </div>
             </td>
         `;
@@ -278,6 +296,6 @@ function getStatusBadgeClass(status) {
         case 'failed':
             return 'badge-error';
         default:
-            return 'badge-ready';
+            return 'badge-unknown';
     }
 }
