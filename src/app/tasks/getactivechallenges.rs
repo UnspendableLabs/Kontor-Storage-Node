@@ -8,10 +8,21 @@ use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::{ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use tracing::{info, warn};
 
+/// Aggregate counters returned by `update_existing_challenge_metadata`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileCounts {
+    updated: usize,
+    transitioned_to_failed: usize,
+}
+
+/// Reconcile local challenge state with Portal.
+///
+/// Returns the number of challenges that transitioned to the `failed` status
+/// during this pass. Callers can use this to trigger a nonce resync.
 pub async fn sync_active_challenges(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
-) -> Result<()> {
+) -> Result<usize> {
     let challenges = portal_client
         .get_all_node_challenges()
         .await
@@ -46,21 +57,25 @@ pub async fn sync_active_challenges(
     )
     .await?;
 
-    update_existing_challenge_metadata(&to_update, database)
+    let counts = update_existing_challenge_metadata(&to_update, database)
         .await
         .context("updating existing challenge statuses")?;
 
-    Ok(())
+    Ok(counts.transitioned_to_failed)
 }
 
 /// Update mutable fields (`status`, `proof`, `bls_signature`, `updated_at`) of
 /// challenges already present locally whose remote representation has changed.
+///
+/// Returns the number of challenges that were updated together with the
+/// number of challenges that transitioned to the `failed` status.
 async fn update_existing_challenge_metadata(
     remote_challenges: &[Challenge],
     database: &DatabaseConnection,
-) -> Result<usize> {
+) -> Result<ReconcileCounts> {
+    let mut counts = ReconcileCounts::default();
     if remote_challenges.is_empty() {
-        return Ok(0);
+        return Ok(counts);
     }
 
     let ids: Vec<String> = remote_challenges
@@ -73,7 +88,6 @@ async fn update_existing_challenge_metadata(
         .await
         .context("loading existing challenges for status reconciliation")?;
 
-    let mut updated = 0usize;
     for local in local_models {
         let Some(remote) = remote_challenges
             .iter()
@@ -101,6 +115,9 @@ async fn update_existing_challenge_metadata(
                     "challenge {} status: {} -> {}",
                     local.challenge_id, local.status, remote.status
                 );
+                if local.status != STATUS_FAILED {
+                    counts.transitioned_to_failed += 1;
+                }
             } else {
                 info!(
                     "challenge {} status: {} -> {}",
@@ -130,10 +147,10 @@ async fn update_existing_challenge_metadata(
             .exec(database)
             .await
             .context("updating challenge metadata")?;
-        updated += 1;
+        counts.updated += 1;
     }
 
-    Ok(updated)
+    Ok(counts)
 }
 
 fn challenge_to_active_model(
@@ -482,6 +499,59 @@ mod tests {
             stored.created_at,
             DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap(),
             "created_at must not be touched by reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_to_failed_is_counted() {
+        let mock_server = MockServer::start().await;
+        let mut remote = sample_challenge("chal_count_fail");
+        remote.status = "failed".into();
+        remote.updated_at = "2025-01-16T11:00:00Z".into();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 1,
+                "challenges": [challenge_json(&remote)]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let db = setup_challenges_db().await;
+        let seeded = challenges::ActiveModel {
+            challenge_id: Set("chal_count_fail".into()),
+            agreement_id: Set("AGREEMENT-123".into()),
+            block_height: Set(850000),
+            challenge_count: Set(5),
+            seed: Set("0102030405060708".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(850100),
+            status: Set("active".into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+            updated_at: Set(DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z").unwrap()),
+        };
+        seeded.insert(&db).await.unwrap();
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            unique_storage_dir("challenges_count_failed"),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+
+        let failed_count = sync_active_challenges(&client, &db).await.unwrap();
+        assert_eq!(
+            failed_count, 1,
+            "transition from active to failed should be counted once"
         );
     }
 }

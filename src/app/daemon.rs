@@ -68,7 +68,10 @@ async fn run_portal_daemon(
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
 
     if let Some(node_id) = portal_client.node_id() {
-        reconcile::reconcile_from_portal(
+        // Startup reconcile: ignore the failed-transitions counter. The nonce
+        // was just freshly read from the registry during onboarding, so there
+        // is no desync window to recover from at this point.
+        let _ = reconcile::reconcile_from_portal(
             &portal_client,
             &database,
             node_id,
@@ -143,8 +146,10 @@ async fn sync_portal_once(
         }
     }
 
+    let mut failed_count: usize = 0;
+
     if let Some(node_id) = portal_client.node_id() {
-        reconcile::reconcile_from_portal(
+        failed_count += reconcile::reconcile_from_portal(
             portal_client,
             database,
             node_id,
@@ -163,13 +168,21 @@ async fn sync_portal_once(
         .await
         .context("downloading agreements failed")?;
 
-    sync_active_challenges(portal_client, database)
+    failed_count += sync_active_challenges(portal_client, database)
         .await
         .context("syncing active challenges failed")?;
 
     compute_and_submit_proofs(portal_client, database, storage_backend, storage_dir)
         .await
         .context("computing and submitting proofs failed")?;
+
+    if failed_count > 0 {
+        if let Err(e) = portal_client.resync_nonce().await {
+            warn!(
+                "failed to resync nonce after observing {failed_count} on-chain failure(s): {e:#}"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -653,6 +666,201 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "lock file should be cleaned up when daemon task is dropped"
+        );
+    }
+
+    fn portal_client_with_nonce(
+        mock_server_uri: &str,
+        storage_dir: PathBuf,
+        initial_nonce: u64,
+    ) -> PortalClient {
+        use crate::crypto::BlsKeyPair;
+        let keypair = std::sync::Arc::new(BlsKeyPair::generate().unwrap());
+        PortalClient::with_auth(
+            mock_server_uri,
+            storage_dir,
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            initial_nonce,
+        )
+    }
+
+    async fn mount_empty_ready_agreements(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn mount_empty_challenges(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "challenges": []
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    fn agreement_payload(agreement_id: &str, file_id: &str, status: &str) -> serde_json::Value {
+        json!({
+            "agreement_id": agreement_id,
+            "user_id": "user_1",
+            "file_id": file_id,
+            "filename": "test.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": [{"node_id": "NODE-test", "status": "valid"}],
+            "transaction_id": null,
+            "curation": {},
+            "status": status,
+            "created_at": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn sync_portal_once_resyncs_nonce_after_failed_transition() {
+        let mock_server = MockServer::start().await;
+        let agreement_id = "AGR-failed-nonce";
+        let file_id = "FILE-AGR-failed-nonce";
+
+        // Reconcile endpoint: agreement transitions to failed.
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 1,
+                "agreements": [agreement_payload(agreement_id, file_id, "failed")]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+
+        // Registry endpoint must be hit exactly once after observing failure.
+        Mock::given(method("GET"))
+            .and(path("/api/registry/entry/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "abcd",
+                "bls_pubkey": null,
+                "next_nonce": 99
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_resync");
+        fs::create_dir_all(&storage_dir).ok();
+
+        // Seed the agreement locally with status=ready so reconcile detects the
+        // remote `failed` as a fresh transition.
+        let seeded = agreements::ActiveModel {
+            agreement_id: Set(agreement_id.into()),
+            user_id: Set("user_1".into()),
+            file_id: Set(file_id.into()),
+            filename: Set("test.bin".into()),
+            mime_type: Set("application/octet-stream".into()),
+            original_size: Set(123),
+            nodes: Set(json!([{"node_id": "NODE-test", "status": "valid"}])),
+            root: Set(None),
+            padded_len: Set(None),
+            downloaded: Set(true),
+            transaction_id: Set(None),
+            curation: Set(json!({})),
+            status: Set("ready".into()),
+            created_at: Set(DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap()),
+        };
+        seeded.insert(&database).await.unwrap();
+
+        let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
+        assert_eq!(portal_client.current_nonce(), Some(5));
+
+        sync_portal_once(
+            &portal_client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+        )
+        .await
+        .expect("sync_portal_once should succeed");
+
+        assert_eq!(
+            portal_client.current_nonce(),
+            Some(99),
+            "nonce should be resynced from registry after observing failed transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_portal_once_does_not_resync_nonce_without_failed_transition() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+
+        // Registry endpoint must NOT be hit when there are no failed transitions.
+        Mock::given(method("GET"))
+            .and(path("/api/registry/entry/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "abcd",
+                "bls_pubkey": null,
+                "next_nonce": 99
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_no_resync");
+        fs::create_dir_all(&storage_dir).ok();
+
+        let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
+
+        sync_portal_once(
+            &portal_client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+        )
+        .await
+        .expect("sync_portal_once should succeed");
+
+        assert_eq!(
+            portal_client.current_nonce(),
+            Some(5),
+            "nonce should remain unchanged when no failed transitions are observed"
         );
     }
 }
