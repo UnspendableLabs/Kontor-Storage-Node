@@ -14,7 +14,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -26,7 +26,9 @@ RUN groupadd --system --gid 1001 kontor \
     && useradd --system --uid 1001 --gid 1001 --create-home --home-dir /home/kontor kontor \
     && mkdir -p /data \
     && chown -R kontor:kontor /app /data
-USER kontor
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV KONTOR_APP_DIR=/data
 
@@ -35,5 +37,5 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD curl --fail --silent --show-error http://localhost:8081/api/info || exit 1
 
-ENTRYPOINT ["/app/Kontor-Storage-Node"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["run"]
