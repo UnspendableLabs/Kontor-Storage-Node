@@ -12,10 +12,22 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::{info, warn};
 
+/// Aggregate counters returned by `update_existing_agreement_metadata`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileCounts {
+    updated: usize,
+    transitioned_to_failed: usize,
+}
+
 /// Reconcile local DB with Portal:
 /// - inserts agreements that are remote but missing locally,
 /// - updates `status` and `nodes` of existing agreements when they diverge,
 /// - optionally re-downloads undownloaded files from GCS (startup only).
+///
+/// Returns the number of agreements that transitioned to the `failed` status
+/// during this reconciliation pass. Callers can use this to trigger a nonce
+/// resync (Kontor on-chain failures may have left gaps in the local nonce
+/// sequence).
 pub(crate) async fn reconcile_from_portal(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
@@ -23,7 +35,7 @@ pub(crate) async fn reconcile_from_portal(
     storage_backend: &StorageBackend,
     storage_dir: &Path,
     redownload_from_gcs: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let remote_agreements = portal_client
         .get_node_agreements(node_id)
         .await
@@ -31,7 +43,7 @@ pub(crate) async fn reconcile_from_portal(
 
     if remote_agreements.is_empty() {
         info!("Reconciliation: no agreements found on Portal for node {node_id}");
-        return Ok(());
+        return Ok(0);
     }
 
     let requested_ids: Vec<String> = remote_agreements
@@ -69,7 +81,7 @@ pub(crate) async fn reconcile_from_portal(
 
     let newly_inserted = total_remote - already_in_db;
 
-    let updated = update_existing_agreement_metadata(&to_update, database)
+    let counts = update_existing_agreement_metadata(&to_update, database)
         .await
         .context("updating existing agreement statuses")?;
 
@@ -96,22 +108,36 @@ pub(crate) async fn reconcile_from_portal(
         }
     }
 
-    info!(
-        "Reconciled {total_remote} agreements ({already_in_db} already in DB, \
-         {newly_inserted} inserted, {updated} updated, {redownloaded} re-downloaded from GCS)"
-    );
+    let updated = counts.updated;
+    let transitioned_to_failed = counts.transitioned_to_failed;
+    if transitioned_to_failed > 0 {
+        info!(
+            "Reconciled {total_remote} agreements ({already_in_db} already in DB, \
+             {newly_inserted} inserted, {updated} updated, {transitioned_to_failed} \
+             transitioned to failed, {redownloaded} re-downloaded from GCS)"
+        );
+    } else {
+        info!(
+            "Reconciled {total_remote} agreements ({already_in_db} already in DB, \
+             {newly_inserted} inserted, {updated} updated, {redownloaded} re-downloaded from GCS)"
+        );
+    }
 
-    Ok(())
+    Ok(transitioned_to_failed)
 }
 
 /// Update `status` and `nodes` of agreements already present in DB whose
 /// remote representation has changed. Only those two columns are touched.
+///
+/// Returns the number of agreements that were updated together with the
+/// number of agreements that transitioned to the `failed` status.
 async fn update_existing_agreement_metadata(
     remote_agreements: &[Agreement],
     database: &DatabaseConnection,
-) -> Result<usize> {
+) -> Result<ReconcileCounts> {
+    let mut counts = ReconcileCounts::default();
     if remote_agreements.is_empty() {
-        return Ok(0);
+        return Ok(counts);
     }
 
     let ids: Vec<String> = remote_agreements
@@ -124,7 +150,6 @@ async fn update_existing_agreement_metadata(
         .await
         .context("loading existing agreements for status reconciliation")?;
 
-    let mut updated = 0usize;
     for local in local_models {
         let Some(remote) = remote_agreements
             .iter()
@@ -149,6 +174,9 @@ async fn update_existing_agreement_metadata(
                     "agreement {} status: {} -> {}",
                     local.agreement_id, local.status, remote.status
                 );
+                if local.status != STATUS_FAILED {
+                    counts.transitioned_to_failed += 1;
+                }
             } else {
                 info!(
                     "agreement {} status: {} -> {}",
@@ -176,10 +204,10 @@ async fn update_existing_agreement_metadata(
             .exec(database)
             .await
             .context("updating agreement metadata")?;
-        updated += 1;
+        counts.updated += 1;
     }
 
-    Ok(updated)
+    Ok(counts)
 }
 
 async fn redownload_one_from_gcs(
@@ -633,6 +661,66 @@ mod tests {
             stored.nodes,
             json!([{"node_id": "NODE-test", "status": "valid"}]),
             "nodes should reflect the latest portal payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_to_failed_is_counted() {
+        let mock_server = MockServer::start().await;
+        let agreements = vec![sample_agreement("AGR-count-fail", "failed")];
+        mount_node_agreements(&mock_server, &agreements).await;
+
+        let db = setup_agreements_db().await;
+
+        let mut seeded = AgreementFixture::new("AGR-count-fail", "FILE-AGR-count-fail");
+        seeded.status = "ready".into();
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
+
+        let storage_dir = unique_storage_dir("reconcile_count_failed");
+        stdfs::create_dir_all(&storage_dir).ok();
+
+        let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
+        let backend = StorageBackend::local();
+
+        let failed_count =
+            reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, false)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            failed_count, 1,
+            "transition from ready to failed should be counted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_transition_returns_zero() {
+        let mock_server = MockServer::start().await;
+        let agreements = vec![sample_agreement("AGR-no-fail", "ready")];
+        mount_node_agreements(&mock_server, &agreements).await;
+
+        let db = setup_agreements_db().await;
+
+        let mut seeded = AgreementFixture::new("AGR-no-fail", "FILE-AGR-no-fail");
+        seeded.status = "ready".into();
+        seeded.created_at = DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap();
+        seeded.into_active_model().insert(&db).await.unwrap();
+
+        let storage_dir = unique_storage_dir("reconcile_no_failed");
+        stdfs::create_dir_all(&storage_dir).ok();
+
+        let client = mock_portal_client(&mock_server.uri(), storage_dir.clone());
+        let backend = StorageBackend::local();
+
+        let failed_count =
+            reconcile_from_portal(&client, &db, "NODE-test", &backend, &storage_dir, false)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            failed_count, 0,
+            "no transition to failed should yield a zero count"
         );
     }
 }

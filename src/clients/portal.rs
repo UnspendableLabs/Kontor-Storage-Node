@@ -218,6 +218,32 @@ impl PortalClient {
         self.auth.as_ref().map(|a| a.signer_id)
     }
 
+    /// Resynchronize the local nonce counter with the Portal's view of the
+    /// registry. Useful after observing on-chain failures that may have left
+    /// gaps in the local nonce sequence.
+    ///
+    /// Returns the new nonce value.
+    pub async fn resync_nonce(&self) -> Result<u64> {
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| anyhow!("authentication required to resync nonce"))?;
+        let entry = self.get_registry_entry(auth.signer_id).await?;
+        let old = auth.next_nonce.swap(entry.next_nonce, Ordering::Relaxed);
+        if old != entry.next_nonce {
+            tracing::warn!(old, new = entry.next_nonce, "resynced registry nonce");
+        }
+        Ok(entry.next_nonce)
+    }
+
+    /// Read the current local nonce counter (test-only helper).
+    #[cfg(test)]
+    pub fn current_nonce(&self) -> Option<u64> {
+        self.auth
+            .as_ref()
+            .map(|a| a.next_nonce.load(Ordering::Relaxed))
+    }
+
     fn jwt_and_digest_headers(
         &self,
         body: Option<(&[u8], &str)>,
@@ -1925,6 +1951,50 @@ mod tests {
     async fn get_node_challenges_requires_authentication() {
         let client = PortalClient::new("http://localhost:1234", storage_dir("chal_no_auth"));
         let err = client.get_node_challenges().await.unwrap_err();
+        assert!(
+            err.to_string().contains("authentication required"),
+            "expected auth error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_nonce_updates_local_counter_from_registry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/entry/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "abcd",
+                "bls_pubkey": null,
+                "next_nonce": 99
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            storage_dir("resync_nonce"),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            5,
+        );
+
+        assert_eq!(client.current_nonce(), Some(5));
+
+        let new_nonce = client.resync_nonce().await.unwrap();
+        assert_eq!(new_nonce, 99);
+        assert_eq!(client.current_nonce(), Some(99));
+    }
+
+    #[tokio::test]
+    async fn resync_nonce_requires_authentication() {
+        let client = PortalClient::new("http://localhost:1234", storage_dir("resync_no_auth"));
+        let err = client.resync_nonce().await.unwrap_err();
         assert!(
             err.to_string().contains("authentication required"),
             "expected auth error, got {err}"
