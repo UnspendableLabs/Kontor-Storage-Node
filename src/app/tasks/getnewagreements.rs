@@ -107,6 +107,10 @@ mod tests {
             padded_len: None,
             blob_size: None,
             file_hash: None,
+            txid: None,
+            block_height: None,
+            block_time: None,
+            thumbnail_url: None,
         }
     }
 
