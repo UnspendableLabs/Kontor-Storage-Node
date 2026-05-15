@@ -224,6 +224,11 @@ mod tests {
             bls_signature: None,
             created_at: "2025-01-15T10:30:00Z".to_string(),
             updated_at: "2025-01-15T10:30:00Z".to_string(),
+            transaction_id: None,
+            txid: None,
+            tx_block_height: None,
+            tx_block_time: None,
+            tx_status: None,
         }
     }
 

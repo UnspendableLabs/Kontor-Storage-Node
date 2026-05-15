@@ -19,31 +19,61 @@ const FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
 /// Default gas limit for filestorage contract calls.
 const DEFAULT_GAS_LIMIT: u64 = 100_000;
 
-/// Kontor BlsBulkOp::Call representation for signing.
+/// Mirror of Kontor's `SignerClaim` enum.
 ///
-/// This must serialize identically to Kontor's `BlsBulkOp::Call` variant via postcard.
-/// The `contract` field uses `String` because Kontor serializes `ContractAddress`
-/// as its Display string (`"{name}_{height}_{tx_index}"`) via `serde_as(as = "DisplayFromStr")`.
+/// Variant ordering MUST match Kontor's `indexer-types` exactly so that postcard
+/// encodes the same variant indices.
 #[derive(Serialize)]
-enum BlsBulkOp {
+enum SignerClaim {
+    Id(u64),
+    #[allow(dead_code)]
+    PubKey(Vec<u8>), // present only to maintain correct variant indices
+}
+
+/// Mirror of Kontor's `PaymentIntent` enum.
+///
+/// Variant ordering MUST match Kontor's `indexer-types` exactly.
+#[derive(Serialize)]
+enum PaymentIntent {
+    SelfPay {
+        limit: u64,
+    },
+    #[allow(dead_code)]
+    Sponsored, // present only to maintain correct variant indices
+}
+
+/// Mirror of Kontor's `InstKind` enum.
+///
+/// Variant ordering MUST match Kontor's `indexer-types` exactly.
+/// `ContractAddress` is serialized via `DisplayFromStr` in Kontor, so `String` here
+/// produces an identical postcard encoding.
+#[derive(Serialize)]
+enum InstKind {
+    #[allow(dead_code)]
+    Publish {
+        name: String,
+        bytes: Vec<u8>,
+    }, // index 0 — present for correct ordering
     Call {
-        signer_id: u64,
-        nonce: u64,
-        gas_limit: u64,
         contract: String,
         expr: String,
+    }, // index 1
+    #[allow(dead_code)]
+    Issuance, // index 2
+    #[allow(dead_code)]
+    RegisterBlsKey {
+        // index 3
+        bls_pubkey: Vec<u8>,
+        schnorr_sig: Vec<u8>,
+        bls_sig: Vec<u8>,
     },
 }
 
-impl BlsBulkOp {
-    /// Build the domain-separated signing message: `KONTOR-OP-V1 || postcard(self)`.
-    fn signing_message(&self) -> Result<Vec<u8>> {
-        let op_bytes = postcard::to_allocvec(self).context("failed to serialize BlsBulkOp")?;
-        let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
-        msg.extend_from_slice(KONTOR_OP_PREFIX);
-        msg.extend_from_slice(&op_bytes);
-        Ok(msg)
-    }
+/// Mirror of Kontor's `Inst` struct.
+#[derive(Serialize)]
+struct Inst {
+    payment: PaymentIntent,
+    kind: InstKind,
 }
 
 /// Encode `s` as a Wave string literal, validating it contains only safe
@@ -490,12 +520,13 @@ impl PortalClient {
         Ok(page)
     }
 
-    /// Sign a Kontor operation with BLS using the BlsBulkOp::Call protocol.
+    /// Sign a Kontor operation with BLS.
     ///
     /// This method:
     /// 1. Atomically reads and increments the nonce
-    /// 2. Builds a `BlsBulkOp::Call` with the given Wave expression
-    /// 3. Signs `KONTOR-OP-V1 || postcard(op)` with the BLS keypair
+    /// 2. Builds the signing message `KONTOR-OP-V1 || postcard((SignerClaim, nonce, Inst))`
+    ///    matching Kontor's `Inst::aggregate_signing_message` protocol
+    /// 3. Signs the message with the BLS keypair
     ///
     /// Returns `(hex_signature, nonce_used)`.
     fn sign_kontor_op(&self, expr: String) -> Result<(String, u64)> {
@@ -506,15 +537,23 @@ impl PortalClient {
 
         let nonce = auth.next_nonce.fetch_add(1, Ordering::Relaxed);
 
-        let op = BlsBulkOp::Call {
-            signer_id: auth.signer_id,
-            nonce,
-            gas_limit: DEFAULT_GAS_LIMIT,
-            contract: FILESTORAGE_CONTRACT.to_string(),
-            expr,
+        let claim = SignerClaim::Id(auth.signer_id);
+        let inst = Inst {
+            payment: PaymentIntent::SelfPay {
+                limit: DEFAULT_GAS_LIMIT,
+            },
+            kind: InstKind::Call {
+                contract: FILESTORAGE_CONTRACT.to_string(),
+                expr,
+            },
         };
 
-        let msg = op.signing_message()?;
+        let op_bytes = postcard::to_allocvec(&(&claim, nonce, &inst))
+            .context("failed to serialize signing payload")?;
+        let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
+        msg.extend_from_slice(KONTOR_OP_PREFIX);
+        msg.extend_from_slice(&op_bytes);
+
         let sig = auth.keypair.sign_kontor_op_message(&msg)?;
         Ok((sig, nonce))
     }
@@ -787,6 +826,16 @@ pub struct Challenge {
     pub bls_signature: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[allow(dead_code)]
+    pub transaction_id: Option<String>,
+    #[allow(dead_code)]
+    pub txid: Option<String>,
+    #[allow(dead_code)]
+    pub tx_block_height: Option<u64>,
+    #[allow(dead_code)]
+    pub tx_block_time: Option<u64>,
+    #[allow(dead_code)]
+    pub tx_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -821,12 +870,24 @@ pub struct Agreement {
     pub blob_size: Option<u64>,
     #[allow(dead_code)]
     pub file_hash: Option<String>,
+    #[allow(dead_code)]
+    pub txid: Option<String>,
+    #[allow(dead_code)]
+    pub block_height: Option<u64>,
+    #[allow(dead_code)]
+    pub block_time: Option<u64>,
+    #[allow(dead_code)]
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct JoinAgreementResponse {
     pub node_id: String,
     pub created: bool,
+    #[allow(dead_code)]
+    pub agreement_id: Option<String>,
+    #[allow(dead_code)]
+    pub joined_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -901,6 +962,8 @@ pub struct RegistryEntry {
     pub x_only_pubkey: String,
     pub bls_pubkey: Option<String>,
     pub next_nonce: u64,
+    pub kor_balance: Option<String>,
+    pub user_id: Option<String>,
 }
 
 #[cfg(test)]
