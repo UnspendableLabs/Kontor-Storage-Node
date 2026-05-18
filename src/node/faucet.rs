@@ -91,15 +91,27 @@ async fn poll_until_balance(
     writer.flush()?;
     loop {
         tokio::time::sleep(KOR_POLL_INTERVAL).await;
-        let entry = client.get_registry_entry(signer_id).await?;
-        if !kor_balance_is_empty(&entry.kor_balance) {
-            let balance = entry.kor_balance.as_deref().unwrap_or("0");
-            writeln!(writer)?;
-            writeln!(writer, "✓ KOR balance: {balance}")?;
-            return Ok(());
+        // Transient HTTP errors must not kill the process: if main exits, the
+        // container is restarted, onboarding sees `kor_balance: 0`, and a
+        // brand-new faucet broadcast is fired. A single network hiccup then
+        // turns into a runaway loop that floods the Portal with TXs.
+        match client.get_registry_entry(signer_id).await {
+            Ok(entry) => {
+                if !kor_balance_is_empty(&entry.kor_balance) {
+                    let balance = entry.kor_balance.as_deref().unwrap_or("0");
+                    writeln!(writer)?;
+                    writeln!(writer, "✓ KOR balance: {balance}")?;
+                    return Ok(());
+                }
+                write!(writer, ".")?;
+                writer.flush()?;
+            }
+            Err(e) => {
+                tracing::warn!("Transient error while polling KOR balance: {e:#}");
+                write!(writer, "!")?;
+                writer.flush()?;
+            }
         }
-        write!(writer, ".")?;
-        writer.flush()?;
     }
 }
 
