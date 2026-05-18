@@ -179,6 +179,8 @@ pub async fn run_with_shutdown(
             writeln!(writer, "Node onboarding complete. Starting services...")?;
             writeln!(writer)?;
 
+            node::ensure_kor_balance(&client, onboarding_result.signer_id, &mut writer).await?;
+
             let node_id = onboarding_result.node_id;
 
             let authenticated_client = PortalClient::try_with_auth(
@@ -642,7 +644,8 @@ mod tests {
                 "signer_id": 42,
                 "x_only_pubkey": "abc123",
                 "bls_pubkey": public_key,
-                "next_nonce": 7
+                "next_nonce": 7,
+                "kor_balance": "10.0"
             })))
             .mount(mock_server)
             .await;
@@ -859,7 +862,8 @@ mod tests {
                 "signer_id": 42,
                 "x_only_pubkey": "abc123",
                 "bls_pubkey": public_key,
-                "next_nonce": 7
+                "next_nonce": 7,
+                "kor_balance": "10.0"
             })))
             .mount(mock_server)
             .await;

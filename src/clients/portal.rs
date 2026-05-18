@@ -472,6 +472,23 @@ impl PortalClient {
             .context("failed to deserialize registry entry")
     }
 
+    /// Request KOR from the Portal faucet.
+    ///
+    /// Public endpoint — does not require authentication. The Portal will compose,
+    /// sign, and broadcast a BTC-anchored `Call::transfer` to the given recipient.
+    pub async fn request_faucet(&self, recipient: &str, amount: f64) -> Result<FaucetResponse> {
+        let url = format!("{}/api/faucet", self.base_url);
+        let payload = FaucetRequest {
+            recipient: recipient.to_string(),
+            amount,
+        };
+        let resp = self.http.post(&url).json(&payload).send().await?;
+        let resp = check_response_status(resp, "request faucet").await?;
+        resp.json::<FaucetResponse>()
+            .await
+            .context("failed to deserialize faucet response")
+    }
+
     /// Fetch all agreements that are marked as ready.
     ///
     /// This method handles pagination automatically, fetching all pages.
@@ -964,6 +981,21 @@ pub struct RegistryEntry {
     pub next_nonce: u64,
     pub kor_balance: Option<String>,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FaucetRequest {
+    recipient: String,
+    amount: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FaucetResponse {
+    pub commit_txid: String,
+    pub reveal_txid: String,
+    pub recipient: String,
+    pub amount: f64,
 }
 
 #[cfg(test)]
