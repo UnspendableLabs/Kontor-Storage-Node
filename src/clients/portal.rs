@@ -464,12 +464,29 @@ impl PortalClient {
 
     /// Fetch a registry entry by signer ID.
     pub async fn get_registry_entry(&self, signer_id: u64) -> Result<RegistryEntry> {
-        let url = format!("{}/api/registry/entry/{}", self.base_url, signer_id);
+        let url = format!("{}/api/signers/{}", self.base_url, signer_id);
         let resp = self.http.get(&url).send().await?;
         let resp = check_response_status(resp, "fetch registry entry").await?;
         resp.json::<RegistryEntry>()
             .await
             .context("failed to deserialize registry entry")
+    }
+
+    /// Request KOR from the Portal faucet.
+    ///
+    /// Public endpoint — does not require authentication. The Portal will compose,
+    /// sign, and broadcast a BTC-anchored `Call::transfer` to the given recipient.
+    pub async fn request_faucet(&self, recipient: &str, amount: f64) -> Result<FaucetResponse> {
+        let url = format!("{}/api/faucet", self.base_url);
+        let payload = FaucetRequest {
+            recipient: recipient.to_string(),
+            amount,
+        };
+        let resp = self.http.post(&url).json(&payload).send().await?;
+        let resp = check_response_status(resp, "request faucet").await?;
+        resp.json::<FaucetResponse>()
+            .await
+            .context("failed to deserialize faucet response")
     }
 
     /// Fetch all agreements that are marked as ready.
@@ -964,6 +981,21 @@ pub struct RegistryEntry {
     pub next_nonce: u64,
     pub kor_balance: Option<String>,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FaucetRequest {
+    recipient: String,
+    amount: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FaucetResponse {
+    pub commit_txid: String,
+    pub reveal_txid: String,
+    pub recipient: String,
+    pub amount: f64,
 }
 
 #[cfg(test)]
@@ -2025,7 +2057,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abcd",
