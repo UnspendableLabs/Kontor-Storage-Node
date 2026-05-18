@@ -754,7 +754,7 @@ mod tests {
 
         // Registry endpoint must be hit exactly once after observing failure.
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abcd",
@@ -830,7 +830,7 @@ mod tests {
 
         // Registry endpoint must NOT be hit when there are no failed transitions.
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abcd",

@@ -464,7 +464,7 @@ impl PortalClient {
 
     /// Fetch a registry entry by signer ID.
     pub async fn get_registry_entry(&self, signer_id: u64) -> Result<RegistryEntry> {
-        let url = format!("{}/api/registry/entry/{}", self.base_url, signer_id);
+        let url = format!("{}/api/signers/{}", self.base_url, signer_id);
         let resp = self.http.get(&url).send().await?;
         let resp = check_response_status(resp, "fetch registry entry").await?;
         resp.json::<RegistryEntry>()
@@ -2057,7 +2057,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abcd",

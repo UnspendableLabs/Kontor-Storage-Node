@@ -639,7 +639,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abc123",
@@ -857,7 +857,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abc123",

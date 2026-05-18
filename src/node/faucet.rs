@@ -139,7 +139,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("5.0"))),
             )
@@ -173,7 +173,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
             .up_to_n_times(1)
             .mount(&mock_server)
@@ -191,7 +191,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("10.0"))),
             )
@@ -217,7 +217,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
             .up_to_n_times(2)
             .mount(&mock_server)
@@ -233,7 +233,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("3.0"))),
             )
@@ -258,7 +258,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
             .up_to_n_times(1)
             .mount(&mock_server)
@@ -274,7 +274,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("7.0"))),
             )
@@ -299,7 +299,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/registry/entry/42"))
+            .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
             .mount(&mock_server)
             .await;
