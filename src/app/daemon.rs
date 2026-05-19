@@ -146,6 +146,15 @@ async fn sync_portal_once(
         }
     }
 
+    // Resync the nonce from Kontor's registry at the start of every cycle so
+    // that the local counter always reflects the confirmed on-chain state before
+    // any new signed ops are submitted.
+    if portal_client.node_id().is_some() {
+        if let Err(e) = portal_client.resync_nonce().await {
+            warn!("failed to resync nonce at start of sync cycle: {e:#}");
+        }
+    }
+
     let mut failed_count: usize = 0;
 
     if let Some(node_id) = portal_client.node_id() {
@@ -752,7 +761,8 @@ mod tests {
         mount_empty_ready_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
 
-        // Registry endpoint must be hit exactly once after observing failure.
+        // Registry endpoint is hit twice: once at startup resync, once after
+        // observing the failed transition.
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -761,7 +771,7 @@ mod tests {
                 "bls_pubkey": null,
                 "next_nonce": 99
             })))
-            .expect(1)
+            .expect(2)
             .mount(&mock_server)
             .await;
 
@@ -810,7 +820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_portal_once_does_not_resync_nonce_without_failed_transition() {
+    async fn sync_portal_once_resyncs_nonce_at_start_of_every_cycle() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -828,7 +838,8 @@ mod tests {
         mount_empty_ready_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
 
-        // Registry endpoint must NOT be hit when there are no failed transitions.
+        // Registry endpoint is now hit once per cycle (startup resync), even
+        // without any failed transitions.
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -837,12 +848,12 @@ mod tests {
                 "bls_pubkey": null,
                 "next_nonce": 99
             })))
-            .expect(0)
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let database = setup_in_memory_db().await;
-        let storage_dir = unique_test_path("daemon_no_resync");
+        let storage_dir = unique_test_path("daemon_resync_each_cycle");
         fs::create_dir_all(&storage_dir).ok();
 
         let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
@@ -859,8 +870,8 @@ mod tests {
 
         assert_eq!(
             portal_client.current_nonce(),
-            Some(5),
-            "nonce should remain unchanged when no failed transitions are observed"
+            Some(99),
+            "nonce should be resynced from registry at the start of each sync cycle"
         );
     }
 }
