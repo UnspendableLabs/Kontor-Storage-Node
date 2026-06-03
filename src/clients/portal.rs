@@ -30,18 +30,6 @@ enum SignerClaim {
     PubKey(Vec<u8>), // present only to maintain correct variant indices
 }
 
-/// Mirror of Kontor's `PaymentIntent` enum.
-///
-/// Variant ordering MUST match Kontor's `indexer-types` exactly.
-#[derive(Serialize)]
-enum PaymentIntent {
-    SelfPay {
-        limit: u64,
-    },
-    #[allow(dead_code)]
-    Sponsored, // present only to maintain correct variant indices
-}
-
 /// Mirror of Kontor's `InstKind` enum.
 ///
 /// Variant ordering MUST match Kontor's `indexer-types` exactly.
@@ -72,7 +60,7 @@ enum InstKind {
 /// Mirror of Kontor's `Inst` struct.
 #[derive(Serialize)]
 struct Inst {
-    payment: PaymentIntent,
+    gas_limit: u64,
     kind: InstKind,
 }
 
@@ -541,7 +529,7 @@ impl PortalClient {
     ///
     /// This method:
     /// 1. Atomically reads and increments the nonce
-    /// 2. Builds the signing message `KONTOR-OP-V1 || postcard((SignerClaim, nonce, Inst))`
+    /// 2. Builds the signing message `KONTOR-OP-V1 || postcard((SignerClaim, nonce, sponsored, Inst))`
     ///    matching Kontor's `Inst::aggregate_signing_message` protocol
     /// 3. Signs the message with the BLS keypair
     ///
@@ -556,16 +544,15 @@ impl PortalClient {
 
         let claim = SignerClaim::Id(auth.signer_id);
         let inst = Inst {
-            payment: PaymentIntent::SelfPay {
-                limit: DEFAULT_GAS_LIMIT,
-            },
+            gas_limit: DEFAULT_GAS_LIMIT,
             kind: InstKind::Call {
                 contract: FILESTORAGE_CONTRACT.to_string(),
                 expr,
             },
         };
 
-        let op_bytes = postcard::to_allocvec(&(&claim, nonce, &inst))
+        // `sponsored = false`: node self-pays gas (nodes never use sponsored ops).
+        let op_bytes = postcard::to_allocvec(&(&claim, nonce, false, &inst))
             .context("failed to serialize signing payload")?;
         let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
         msg.extend_from_slice(KONTOR_OP_PREFIX);
