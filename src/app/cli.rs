@@ -79,6 +79,15 @@ pub struct Cli {
     #[arg(long, env = "BLS_KEY_PATH")]
     pub bls_key_path: Option<PathBuf>,
 
+    /// Password guarding the operator UI at `/admin`.
+    ///
+    /// Unset (the default) disables the UI: the page still renders, but login
+    /// answers 503 so there is nothing to guess. When set it must be at least
+    /// [`crate::app::config::MIN_ADMIN_PASSWORD_LEN`] characters — it is the
+    /// only credential standing between the internet and a database wipe.
+    #[arg(long, env = "ADMIN_PASSWORD")]
+    pub admin_password: Option<String>,
+
     /// Kontor address of the filestorage contract this node signs operations
     /// against. MUST match the Portal's own `KONTOR_CONTRACT_ADDRESS`: the
     /// contract address is part of the signed `Inst`, so a mismatch makes every

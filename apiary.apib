@@ -158,6 +158,143 @@ For local storage, the file content is streamed directly. For GCS storage, a tem
 
             (error details)
 
+## Group Admin
+
+The operator UI at `/admin` and the endpoints behind it.
+
+These are disabled unless `ADMIN_PASSWORD` is configured, in which case login answers `503 ADMIN_UI_DISABLED`. The password is exchanged for a session token that expires after 8 hours and is signed with a key generated at startup, so restarting the node invalidates every session. Errors are returned as `{"error": {"code": ..., "message": ...}}`.
+
+Unlike the file endpoints, these carry no CORS headers: they are only ever called same-origin by the embedded page.
+
+### Operator UI [GET /admin]
+
+The single-page operator UI. Public — it is the login screen — and contains no secrets. Served with `Content-Security-Policy: default-src 'self'`, `X-Frame-Options: DENY` and `Cache-Control: no-store`. `GET /admin/` resolves the same page.
+
++ Response 200 (text/html; charset=utf-8)
+
+### Sign In [POST /api/admin/login]
+
+Exchange the configured password for a session token.
+
++ Request (application/json)
+
+    + Attributes
+        + password: `correct horse battery staple` (string, required) - Value of `ADMIN_PASSWORD`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "token": "eyJhbGciOiJIUzI1NiJ9...",
+                "expires_at": 1798761600,
+                "expires_in": 28800
+            }
+
++ Response 401 (application/json)
+
+    Wrong password (`INVALID_PASSWORD`). Every rejection costs a fixed 250 ms.
+
++ Response 429 (application/json)
+
+    More than 10 failed attempts from this client in 15 minutes (`TOO_MANY_ATTEMPTS`). The correct password is refused too until the window expires.
+
++ Response 503 (application/json)
+
+    `ADMIN_PASSWORD` is not configured (`ADMIN_UI_DISABLED`).
+
+### Node Status [GET /api/admin/status]
+
+Counts of everything a reset would erase, plus where it is stored.
+
++ Request
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "node_id": "abc123def456",
+                "storage": {
+                    "method": "local",
+                    "directory": "/var/lib/kontor/files"
+                },
+                "agreements": {
+                    "total": 42,
+                    "downloaded": 40,
+                    "stored_bytes": 1048576
+                },
+                "challenges": {
+                    "total": 7
+                },
+                "session_expires_at": 1798761600
+            }
+
+    `storage.directory` is `null` when the backend is GCS.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 503 (application/json)
+
+    `ADMIN_PASSWORD` is not configured (`ADMIN_UI_DISABLED`).
+
+### Reset Database [POST /api/admin/reset-database]
+
+Deletes every row of `agreements` and `challenges` in a single transaction. Both tables are chain-derived, so after a Kontor signet reset they describe a chain that no longer exists; the daemon re-fetches agreements from the Portal afterwards.
+
+With `delete_files`, the stored blobs of the deleted rows are removed too — local files, or objects in the node's GCS bucket. Only blobs named by those rows are touched, so the BLS key and everything else in the storage directory survive. Blob deletion never fails the request: the rows are already gone, and the counts say what happened.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + confirm: `RESET` (string, required) - Must be exactly `RESET`
+        + delete_files: false (boolean, optional) - Also delete the stored file blobs
+            + Default: `false`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "deleted": {
+                    "challenges": 7,
+                    "agreements": 42
+                },
+                "total_rows_deleted": 49,
+                "storage_method": "local",
+                "files": {
+                    "requested": 40,
+                    "deleted": 39,
+                    "missing": 1,
+                    "failed": 0,
+                    "skipped": 0
+                }
+            }
+
+    `files` is `null` when `delete_files` was not set. `missing` is only meaningful for the local backend: GCS reports an absent object as an error, which lands in `failed`. `skipped` counts file ids that were not plain object names and were therefore never turned into a path.
+
++ Response 400 (application/json)
+
+    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`). Nothing is deleted.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 500 (application/json)
+
+    The transaction could not be opened or committed (`DATABASE_ERROR`). The wipe is rolled back.
+
 ## Data Structures
 
 ### FileEntry (object)

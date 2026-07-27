@@ -10,6 +10,7 @@ use crate::clients::PortalClient;
 use crate::database::DBClient;
 use crate::node;
 use crate::server;
+use crate::server::admin::AdminState;
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 use std::future::Future;
@@ -31,6 +32,7 @@ pub struct DaemonConfig {
     pub storage_dir: PathBuf,
     pub download_addr: SocketAddr,
     pub node_id: String,
+    pub admin: AdminState,
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
@@ -95,6 +97,18 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Filestorage contract: {}",
         config.kontor_contract_address
     )?;
+    // Says which way the switch is set without ever naming the value: an
+    // operator who forgot to set ADMIN_PASSWORD sees it here rather than at a
+    // login screen that answers 503.
+    writeln!(
+        writer,
+        "Admin UI: {}",
+        if config.admin_password.is_empty() {
+            "disabled (set ADMIN_PASSWORD to enable /admin)"
+        } else {
+            "enabled at /admin"
+        }
+    )?;
 
     Ok(())
 }
@@ -146,6 +160,7 @@ async fn build_daemon_config(
         storage_dir: config.storage_dir.clone(),
         download_addr,
         node_id,
+        admin: AdminState::new(config.admin_password.clone()),
     })
 }
 
@@ -238,6 +253,7 @@ pub async fn run_daemon_command(
             storage_dir: daemon.storage_dir,
             storage_backend: daemon.storage_backend,
             node_id: daemon.node_id,
+            admin: daemon.admin,
         },
         async move {
             let _ = server_shutdown_rx.await;
@@ -374,6 +390,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
@@ -434,6 +451,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
@@ -483,6 +501,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
@@ -532,6 +551,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
@@ -586,6 +606,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
@@ -715,6 +736,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
@@ -794,6 +816,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
@@ -932,6 +955,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
@@ -983,6 +1007,7 @@ mod tests {
                 storage_dir: storage_dir.clone(),
                 download_addr: "127.0.0.1:1".parse().unwrap(),
                 node_id: "NODE-TEST".to_string(),
+                admin: AdminState::disabled(),
             },
             shutdown,
         )

@@ -36,6 +36,52 @@ impl fmt::Display for StorageMethod {
     }
 }
 
+/// Minimum length of `ADMIN_PASSWORD` when it is set.
+///
+/// Unlike a generated token this is typed by a human, so the floor is length
+/// rather than entropy. It is enforced at startup because the password is the
+/// only credential guarding `/admin`, which can wipe the node's database.
+pub const MIN_ADMIN_PASSWORD_LEN: usize = 16;
+
+/// Password guarding the operator UI, kept out of `Debug` output.
+///
+/// [`Config`] derives `Debug` and is cheap to interpolate into a log line; a
+/// bare `String` here would eventually end up in one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdminPassword(String);
+
+impl AdminPassword {
+    /// Builds the password from the CLI/env value. Absent and blank are the
+    /// same thing — both mean "no admin UI".
+    pub fn new(raw: Option<&str>) -> Self {
+        Self(
+            raw.filter(|value| !value.trim().is_empty())
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// True when no password is configured, i.e. the admin UI is disabled.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The password itself. Only the login comparison should call this.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AdminPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        })
+    }
+}
+
 /// Application configuration derived from CLI arguments and environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -52,6 +98,8 @@ pub struct Config {
     pub server_address: String,
     pub public_url: String,
     pub bls_key_path: Option<PathBuf>,
+    /// Password for the operator UI at `/admin`. Empty disables the UI.
+    pub admin_password: AdminPassword,
     /// Kontor address of the filestorage contract, mirroring the Portal's
     /// `KONTOR_CONTRACT_ADDRESS`. Part of every signed `Inst`, so both sides
     /// must agree or signature verification fails.
@@ -76,6 +124,17 @@ impl Config {
         let kontor_contract_address = cli.kontor_contract_address.trim().to_string();
         if kontor_contract_address.is_empty() {
             return Err(anyhow!("KONTOR_CONTRACT_ADDRESS cannot be empty"));
+        }
+
+        let admin_password = AdminPassword::new(cli.admin_password.as_deref());
+        if !admin_password.is_empty()
+            && admin_password.expose().chars().count() < MIN_ADMIN_PASSWORD_LEN
+        {
+            return Err(anyhow!(
+                "ADMIN_PASSWORD must be at least {MIN_ADMIN_PASSWORD_LEN} characters. \
+                 It is the only credential guarding the /admin UI, which can wipe this \
+                 node's database. Leave it unset to disable the admin UI entirely."
+            ));
         }
 
         if storage_method == StorageMethod::Gcs {
@@ -105,6 +164,7 @@ impl Config {
             server_address: cli.server_address.clone(),
             public_url: cli.public_url.clone(),
             bls_key_path: cli.bls_key_path.clone(),
+            admin_password,
             kontor_contract_address,
         })
     }
@@ -155,6 +215,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         }
@@ -402,6 +463,66 @@ mod tests {
 
         let config = Config::from_cli(&cli).unwrap();
         assert_eq!(config.kontor_contract_address, "filestorage_1_0");
+    }
+
+    /// No password means no admin UI, which is the default posture for a node
+    /// nobody administers through a browser.
+    #[test]
+    fn config_from_cli_leaves_admin_password_empty_by_default() {
+        let config = Config::from_cli(&make_cli()).unwrap();
+        assert!(config.admin_password.is_empty());
+    }
+
+    #[test]
+    fn config_from_cli_accepts_a_long_enough_admin_password() {
+        let cli = Cli {
+            admin_password: Some("correct horse battery".to_string()),
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.admin_password.expose(), "correct horse battery");
+    }
+
+    /// A short password would be guessable through the login endpoint, so it is
+    /// refused at startup rather than discovered after a wipe.
+    #[test]
+    fn config_from_cli_rejects_a_short_admin_password() {
+        let cli = Cli {
+            admin_password: Some("hunter2".to_string()),
+            ..make_cli()
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("ADMIN_PASSWORD"));
+    }
+
+    /// A variable left as `ADMIN_PASSWORD=` (or spaces) is an operator saying
+    /// "no UI", not a one-character password to be rejected as too short.
+    #[test]
+    fn config_from_cli_treats_a_blank_admin_password_as_unset() {
+        let cli = Cli {
+            admin_password: Some("   ".to_string()),
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert!(config.admin_password.is_empty());
+    }
+
+    /// The whole point of the newtype: `{:?}` on the config must not print it.
+    #[test]
+    fn admin_password_is_redacted_in_debug_output() {
+        let cli = Cli {
+            admin_password: Some("correct horse battery".to_string()),
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("correct horse battery"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert_eq!(format!("{:?}", AdminPassword::new(None)), "<empty>");
     }
 
     #[test]

@@ -39,6 +39,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--server-address` | `SERVER_ADDRESS` | `0.0.0.0:8081` | Address the public HTTP server binds to |
 | `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
 | `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. |
+| `--admin-password` | `ADMIN_PASSWORD` | _unset (UI disabled)_ | Password for the operator UI at `/admin`. At least 16 characters when set; leave unset to disable the UI entirely. See [Operator UI](#operator-ui). |
 | `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
 
 
@@ -158,8 +159,25 @@ Endpoints:
 | `GET /files?offset=&limit=` | JSON: paginated list of stored files |
 | `GET /files/:file_id` | Download (local backend) or 307 redirect to a GCS signed URL |
 | `GET /static/*` | Static assets (logo, dashboard CSS/JS) |
+| `GET /admin` | Operator UI (password-gated, see below) |
+| `POST /api/admin/login` | Exchange `ADMIN_PASSWORD` for an 8-hour session token |
+| `GET /api/admin/status` | JSON: row counts and storage summary (session required) |
+| `POST /api/admin/reset-database` | Wipe the node's database (session required) |
 
-CORS is permissive (`Access-Control-Allow-Origin: *`). All routes are public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. See [`apiary.apib`](apiary.apib) for the full API specification.
+CORS is permissive (`Access-Control-Allow-Origin: *`) on the serving routes, which are all public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. The `/admin` routes are deliberately outside that CORS layer and carry their own password gate. See [`apiary.apib`](apiary.apib) for the full API specification.
+
+### Operator UI
+
+Setting `ADMIN_PASSWORD` (at least 16 characters) enables a single-page operator UI at `/admin`. Leaving it unset — the default — disables it: the page still renders, but login answers `503 ADMIN_UI_DISABLED`. It is the counterpart of the Horizon Portal's own `/admin` page and is protected the same way:
+
+- the password is exchanged at `POST /api/admin/login` for a session token that expires after 8 hours and is held in `sessionStorage`, never a cookie;
+- the token is signed with a key generated at startup and never persisted, so restarting the node ends every session;
+- failed logins are throttled per peer IP (10 per 15 minutes) with a fixed 250 ms delay on each rejection, and the password is compared in constant time;
+- `X-Forwarded-For` is not trusted, so behind a reverse proxy every client shares one throttle bucket (which fails closed, not open).
+
+The UI shows what the node holds and offers one action: **reset the database**. It deletes every row of `agreements` and `challenges` — both are chain-derived, so after a Kontor signet reset they refer to a chain that no longer exists — and the daemon then re-fetches agreements from the Portal from scratch. It requires typing `RESET` to confirm.
+
+Stored file blobs are kept by default and become orphans; ticking *also delete the stored file blobs* removes them too (local files, or objects in the node's GCS bucket). Only blobs named by the rows being deleted are removed, so the BLS key, the daemon lock and anything else in the storage directory always survive. A node restart after a reset is the clean way to be sure no in-flight download writes a file back.
 
 ## Development
 

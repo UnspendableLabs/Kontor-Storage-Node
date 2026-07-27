@@ -1,0 +1,107 @@
+//! `GET /admin` — serves the single-page operator UI.
+//!
+//! The page is embedded with `include_str!`, so the node keeps shipping as one
+//! binary with no build step and no runtime dependency on an asset directory —
+//! unlike the public dashboard, which pulls its CSS and JS from `/static`. It
+//! talks to the JSON API described in [`super`].
+
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+
+/// The operator UI, compiled into the binary.
+const ADMIN_HTML: &str = include_str!("index.html");
+
+/// Locks the page down to its own origin.
+///
+/// The markup carries one inline `<script>` and one inline `<style>`, hence
+/// `'unsafe-inline'`; everything else — no external scripts, no remote fonts,
+/// no third-party XHR — is denied outright, so an injected string cannot call
+/// home. `connect-src 'self'` keeps the session token from being posted
+/// elsewhere.
+const CSP: &str = "default-src 'self'; \
+                   script-src 'self' 'unsafe-inline'; \
+                   style-src 'self' 'unsafe-inline'; \
+                   img-src 'self' data:; \
+                   connect-src 'self'; \
+                   base-uri 'none'; \
+                   form-action 'none'; \
+                   frame-ancestors 'none'";
+
+/// Returns the operator UI.
+///
+/// Public by necessity — it *is* the login screen. It contains no secrets: the
+/// password is typed in by the operator and every API call it makes is
+/// authenticated separately.
+#[must_use]
+pub async fn admin_page() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(CSP),
+            ),
+            (header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY")),
+            (
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ),
+            (
+                header::REFERRER_POLICY,
+                HeaderValue::from_static("no-referrer"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        ADMIN_HTML,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page must not embed anything that would only work with a laxer CSP
+    /// — the public dashboard's Tailwind CDN tag, most of all — and must not
+    /// accidentally ship a credential.
+    #[test]
+    fn admin_html_is_self_contained() {
+        assert!(ADMIN_HTML.contains("<title>"));
+        assert!(
+            !ADMIN_HTML.contains("http://") && !ADMIN_HTML.contains("https://"),
+            "the page must not reference external origins (CSP forbids them)"
+        );
+        assert!(
+            !ADMIN_HTML.contains("ADMIN_PASSWORD="),
+            "no credential should be echoed into the page"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_page_sets_security_headers() {
+        let response = admin_page().await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert!(headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
+    }
+}

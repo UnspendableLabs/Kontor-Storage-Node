@@ -39,6 +39,9 @@ byte-unit = "4.0"
 # contract is the verifier, so a version skew means proofs that never verify.
 kontor-crypto = "0.3.0"
 jsonwebtoken = "9"
+# Constant-time comparison for the admin password (already in the tree via
+# aes-gcm; named here because the login path depends on it directly).
+subtle = "2"
 urlencoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
