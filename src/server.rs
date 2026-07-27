@@ -99,6 +99,8 @@ mod tests {
             nodes: serde_json::json!([]),
             root: None,
             padded_len: Some(size),
+            object_id: None,
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: serde_json::json!({}),

@@ -1003,7 +1003,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1859,24 +1859,48 @@ dependencies = [
 
 [[package]]
 name = "kontor-crypto"
-version = "0.1.3"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3a629a9f2c31674fa2f865fe5b36f24297c7831cb2a795080046ff5b33559f"
+checksum = "2626a13dfce013c1d6d09af424212b8f7801943334a6fa8621abe3fa75b2f658"
 dependencies = [
  "bincode",
+ "blake2b_simd",
  "clap",
+ "constant_time_eq",
  "ff",
  "generic-array 0.14.7",
+ "kontor-crypto-core",
+ "libc",
  "nova-snark",
+ "num-bigint 0.4.6",
  "once_cell",
  "rand",
- "reed-solomon-erasure",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
  "tracing-tree",
+]
+
+[[package]]
+name = "kontor-crypto-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c69296ba68591d88f4e9339c09e528488d0d8bcb20b2fd4cf75e835091f29d2"
+dependencies = [
+ "blake2b_simd",
+ "constant_time_eq",
+ "ff",
+ "generic-array 0.14.7",
+ "halo2curves",
+ "nova-snark",
+ "once_cell",
+ "reed-solomon-erasure",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2076,7 +2100,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2914,7 +2938,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3738,7 +3762,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

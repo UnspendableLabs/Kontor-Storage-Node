@@ -1,10 +1,11 @@
 use crate::app::config::StorageMethod;
 use crate::app::daemon::StorageLimits;
+use crate::app::tasks::field_from_hex;
 use crate::clients::{GcsClient, PortalClient};
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
-use kontor_crypto::{api, FileLedger, FileMetadata as CryptoFileMetadata};
+use kontor_crypto::{api, FileDescriptor, FileLedger, FileMetadata as CryptoFileMetadata};
 use sea_orm::sea_query::Expr;
 #[cfg(test)]
 use sea_orm::DbErr;
@@ -88,7 +89,6 @@ impl<'a> CleanupGuard<'a> {
 pub(crate) enum PostProcessError {
     Prepare(anyhow::Error),
     Metadata(anyhow::Error),
-    Ledger(anyhow::Error),
 }
 
 impl fmt::Display for PostProcessError {
@@ -96,7 +96,6 @@ impl fmt::Display for PostProcessError {
         match self {
             Self::Prepare(err) => write!(f, "prepare_file failed: {err}"),
             Self::Metadata(err) => write!(f, "metadata persistence failed: {err}"),
-            Self::Ledger(err) => write!(f, "ledger update failed: {err}"),
         }
     }
 }
@@ -312,19 +311,16 @@ async fn store_agreement_file(
     }
 
     // If post-processing fails, cleanup guard will handle resource cleanup
-    if let Err(err) = process_downloaded_file(
-        downloaded.path.as_path(),
-        &downloaded.bytes,
-        agreement,
-        &txn,
-    )
-    .await
-    {
+    if let Err(err) = process_downloaded_file(&downloaded.bytes, agreement, &txn).await {
         cleanup_guard.cleanup().await;
         txn.rollback().await.ok();
         return Err(anyhow!(err));
     }
 
+    // Only `downloaded` is `Set` here: every other column stays `NotSet` so the
+    // UPDATE leaves it alone. In particular `object_id` / `ledger_index` are
+    // mirrored from the Portal by the agreement sync and must survive a
+    // download — writing `Set(None)` here would null them out.
     let model = agreements::ActiveModel {
         agreement_id: Set(agreement.agreement_id.clone()),
         downloaded: Set(true),
@@ -487,38 +483,23 @@ async fn current_downloaded_count(database: &DatabaseConnection) -> Result<u64> 
     Ok(count)
 }
 
+/// Derive the crypto metadata of a freshly downloaded file and persist it on the
+/// agreement row.
+///
+/// Takes no storage path: the aggregated ledger is a derived artifact rebuilt
+/// from the database by [`rebuild_ledger`], so post-processing only touches the
+/// database.
 pub(crate) async fn process_downloaded_file(
-    saved_path: &Path,
     file_bytes: &[u8],
     agreement: &agreements::Model,
     transaction: &DatabaseTransaction,
 ) -> Result<(), PostProcessError> {
     let metadata = prepare_file_metadata(file_bytes, &agreement.filename)
         .map_err(PostProcessError::Prepare)?;
-    let storage_root = saved_path
-        .parent()
-        .and_then(|parent| {
-            if parent.as_os_str().is_empty() {
-                None
-            } else {
-                Some(parent)
-            }
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "downloaded file path {} does not have a parent directory",
-                saved_path.display()
-            )
-        })
-        .map_err(PostProcessError::Prepare)?;
-    // Persist metadata first within the transaction so DB writes roll back if ledger fails.
+
     persist_file_metadata(transaction, agreement, &metadata)
         .await
         .map_err(PostProcessError::Metadata)?;
-
-    update_ledger(storage_root, &metadata)
-        .await
-        .map_err(PostProcessError::Ledger)?;
 
     Ok(())
 }
@@ -543,7 +524,7 @@ pub(crate) async fn finalize_downloaded_bytes(
 ) -> Result<()> {
     let txn = database.begin().await?;
 
-    if let Err(err) = process_downloaded_file(local_path, bytes, agreement, &txn).await {
+    if let Err(err) = process_downloaded_file(bytes, agreement, &txn).await {
         txn.rollback().await.ok();
         let _ = fs::remove_file(local_path).await;
         return Err(anyhow!(err).context(format!(
@@ -552,6 +533,8 @@ pub(crate) async fn finalize_downloaded_bytes(
         )));
     }
 
+    // See `store_agreement_file`: `object_id` / `ledger_index` stay `NotSet` so
+    // the Portal-mirrored values survive the download.
     let model = agreements::ActiveModel {
         agreement_id: Set(agreement.agreement_id.clone()),
         downloaded: Set(true),
@@ -571,9 +554,19 @@ pub(crate) async fn finalize_downloaded_bytes(
     Ok(())
 }
 
+/// The `nonce` every Portal-published file descriptor carries.
+///
+/// The Portal calls `prepare_file(.., &[])` for both `create-agreement` and
+/// `nft::mint` (see `create_agreement_data::build_expr_for`, which renders
+/// `nonce: []`), so `file_id = file_<SHA256(domain || len || data || 0)>` and
+/// the on-chain descriptor's `nonce` is empty. The node must prepare files with
+/// the same nonce or it derives a different `file_id` than the one the
+/// agreement is keyed on.
+pub(crate) const PORTAL_FILE_NONCE: &[u8] = &[];
+
 fn prepare_file_metadata(bytes: &[u8], filename: &str) -> Result<CryptoFileMetadata> {
-    let (_prepared, metadata) =
-        api::prepare_file(bytes, filename).context("preparing file with kontor_crypto")?;
+    let (_prepared, metadata) = api::prepare_file(bytes, filename, PORTAL_FILE_NONCE)
+        .context("preparing file with kontor_crypto")?;
     Ok(metadata)
 }
 
@@ -609,7 +602,127 @@ async fn persist_file_metadata(
     Ok(())
 }
 
-async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Result<()> {
+/// A [`FileDescriptor`] pinned to the ledger slot the filestorage contract
+/// assigned the file.
+///
+/// `FileLedger::add_file` appends at the next free local index, which is only
+/// correct for the registry that owns the counter — the contract. A storage
+/// node holds an arbitrary subset of the network's files, so it must place each
+/// one at its absolute on-chain slot and go through `add_files`, the
+/// reconstruction path that takes explicit indices.
+struct IndexedFile {
+    file_id: String,
+    root: kontor_crypto::FieldElement,
+    depth: usize,
+    ledger_index: usize,
+}
+
+impl FileDescriptor for IndexedFile {
+    fn file_id(&self) -> &str {
+        &self.file_id
+    }
+
+    fn root(&self) -> kontor_crypto::FieldElement {
+        self.root
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn ledger_index(&self) -> Option<usize> {
+        Some(self.ledger_index)
+    }
+}
+
+/// Outcome of a [`rebuild_ledger`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LedgerStats {
+    /// Files placed in the rebuilt ledger.
+    pub placed: usize,
+    /// Downloaded agreements skipped because the Portal has not published
+    /// their contract-assigned `ledger_index` yet.
+    pub awaiting_ledger_index: usize,
+}
+
+/// Rebuild `<storage_dir>/ledger.bin` from the database.
+///
+/// The ledger is a derived artifact: a `file_id -> (ledger_index, root
+/// commitment)` view over the agreements this node has downloaded. Proving a
+/// single challenge uses it purely to resolve the challenged file's slot, which
+/// the contract resolves independently from its own registry — the two must
+/// agree or the SNARK's public inputs differ and verification fails.
+///
+/// Rebuilding wholesale (rather than appending per download) is what makes the
+/// node self-healing: an agreement is normally stored before its creating
+/// transaction confirms, so its `ledger_index` arrives on a later reconcile
+/// pass and simply gets picked up by the next rebuild.
+///
+/// Agreements without a known `ledger_index` are left out and counted in
+/// [`LedgerStats::awaiting_ledger_index`]; they are unprovable until the Portal
+/// reconciles them, but the node still stores and serves their files.
+pub(crate) async fn rebuild_ledger(
+    database: &DatabaseConnection,
+    storage_root: &Path,
+) -> Result<LedgerStats> {
+    let downloaded = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .all(database)
+        .await
+        .context("loading downloaded agreements for ledger rebuild")?;
+
+    let mut entries: Vec<IndexedFile> = Vec::with_capacity(downloaded.len());
+    let mut stats = LedgerStats::default();
+
+    for agreement in &downloaded {
+        let (Some(root_hex), Some(padded_len)) = (agreement.root.as_ref(), agreement.padded_len)
+        else {
+            // Downloaded but not post-processed (or processed by an older
+            // version); the next download pass fills these in.
+            continue;
+        };
+        let Some(ledger_index) = agreement.ledger_index else {
+            stats.awaiting_ledger_index += 1;
+            continue;
+        };
+
+        entries.push(IndexedFile {
+            file_id: agreement.file_id.clone(),
+            root: field_from_hex(root_hex, "root").with_context(|| {
+                format!("decoding root of agreement {}", agreement.agreement_id)
+            })?,
+            depth: depth_from_padded_len(padded_len).with_context(|| {
+                format!(
+                    "invalid padded_len for agreement {}",
+                    agreement.agreement_id
+                )
+            })?,
+            ledger_index: ledger_index
+                .try_into()
+                .with_context(|| format!("ledger_index of {} is negative", agreement.file_id))?,
+        });
+    }
+
+    stats.placed = entries.len();
+
+    let mut ledger = FileLedger::new();
+    if !entries.is_empty() {
+        ledger.add_files(entries.iter()).map_err(|err| {
+            let highest = entries
+                .iter()
+                .map(|entry| entry.ledger_index)
+                .max()
+                .unwrap_or(0);
+            anyhow!(err).context(format!(
+                "placing {} file(s) at their contract ledger slots (highest slot {highest}); \
+                 note that kontor-crypto rejects a ledger whose highest slot exceeds the file \
+                 count by more than MAX_LEDGER_INDEX_SPARSITY_GAP (1024), which a node holding \
+                 a small subset of the network's files will eventually hit",
+                entries.len()
+            ))
+        })?;
+    }
+
     let ledger_path = ledger_path(storage_root);
     if let Some(parent) = ledger_path.parent() {
         fs::create_dir_all(parent)
@@ -617,22 +730,33 @@ async fn update_ledger(storage_root: &Path, metadata: &CryptoFileMetadata) -> Re
             .with_context(|| format!("creating ledger directory {}", parent.display()))?;
     }
 
-    let mut ledger = if ledger_path.exists() {
-        FileLedger::load(&ledger_path)
-            .with_context(|| format!("loading ledger from {}", ledger_path.display()))?
-    } else {
-        FileLedger::new()
-    };
-
-    if !ledger.files.contains_key(&metadata.file_id) {
-        ledger
-            .add_file(metadata)
-            .map_err(|err| anyhow!(err).context("adding file to ledger"))?;
-    }
-
     ledger
         .save(&ledger_path)
-        .with_context(|| format!("saving ledger to {}", ledger_path.display()))
+        .with_context(|| format!("saving ledger to {}", ledger_path.display()))?;
+
+    if stats.awaiting_ledger_index > 0 {
+        warn!(
+            "Ledger rebuilt with {} file(s); {} downloaded agreement(s) have no ledger_index yet \
+             and cannot be proven until the Portal reconciles them on chain",
+            stats.placed, stats.awaiting_ledger_index
+        );
+    }
+
+    Ok(stats)
+}
+
+/// Merkle depth implied by a padded leaf count, mirroring
+/// `FileMetadata::depth()`.
+fn depth_from_padded_len(padded_len: i64) -> Result<usize> {
+    let padded_len: usize = padded_len
+        .try_into()
+        .context("padded_len does not fit into usize")?;
+    if padded_len == 0 || !padded_len.is_power_of_two() {
+        return Err(anyhow!(
+            "padded_len {padded_len} is not a positive power of two"
+        ));
+    }
+    Ok(padded_len.trailing_zeros() as usize)
 }
 
 fn ledger_path(storage_root: &Path) -> PathBuf {
@@ -652,7 +776,6 @@ mod tests {
     use sea_orm::{EntityTrait, PaginatorTrait};
     use serde_json::json;
     use std::fs as stdfs;
-    use std::path::Path;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::thread::ThreadId;
@@ -781,6 +904,9 @@ mod tests {
         let mut fx = AgreementFixture::new(agreement_id, file_id);
         fx.filename = filename.into();
         fx.mime_type = "application/pdf".into();
+        // Mirrored from the Portal by the agreement sync, before the download.
+        fx.object_id = Some("obj_download".into());
+        fx.ledger_index = Some(3);
         fx.into_active_model().insert(&database).await.unwrap();
 
         let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
@@ -814,10 +940,15 @@ mod tests {
         );
         assert_eq!(downloaded.filename, filename);
         assert_eq!(downloaded.file_id, file_id);
-
-        assert!(
-            storage_dir.join("ledger.bin").exists(),
-            "ledger file should be created alongside downloads"
+        assert_eq!(
+            downloaded.object_id.as_deref(),
+            Some("obj_download"),
+            "the download must not clear the Portal-mirrored object_id"
+        );
+        assert_eq!(
+            downloaded.ledger_index,
+            Some(3),
+            "the download must not clear the contract-assigned ledger_index"
         );
     }
 
@@ -897,11 +1028,6 @@ mod tests {
             !storage_dir.join(file_id).exists(),
             "local file should be removed after GCS upload"
         );
-        assert!(
-            storage_dir.join("ledger.bin").exists(),
-            "ledger should still be written when using the GCS backend"
-        );
-
         let downloaded = Agreements::find()
             .filter(agreements::Column::AgreementId.eq(agreement_id))
             .one(&database)
@@ -1165,11 +1291,6 @@ mod tests {
             agreement_after_retry.original_size,
             "file-body".len() as i64,
             "original_size reflects prepared file bytes"
-        );
-
-        assert!(
-            storage_dir.join("ledger.bin").exists(),
-            "ledger should remain persisted after retry"
         );
     }
 
@@ -1564,13 +1685,15 @@ mod tests {
         );
     }
 
+    /// A post-processing failure must roll the whole download back: no local
+    /// file left behind and the agreement still un-downloaded.
     #[tokio::test]
-    async fn errors_when_ledger_cannot_be_written() {
+    async fn post_processing_failure_rolls_back_the_download() {
         let mock_server = MockServer::start().await;
-        let agreement_id = "AGREEMENT-ledger-error";
-        let file_id = "FILE-ledger-error";
+        let agreement_id = "AGREEMENT-post-process-error";
+        let file_id = "FILE-post-process-error";
         let filename = "contract.pdf";
-        let download_path = "/files/bad-ledger.pdf";
+        let download_path = "/files/bad-post-process.pdf";
         let download_url = format!("{}{}", mock_server.uri(), download_path);
 
         Mock::given(method("GET"))
@@ -1584,21 +1707,19 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(download_path))
-            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            // Empty body: `prepare_file` rejects empty data, which is how this
+            // test drives `process_downloaded_file` into its failure branch.
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
             .mount(&mock_server)
             .await;
 
         let database = setup_agreements_db().await;
-        let storage_dir = unique_storage_dir("ledger_error");
+        let storage_dir = unique_storage_dir("post_process_error");
         stdfs::remove_dir_all(&storage_dir).ok();
         let mut fx = AgreementFixture::new(agreement_id, file_id);
         fx.filename = filename.into();
         fx.mime_type = "application/pdf".into();
         fx.into_active_model().insert(&database).await.unwrap();
-
-        // Create a directory where the ledger file should be written to force a failure.
-        let ledger_dir = storage_dir.join("ledger.bin");
-        stdfs::create_dir_all(&ledger_dir).unwrap();
 
         let result = download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
@@ -1608,7 +1729,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "ledger write failure should bubble up");
+        assert!(result.is_err(), "post-processing failure should bubble up");
         assert!(
             !storage_dir.join(file_id).exists(),
             "downloaded file should be removed when post-processing fails"
@@ -1630,47 +1751,56 @@ mod tests {
         );
     }
 
+    /// `object_id` / `ledger_index` are mirrored from the Portal by the
+    /// agreement sync, well before the file is downloaded. Marking an agreement
+    /// as downloaded must not touch them: nulling them out would drop the file
+    /// out of the rebuilt ledger and make `build_file_metadata` fail, so the
+    /// node could not prove anything until the next reconcile pass refilled
+    /// them.
     #[tokio::test]
-    async fn process_downloaded_file_errors_when_path_missing_parent() {
+    async fn finalize_downloaded_bytes_preserves_the_portal_descriptor_fields() {
         let database = setup_agreements_db().await;
-        let txn = database.begin().await.unwrap();
-        let agreement = agreements::Model {
-            agreement_id: "AGREEMENT-no-parent".into(),
-            user_id: "user_1".into(),
-            file_id: "FILE-no-parent".into(),
-            filename: "file.pdf".into(),
-            mime_type: "application/pdf".into(),
-            original_size: 10,
-            nodes: json!(["NODE-1"]),
-            root: None,
-            padded_len: None,
-            downloaded: false,
-            transaction_id: None,
-            curation: json!({}),
-            status: "ready".into(),
-            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
-        };
+        let storage_dir = unique_storage_dir("finalize_keeps_descriptor");
+        stdfs::create_dir_all(&storage_dir).unwrap();
 
-        let result =
-            process_downloaded_file(Path::new("orphaned_file"), b"file-body", &agreement, &txn)
-                .await;
+        let agreement_id = "AGREEMENT-keeps-descriptor";
+        let file_id = "FILE-keeps-descriptor";
+        let file_path = storage_dir.join(file_id);
+        let bytes = b"descriptor preservation bytes";
+        stdfs::write(&file_path, bytes).unwrap();
 
-        assert!(
-            matches!(result, Err(PostProcessError::Prepare(_))),
-            "expected missing parent path to be reported as prepare error"
-        );
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.filename = "descriptor.bin".into();
+        fx.object_id = Some("obj_descriptor".into());
+        fx.ledger_index = Some(7);
+        fx.into_active_model().insert(&database).await.unwrap();
 
-        txn.rollback().await.unwrap();
+        let agreement = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
 
-        let agreement_rows = Agreements::find().count(&database).await.unwrap();
-        assert_eq!(agreement_rows, 0, "no agreements should be persisted");
+        finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
+            .await
+            .expect("finalize should succeed");
+
+        let stored = Agreements::find()
+            .filter(agreements::Column::AgreementId.eq(agreement_id))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.downloaded);
+        assert_eq!(stored.object_id.as_deref(), Some("obj_descriptor"));
+        assert_eq!(stored.ledger_index, Some(7));
     }
 
     #[test]
     fn post_process_error_display_is_readable() {
         let prepare_err = PostProcessError::Prepare(anyhow!("prep"));
         let metadata_err = PostProcessError::Metadata(anyhow!("meta"));
-        let ledger_err = PostProcessError::Ledger(anyhow!("ledger"));
 
         assert!(
             prepare_err.to_string().contains("prepare_file failed"),
@@ -1682,10 +1812,6 @@ mod tests {
                 .contains("metadata persistence failed"),
             "metadata variant should mention persistence failure"
         );
-        assert!(
-            ledger_err.to_string().contains("ledger update failed"),
-            "ledger variant should mention ledger failure"
-        );
     }
 
     #[tokio::test]
@@ -1693,7 +1819,9 @@ mod tests {
         let database = setup_agreements_db().await;
         let metadata = CryptoFileMetadata {
             root: Fq::one(),
+            object_id: "obj_overflow".into(),
             file_id: "FILE-overflow".into(),
+            nonce: PORTAL_FILE_NONCE.to_vec(),
             padded_len: usize::MAX,
             original_size: usize::MAX,
             filename: "huge.bin".into(),
@@ -1709,6 +1837,8 @@ mod tests {
             nodes: json!(["NODE-1"]),
             root: None,
             padded_len: None,
+            object_id: None,
+            ledger_index: None,
             downloaded: false,
             transaction_id: None,
             curation: json!({}),
@@ -1848,7 +1978,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(download_path))
-            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            // Empty body: `prepare_file` rejects empty data, which is how this
+            // test drives `process_downloaded_file` into its failure branch.
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
             .mount(&mock_server)
             .await;
 
@@ -1884,10 +2016,6 @@ mod tests {
         let mut fx = AgreementFixture::new(agreement_id, file_id);
         fx.filename = "postprocess.bin".into();
         fx.into_active_model().insert(&database).await.unwrap();
-
-        // Create a directory where the ledger should be to force post-processing failure
-        let ledger_dir = storage_dir.join("ledger.bin");
-        stdfs::create_dir_all(&ledger_dir).unwrap();
 
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
@@ -1947,7 +2075,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(download_path))
-            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            // Empty body: `prepare_file` rejects empty data, which is how this
+            // test drives `process_downloaded_file` into its failure branch.
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
             .mount(&mock_server)
             .await;
 
@@ -1984,10 +2114,6 @@ mod tests {
         fx.filename = "delete-fail.bin".into();
         fx.into_active_model().insert(&database).await.unwrap();
 
-        // Create a directory where the ledger should be to force post-processing failure
-        let ledger_dir = storage_dir.join("ledger.bin");
-        stdfs::create_dir_all(&ledger_dir).unwrap();
-
         let gcs_client = GcsClient::with_test_endpoints(
             bucket,
             "svc@example.com",
@@ -2015,8 +2141,10 @@ mod tests {
         );
     }
 
+    /// `rebuild_ledger` writes `ledger.bin` under the storage directory, which
+    /// the download pipeline may have created several levels deep.
     #[tokio::test]
-    async fn ledger_directory_is_created_when_missing() {
+    async fn rebuild_ledger_creates_the_storage_directory_when_missing() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGREEMENT-ledger-dir";
         let file_id = "FILE-ledger-dir";
@@ -2059,6 +2187,8 @@ mod tests {
         )
         .await
         .unwrap();
+
+        rebuild_ledger(&database, &storage_dir).await.unwrap();
 
         assert!(
             storage_dir.join("ledger.bin").exists(),
@@ -2199,7 +2329,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(download_path))
-            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            // Empty body: `prepare_file` rejects empty data, which is how this
+            // test drives `process_downloaded_file` into its failure branch.
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
             .mount(&mock_server)
             .await;
 
@@ -2221,8 +2353,6 @@ mod tests {
 
         let storage_dir = unique_storage_dir("post_cleanup");
         stdfs::remove_dir_all(&storage_dir).ok();
-        let ledger_dir = storage_dir.join("ledger.bin");
-        stdfs::create_dir_all(&ledger_dir).unwrap();
         let file_path = storage_dir.join(file_id);
         let file_path_for_mock = file_path.clone();
 
@@ -2263,7 +2393,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("ledger update failed"),
+            err.to_string().contains("prepare_file failed"),
             "post-processing failure should bubble up"
         );
         assert!(
@@ -2422,18 +2552,16 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_downloaded_bytes_handles_post_processing_error() {
-        // Cover the post_processing error rollback branch (lines 547-552):
-        // force prepare_file_metadata path failure by putting a directory at ledger.bin
+        // Cover the post-processing rollback branch. `prepare_file` rejects
+        // empty data, so empty bytes are the cheapest way in.
         let database = setup_agreements_db().await;
         let storage_dir = unique_storage_dir("finalize_postproc_err");
         stdfs::create_dir_all(&storage_dir).unwrap();
-        // Pre-create the ledger.bin path as a directory so update_ledger fails.
-        stdfs::create_dir_all(storage_dir.join("ledger.bin")).unwrap();
 
         let agreement_id = "AGREEMENT-finalize-pp-err";
         let file_id = "FILE-finalize-pp-err";
         let file_path = storage_dir.join(file_id);
-        let bytes = b"finalize pp err bytes";
+        let bytes = b"";
         stdfs::write(&file_path, bytes).unwrap();
 
         let mut fx = AgreementFixture::new(agreement_id, file_id);
@@ -2449,7 +2577,7 @@ mod tests {
 
         let err = finalize_downloaded_bytes(&database, &agreement, &file_path, bytes)
             .await
-            .expect_err("finalize should fail on ledger update");
+            .expect_err("finalize should fail when the file cannot be prepared");
 
         assert!(
             err.to_string().contains("post-processing downloaded file"),
@@ -2473,33 +2601,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_ledger_errors_when_parent_dir_cannot_be_created() {
-        // Cover line 618 (creating ledger directory error) by passing a path
-        // where parent creation fails. We use a regular file as the storage root.
-        let storage_dir = unique_storage_dir("update_ledger_bad_parent");
+    async fn rebuild_ledger_errors_when_parent_dir_cannot_be_created() {
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("rebuild_ledger_bad_parent");
         let parent_dir = storage_dir.parent().unwrap().to_path_buf();
         stdfs::create_dir_all(&parent_dir).unwrap();
-        // Create a file where the storage_dir should be — fs::create_dir_all on
-        // a path under a regular file should fail.
+        // Create a file where the storage_dir should be, so
+        // `create_dir_all(ledger.bin's parent)` fails.
         stdfs::write(&storage_dir, b"not a directory").unwrap();
 
-        let metadata = CryptoFileMetadata {
-            root: Fq::one(),
-            file_id: "FILE-bad-parent".into(),
-            padded_len: 64,
-            original_size: 32,
-            filename: "bad_parent.bin".into(),
-        };
-
-        // storage_dir is now a file, so storage_dir.join("ledger.bin").parent()
-        // is the file path — fs::create_dir_all will fail.
-        let result = update_ledger(&storage_dir, &metadata).await;
-        // Using a directory as a parent for ledger.bin fails — expect error.
+        let result = rebuild_ledger(&database, &storage_dir).await;
         assert!(result.is_err(), "should fail to create ledger directory");
-        let msg = result.unwrap_err().to_string();
+        let msg = format!("{:#}", result.unwrap_err());
         assert!(
-            msg.contains("creating ledger directory") || msg.contains("loading ledger"),
+            msg.contains("creating ledger directory") || msg.contains("saving ledger"),
             "expected ledger error message, got: {msg}"
         );
+    }
+
+    /// The rebuilt ledger must place each file at the slot the filestorage
+    /// contract assigned it, not at the node's local insertion order: the
+    /// contract resolves the same index when verifying, and a mismatch changes
+    /// the SNARK's public inputs.
+    #[tokio::test]
+    async fn rebuild_ledger_places_files_at_their_contract_slots() {
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("rebuild_ledger_slots");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+
+        let (_prepared, metadata) =
+            api::prepare_file(b"ledger slot fixture", "slot.bin", PORTAL_FILE_NONCE).unwrap();
+        let root_hex = hex::encode(metadata.root.to_repr());
+
+        // Stored second locally, but slot 5 on chain.
+        let mut fixture = AgreementFixture::new("AGREEMENT-slot", &metadata.file_id);
+        fixture.downloaded = true;
+        fixture.root = Some(root_hex);
+        fixture.padded_len = Some(metadata.padded_len as i64);
+        fixture.object_id = Some(metadata.object_id.clone());
+        fixture.ledger_index = Some(5);
+        fixture.into_active_model().insert(&database).await.unwrap();
+
+        let stats = rebuild_ledger(&database, &storage_dir).await.unwrap();
+        assert_eq!(stats.placed, 1);
+        assert_eq!(stats.awaiting_ledger_index, 0);
+
+        let ledger = FileLedger::load(&storage_dir.join("ledger.bin")).unwrap();
+        let (index, _rc) = ledger
+            .lookup(&metadata.file_id)
+            .expect("file should be in the rebuilt ledger");
+        assert_eq!(index, 5, "file must sit at its contract-assigned slot");
+    }
+
+    /// A downloaded agreement whose creating transaction the Portal has not
+    /// reconciled yet has no `ledger_index`. It must be left out of the ledger
+    /// (proving it is impossible) without failing the rebuild for the others.
+    #[tokio::test]
+    async fn rebuild_ledger_skips_agreements_without_a_ledger_index() {
+        let database = setup_agreements_db().await;
+        let storage_dir = unique_storage_dir("rebuild_ledger_pending");
+        stdfs::create_dir_all(&storage_dir).unwrap();
+
+        let (_prepared, metadata) =
+            api::prepare_file(b"pending slot fixture", "pending.bin", PORTAL_FILE_NONCE).unwrap();
+
+        let mut fixture = AgreementFixture::new("AGREEMENT-pending", &metadata.file_id);
+        fixture.downloaded = true;
+        fixture.root = Some(hex::encode(metadata.root.to_repr()));
+        fixture.padded_len = Some(metadata.padded_len as i64);
+        fixture.object_id = Some(metadata.object_id.clone());
+        fixture.ledger_index = None;
+        fixture.into_active_model().insert(&database).await.unwrap();
+
+        let stats = rebuild_ledger(&database, &storage_dir).await.unwrap();
+        assert_eq!(stats.placed, 0);
+        assert_eq!(stats.awaiting_ledger_index, 1);
+
+        let ledger = FileLedger::load(&storage_dir.join("ledger.bin")).unwrap();
+        assert!(ledger.lookup(&metadata.file_id).is_none());
+    }
+
+    #[test]
+    fn depth_from_padded_len_requires_a_power_of_two() {
+        assert_eq!(depth_from_padded_len(64).unwrap(), 6);
+        assert!(depth_from_padded_len(0).is_err());
+        assert!(depth_from_padded_len(48).is_err());
+        assert!(depth_from_padded_len(-8).is_err());
     }
 }

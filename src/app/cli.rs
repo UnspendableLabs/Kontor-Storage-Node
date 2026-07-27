@@ -79,6 +79,17 @@ pub struct Cli {
     #[arg(long, env = "BLS_KEY_PATH")]
     pub bls_key_path: Option<PathBuf>,
 
+    /// Kontor address of the filestorage contract this node signs operations
+    /// against. MUST match the Portal's own `KONTOR_CONTRACT_ADDRESS`: the
+    /// contract address is part of the signed `Inst`, so a mismatch makes every
+    /// join/proof signature fail the Portal's verification.
+    #[arg(
+        long,
+        env = "KONTOR_CONTRACT_ADDRESS",
+        default_value = "filestorage_0_0"
+    )]
+    pub kontor_contract_address: String,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

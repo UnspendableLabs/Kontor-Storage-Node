@@ -52,6 +52,10 @@ pub struct Config {
     pub server_address: String,
     pub public_url: String,
     pub bls_key_path: Option<PathBuf>,
+    /// Kontor address of the filestorage contract, mirroring the Portal's
+    /// `KONTOR_CONTRACT_ADDRESS`. Part of every signed `Inst`, so both sides
+    /// must agree or signature verification fails.
+    pub kontor_contract_address: String,
 }
 
 impl Config {
@@ -68,6 +72,11 @@ impl Config {
             .transpose()?;
 
         let storage_method = StorageMethod::from_str(&cli.storage_method)?;
+
+        let kontor_contract_address = cli.kontor_contract_address.trim().to_string();
+        if kontor_contract_address.is_empty() {
+            return Err(anyhow!("KONTOR_CONTRACT_ADDRESS cannot be empty"));
+        }
 
         if storage_method == StorageMethod::Gcs {
             if cli.storage_gcs_bucket_name.is_none() {
@@ -96,6 +105,7 @@ impl Config {
             server_address: cli.server_address.clone(),
             public_url: cli.public_url.clone(),
             bls_key_path: cli.bls_key_path.clone(),
+            kontor_contract_address,
         })
     }
 }
@@ -145,6 +155,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         }
     }
@@ -366,6 +377,31 @@ mod tests {
 
         let err = Config::from_cli(&cli).unwrap_err();
         assert!(err.to_string().contains("invalid STORAGE_MAX_FILE_SIZE"));
+    }
+
+    /// An empty contract address would be signed into every op and rejected by
+    /// the Portal on every request, so fail at startup with the variable's name
+    /// rather than at the first join.
+    #[test]
+    fn config_from_cli_rejects_empty_contract_address() {
+        let cli = Cli {
+            kontor_contract_address: "   ".to_string(),
+            ..make_cli()
+        };
+
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("KONTOR_CONTRACT_ADDRESS"));
+    }
+
+    #[test]
+    fn config_from_cli_trims_the_contract_address() {
+        let cli = Cli {
+            kontor_contract_address: "  filestorage_1_0  ".to_string(),
+            ..make_cli()
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.kontor_contract_address, "filestorage_1_0");
     }
 
     #[test]

@@ -39,6 +39,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--server-address` | `SERVER_ADDRESS` | `0.0.0.0:8081` | Address the public HTTP server binds to |
 | `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
 | `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. |
+| `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
 
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
@@ -75,10 +76,37 @@ When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or bel
 
 After an agreement file is downloaded into `storage_dir`, the node:
 
-- prepares the file with `kontor_crypto::api::prepare_file`, discarding the `PreparedFile`;
+- prepares the file with `kontor_crypto::api::prepare_file(bytes, filename, &[])`, discarding the `PreparedFile`. The empty nonce is not arbitrary: the Portal publishes every file descriptor with `nonce: []`, and the nonce enters the `file_id` hash;
 - persists the resulting metadata directly on the `agreements` table (1:1 with each agreement);
-- updates the aggregated ledger at `<storage_dir>/ledger.bin` via `FileLedger`, creating it when absent;
-- marks the agreement as downloaded only after metadata and ledger persistence succeed.
+- marks the agreement as downloaded once metadata persistence succeeds.
+
+### The aggregated ledger
+
+`<storage_dir>/ledger.bin` is a **derived artifact**, rebuilt from the database
+once per sync cycle (just before proofs are computed) rather than appended to
+during downloads.
+
+Since kontor-crypto 0.3.0 the aggregated ledger is append-only and the
+filestorage contract owns the slot counter: each file gets a stable
+`ledger_index` at `create-agreement` time. That slot is a public input of the
+Proof-of-Retrievability SNARK — the prover resolves it from its local
+`FileLedger`, the contract from its own registry — so the node places each file
+at its **absolute on-chain slot** (`FileLedger::add_files` with explicit
+indices), not at its local insertion order.
+
+The `ledger_index` comes from the Portal's agreements API and is only known once
+the creating Bitcoin transaction has been confirmed and reconciled against
+Kontor. Agreements still awaiting it are downloaded and served normally but left
+out of the ledger, and are logged as unprovable until the slot arrives.
+
+**Known limitation.** `FileLedger` refuses a set of slots whose highest index
+exceeds the file count by more than `MAX_LEDGER_INDEX_SPARSITY_GAP` (1024 in
+kontor-crypto 0.3.0). A node holding only a subset of the network's files at
+their absolute on-chain slots therefore stops being able to rebuild the ledger
+once the contract's slot counter runs more than ~1024 ahead of what the node
+stores. The rebuild failure is logged and the sync cycle continues — downloads,
+agreement sync and file serving are unaffected — but proofs are skipped until
+the constraint is lifted upstream.
 
 
 ### Database

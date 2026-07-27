@@ -90,6 +90,11 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Portal polling interval: {}s",
         config.portal_polling_interval.as_secs()
     )?;
+    writeln!(
+        writer,
+        "Filestorage contract: {}",
+        config.kontor_contract_address
+    )?;
 
     Ok(())
 }
@@ -155,7 +160,8 @@ pub async fn run_with_shutdown(
     print_config_info(&config, &mut writer)?;
     setup_storage_directory(&config)?;
 
-    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?;
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
+        .with_contract_address(&config.kontor_contract_address);
 
     match cli.command {
         Commands::Ping => {
@@ -191,7 +197,8 @@ pub async fn run_with_shutdown(
                 onboarding_result.signer_id,
                 onboarding_result.token,
                 onboarding_result.next_nonce,
-            )?;
+            )?
+            .with_contract_address(&config.kontor_contract_address);
 
             if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
                 tracing::warn!("Failed to announce node URL: {e}");
@@ -367,6 +374,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -426,6 +434,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -474,6 +483,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -522,6 +532,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -575,6 +586,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -703,6 +715,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -781,6 +794,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -918,6 +932,7 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 

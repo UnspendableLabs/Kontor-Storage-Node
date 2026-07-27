@@ -1,9 +1,11 @@
 # Builder
-FROM rust:1-bookworm AS builder
+# Pinned to the channel in rust-toolchain.toml, matching Kontor and the Horizon
+# Portal so the shared kontor-crypto dependency set builds identically.
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /build
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY migration/ ./migration/
 COPY src/ ./src/
 COPY static/ ./static/

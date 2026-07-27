@@ -54,6 +54,12 @@ pub(crate) fn agreement_to_active_model(
         .try_into()
         .context("original_size does not fit into i64")?;
 
+    let ledger_index: Option<i64> = agreement
+        .ledger_index
+        .map(i64::try_from)
+        .transpose()
+        .context("ledger_index does not fit into i64")?;
+
     Ok(agreements::ActiveModel {
         agreement_id: Set(agreement.agreement_id.clone()),
         user_id: Set(agreement.user_id.clone()),
@@ -64,6 +70,10 @@ pub(crate) fn agreement_to_active_model(
         nodes: Set(nodes_json),
         root: Set(None),
         padded_len: Set(None),
+        // Descriptor fields mirrored from the Portal: they describe the file as
+        // the contract sees it, so they are never derived locally.
+        object_id: Set(agreement.file_hash.clone()),
+        ledger_index: Set(ledger_index),
         downloaded: Set(false),
         transaction_id: Set(agreement.transaction_id.clone()),
         curation: Set(agreement.curation.clone()),
@@ -107,6 +117,7 @@ mod tests {
             padded_len: None,
             blob_size: None,
             file_hash: None,
+            ledger_index: None,
             txid: None,
             block_height: None,
             block_time: None,
@@ -255,6 +266,8 @@ mod tests {
             nodes: Set(json!(agreement.nodes)),
             root: Set(None),
             padded_len: Set(None),
+            object_id: Set(None),
+            ledger_index: Set(None),
             downloaded: Set(false),
             transaction_id: Set(agreement.transaction_id.clone()),
             curation: Set(agreement.curation.clone()),
