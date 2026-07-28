@@ -635,6 +635,20 @@ impl FileDescriptor for IndexedFile {
     }
 }
 
+/// Mirror of kontor-crypto's own `MAX_LEDGER_INDEX_SPARSITY_GAP` (private to
+/// that crate, 1024 as of 0.3.0).
+///
+/// `FileLedger::add_files` rebuilds the aggregated Merkle tree and refuses a set
+/// of slots whose highest index implies more leaves than the file count plus
+/// this gap. A storage node holds an arbitrary subset of the network's files at
+/// their absolute on-chain slots, so it eventually trips this — see the README.
+///
+/// Duplicated here only so the node can *say* it is about to trip it
+/// ([`crate::server::admin::status`]) instead of only discovering it when the
+/// rebuild fails. If upstream changes the value, this over- or under-predicts
+/// the wall; it never changes what the ledger actually accepts.
+pub(crate) const MAX_LEDGER_INDEX_SPARSITY_GAP: usize = 1024;
+
 /// Outcome of a [`rebuild_ledger`] pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LedgerStats {
@@ -716,8 +730,8 @@ pub(crate) async fn rebuild_ledger(
             anyhow!(err).context(format!(
                 "placing {} file(s) at their contract ledger slots (highest slot {highest}); \
                  note that kontor-crypto rejects a ledger whose highest slot exceeds the file \
-                 count by more than MAX_LEDGER_INDEX_SPARSITY_GAP (1024), which a node holding \
-                 a small subset of the network's files will eventually hit",
+                 count by more than MAX_LEDGER_INDEX_SPARSITY_GAP ({MAX_LEDGER_INDEX_SPARSITY_GAP}), \
+                 which a node holding a small subset of the network's files will eventually hit",
                 entries.len()
             ))
         })?;

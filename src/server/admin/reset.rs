@@ -21,10 +21,12 @@ use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
 use futures_util::stream::{self, StreamExt};
-use sea_orm::{ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::app::config::StorageMethod;
 use crate::clients::http_helpers::HttpStatusError;
@@ -166,34 +168,34 @@ pub async fn reset_database(
     };
 
     let txn = state.db.begin().await.map_err(|err| {
-        error!("Database error opening reset transaction: {err}");
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_codes::DATABASE_ERROR,
             "failed to open database transaction",
         )
+        .with_detail(err.to_string())
     })?;
 
     let deleted = match delete_all_rows(&txn).await {
         Ok(deleted) => deleted,
         Err(err) => {
-            error!("Database reset failed, rolling back: {err}");
             txn.rollback().await.ok();
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_codes::DATABASE_ERROR,
-                format!("failed to reset database: {err}"),
-            ));
+                "failed to reset database",
+            )
+            .with_detail(format!("reset rolled back: {err}")));
         }
     };
 
     txn.commit().await.map_err(|err| {
-        error!("Failed to commit database reset: {err}");
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_codes::DATABASE_ERROR,
             "failed to commit database transaction",
         )
+        .with_detail(err.to_string())
     })?;
 
     let total: u64 = deleted.iter().map(|(_, count)| *count).sum();
@@ -228,24 +230,25 @@ pub async fn reset_database(
 }
 
 /// File ids of the agreements whose blobs this node actually stored.
+///
+/// Only the one column is selected: a node at capacity holds a lot of rows, and
+/// none of the rest of them is read.
 async fn stored_file_ids(state: &DownloadServerState) -> Result<Vec<String>, ApiError> {
-    let agreements = Agreements::find()
+    Agreements::find()
         .filter(agreements::Column::Downloaded.eq(true))
+        .select_only()
+        .column(agreements::Column::FileId)
+        .into_tuple::<String>()
         .all(&state.db)
         .await
         .map_err(|err| {
-            error!("Database error listing stored files: {err}");
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_codes::DATABASE_ERROR,
                 "failed to list stored files",
             )
-        })?;
-
-    Ok(agreements
-        .into_iter()
-        .map(|agreement| agreement.file_id)
-        .collect())
+            .with_detail(err.to_string())
+        })
 }
 
 /// Deletes the blobs behind `file_ids` from whichever backend holds them.

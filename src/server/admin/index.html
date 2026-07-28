@@ -128,7 +128,13 @@
     <div class="row"><span class="k">Node ID</span><span class="mono trunc" id="node-id">—</span></div>
     <div class="row"><span class="k">Storage backend</span><span id="storage-method">—</span></div>
     <div class="row" id="storage-directory-row"><span class="k">Storage directory</span><span class="mono trunc" id="storage-directory">—</span></div>
+    <div class="row"><span class="k">Provable files</span><span id="ledger-placed">—</span></div>
   </div>
+
+  <!-- Only shown when there is something to say: a node proving normally has
+       no reason to read about the ledger. -->
+  <div class="msg err" id="ledger-blocked"></div>
+  <div class="msg" id="ledger-awaiting"></div>
 
   <div class="card danger-zone">
     <h2>Reset the database</h2>
@@ -378,7 +384,34 @@
     } else {
       $("storage-directory-row").style.display = "none";
     }
+    renderLedger(data.ledger || {});
     $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  }
+
+  // The counts above stay healthy while proving is dead — a blocked rebuild is
+  // the one failure this page has to volunteer rather than let an operator
+  // infer. Both messages are kept (`show(.., true)`) because they describe a
+  // standing condition, not an event.
+  function renderLedger(ledger) {
+    $("ledger-placed").textContent = num(ledger.placed);
+
+    if (ledger.rebuild_blocked === true) {
+      show($("ledger-blocked"),
+        "Proving is stopped: this node's files sit at contract slots too sparse to rebuild the " +
+        "ledger (highest slot " + num(ledger.highest_slot) + " for " + num(ledger.placed) +
+        " files). Downloads and file serving are unaffected. See the README.",
+        true);
+    } else {
+      show($("ledger-blocked"), "", true);
+    }
+
+    var awaiting = Number(ledger.awaiting_ledger_index || 0);
+    show($("ledger-awaiting"),
+      awaiting > 0
+        ? awaiting + " stored file(s) have no contract slot yet and cannot be proven until the " +
+          "Portal reconciles their creating transaction. This usually clears on its own."
+        : "",
+      true);
   }
 
   function loadStatus() {

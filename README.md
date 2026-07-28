@@ -100,14 +100,27 @@ the creating Bitcoin transaction has been confirmed and reconciled against
 Kontor. Agreements still awaiting it are downloaded and served normally but left
 out of the ledger, and are logged as unprovable until the slot arrives.
 
-**Known limitation.** `FileLedger` refuses a set of slots whose highest index
-exceeds the file count by more than `MAX_LEDGER_INDEX_SPARSITY_GAP` (1024 in
-kontor-crypto 0.3.0). A node holding only a subset of the network's files at
-their absolute on-chain slots therefore stops being able to rebuild the ledger
-once the contract's slot counter runs more than ~1024 ahead of what the node
-stores. The rebuild failure is logged and the sync cycle continues — downloads,
-agreement sync and file serving are unaffected — but proofs are skipped until
-the constraint is lifted upstream.
+**Known limitation — this node stops proving on a network of any size.**
+`FileLedger::add_files` rebuilds the aggregated Merkle tree eagerly and refuses
+a set of slots whose highest index implies more leaves than the file count plus
+`MAX_LEDGER_INDEX_SPARSITY_GAP` (1024 in kontor-crypto 0.3.0). A node holding
+only a subset of the network's files at their absolute on-chain slots therefore
+stops being able to build a `FileLedger` at all once the contract's slot counter
+runs more than ~1024 ahead of what the node stores.
+
+Nothing about a proof needs that aggregated tree: this node only ever submits
+single-file proofs, for which the verifier skips the ledger-root check entirely
+(`aggregated_tree_depth` must be 0) and uses the file's own Merkle root. Only
+the per-file slot is a public input. The wall is imposed by ledger
+*construction*, not by the statement being proven, so it needs an upstream fix —
+placing a file at an arbitrary slot without materializing every leaf below it.
+
+Until then the failure is contained but total: the rebuild error is logged and
+the sync cycle continues — downloads, agreement sync and file serving are
+unaffected — but every proof is skipped. Because a log line is easy to miss, the
+operator UI answers this directly: `GET /api/admin/status` returns a `ledger`
+block with `rebuild_blocked`, which applies the same predicate to the node's own
+rows and so goes true *before* the next rebuild fails.
 
 
 ### Database

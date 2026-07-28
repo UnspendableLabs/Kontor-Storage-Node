@@ -171,11 +171,17 @@ pub mod error_codes {
 ///
 /// The admin page is the only consumer, and it reads `code` to decide whether
 /// to show the message, fall back to the login screen, or keep polling.
+///
+/// `message` is public — it reaches a browser. Anything that names internal
+/// machinery (a `DbErr`, a signing failure) belongs in `detail`, which is
+/// logged and never serialized.
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Logged next to the response, never rendered into it.
+    detail: Option<String>,
 }
 
 impl ApiError {
@@ -185,6 +191,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            detail: None,
         }
     }
 
@@ -193,31 +200,44 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
 
-    /// A 500 whose detail is logged but not echoed: the caller is an admin, but
-    /// the login screen in front of them is public.
+    /// Attaches the internal cause. It is logged with the response and stays
+    /// out of the body.
     #[must_use]
-    pub fn server_error(message: impl Into<String>) -> Self {
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// A 500 whose detail is logged but not echoed: the session behind it is an
+    /// operator's, but the login screen in front of it is public, and an error
+    /// string is the cheapest way to hand out the shape of what is running.
+    #[must_use]
+    pub fn server_error(detail: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_codes::INTERNAL_ERROR,
-            message,
+            "Internal error",
         )
+        .with_detail(detail)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // The log line carries the cause; the body carries only `message`.
+        let logged = self.detail.as_deref().unwrap_or(&self.message);
+
         // Level matched to severity: 5xx is operator-actionable, 401/403 is an
         // auditable denial, everything else is routine validation noise.
         if self.status.is_server_error() {
-            error!(status = self.status.as_u16(), code = self.code, message = %self.message, "Admin API error");
+            error!(status = self.status.as_u16(), code = self.code, detail = %logged, "Admin API error");
         } else if matches!(
             self.status,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
-            info!(status = self.status.as_u16(), code = self.code, message = %self.message, "Admin API auth denial");
+            info!(status = self.status.as_u16(), code = self.code, detail = %logged, "Admin API auth denial");
         } else {
-            debug!(status = self.status.as_u16(), code = self.code, message = %self.message, "Admin API rejection");
+            debug!(status = self.status.as_u16(), code = self.code, detail = %logged, "Admin API rejection");
         }
 
         (
@@ -324,6 +344,51 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["code"], error_codes::CONFIRMATION_REQUIRED);
         assert_eq!(payload["error"]["message"], "nope");
+    }
+
+    /// The detail is the reason `server_error` exists: it goes to the log and
+    /// stops there. A `DbErr` or a signing failure names internal machinery,
+    /// and the page that would display it sits behind a public login screen.
+    #[tokio::test]
+    async fn an_internal_cause_is_logged_and_never_rendered() {
+        let error = ApiError::server_error("sqlx: no such table: agreements");
+        assert_eq!(error.code, error_codes::INTERNAL_ERROR);
+
+        let body = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            !rendered.contains("no such table"),
+            "the cause must not reach the response: {rendered}"
+        );
+        let payload: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(payload["error"]["message"], "Internal error");
+    }
+
+    /// Same guarantee for a hand-built error that attaches a cause: only
+    /// `message` is public.
+    #[tokio::test]
+    async fn with_detail_keeps_the_cause_out_of_the_body() {
+        let error = ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::DATABASE_ERROR,
+            "failed to reset database",
+        )
+        .with_detail("reset rolled back: no such table: challenges");
+
+        let body = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["error"]["code"], error_codes::DATABASE_ERROR);
+        assert_eq!(payload["error"]["message"], "failed to reset database");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("no such table"),
+            "the cause must not reach the response"
+        );
     }
 
     /// The three logging arms of `into_response` — server error, auth denial,

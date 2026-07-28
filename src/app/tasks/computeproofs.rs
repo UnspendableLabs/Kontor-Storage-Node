@@ -412,10 +412,11 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 mod tests {
     #![allow(deprecated)]
     use super::*;
+    use crate::app::tasks::downloadagreements::rebuild_ledger;
     use crate::clients::GcsClient;
     use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Challenges;
-    use crate::testutils::{setup_in_memory_db, unique_storage_dir};
+    use crate::testutils::{setup_in_memory_db, unique_storage_dir, AgreementFixture};
     use chrono::DateTime;
     use ff::PrimeField;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -1523,34 +1524,69 @@ mod tests {
         );
     }
 
-    /// End-to-end run of the production proof generator, asserting the wire
-    /// format the filestorage contract expects: kontor-crypto's own `NPOR`
-    /// container, which `proof::from-bytes` parses. A postcard-encoded proof
-    /// (what this node used to emit) is rejected before verification starts, so
-    /// the magic bytes are the contract under test here.
-    #[test]
-    fn real_proof_generator_emits_the_npor_wire_format() {
+    /// End-to-end run of the production proof path, at a contract slot that is
+    /// not the one a local append would have picked.
+    ///
+    /// Every input comes from where it comes from in production: the ledger
+    /// from [`rebuild_ledger`] (`add_files` at the absolute on-chain slot, not
+    /// `add_file` at the next free local index), the descriptor from
+    /// [`build_file_metadata`]. Two things are asserted:
+    ///
+    /// - the wire format is kontor-crypto's own `NPOR` container, which
+    ///   `proof::from-bytes` parses — a postcard-encoded proof (what this node
+    ///   used to emit) is rejected before verification even starts;
+    /// - the proof actually *verifies* against the statement the verifier
+    ///   rebuilds. Deserializing only proves the bytes are well-formed; since
+    ///   `ledger_indices` are public inputs even for a single-file proof, a
+    ///   file placed at the wrong slot would round-trip through `from_bytes`
+    ///   just fine and still fail on chain.
+    #[tokio::test]
+    async fn a_real_proof_verifies_against_the_file_at_its_contract_slot() {
+        /// Deliberately not 0: a ledger built by local insertion order would
+        /// put this lone file at index 0 and the test would pass without ever
+        /// exercising the absolute-slot path.
+        const LEDGER_INDEX: i64 = 5;
+
         let file_bytes = b"real proof generator coverage";
         let filename = "real.bin";
-
-        let (_prepared, metadata) =
+        let (_prepared, prepared) =
             api::prepare_file(file_bytes, filename, PORTAL_FILE_NONCE).unwrap();
 
-        let mut ledger = FileLedger::new();
-        ledger.add_file(&metadata).unwrap();
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("real_proof_slot");
+        stdfs::create_dir_all(&storage_dir).ok();
 
-        let seed_field = seed_to_field_element(TEST_SEED_HEX).unwrap();
+        AgreementFixture {
+            filename: filename.to_string(),
+            original_size: prepared.original_size as i64,
+            root: Some(hex::encode(prepared.root.to_repr())),
+            padded_len: Some(prepared.padded_len as i64),
+            object_id: Some(prepared.object_id.clone()),
+            ledger_index: Some(LEDGER_INDEX),
+            downloaded: true,
+            ..AgreementFixture::new("agr_real", &prepared.file_id)
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
+        .unwrap();
 
+        let stats = rebuild_ledger(&db, &storage_dir).await.unwrap();
+        assert_eq!(stats.placed, 1);
+        let ledger = FileLedger::load(&storage_dir.join("ledger.bin")).unwrap();
+
+        let agreement = Agreements::find().one(&db).await.unwrap().unwrap();
+        let metadata = build_file_metadata(&agreement).unwrap();
         let challenge = CryptoChallenge::new(
             metadata.clone(),
             850_000,
             5,
-            seed_field,
+            seed_to_field_element(TEST_SEED_HEX).unwrap(),
             prover_challenge_key(42),
         );
 
         let proof_bytes = RealProofGenerator
-            .generate_proof(file_bytes, filename, &ledger, metadata, challenge)
+            .generate_proof(file_bytes, filename, &ledger, metadata, challenge.clone())
             .expect("real proof generator should succeed");
 
         assert_eq!(
@@ -1558,10 +1594,18 @@ mod tests {
             b"NPOR",
             "proof must carry kontor-crypto's magic bytes"
         );
+        let proof = kontor_crypto::Proof::from_bytes(&proof_bytes)
+            .expect("the contract must be able to deserialize what we emit");
+
         assert!(
-            kontor_crypto::Proof::from_bytes(&proof_bytes).is_ok(),
-            "the contract must be able to deserialize what we emit"
+            PorSystem::new(&ledger)
+                .verify(&proof, &[challenge])
+                .expect("verification should not error"),
+            "a proof built from the rebuilt ledger must satisfy the statement a \
+             verifier reconstructs from the same slot"
         );
+
+        stdfs::remove_dir_all(&storage_dir).ok();
     }
 
     #[tokio::test]

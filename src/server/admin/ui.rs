@@ -92,6 +92,22 @@ mod tests {
         }
     }
 
+    /// The ledger block is the only place a stopped prover shows up: the row
+    /// counts look healthy either way. A rename on the server side must not
+    /// leave the page quietly reading `undefined`.
+    #[test]
+    fn admin_html_reads_the_ledger_fields_the_status_endpoint_sends() {
+        for key in [
+            "data.ledger",
+            "rebuild_blocked",
+            "awaiting_ledger_index",
+            "ledger.placed",
+            "ledger.highest_slot",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still read {key}");
+        }
+    }
+
     #[tokio::test]
     async fn admin_page_sets_security_headers() {
         let response = admin_page().await;

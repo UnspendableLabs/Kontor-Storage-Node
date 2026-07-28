@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tracing::error;
 
 use crate::app::config::StorageMethod;
+use crate::app::tasks::downloadagreements::MAX_LEDGER_INDEX_SPARSITY_GAP;
 use crate::entities::agreements;
 use crate::entities::prelude::{Agreements, Challenges};
 use crate::server::admin::{error_codes, ApiError};
@@ -47,6 +48,7 @@ pub async fn node_status(
         .map_err(|err| database_error("count challenges", &err))?;
 
     let stored_bytes = stored_bytes(state).await?;
+    let ledger = ledger_status(state).await?;
 
     // The directory is meaningless for a GCS node, and the bucket name is
     // configuration the admin session has no business echoing back.
@@ -69,8 +71,68 @@ pub async fn node_status(
         "challenges": {
             "total": challenges_total,
         },
+        "ledger": ledger,
         "restart_available": state.admin.restart().is_available(),
         "session_expires_at": session_expires_at,
+    }))
+}
+
+/// Whether this node can still build the ledger its proofs are made against.
+///
+/// The rebuild runs inside the daemon task, where a failure is a log line and
+/// nothing more: proving simply stops, and the counts above go on looking
+/// healthy. That is the one failure an operator cannot infer from anywhere
+/// else, so it is answered here.
+///
+/// `blocked` is computed rather than remembered — it is the same predicate
+/// `FileLedger` applies (see [`MAX_LEDGER_INDEX_SPARSITY_GAP`]), so it also
+/// says *why*, and says it before the next rebuild rather than after.
+async fn ledger_status(state: &DownloadServerState) -> Result<Value, ApiError> {
+    // Same split as `rebuild_ledger`: a row missing `root`/`padded_len` was
+    // never post-processed and is neither placed nor waiting on a slot.
+    let described = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .filter(agreements::Column::Root.is_not_null())
+        .filter(agreements::Column::PaddedLen.is_not_null());
+
+    let placed = described
+        .clone()
+        .filter(agreements::Column::LedgerIndex.is_not_null())
+        .count(&state.db)
+        .await
+        .map_err(|err| database_error("count files placed in the ledger", &err))?;
+
+    let awaiting = described
+        .clone()
+        .filter(agreements::Column::LedgerIndex.is_null())
+        .count(&state.db)
+        .await
+        .map_err(|err| database_error("count files awaiting a ledger slot", &err))?;
+
+    let highest_slot: Option<i64> = described
+        .select_only()
+        .column_as(Expr::col(agreements::Column::LedgerIndex).max(), "highest")
+        .into_tuple::<Option<i64>>()
+        .one(&state.db)
+        .await
+        .map_err(|err| database_error("read the highest ledger slot", &err))?
+        .flatten();
+
+    // `leaf_count = highest_slot + 1`, refused once it exceeds the file count
+    // by more than the gap.
+    let blocked = match (highest_slot, usize::try_from(placed)) {
+        (Some(highest), Ok(placed)) => usize::try_from(highest)
+            .ok()
+            .and_then(|highest| highest.checked_add(1))
+            .is_some_and(|leaves| leaves > placed.saturating_add(MAX_LEDGER_INDEX_SPARSITY_GAP)),
+        _ => false,
+    };
+
+    Ok(json!({
+        "placed": placed,
+        "awaiting_ledger_index": awaiting,
+        "highest_slot": highest_slot,
+        "rebuild_blocked": blocked,
     }))
 }
 
@@ -109,6 +171,22 @@ mod tests {
     use crate::server::admin::AdminState;
     use crate::testutils::{setup_in_memory_db, tempdir, AgreementFixture};
     use sea_orm::ActiveModelTrait;
+
+    /// A stored, fully post-processed agreement at `slot`; `None` for one the
+    /// Portal has not reconciled yet.
+    async fn insert_stored(db: &sea_orm::DatabaseConnection, index: usize, slot: Option<i64>) {
+        AgreementFixture {
+            root: Some("0".repeat(64)),
+            padded_len: Some(128),
+            ledger_index: slot,
+            downloaded: true,
+            ..AgreementFixture::new(format!("AGR-slot-{index}"), format!("FILE-slot-{index}"))
+        }
+        .into_active_model()
+        .insert(db)
+        .await
+        .unwrap();
+    }
 
     async fn state_with(sizes: &[(i64, bool)]) -> (DownloadServerState, tempfile::TempDir) {
         let db = setup_in_memory_db().await;
@@ -204,6 +282,76 @@ mod tests {
         // scope from the query above and its own `is_null` wins method
         // resolution on a `serde_json::Value`.
         assert_eq!(value["storage"]["directory"], Value::Null);
+    }
+
+    /// A row that was never post-processed counts as neither placed nor
+    /// awaiting — exactly the split `rebuild_ledger` makes, and the reason the
+    /// two numbers are worth showing separately.
+    #[tokio::test]
+    async fn ledger_splits_placed_from_files_still_awaiting_a_slot() {
+        let (state, _dir) = state_with(&[]).await;
+        insert_stored(&state.db, 0, Some(3)).await;
+        insert_stored(&state.db, 1, Some(7)).await;
+        insert_stored(&state.db, 2, None).await;
+        // Downloaded but never post-processed: no root, so no ledger entry.
+        AgreementFixture {
+            downloaded: true,
+            ..AgreementFixture::new("AGR-raw", "FILE-raw")
+        }
+        .into_active_model()
+        .insert(&state.db)
+        .await
+        .unwrap();
+
+        let ledger = &node_status(&state, SESSION_EXPIRY).await.unwrap()["ledger"];
+
+        assert_eq!(ledger["placed"], 2);
+        assert_eq!(ledger["awaiting_ledger_index"], 1);
+        assert_eq!(ledger["highest_slot"], 7);
+        assert_eq!(ledger["rebuild_blocked"], false);
+    }
+
+    /// An empty node has no slot at all, and must not read as blocked — that
+    /// would send an operator chasing a wall it has not reached.
+    #[tokio::test]
+    async fn an_empty_ledger_is_not_blocked() {
+        let (state, _dir) = state_with(&[]).await;
+
+        let ledger = &node_status(&state, SESSION_EXPIRY).await.unwrap()["ledger"];
+
+        assert_eq!(ledger["placed"], 0);
+        assert_eq!(ledger["highest_slot"], Value::Null);
+        assert_eq!(ledger["rebuild_blocked"], false);
+    }
+
+    /// A predicate that disagrees with the ledger it is predicting is worse
+    /// than no signal at all, so it is pinned against the real
+    /// `rebuild_ledger` — and pinned at the boundary, which is the only place
+    /// an off-by-one could hide.
+    ///
+    /// For a lone stored file, `leaf_count = slot + 1` and the ledger accepts
+    /// up to `placed + gap`: slot `gap` is the last one that still rebuilds.
+    #[tokio::test]
+    async fn the_blocked_predicate_agrees_with_an_actual_rebuild() {
+        use crate::app::tasks::downloadagreements::rebuild_ledger;
+
+        let gap = i64::try_from(MAX_LEDGER_INDEX_SPARSITY_GAP).unwrap();
+
+        for (slot, expect_blocked) in [(gap, false), (gap + 1, true)] {
+            let (state, dir) = state_with(&[]).await;
+            insert_stored(&state.db, 0, Some(slot)).await;
+
+            let ledger = &node_status(&state, SESSION_EXPIRY).await.unwrap()["ledger"];
+            let blocked = ledger["rebuild_blocked"] == Value::Bool(true);
+            let rebuild_failed = rebuild_ledger(&state.db, dir.path()).await.is_err();
+
+            assert_eq!(ledger["highest_slot"], slot);
+            assert_eq!(blocked, expect_blocked, "slot {slot}");
+            assert_eq!(
+                blocked, rebuild_failed,
+                "the verdict predicted for slot {slot} must match what the ledger does"
+            );
+        }
     }
 
     /// A database the node cannot read is a 500, not a status page full of
