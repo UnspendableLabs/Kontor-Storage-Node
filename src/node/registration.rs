@@ -26,7 +26,9 @@ use crate::clients::kontor_op::{
     build_signing_message, Inst, InstKind, SignerRef, REGISTER_BLS_KEY_GAS_LIMIT,
 };
 use crate::clients::portal::RegisterNodeRequest;
-use crate::crypto::BlsKeyPair;
+use crate::clients::PortalClient;
+use crate::crypto::mnemonic::ACCOUNT_INDEX_ENV;
+use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
 
 /// Prefix the Portal signs over to bind a BLS key to a Taproot identity.
 ///
@@ -210,6 +212,143 @@ pub fn build_registration_request(
     })
 }
 
+/// Build the registration for a mnemonic-derived identity.
+///
+/// The wallet-driven path gets `xpubkey` and `schnorr_sig` from a browser; a
+/// node holding the seed phrase signs the Schnorr half itself, and everything
+/// downstream is the same code.
+///
+/// # Errors
+/// If the Schnorr signature cannot be produced, or the request cannot be built.
+pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNodeRequest> {
+    // The Portal recovers the x-only key from the xpub and verifies both halves
+    // of the proof of possession against it, while the node signs with the key
+    // it derived directly. They are the same key by construction — this catches
+    // the construction being wrong, here rather than as an opaque 400.
+    let from_xpub = x_only_from_xpub(&identity.xpubkey)?;
+    if from_xpub != identity.x_only {
+        return Err(anyhow!(
+            "the derived Taproot key does not match its own extended public key \
+             (xpub carries {}, signing with {})",
+            hex::encode(from_xpub),
+            hex::encode(identity.x_only),
+        ));
+    }
+
+    let schnorr_sig = identity.schnorr_binding_sig()?;
+    build_registration_request(
+        &identity.keypair,
+        &identity.xpubkey,
+        &identity.bls_pubkey(),
+        &schnorr_sig,
+    )
+}
+
+/// How many wallet accounts to probe when the configured one is unknown.
+///
+/// Only reached on the failure path, and only until something is found. Ten
+/// covers every account a wallet realistically hands out before an operator
+/// would have noticed something else was wrong.
+const ACCOUNT_SCAN_MAX: u32 = 10;
+
+/// A node the Portal knows, derived from the same mnemonic as this one.
+#[derive(Debug, Clone)]
+pub struct RegisteredSibling {
+    pub account: u32,
+    pub network: BitcoinNetwork,
+    pub node_id: String,
+    pub taproot_address: String,
+}
+
+impl std::fmt::Display for RegisteredSibling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "account {} ({}) -> {} ({})",
+            self.account, self.network, self.node_id, self.taproot_address
+        )
+    }
+}
+
+/// Find identities from this mnemonic that the Portal has already registered.
+///
+/// # Why this runs before registering
+///
+/// A 404 on the configured account means one of two things: this node is new, or
+/// the account index is wrong. Registering is right for the first and quietly
+/// destructive for the second — it mints a *second* node while the real one
+/// keeps the agreements, and the operator sees a node that works and does
+/// nothing. Since every account of a mnemonic is one derivation away, the node
+/// can simply go and look, and say which account it should have been.
+///
+/// The configured account's own network is scanned first, then that account on
+/// the other coin type: a wrong `KONTOR_STORAGE_NETWORK` produces exactly the
+/// same symptom and costs one extra lookup to rule out.
+///
+/// Errors from individual probes are swallowed. This runs to explain a failure
+/// that has already happened; a Portal that answers some lookups and not others
+/// should not turn a clear diagnosis into an obscure one.
+pub async fn find_registered_siblings(
+    client: &PortalClient,
+    identity: &MnemonicIdentity,
+) -> Vec<RegisteredSibling> {
+    let mut candidates: Vec<(u32, BitcoinNetwork)> = (0..=ACCOUNT_SCAN_MAX)
+        .filter(|account| *account != identity.account)
+        .map(|account| (account, identity.network))
+        .collect();
+    candidates.push((identity.account, identity.network.counterpart()));
+
+    let mut found = Vec::new();
+    for (account, network) in candidates {
+        let Ok(sibling) = identity.sibling(account, network) else {
+            continue;
+        };
+        if client.lookup_node(&sibling.bls_pubkey()).await.is_ok() {
+            found.push(RegisteredSibling {
+                account,
+                network,
+                node_id: sibling.node_id,
+                taproot_address: sibling.taproot_address,
+            });
+        }
+    }
+    found
+}
+
+/// The error an operator sees when the configured account is not the registered
+/// one.
+///
+/// Deliberately fatal. The alternative — carry on and register — is the case
+/// this whole path exists to prevent.
+#[must_use]
+pub fn wrong_account_error(
+    identity: &MnemonicIdentity,
+    siblings: &[RegisteredSibling],
+) -> anyhow::Error {
+    let listed = siblings
+        .iter()
+        .map(|sibling| format!("    {sibling}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    anyhow!(
+        "No node is registered for {} = {} ({}).\n  \
+           derived BLS key: {}\n  \
+           derived address: {}\n\n  \
+         This mnemonic does have registered nodes, on other accounts:\n{}\n\n  \
+         Set {} to the account this node runs as. Registering account {} would \
+         create a second node and leave this one's agreements behind.",
+        ACCOUNT_INDEX_ENV,
+        identity.account,
+        identity.network,
+        identity.bls_pubkey(),
+        identity.taproot_address,
+        listed,
+        ACCOUNT_INDEX_ENV,
+        identity.account,
+    )
+}
+
 /// Reject a hex field before it reaches the Portal, so a typo reads as a
 /// message about the field rather than a 400 from somewhere else.
 fn validate_hex_field(value: &str, expected_len: usize, field: &str) -> Result<()> {
@@ -332,6 +471,69 @@ mod tests {
         assert_eq!(request.schnorr_sig, "ab".repeat(64));
         assert_eq!(request.bls_sig.len(), 96);
         assert_eq!(request.registration_signature.len(), 96);
+    }
+
+    fn derived(account: u32) -> MnemonicIdentity {
+        MnemonicIdentity::derive(&crate::crypto::MnemonicSettings::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon about",
+            BitcoinNetwork::Signet,
+            account,
+        ))
+        .unwrap()
+    }
+
+    /// A mnemonic node fills in the two fields the wallet used to supply, and
+    /// the result has to be indistinguishable from the wallet-driven one.
+    #[test]
+    fn a_self_registration_is_shaped_like_a_wallet_one() {
+        let identity = derived(2);
+        let request = build_self_registration(&identity).unwrap();
+
+        assert_eq!(request.xpubkey, identity.xpubkey);
+        assert_eq!(request.bls_pubkey, identity.bls_pubkey());
+        assert_eq!(request.schnorr_sig.len(), SCHNORR_SIG_HEX_LEN);
+        assert_eq!(request.bls_sig.len(), 96);
+        assert_eq!(request.registration_signature.len(), 96);
+
+        // The x-only key the Portal will recover from `xpubkey` is the one the
+        // node signed with.
+        assert_eq!(x_only_from_xpub(&request.xpubkey).unwrap(), identity.x_only);
+    }
+
+    /// Same property the wallet path has: no nonce, no timestamp, so a node can
+    /// re-register itself unattended after a Portal reset.
+    #[test]
+    fn a_self_registration_is_deterministic() {
+        let identity = derived(3);
+        let first = build_self_registration(&identity).unwrap();
+        let second = build_self_registration(&identity).unwrap();
+
+        assert_eq!(first.schnorr_sig, second.schnorr_sig);
+        assert_eq!(first.bls_sig, second.bls_sig);
+        assert_eq!(first.registration_signature, second.registration_signature);
+    }
+
+    /// The message an operator acts on. It has to name the variable, the
+    /// account they should have used, and its address.
+    #[test]
+    fn the_wrong_account_error_names_what_to_change() {
+        let identity = derived(1);
+        let real = derived(3);
+        let siblings = vec![RegisteredSibling {
+            account: real.account,
+            network: real.network,
+            node_id: real.node_id.clone(),
+            taproot_address: real.taproot_address.clone(),
+        }];
+
+        let rendered = wrong_account_error(&identity, &siblings).to_string();
+
+        assert!(rendered.contains(ACCOUNT_INDEX_ENV), "{rendered}");
+        assert!(rendered.contains("account 3"), "{rendered}");
+        assert!(rendered.contains(&real.taproot_address), "{rendered}");
+        assert!(rendered.contains(&identity.taproot_address), "{rendered}");
+        assert!(rendered.contains("second node"), "{rendered}");
     }
 
     /// The two signatures answer different questions — "this BLS key accepts

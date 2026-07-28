@@ -8,6 +8,7 @@ use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
 use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::clients::PortalClient;
+use crate::crypto::mnemonic::DerivedIdentityInfo;
 use crate::database::DBClient;
 use crate::node;
 use crate::server;
@@ -212,12 +213,13 @@ async fn run_unregistered(
     client: PortalClient,
     keypair: Arc<crate::crypto::BlsKeyPair>,
     bls_pubkey: String,
+    derived: Option<DerivedIdentityInfo>,
     writer: &mut impl Write,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Outcome> {
     let parts = build_server_parts(config).await?;
     let restart = RestartHandle::from_env();
-    let identity = NodeIdentity::new(keypair, client.clone(), None);
+    let identity = NodeIdentity::new(keypair, client.clone(), None, derived);
     let admin = AdminState::new(
         config.admin_password.clone(),
         restart.clone(),
@@ -300,6 +302,7 @@ pub async fn run_with_shutdown(
             // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
             let onboarding_config = node::OnboardingConfig {
                 bls_key_path: config.bls_key_path.clone(),
+                mnemonic: crate::crypto::MnemonicSettings::from_env()?,
             };
             let onboarding_result =
                 match node::perform_onboarding(&client, &onboarding_config, &mut writer).await? {
@@ -310,6 +313,7 @@ pub async fn run_with_shutdown(
                             client,
                             Arc::new(node.keypair),
                             node.bls_pubkey,
+                            node.derived,
                             &mut writer,
                             shutdown,
                         )
@@ -358,6 +362,7 @@ pub async fn run_with_shutdown(
                     node_id: node_id.clone(),
                     signer_id: onboarding_result.signer_id,
                 }),
+                onboarding_result.derived,
             );
 
             let daemon_config =

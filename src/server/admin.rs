@@ -52,6 +52,7 @@ use tracing::{debug, error, info};
 use crate::app::config::AdminPassword;
 use crate::app::restart::RestartHandle;
 use crate::clients::PortalClient;
+use crate::crypto::mnemonic::DerivedIdentityInfo;
 use crate::crypto::BlsKeyPair;
 use crate::server::state::DownloadServerState;
 use session::AdminSession;
@@ -72,6 +73,10 @@ pub struct NodeIdentity {
     client: PortalClient,
     /// What the Portal knows about this key, `None` when it knows nothing.
     registered: Option<RegisteredNode>,
+    /// Set when the key was derived from a mnemonic. Its Taproot address is
+    /// what an unregistered node is waiting on, so the page can name it instead
+    /// of sending the operator to the logs.
+    derived: Option<DerivedIdentityInfo>,
 }
 
 /// The Portal-side identity of a registered node.
@@ -87,11 +92,13 @@ impl NodeIdentity {
         keypair: Arc<BlsKeyPair>,
         client: PortalClient,
         registered: Option<RegisteredNode>,
+        derived: Option<DerivedIdentityInfo>,
     ) -> Self {
         Self {
             keypair,
             client,
             registered,
+            derived,
         }
     }
 
@@ -106,12 +113,17 @@ impl NodeIdentity {
     pub(crate) fn registered(&self) -> Option<&RegisteredNode> {
         self.registered.as_ref()
     }
+
+    pub(crate) fn derived(&self) -> Option<&DerivedIdentityInfo> {
+        self.derived.as_ref()
+    }
 }
 
 impl std::fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeIdentity")
             .field("registered", &self.registered)
+            .field("derived", &self.derived)
             .field("keypair", &"<BlsKeyPair>")
             .finish_non_exhaustive()
     }
@@ -449,6 +461,7 @@ mod tests {
                 node_id: "node-debug".to_string(),
                 signer_id: 7,
             }),
+            None,
         );
         let rendered = format!(
             "{:?}",

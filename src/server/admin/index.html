@@ -138,8 +138,13 @@
       Portal's database has been reset.
     </p>
     <div class="row"><span class="k">BLS public key</span><span class="mono trunc" id="register-bls-pubkey">—</span></div>
+    <!-- Mnemonic mode only. The address is what an unregistered node is waiting
+         on, so it is shown rather than left in the container's logs. -->
+    <div class="row" id="register-derived-account-row" hidden><span class="k">Wallet account</span><span id="register-derived-account">—</span></div>
+    <div class="row" id="register-derived-address-row" hidden><span class="k">Taproot address</span><span class="mono trunc" id="register-derived-address">—</span></div>
     <div class="divider"></div>
-    <p class="muted">
+    <p class="muted" id="register-derived-note" hidden></p>
+    <p class="muted" id="register-wallet-note">
       Registering needs one signature from Horizon Wallet — the proof that the
       Taproot key you own vouches for this BLS key. Everything else is signed
       here with the node's own key. Open this page in a browser with the
@@ -481,6 +486,7 @@
     card.hidden = false;
     card.setAttribute("data-registered", registered ? "true" : "false");
     $("register-bls-pubkey").textContent = registration.bls_pubkey || "—";
+    renderDerived(registration.derived, registered);
 
     if (registered) {
       $("registration-title").textContent = "Portal registration";
@@ -499,7 +505,54 @@
       $("register-submit").textContent = "Register with Horizon Wallet";
     }
 
+    // A mnemonic node registers itself at startup, so the wallet flow below is
+    // dead weight to it — the only thing it can still be waiting for is a
+    // whitelist entry, and that is not something this page can do.
+    if (registration.derived) { return; }
+
     detectWallet();
+  }
+
+  // Mnemonic mode: the node derived its own keys, so what matters is which
+  // account it derived and which address a Portal admin has to whitelist.
+  function renderDerived(derived, registered) {
+    var accountRow = $("register-derived-account-row");
+    var addressRow = $("register-derived-address-row");
+    var note = $("register-derived-note");
+    var walletNote = $("register-wallet-note");
+    var submit = $("register-submit");
+    var walletState = $("register-wallet-state");
+
+    if (!derived) {
+      accountRow.hidden = true;
+      addressRow.hidden = true;
+      note.hidden = true;
+      walletNote.hidden = false;
+      submit.hidden = false;
+      walletState.hidden = false;
+      return;
+    }
+
+    $("register-derived-account").textContent =
+      "account " + derived.account + " (" + derived.network + ")";
+    $("register-derived-address").textContent = derived.taproot_address || "—";
+    accountRow.hidden = false;
+    addressRow.hidden = false;
+
+    note.textContent = registered
+      ? "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself " +
+        "and needs no wallet. Change KONTOR_STORAGE_ACCOUNT_INDEX and restart to bind " +
+        "a different account."
+      : "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself — " +
+        "no wallet needed. It is still unregistered, which almost always means the " +
+        "Taproot address above is not on the Portal's whitelist yet. Ask a Portal admin " +
+        "to add it; the node retries on its own.";
+    note.hidden = false;
+
+    // Nothing here for a browser to sign.
+    walletNote.hidden = true;
+    submit.hidden = true;
+    walletState.hidden = true;
   }
 
   function detectWallet() {

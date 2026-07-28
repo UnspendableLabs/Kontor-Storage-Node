@@ -38,7 +38,10 @@ The node can be configured via command-line arguments or environment variables:
 | `--storage-gcs-service-account-json` | `STORAGE_GCS_SERVICE_ACCOUNT_JSON` | _required if gcs_ | Path to GCS service account JSON file, or inline JSON (Horizon Portal: `[n]` newline escapes; required when `STORAGE_METHOD=gcs`) |
 | `--server-address` | `SERVER_ADDRESS` | `0.0.0.0:8081` | Address the public HTTP server binds to |
 | `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
-| `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. |
+| `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. Ignored entirely when `KONTOR_STORAGE_MNEMONIC` is set. |
+| _(env only)_ | `KONTOR_STORAGE_MNEMONIC` | _unset_ | Horizon Wallet seed phrase. Setting it puts the node in [mnemonic mode](#mnemonic-mode): it derives its own keys and registers itself, and `BLS_ENCRYPTED_BLOB` / `BLS_PASSWORD` are ignored. |
+| _(env only)_ | `KONTOR_STORAGE_ACCOUNT_INDEX` | `0` | Which wallet account to derive. Must match the account the node is registered under — see [mnemonic mode](#mnemonic-mode). |
+| _(env only)_ | `KONTOR_STORAGE_NETWORK` | `signet` | `mainnet`, `testnet`, or `signet`. Selects the coin type in both derivation paths, so it changes every derived key. |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset (UI disabled)_ | Password for the operator UI at `/admin`. At least 16 characters when set; leave unset to disable the UI entirely. See [Operator UI](#operator-ui). |
 | `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
 
@@ -72,6 +75,72 @@ The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits 
 
 When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
+
+### Mnemonic mode
+
+Set `KONTOR_STORAGE_MNEMONIC` and the node needs nothing else to reach a running
+state — no Horizon Wallet, no browser, no key file:
+
+```
+KONTOR_STORAGE_MNEMONIC="word1 word2 ... word12"
+KONTOR_STORAGE_ACCOUNT_INDEX=2
+KONTOR_STORAGE_NETWORK=signet
+```
+
+Without it, bringing a node up takes the wallet twice: once to export the BLS key
+as `BLS_ENCRYPTED_BLOB`, and again from a browser to sign the Schnorr half of the
+proof of possession that registration needs, because the Taproot key never leaves
+the extension. With the seed phrase the node derives both keys itself, so it can
+sign a complete registration — which also means it re-registers itself unattended
+after the Portal's database is reset, instead of waiting for someone to open
+`/admin`.
+
+Derivation matches Horizon Wallet exactly (BIP-39 with an empty passphrase, then
+`m/12381/{coin}/{account}/0` for the BLS key via EIP-2333 and
+`m/86'/{coin}'/{account}'/0/0` for the Taproot key), so a mnemonic node and a
+wallet-exported one with the same account are the same node.
+
+On startup it prints the identity it derived:
+
+```
+✓ Identity derived from KONTOR_STORAGE_MNEMONIC (signet, account 2)
+  BLS public key:  9251e095…
+  Taproot xpub:    tpubDF…
+  Taproot address: tb1p…q2x   <- whitelist this on the Portal
+  Node id:         node-8f3a…
+```
+
+The Taproot address is the one thing a Portal admin still has to act on: node
+registration is gated on a whitelist of addresses. Until it is whitelisted the
+node serves `/admin` and retries; the address is shown there too.
+
+#### Migrating a running node
+
+Add `KONTOR_STORAGE_MNEMONIC` and `KONTOR_STORAGE_ACCOUNT_INDEX`, remove
+`BLS_ENCRYPTED_BLOB` and `BLS_PASSWORD`, and restart. The mnemonic is checked
+before the key file, so the `bls_key.enc` left over from the export is ignored
+rather than prompting for a password the container cannot supply — leave it or
+delete it, it makes no difference.
+
+The account index has to be the one the node is already registered under. If it
+is not, the node **refuses to start** rather than registering a second identity
+and stranding the first one's agreements:
+
+```
+No node is registered for KONTOR_STORAGE_ACCOUNT_INDEX = 1 (signet).
+  derived BLS key: 84a1c0…
+  derived address: tb1p…7k2q
+
+  This mnemonic does have registered nodes, on other accounts:
+    account 2 (signet) -> node-8f3a… (tb1p…q2x)
+    account 3 (signet) -> node-1b7c… (tb1p…m4d)
+
+  Set KONTOR_STORAGE_ACCOUNT_INDEX to the account this node runs as. …
+```
+
+It finds those by deriving the neighbouring accounts and asking the Portal about
+each, which also catches a wrong `KONTOR_STORAGE_NETWORK` — the wrong coin type
+produces a key the Portal has never seen, exactly like a wrong account.
 
 ### Download and preparation pipeline
 
@@ -213,6 +282,8 @@ A Portal database reset drops every `nodes` row, so the node's next `GET /api/no
 
 That leaves exactly one wallet prompt. Open `/admin` in a browser with the extension installed and unlocked, on the wallet account this node's BLS key was exported from — the node refuses a `bls_pubkey` that is not its own, since registering one would only produce the same `404` a restart later. The Portal gates registration on the operator's Taproot address being whitelisted; that table survives the Portal's own reset, and a `403 ADDRESS_NOT_WHITELISTED` is forwarded verbatim because only a Portal admin can clear it.
 
+A node in [mnemonic mode](#mnemonic-mode) skips all of this: it holds the Taproot key too, so it fills in all five fields and registers itself during onboarding. The card then shows the account and the Taproot address to whitelist instead of the wallet button, since there is nothing left for a browser to sign.
+
 An unregistered node also re-checks the Portal every 30 seconds, so a registration made anywhere else brings it back without anyone touching the container.
 
 #### Restarting after a reset
@@ -229,7 +300,7 @@ Restarting also settles any download still in flight, which would otherwise writ
 
 The exit code is deliberately non-zero: Railway's default policy and Docker Compose's `restart: on-failure` only bring back a container that failed, so a clean `0` would leave the node stopped.
 
-The restart is offered only when `BLS_PASSWORD` is set. Without it, onboarding prompts for the key password on a terminal a restarted container does not have, so the node would go down and stay down — the checkbox is disabled and the API answers `400 RESTART_UNAVAILABLE`. Reset without it and restart the node yourself.
+The restart is offered only when `BLS_PASSWORD` or `KONTOR_STORAGE_MNEMONIC` is set. With neither, onboarding prompts for the key password on a terminal a restarted container does not have, so the node would go down and stay down — the checkbox is disabled and the API answers `400 RESTART_UNAVAILABLE`. Reset without it and restart the node yourself. A mnemonic node re-derives its key and never prompts, so it always qualifies.
 
 ## Development
 

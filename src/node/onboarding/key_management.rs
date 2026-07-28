@@ -2,7 +2,8 @@
 //!
 //! Handles loading, generating, and encrypting BLS keys.
 
-use crate::crypto::{BlsKeyPair, BLS_KEY_FILENAME};
+use crate::crypto::mnemonic::MNEMONIC_ENV;
+use crate::crypto::{BlsKeyPair, MnemonicIdentity, MnemonicSettings, BLS_KEY_FILENAME};
 use crate::database::default_app_dir;
 use crate::node::onboarding::OnboardingConfig;
 use anyhow::{anyhow, Result};
@@ -175,6 +176,106 @@ pub fn get_key_path(config: &OnboardingConfig) -> Result<PathBuf> {
     Ok(app_dir.join(BLS_KEY_FILENAME))
 }
 
+/// This node's key material, and where it came from.
+///
+/// The distinction matters past onboarding: a mnemonic node holds the Taproot
+/// key as well, so it can sign its own registration, while an imported one has
+/// only the BLS half and needs a browser for the rest.
+// Both variants are boxed: a `MnemonicIdentity` is several times the size of a
+// bare keypair, and this value is built once per start, so the indirection costs
+// nothing worth measuring.
+pub enum NodeKeys {
+    /// Derived from [`MNEMONIC_ENV`]. Self-sufficient.
+    Derived(Box<MnemonicIdentity>),
+    /// Decrypted from Horizon Wallet's export and kept on disk under a password.
+    Imported(Box<BlsKeyPair>),
+}
+
+impl NodeKeys {
+    #[must_use]
+    pub fn keypair(&self) -> &BlsKeyPair {
+        match self {
+            Self::Derived(identity) => &identity.keypair,
+            Self::Imported(keypair) => keypair,
+        }
+    }
+
+    /// The mnemonic-derived identity, if this node has one.
+    #[must_use]
+    pub fn identity(&self) -> Option<&MnemonicIdentity> {
+        match self {
+            Self::Derived(identity) => Some(identity),
+            Self::Imported(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn into_keypair(self) -> BlsKeyPair {
+        match self {
+            Self::Derived(identity) => identity.keypair,
+            Self::Imported(keypair) => *keypair,
+        }
+    }
+}
+
+impl std::fmt::Debug for NodeKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Derived(identity) => f.debug_tuple("Derived").field(identity).finish(),
+            Self::Imported(keypair) => f.debug_tuple("Imported").field(keypair).finish(),
+        }
+    }
+}
+
+/// Obtain this node's keys: derived from the mnemonic, loaded from disk, or
+/// imported from a Horizon Wallet export.
+///
+/// The mnemonic is checked first, and deliberately so. Both the key file and the
+/// blob exist to get a wallet-held key onto a machine; a mnemonic is that key's
+/// source, so once one is configured everything else is a stale copy. Ignoring
+/// the file rather than preferring it is also what makes migrating a running
+/// node a pure environment change: `bls_key.enc` is still sitting there from the
+/// blob era, and with `BLS_PASSWORD` deleted the disk path would stop at a
+/// password prompt no container has a terminal to answer.
+pub async fn ensure_node_keys(
+    key_path: &Path,
+    mnemonic: Option<&MnemonicSettings>,
+    writer: &mut impl Write,
+    password_reader: &dyn PasswordReader,
+) -> Result<NodeKeys> {
+    if let Some(settings) = mnemonic {
+        let identity = MnemonicIdentity::derive(settings)?;
+
+        writeln!(
+            writer,
+            "✓ Identity derived from {MNEMONIC_ENV} ({}, account {})",
+            identity.network, identity.account
+        )?;
+        writeln!(writer, "  BLS public key:  {}", identity.bls_pubkey())?;
+        writeln!(writer, "  Taproot xpub:    {}", identity.xpubkey)?;
+        writeln!(
+            writer,
+            "  Taproot address: {}   <- whitelist this on the Portal",
+            identity.taproot_address
+        )?;
+        writeln!(writer, "  Node id:         {}", identity.node_id)?;
+
+        if BlsKeyPair::key_file_exists(key_path).await? {
+            writeln!(
+                writer,
+                "  ({} is left untouched; the mnemonic is the key now)",
+                key_path.display()
+            )?;
+        }
+
+        return Ok(NodeKeys::Derived(Box::new(identity)));
+    }
+
+    ensure_bls_keypair(key_path, writer, password_reader)
+        .await
+        .map(|keypair| NodeKeys::Imported(Box::new(keypair)))
+}
+
 /// Ensure a BLS keypair exists, either by loading it or importing from Horizon Wallet.
 pub async fn ensure_bls_keypair(
     key_path: &Path,
@@ -285,6 +386,7 @@ mod tests {
         let custom_path = PathBuf::from("/custom/path/key.enc");
         let config = OnboardingConfig {
             bls_key_path: Some(custom_path.clone()),
+            mnemonic: None,
         };
         assert_eq!(get_key_path(&config).unwrap(), custom_path);
     }
@@ -435,6 +537,96 @@ mod tests {
         let reader = MockPasswordReader::new("testpassword");
         let result = reader.wait_for_enter();
         assert!(result.is_ok());
+    }
+
+    /// The migration in one test: a node that bootstrapped from a blob still has
+    /// `bls_key.enc` on disk, and its `BLS_PASSWORD` is gone. The mnemonic has
+    /// to win outright — reading the file would stop at a password prompt no
+    /// container can answer, and preferring it would ignore the account index
+    /// the operator just set.
+    #[tokio::test]
+    async fn a_mnemonic_wins_over_a_key_file_it_cannot_open() {
+        use crate::crypto::BitcoinNetwork;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let stale = BlsKeyPair::generate().unwrap();
+        stale
+            .save_encrypted(&key_path, "the-password-we-no-longer-have")
+            .await
+            .unwrap();
+
+        let settings = MnemonicSettings::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon about",
+            BitcoinNetwork::Signet,
+            2,
+        );
+        let expected = MnemonicIdentity::derive(&settings).unwrap();
+
+        // Any password this reader offers is wrong for the file above, so
+        // reaching the file at all would fail rather than pass quietly.
+        let reader = MockPasswordReader::new("not-the-password");
+        let mut buffer = Vec::new();
+
+        let keys = ensure_node_keys(&key_path, Some(&settings), &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert_eq!(keys.keypair().public_key_hex(), expected.bls_pubkey());
+        assert_ne!(keys.keypair().public_key_hex(), stale.public_key_hex());
+        let identity = keys.identity().expect("mnemonic mode yields an identity");
+        assert_eq!(identity.account, 2);
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains(&expected.taproot_address), "{output}");
+        assert!(output.contains("left untouched"), "{output}");
+    }
+
+    /// `NodeKeys` reaches a `tracing` field on the error paths, and both arms
+    /// wrap a secret key.
+    #[tokio::test]
+    async fn node_keys_debug_redacts_either_way() {
+        use crate::crypto::BitcoinNetwork;
+
+        let imported = NodeKeys::Imported(Box::new(BlsKeyPair::generate().unwrap()));
+        let rendered = format!("{imported:?}");
+        assert!(rendered.contains("Imported"), "{rendered}");
+        assert!(rendered.contains("BlsKeyPair"), "{rendered}");
+
+        let settings = MnemonicSettings::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon about",
+            BitcoinNetwork::Signet,
+            2,
+        );
+        let derived = NodeKeys::Derived(Box::new(MnemonicIdentity::derive(&settings).unwrap()));
+        let rendered = format!("{derived:?}");
+        assert!(rendered.contains("Derived"), "{rendered}");
+        assert!(!rendered.contains("abandon"), "{rendered}");
+    }
+
+    /// Without a mnemonic nothing changes: the key file is still the key.
+    #[tokio::test]
+    async fn without_a_mnemonic_the_key_file_is_still_used() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let keys = ensure_node_keys(&key_path, None, &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert_eq!(keys.keypair().public_key_hex(), keypair.public_key_hex());
+        assert!(keys.identity().is_none());
     }
 
     #[tokio::test]

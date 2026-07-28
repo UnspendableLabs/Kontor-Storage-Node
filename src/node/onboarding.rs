@@ -7,7 +7,9 @@ pub mod key_management;
 
 use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::PortalClient;
-use anyhow::Result;
+use crate::crypto::mnemonic::{DerivedIdentityInfo, MnemonicIdentity, MnemonicSettings};
+use crate::node::registration;
+use anyhow::{anyhow, Result};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,6 +40,9 @@ pub struct OnboardingResult {
     pub token: String,
     /// Next nonce for registry transactions.
     pub next_nonce: u64,
+    /// Set when the keys came from a mnemonic, so `/admin` can name the account
+    /// and address this node runs as.
+    pub derived: Option<DerivedIdentityInfo>,
 }
 
 // Manual Debug impl: the keypair and JWT token are secrets and must never be
@@ -77,12 +82,17 @@ pub enum OnboardingOutcome {
 pub struct UnregisteredNode {
     pub keypair: crate::crypto::BlsKeyPair,
     pub bls_pubkey: String,
+    /// Set when the keys came from a mnemonic. On this outcome it carries the
+    /// Taproot address a Portal admin still has to whitelist, which is the one
+    /// thing standing between the node and a normal start.
+    pub derived: Option<DerivedIdentityInfo>,
 }
 
 impl std::fmt::Debug for UnregisteredNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnregisteredNode")
             .field("bls_pubkey", &self.bls_pubkey)
+            .field("derived", &self.derived)
             .field("keypair", &"<BlsKeyPair>")
             .finish()
     }
@@ -114,6 +124,13 @@ impl std::fmt::Debug for OnboardingOutcome {
 pub struct OnboardingConfig {
     /// Path to the BLS key file. If None, uses the default location.
     pub bls_key_path: Option<PathBuf>,
+    /// The seed phrase to derive from, when one is configured. `Some` puts the
+    /// node in mnemonic mode: it derives its own keys, ignores the key file, and
+    /// registers itself.
+    ///
+    /// Read from the environment by the caller rather than in here, so the
+    /// whole flow stays a function of its arguments.
+    pub mnemonic: Option<MnemonicSettings>,
 }
 
 /// Perform the node onboarding process.
@@ -134,6 +151,84 @@ pub async fn perform_onboarding(
     perform_onboarding_with_reader(client, config, writer, password_reader.as_ref()).await
 }
 
+/// Register a mnemonic-derived node with the Portal, after checking that doing
+/// so is the right move.
+///
+/// Returns `true` if the Portal accepted the registration and the caller should
+/// look the node up again, `false` if it refused for a reason an operator has to
+/// act on — a whitelist entry, most often — and the node should fall back to
+/// serving `/admin` and waiting.
+///
+/// # Errors
+/// If the configured account is not the one this node is registered under. That
+/// is fatal on purpose: see [`registration::find_registered_siblings`].
+async fn self_register(
+    client: &PortalClient,
+    identity: &crate::crypto::MnemonicIdentity,
+    writer: &mut impl Write,
+) -> Result<bool> {
+    writeln!(
+        writer,
+        "\nThe Portal does not know this BLS key yet. Checking why before registering..."
+    )?;
+
+    // Is this node's own Taproot address already registered, but against some
+    // other BLS key? Registering again would not help — the Portal keys its
+    // nodes by the xpub, so the row is already taken.
+    if let Ok(existing) = client.check_node(&identity.node_id).await {
+        if let Some(other) = existing
+            .bls_public_key
+            .filter(|key| !key.eq_ignore_ascii_case(&identity.bls_pubkey()))
+        {
+            return Err(anyhow!(
+                "This node's Taproot address is already registered with a different BLS key.\n  \
+                   node id:  {}\n  \
+                   address:  {}\n  \
+                   registered key: {other}\n  \
+                   derived key:    {}\n  \
+                 The mnemonic or the account index does not match the wallet this node \
+                 was registered from.",
+                identity.node_id,
+                identity.taproot_address,
+                identity.bls_pubkey(),
+            ));
+        }
+    }
+
+    let siblings = registration::find_registered_siblings(client, identity).await;
+    if !siblings.is_empty() {
+        return Err(registration::wrong_account_error(identity, &siblings));
+    }
+
+    writeln!(
+        writer,
+        "No node is registered on any account of this mnemonic. Registering account {}...",
+        identity.account
+    )?;
+
+    let request = registration::build_self_registration(identity)?;
+    match client.register_node(&request).await {
+        Ok(response) => {
+            writeln!(writer, "✓ Registered as {}", response.node_id)?;
+            Ok(true)
+        }
+        Err(e) => {
+            // Not fatal: the commonest cause by far is an address a Portal admin
+            // has not whitelisted yet, and `/admin` plus the background lookup
+            // will pick the node up the moment they do.
+            writeln!(
+                writer,
+                "\nThe Portal refused the registration: {e:#}\n  \
+                   Taproot address: {}\n  \
+                 If this is ADDRESS_NOT_WHITELISTED, ask a Portal admin to whitelist that \
+                 address. This node re-checks on its own once they have.",
+                identity.taproot_address
+            )?;
+            Ok(false)
+        }
+    }
+}
+
 /// Perform the node onboarding process with a custom password reader.
 /// This variant is useful for testing.
 pub async fn perform_onboarding_with_reader(
@@ -142,15 +237,26 @@ pub async fn perform_onboarding_with_reader(
     writer: &mut impl Write,
     password_reader: &dyn PasswordReader,
 ) -> Result<OnboardingOutcome> {
-    // Step 1: Load or import BLS keypair
+    // Step 1: Derive, load, or import the BLS keypair
     let key_path = key_management::get_key_path(config)?;
-    let keypair = key_management::ensure_bls_keypair(&key_path, writer, password_reader).await?;
-    let bls_pubkey = keypair.public_key_hex();
+    let keys = key_management::ensure_node_keys(
+        &key_path,
+        config.mnemonic.as_ref(),
+        writer,
+        password_reader,
+    )
+    .await?;
+    let bls_pubkey = keys.keypair().public_key_hex();
     writeln!(writer, "✓ BLS key loaded")?;
 
     // Step 2: Look up node by BLS public key
     writeln!(writer, "Looking up node identity...")?;
     let mut waiting = false;
+    // A mnemonic node registers itself, but only once per start: after the call
+    // succeeds the row exists and the loop below waits for it to confirm. Trying
+    // again on a second 404 would be an infinite loop over a Portal that is
+    // telling us something we are not listening to.
+    let mut self_registered = false;
     let (node_id, signer_id) = loop {
         let lookup = match client.lookup_node(&bls_pubkey).await {
             Ok(l) => l,
@@ -163,16 +269,40 @@ pub async fn perform_onboarding_with_reader(
                     if waiting {
                         writeln!(writer)?;
                     }
-                    writeln!(
-                        writer,
-                        "\nNo node registered with this BLS public key.\n  \
-                         BLS public key: {bls_pubkey}\n  \
-                         Open /admin and register this key on the Portal to continue."
-                    )?;
+
+                    match (keys.identity(), self_registered) {
+                        (Some(identity), false) => {
+                            self_registered = true;
+                            if self_register(client, identity, writer).await? {
+                                continue;
+                            }
+                        }
+                        // Registered a moment ago and the Portal still says no.
+                        // Nothing here can fix that, and nothing a browser could
+                        // do would either — the node already signed everything.
+                        (Some(identity), true) => writeln!(
+                            writer,
+                            "\nThe Portal accepted the registration but still has no node for \
+                             this key.\n  \
+                               BLS public key:  {bls_pubkey}\n  \
+                               Taproot address: {}\n  \
+                             Restart the node to try again.",
+                            identity.taproot_address
+                        )?,
+                        (None, _) => writeln!(
+                            writer,
+                            "\nNo node registered with this BLS public key.\n  \
+                             BLS public key: {bls_pubkey}\n  \
+                             Open /admin and register this key on the Portal to continue."
+                        )?,
+                    }
+
+                    let derived = keys.identity().map(MnemonicIdentity::info);
                     return Ok(OnboardingOutcome::Unregistered(Box::new(
                         UnregisteredNode {
-                            keypair,
+                            keypair: keys.into_keypair(),
                             bls_pubkey,
+                            derived,
                         },
                     )));
                 }
@@ -206,6 +336,8 @@ pub async fn perform_onboarding_with_reader(
     };
 
     // Step 3: Login (challenge/response)
+    let derived = keys.identity().map(MnemonicIdentity::info);
+    let keypair = keys.into_keypair();
     writeln!(writer, "Authenticating with Portal...")?;
     let challenge = client.login_challenge(&node_id).await?;
     // Horizon Portal verifies with `request.challenge.as_bytes()` (hex string UTF-8), not decoded bytes.
@@ -225,6 +357,7 @@ pub async fn perform_onboarding_with_reader(
         signer_id,
         token: login.token,
         next_nonce: registry.next_nonce,
+        derived,
     })))
 }
 
@@ -290,6 +423,298 @@ mod tests {
         mount_all_mocks_except_lookup(mock_server, node_id, public_key).await;
     }
 
+    /* ---------------- mnemonic mode ---------------- */
+
+    /// The canonical BIP-39 phrase. Nothing about it is Horizon-specific — the
+    /// derivation is pinned in `crypto::mnemonic`, and these tests only care
+    /// that the keys reach the Portal calls.
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon about";
+
+    fn derived_identity(account: u32) -> MnemonicIdentity {
+        MnemonicIdentity::derive(&MnemonicSettings::new(
+            TEST_PHRASE,
+            crate::crypto::BitcoinNetwork::Signet,
+            account,
+        ))
+        .unwrap()
+    }
+
+    fn mnemonic_config(account: u32) -> OnboardingConfig {
+        OnboardingConfig {
+            // Deliberately a path that cannot exist: mnemonic mode must never
+            // touch the key file, and a bogus path proves it did not try.
+            bls_key_path: Some(PathBuf::from("/nonexistent/bls_key.enc")),
+            mnemonic: Some(MnemonicSettings::new(
+                TEST_PHRASE,
+                crate::crypto::BitcoinNetwork::Signet,
+                account,
+            )),
+        }
+    }
+
+    /// Every lookup answers 404, so nothing on this mnemonic looks registered.
+    /// Mounted last: wiremock takes the first mock that matches.
+    async fn mount_lookup_catch_all_404(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn mount_check_404(mock_server: &MockServer, node_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{node_id}/check")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// The whole point of the feature: a node handed nothing but a seed phrase
+    /// registers itself and comes up, with no wallet and no key file.
+    #[tokio::test]
+    async fn a_mnemonic_node_registers_itself_and_onboards() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let identity = derived_identity(2);
+        let public_key = identity.bls_pubkey();
+
+        // First lookup 404s, which is what triggers the registration; the one
+        // after it finds the row the Portal just wrote.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+
+        mount_check_404(&mock_server, &identity.node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "x_only_pubkey": hex::encode(identity.x_only),
+                "bls_public_key": public_key
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+        mount_all_mocks_except_lookup(&mock_server, &identity.node_id, &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let result =
+            perform_onboarding_with_reader(&client, &mnemonic_config(2), &mut buffer, &reader)
+                .await
+                .unwrap()
+                .expect_ready();
+
+        assert_eq!(result.keypair.public_key_hex(), public_key);
+        let derived = result.derived.expect("a mnemonic node carries its account");
+        assert_eq!(derived.account, 2);
+        assert_eq!(derived.taproot_address, identity.taproot_address);
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains(&identity.taproot_address), "{output}");
+        assert!(output.contains("Registered as"), "{output}");
+    }
+
+    /// The migration hazard. Two nodes run on accounts 2 and 3; pointing one at
+    /// account 1 must stop, not quietly mint a third node and strand the
+    /// agreements of the one it replaced.
+    #[tokio::test]
+    async fn a_wrong_account_index_is_fatal_and_names_the_right_one() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let configured = derived_identity(1);
+        let real = derived_identity(3);
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", real.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": real.node_id,
+                "signer_id": 42,
+                "bls_public_key": real.bls_pubkey()
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_check_404(&mock_server, &configured.node_id).await;
+        // Registering here is the bug this test exists to catch.
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let err =
+            perform_onboarding_with_reader(&client, &mnemonic_config(1), &mut buffer, &reader)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("KONTOR_STORAGE_ACCOUNT_INDEX"), "{err}");
+        assert!(err.contains("account 3"), "{err}");
+        assert!(err.contains(&real.taproot_address), "{err}");
+    }
+
+    /// The other way the same mistake shows up: the address is registered, but
+    /// against a BLS key this mnemonic does not derive. Registering again would
+    /// not fix it — the Portal keys nodes by the xpub.
+    #[tokio::test]
+    async fn an_address_registered_with_another_key_is_fatal() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let identity = derived_identity(2);
+        let stranger = BlsKeyPair::generate().unwrap().public_key_hex();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", identity.node_id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "address": identity.taproot_address,
+                "xpubkey": identity.xpubkey,
+                "bls_public_key": stranger,
+                "signer_id": 9
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let err =
+            perform_onboarding_with_reader(&client, &mnemonic_config(2), &mut buffer, &reader)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("different BLS key"), "{err}");
+        assert!(err.contains(&stranger), "{err}");
+    }
+
+    /// The Portal took the registration and then kept answering 404. Retrying
+    /// would spin forever, so the node gives up for this start — and says so in
+    /// terms that do not send the operator looking for a wallet.
+    #[tokio::test]
+    async fn a_registration_the_portal_forgets_is_not_retried_forever() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let identity = derived_identity(5);
+
+        mount_check_404(&mock_server, &identity.node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "x_only_pubkey": hex::encode(identity.x_only),
+                "bls_public_key": identity.bls_pubkey()
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let outcome =
+            perform_onboarding_with_reader(&client, &mnemonic_config(5), &mut buffer, &reader)
+                .await
+                .unwrap();
+
+        assert!(matches!(outcome, OnboardingOutcome::Unregistered(_)));
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(
+            output.contains("still has no node for this key"),
+            "{output}"
+        );
+        assert!(!output.contains("Open /admin and register"), "{output}");
+    }
+
+    /// A refused registration is the whitelist, not a broken node. `/admin` has
+    /// to come up so the operator can read the address off it, and the node has
+    /// to keep polling so it recovers the moment the address is added.
+    #[tokio::test]
+    async fn a_refused_registration_leaves_the_node_unregistered_not_dead() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let identity = derived_identity(4);
+
+        mount_check_404(&mock_server, &identity.node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": {
+                    "code": "ADDRESS_NOT_WHITELISTED",
+                    "message": "Bitcoin address is not whitelisted for node registration"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let outcome =
+            perform_onboarding_with_reader(&client, &mnemonic_config(4), &mut buffer, &reader)
+                .await
+                .unwrap();
+
+        match outcome {
+            OnboardingOutcome::Unregistered(node) => {
+                assert_eq!(node.bls_pubkey, identity.bls_pubkey());
+                let derived = node.derived.expect("the address to whitelist must survive");
+                assert_eq!(derived.taproot_address, identity.taproot_address);
+            }
+            OnboardingOutcome::Ready(_) => panic!("a refused registration cannot be ready"),
+        }
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("ADDRESS_NOT_WHITELISTED"), "{output}");
+        assert!(output.contains(&identity.taproot_address), "{output}");
+    }
+
     #[tokio::test]
     async fn onboarding_succeeds_full_flow() {
         let mock_server = MockServer::start().await;
@@ -307,6 +732,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -355,6 +781,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -393,6 +820,7 @@ mod tests {
         let unregistered = OnboardingOutcome::Unregistered(Box::new(UnregisteredNode {
             keypair: BlsKeyPair::generate().unwrap(),
             bls_pubkey: "beef".to_string(),
+            derived: None,
         }));
         let rendered = format!("{unregistered:?}");
         assert!(rendered.contains("beef"), "{rendered}");
@@ -404,6 +832,7 @@ mod tests {
             signer_id: 7,
             token: "super-secret-jwt".to_string(),
             next_nonce: 1,
+            derived: None,
         }));
         let rendered = format!("{ready:?}");
         assert!(rendered.contains("node-debug"), "{rendered}");
@@ -445,6 +874,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -484,6 +914,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -536,6 +967,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -606,6 +1038,7 @@ mod tests {
         let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
+            mnemonic: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -635,6 +1068,7 @@ mod tests {
             signer_id: 42,
             token: "test-token".to_string(),
             next_nonce: 0,
+            derived: None,
         };
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("OnboardingResult"));
