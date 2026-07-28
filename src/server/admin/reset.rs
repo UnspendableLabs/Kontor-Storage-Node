@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use crate::app::config::StorageMethod;
+use crate::clients::http_helpers::HttpStatusError;
 use crate::entities::agreements;
 use crate::entities::prelude::{Agreements, Challenges};
 use crate::server::admin::{error_codes, ApiError};
@@ -56,8 +57,8 @@ struct BlobReport {
     /// Blobs the wiped rows claimed to have stored.
     requested: usize,
     deleted: usize,
-    /// Already gone. Only meaningful for the local backend: GCS answers 404
-    /// with an error, which lands in `failed`.
+    /// Already gone: a local file that no longer exists, or a bucket object
+    /// GCS answers `404` for. Nothing for the operator to act on.
     missing: usize,
     failed: usize,
     /// File ids that could not be turned into a safe object name.
@@ -288,6 +289,9 @@ async fn delete_gcs_blobs(
     for outcome in outcomes {
         match outcome {
             Ok(()) => report.deleted += 1,
+            // An object the bucket no longer holds is the same non-event as a
+            // local file that is already gone, so it is counted the same way.
+            Err((_, err)) if is_not_found(&err) => report.missing += 1,
             Err((file_id, err)) => {
                 warn!(%file_id, "Failed to delete stored object: {err}");
                 report.failed += 1;
@@ -296,14 +300,26 @@ async fn delete_gcs_blobs(
     }
 }
 
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpStatusError>()
+        .is_some_and(|status| status.status == reqwest::StatusCode::NOT_FOUND)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::tasks::downloadagreements::StorageBackend;
+    use crate::clients::GcsClient;
     use crate::entities::challenges;
     use crate::server::admin::AdminState;
-    use crate::testutils::{setup_in_memory_db, tempdir, AgreementFixture};
+    use crate::testutils::{
+        setup_agreements_db, setup_challenges_db, setup_in_memory_db, tempdir, AgreementFixture,
+        TEST_PRIVATE_KEY,
+    };
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, PaginatorTrait};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn confirmed(delete_files: bool) -> ResetDatabaseRequest {
         ResetDatabaseRequest {
@@ -523,5 +539,178 @@ mod tests {
         assert_eq!(value["files"]["deleted"], 0);
         // The local copies are irrelevant to a GCS node, and untouched.
         assert!(state.storage_dir.join("FILE-1").exists());
+    }
+
+    /// A blob the node cannot remove is reported, not swallowed: the row is
+    /// gone, so the operator is the only one who can still deal with the file.
+    ///
+    /// Mirrors the read-only-directory pattern used in `database::sqlite`
+    /// tests; it relies on the test process not being root, as those do.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_reports_blobs_it_cannot_delete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (state, _dir) = seeded_state().await;
+        let dir = &state.storage_dir;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let value = reset_database(&confirmed(true), &state).await.unwrap();
+
+        // Restore before the assertions so a failure still cleans up.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(value["files"]["failed"], 2);
+        assert_eq!(value["files"]["deleted"], 0);
+        assert_eq!(
+            value["total_rows_deleted"], 5,
+            "the wipe itself still succeeded"
+        );
+        assert!(dir.join("FILE-1").exists());
+    }
+
+    const BUCKET: &str = "bucket-reset";
+
+    /// A seeded node whose GCS client talks to `mock` instead of Google.
+    async fn gcs_state(mock: &MockServer) -> (DownloadServerState, tempfile::TempDir) {
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "token-gcs"
+            })))
+            .mount(mock)
+            .await;
+
+        let (mut state, dir) = seeded_state().await;
+        state.storage_backend = StorageBackend {
+            method: StorageMethod::Gcs,
+            gcs_client: Some(Arc::new(GcsClient::with_test_endpoints(
+                BUCKET,
+                "svc@example.com",
+                TEST_PRIVATE_KEY,
+                format!("{}/token", mock.uri()),
+                mock.uri(),
+            ))),
+        };
+        (state, dir)
+    }
+
+    async fn mount_delete(mock: &MockServer, file_id: &str, response: ResponseTemplate) {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/storage/v1/b/{BUCKET}/o/{file_id}")))
+            .respond_with(response)
+            .expect(1)
+            .mount(mock)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn gcs_reset_deletes_the_objects_it_stored() {
+        let mock = MockServer::start().await;
+        mount_delete(&mock, "FILE-1", ResponseTemplate::new(204)).await;
+        mount_delete(&mock, "FILE-2", ResponseTemplate::new(204)).await;
+        let (state, _dir) = gcs_state(&mock).await;
+
+        let value = reset_database(&confirmed(true), &state).await.unwrap();
+
+        assert_eq!(value["files"]["requested"], 2);
+        assert_eq!(value["files"]["deleted"], 2);
+        assert_eq!(value["files"]["failed"], 0);
+        assert_eq!(count_rows(&state).await, (0, 0));
+    }
+
+    /// An object the bucket has already lost is a non-event, exactly as it is
+    /// for a local file that is no longer there.
+    #[tokio::test]
+    async fn gcs_reset_counts_a_404_as_missing() {
+        let mock = MockServer::start().await;
+        mount_delete(&mock, "FILE-1", ResponseTemplate::new(204)).await;
+        mount_delete(
+            &mock,
+            "FILE-2",
+            ResponseTemplate::new(404).set_body_string("not found"),
+        )
+        .await;
+        let (state, _dir) = gcs_state(&mock).await;
+
+        let value = reset_database(&confirmed(true), &state).await.unwrap();
+
+        assert_eq!(value["files"]["deleted"], 1);
+        assert_eq!(value["files"]["missing"], 1);
+        assert_eq!(value["files"]["failed"], 0);
+    }
+
+    /// A bucket that refuses the delete leaves an orphan. The rows are already
+    /// gone, so the reset still succeeds and the count carries the news.
+    #[tokio::test]
+    async fn gcs_reset_reports_failed_deletions_without_failing() {
+        let mock = MockServer::start().await;
+        mount_delete(&mock, "FILE-1", ResponseTemplate::new(204)).await;
+        mount_delete(
+            &mock,
+            "FILE-2",
+            ResponseTemplate::new(500).set_body_string("boom"),
+        )
+        .await;
+        let (state, _dir) = gcs_state(&mock).await;
+
+        let value = reset_database(&confirmed(true), &state).await.unwrap();
+
+        assert_eq!(value["files"]["deleted"], 1);
+        assert_eq!(value["files"]["failed"], 1);
+        assert_eq!(value["total_rows_deleted"], 5);
+    }
+
+    /// The blob names are read before the wipe, so a database that cannot
+    /// answer that read fails the request before anything is deleted.
+    #[tokio::test]
+    async fn reset_fails_before_wiping_when_the_file_list_cannot_be_read() {
+        let dir = tempdir();
+        let state = DownloadServerState {
+            // No `agreements` table at all.
+            db: setup_challenges_db().await,
+            storage_dir: dir.path().to_path_buf(),
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
+            admin: AdminState::disabled(),
+        };
+        insert_challenge(&state.db, "CHAL-1").await;
+
+        let err = reset_database(&confirmed(true), &state).await.unwrap_err();
+
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.code, error_codes::DATABASE_ERROR);
+        assert_eq!(
+            Challenges::find().count(&state.db).await.unwrap(),
+            1,
+            "the wipe must not have started"
+        );
+    }
+
+    /// Half a reset is worse than none: a delete that fails mid-transaction
+    /// rolls back and reports, rather than leaving one table emptied.
+    #[tokio::test]
+    async fn a_failed_delete_rolls_the_whole_reset_back() {
+        let dir = tempdir();
+        let state = DownloadServerState {
+            // No `challenges` table, so the first delete of the transaction
+            // fails and the `agreements` delete never runs.
+            db: setup_agreements_db().await,
+            storage_dir: dir.path().to_path_buf(),
+            storage_backend: StorageBackend::local(),
+            node_id: "NODE-TEST".to_string(),
+            admin: AdminState::disabled(),
+        };
+        insert_agreement(&state.db, "FILE-1", true).await;
+
+        let err = reset_database(&confirmed(false), &state).await.unwrap_err();
+
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.code, error_codes::DATABASE_ERROR);
+        assert_eq!(
+            Agreements::find().count(&state.db).await.unwrap(),
+            1,
+            "the agreements must survive a rolled-back reset"
+        );
     }
 }

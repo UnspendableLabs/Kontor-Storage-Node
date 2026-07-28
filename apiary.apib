@@ -281,7 +281,7 @@ With `delete_files`, the stored blobs of the deleted rows are removed too — lo
                 }
             }
 
-    `files` is `null` when `delete_files` was not set. `missing` is only meaningful for the local backend: GCS reports an absent object as an error, which lands in `failed`. `skipped` counts file ids that were not plain object names and were therefore never turned into a path.
+    `files` is `null` when `delete_files` was not set. `missing` covers a local file that had already disappeared or a bucket object GCS answers `404` for — nothing to act on. `failed` is a blob still out there: the row is gone, so only the operator can deal with it now. `skipped` counts file ids that were not plain object names and were therefore never turned into a path.
 
 + Response 400 (application/json)
 

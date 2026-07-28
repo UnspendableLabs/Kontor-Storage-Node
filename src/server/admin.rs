@@ -294,6 +294,38 @@ mod tests {
         assert_eq!(payload["error"]["message"], "nope");
     }
 
+    /// The three logging arms of `into_response` — server error, auth denial,
+    /// routine rejection — must all still produce the same body shape.
+    #[tokio::test]
+    async fn every_error_class_renders_the_same_shape() {
+        let cases = [
+            ApiError::server_error("signing failed"),
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "Authentication required",
+            ),
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::ADMIN_UI_DISABLED,
+                "disabled",
+            ),
+        ];
+
+        for error in cases {
+            let (status, code) = (error.status, error.code);
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"]["code"], code);
+            assert!(payload["error"]["message"].is_string());
+        }
+    }
+
     /// End-to-end over the real router: the routes, the guard and the CORS
     /// boundary, as a browser on `/admin` would meet them.
     mod routes {

@@ -175,9 +175,29 @@ mod tests {
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
 
         assert_eq!(value["storage"]["method"], "gcs");
+        assert_eq!(value["session_expires_at"], SESSION_EXPIRY);
         // Spelled as an equality rather than `is_null()`: `ExprTrait` is in
         // scope from the query above and its own `is_null` wins method
         // resolution on a `serde_json::Value`.
         assert_eq!(value["storage"]["directory"], Value::Null);
+    }
+
+    /// A database the node cannot read is a 500, not a status page full of
+    /// zeros that would talk an operator into a reset. Each count is its own
+    /// query, so a table missing on either side has to surface the same way.
+    #[tokio::test]
+    async fn status_surfaces_database_errors() {
+        for db in [
+            crate::testutils::setup_challenges_db().await,
+            crate::testutils::setup_agreements_db().await,
+        ] {
+            let (mut state, _dir) = state_with(&[]).await;
+            state.db = db;
+
+            let err = node_status(&state, SESSION_EXPIRY).await.unwrap_err();
+
+            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err.code, error_codes::DATABASE_ERROR);
+        }
     }
 }
