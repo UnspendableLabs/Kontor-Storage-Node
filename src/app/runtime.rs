@@ -5,11 +5,13 @@
 use crate::app::cli::{Cli, Commands};
 use crate::app::config::{Config, StorageMethod};
 use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
+use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::clients::PortalClient;
 use crate::database::DBClient;
 use crate::node;
 use crate::server;
+use crate::server::admin::{AdminState, NodeIdentity, RegisteredNode};
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 use std::future::Future;
@@ -30,7 +32,8 @@ pub struct DaemonConfig {
     pub storage_backend: StorageBackend,
     pub storage_dir: PathBuf,
     pub download_addr: SocketAddr,
-    pub node_id: String,
+    pub node_id: Option<String>,
+    pub admin: AdminState,
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
@@ -52,7 +55,10 @@ async fn shutdown_signal() -> io::Result<()> {
 }
 
 /// Run the application with the default shutdown signal (SIGINT/SIGTERM).
-pub async fn run(cli: Cli, writer: impl Write) -> Result<()> {
+///
+/// The [`Outcome`] tells the caller whether to exit `0` or with
+/// [`crate::app::restart::RESTART_EXIT_CODE`]; see [`crate::app::restart`].
+pub async fn run(cli: Cli, writer: impl Write) -> Result<Outcome> {
     run_with_shutdown(cli, writer, shutdown_signal()).await
 }
 
@@ -90,6 +96,23 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Portal polling interval: {}s",
         config.portal_polling_interval.as_secs()
     )?;
+    writeln!(
+        writer,
+        "Filestorage contract: {}",
+        config.kontor_contract_address
+    )?;
+    // Says which way the switch is set without ever naming the value: an
+    // operator who forgot to set ADMIN_PASSWORD sees it here rather than at a
+    // login screen that answers 503.
+    writeln!(
+        writer,
+        "Admin UI: {}",
+        if config.admin_password.is_empty() {
+            "disabled (set ADMIN_PASSWORD to enable /admin)"
+        } else {
+            "enabled at /admin"
+        }
+    )?;
 
     Ok(())
 }
@@ -104,26 +127,42 @@ fn setup_storage_directory(config: &Config) -> Result<()> {
     })
 }
 
+/// What the HTTP server needs, independent of whether the node is registered.
+///
+/// Split out because an unregistered node still serves `/admin` — that is the
+/// only place its registration can be repaired from — and so needs all of this
+/// without ever building a daemon.
+struct ServerParts {
+    conn: DatabaseConnection,
+    storage_backend: StorageBackend,
+    download_addr: SocketAddr,
+}
+
+async fn build_server_parts(config: &Config) -> Result<ServerParts> {
+    let db = DBClient::new(&config.database_url).await?;
+
+    Ok(ServerParts {
+        conn: db.connection().clone(),
+        storage_backend: StorageBackend::new(
+            config.storage_method.clone(),
+            config.storage_gcs_bucket_name.clone(),
+            config.storage_gcs_service_account_json.clone(),
+        )?,
+        download_addr: config
+            .server_address
+            .parse()
+            .context("invalid server address")?,
+    })
+}
+
 /// Build the daemon configuration from the app config and onboarding result.
 async fn build_daemon_config(
     config: &Config,
     authenticated_client: PortalClient,
     node_id: String,
+    identity: NodeIdentity,
 ) -> Result<DaemonConfig> {
-    let db = DBClient::new(&config.database_url).await?;
-    let conn = db.connection().clone();
-
-    let storage_backend = StorageBackend::new(
-        config.storage_method.clone(),
-        config.storage_gcs_bucket_name.clone(),
-        config.storage_gcs_service_account_json.clone(),
-    )?;
-
-    let lock_path = config.storage_dir.join(".portal-daemon.lock");
-    let download_addr: SocketAddr = config
-        .server_address
-        .parse()
-        .context("invalid server address")?;
+    let parts = build_server_parts(config).await?;
 
     let storage_limits = StorageLimits {
         capacity: config.storage_capacity,
@@ -133,15 +172,108 @@ async fn build_daemon_config(
 
     Ok(DaemonConfig {
         client: authenticated_client,
-        conn,
+        conn: parts.conn,
         interval: config.portal_polling_interval,
-        lock_path,
+        lock_path: config.storage_dir.join(".portal-daemon.lock"),
         storage_limits,
-        storage_backend,
+        storage_backend: parts.storage_backend,
         storage_dir: config.storage_dir.clone(),
-        download_addr,
-        node_id,
+        download_addr: parts.download_addr,
+        node_id: Some(node_id),
+        admin: AdminState::new(
+            config.admin_password.clone(),
+            RestartHandle::from_env(),
+            Some(identity),
+        ),
     })
+}
+
+/// How often an unregistered node re-checks whether the Portal has heard of it.
+#[cfg(not(test))]
+const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Serve `/admin` on a node the Portal has never heard of.
+///
+/// No daemon, no announce, no faucet: none of them mean anything without a
+/// `signer_id`. The server is up for one reason, which is to let an operator
+/// register the BLS key from a browser that has Horizon Wallet — see
+/// [`crate::server::admin::register`].
+///
+/// A background lookup runs alongside it so the node also recovers from a
+/// registration made anywhere else. Either way the fix is the same: exit, and
+/// let the supervisor start a process that onboards properly. Restarting is
+/// only offered when a restarted process could get back up unattended, so a
+/// node without `BLS_PASSWORD` stays here until a human intervenes — which is
+/// the same node that would have stopped at a password prompt anyway.
+async fn run_unregistered(
+    config: &Config,
+    client: PortalClient,
+    keypair: Arc<crate::crypto::BlsKeyPair>,
+    bls_pubkey: String,
+    writer: &mut impl Write,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<Outcome> {
+    let parts = build_server_parts(config).await?;
+    let restart = RestartHandle::from_env();
+    let identity = NodeIdentity::new(keypair, client.clone(), None);
+    let admin = AdminState::new(
+        config.admin_password.clone(),
+        restart.clone(),
+        Some(identity),
+    );
+
+    if admin.is_enabled() {
+        writeln!(
+            writer,
+            "Serving /admin only until this node is registered.\n"
+        )?;
+    } else {
+        writeln!(
+            writer,
+            "ADMIN_PASSWORD is unset, so /admin cannot be unlocked to register this key.\n\
+             Set it and restart, or register the key from elsewhere — this node re-checks \
+             every {}s.\n",
+            UNREGISTERED_LOOKUP_INTERVAL.as_secs()
+        )?;
+    }
+
+    // Nothing stops this loop but the abort below: a restart asked for from
+    // `/admin` already woke the run loop, and one more lookup on the way out
+    // costs less than a second flag to check.
+    let watcher = tokio::spawn({
+        let restart = restart.clone();
+        async move {
+            loop {
+                tokio::time::sleep(UNREGISTERED_LOOKUP_INTERVAL).await;
+                if client.lookup_node(&bls_pubkey).await.is_ok() {
+                    tracing::info!("The Portal now knows this BLS key; restarting to onboard");
+                    restart.request();
+                    return;
+                }
+            }
+        }
+    });
+
+    let outcome = serve_until_shutdown(
+        parts.download_addr,
+        server::DownloadServerState {
+            db: parts.conn,
+            storage_dir: config.storage_dir.clone(),
+            storage_backend: parts.storage_backend,
+            node_id: None,
+            admin,
+        },
+        restart,
+        shutdown,
+    )
+    .await;
+
+    watcher.abort();
+    let _ = watcher.await;
+
+    outcome
 }
 
 /// Run the application with a custom shutdown signal.
@@ -149,18 +281,20 @@ pub async fn run_with_shutdown(
     cli: Cli,
     mut writer: impl Write,
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let config = Config::from_cli(&cli)?;
 
     print_config_info(&config, &mut writer)?;
     setup_storage_directory(&config)?;
 
-    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?;
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
+        .with_contract_address(&config.kontor_contract_address);
 
     match cli.command {
         Commands::Ping => {
             let body = client.ping().await?;
             writeln!(writer, "{body}")?;
+            Ok(Outcome::Shutdown)
         }
         Commands::Run => {
             // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
@@ -168,7 +302,20 @@ pub async fn run_with_shutdown(
                 bls_key_path: config.bls_key_path.clone(),
             };
             let onboarding_result =
-                node::perform_onboarding(&client, &onboarding_config, &mut writer).await?;
+                match node::perform_onboarding(&client, &onboarding_config, &mut writer).await? {
+                    node::OnboardingOutcome::Ready(result) => *result,
+                    node::OnboardingOutcome::Unregistered(node) => {
+                        return run_unregistered(
+                            &config,
+                            client,
+                            Arc::new(node.keypair),
+                            node.bls_pubkey,
+                            &mut writer,
+                            shutdown,
+                        )
+                        .await;
+                    }
+                };
 
             tracing::debug!(
                 next_nonce = onboarding_result.next_nonce,
@@ -182,16 +329,18 @@ pub async fn run_with_shutdown(
             node::ensure_kor_balance(&client, onboarding_result.signer_id, &mut writer).await?;
 
             let node_id = onboarding_result.node_id;
+            let keypair = Arc::new(onboarding_result.keypair);
 
             let authenticated_client = PortalClient::try_with_auth(
                 &config.portal_url,
                 &config.storage_dir,
-                Arc::new(onboarding_result.keypair),
+                keypair.clone(),
                 &node_id,
                 onboarding_result.signer_id,
                 onboarding_result.token,
                 onboarding_result.next_nonce,
-            )?;
+            )?
+            .with_contract_address(&config.kontor_contract_address);
 
             if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
                 tracing::warn!("Failed to announce node URL: {e}");
@@ -199,20 +348,36 @@ pub async fn run_with_shutdown(
                 writeln!(writer, "✓ Announced public URL: {}", config.public_url)?;
             }
 
-            let daemon_config = build_daemon_config(&config, authenticated_client, node_id).await?;
-            run_daemon_command(daemon_config, shutdown).await?;
+            // The admin UI can re-register an already-registered node, so it
+            // gets the same key and an unauthenticated client here as it would
+            // on a node that never onboarded.
+            let identity = NodeIdentity::new(
+                keypair,
+                client,
+                Some(RegisteredNode {
+                    node_id: node_id.clone(),
+                    signer_id: onboarding_result.signer_id,
+                }),
+            );
+
+            let daemon_config =
+                build_daemon_config(&config, authenticated_client, node_id, identity).await?;
+            run_daemon_command(daemon_config, shutdown).await
         }
     }
-
-    Ok(())
 }
 
 /// Run the daemon with the download server.
+///
+/// Stops on the shutdown signal, on the download server failing, or on an
+/// operator asking for a restart from `/admin` — the last of which reports
+/// [`Outcome::Restart`] so the caller can exit in a way the supervisor acts on.
 pub async fn run_daemon_command(
     daemon: DaemonConfig,
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let daemon_backend = daemon.storage_backend.clone();
+    let restart = daemon.admin.restart().clone();
     let handle = spawn_portal_daemon(
         daemon.client,
         daemon.conn.clone(),
@@ -223,30 +388,57 @@ pub async fn run_daemon_command(
         daemon.storage_dir.clone(),
     );
 
-    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
-    let server = server::serve(
+    let outcome = serve_until_shutdown(
         daemon.download_addr,
         server::DownloadServerState {
             db: daemon.conn,
             storage_dir: daemon.storage_dir,
             storage_backend: daemon.storage_backend,
             node_id: daemon.node_id,
+            admin: daemon.admin,
         },
-        async move {
-            let _ = server_shutdown_rx.await;
-        },
-    );
+        restart,
+        shutdown,
+    )
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+
+    outcome
+}
+
+/// Run the HTTP server until something asks it to stop.
+///
+/// Shared by the daemon and by an unregistered node, which differ only in
+/// whether there is a daemon alongside the server.
+async fn serve_until_shutdown(
+    addr: SocketAddr,
+    state: server::DownloadServerState,
+    restart: RestartHandle,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<Outcome> {
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server = server::serve(addr, state, async move {
+        let _ = server_shutdown_rx.await;
+    });
 
     pin!(server);
     pin!(shutdown);
 
+    // The restart arm is woken from inside a request handler, so the server is
+    // necessarily still running when it fires. Everything below is the ordinary
+    // shutdown path: the graceful shutdown flushes the reset's own response
+    // before the process goes anywhere.
+    let mut restart_requested = false;
     let shutdown_result = tokio::select! {
-        server_result = &mut server => {
-            handle.abort();
-            let _ = handle.await;
-            return server_result;
-        }
+        server_result = &mut server => return server_result.map(|()| Outcome::Shutdown),
         shutdown_result = &mut shutdown => shutdown_result,
+        () = restart.requested() => {
+            tracing::info!("Restart requested from the admin UI; shutting down");
+            restart_requested = true;
+            Ok(())
+        }
     };
 
     if server_shutdown_tx.send(()).is_err() {
@@ -255,12 +447,13 @@ pub async fn run_daemon_command(
 
     let server_result = server.await;
 
-    handle.abort();
-    let _ = handle.await;
-
     server_result?;
     shutdown_result?;
-    Ok(())
+    Ok(if restart_requested {
+        Outcome::Restart
+    } else {
+        Outcome::Shutdown
+    })
 }
 
 #[cfg(test)]
@@ -268,6 +461,7 @@ mod tests {
     #![allow(deprecated)]
     use super::*;
     use crate::app::cli::{Cli, Commands};
+    use crate::app::config::AdminPassword;
     use crate::crypto::BlsKeyPair;
     use crate::node::BLS_PASSWORD_ENV;
     use futures_util::future;
@@ -367,6 +561,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -426,6 +622,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -474,6 +672,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -522,6 +722,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -575,6 +777,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -703,6 +907,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -738,6 +944,177 @@ mod tests {
             !requests.is_empty(),
             "daemon should poll the portal at least once"
         );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// A BLS key on disk and a password in the environment, with no Portal
+    /// mocks: whatever the caller mounts for `/api/nodes/lookup` decides
+    /// whether the node comes up registered.
+    async fn setup_unregistered_fixtures(storage_dir: &PathBuf) -> PathBuf {
+        let password = "testpassword123";
+        let key_path = storage_dir.join("bls_key.enc");
+
+        let keypair = BlsKeyPair::generate().unwrap();
+        fs::create_dir_all(storage_dir).unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+        env::set_var(BLS_PASSWORD_ENV, password);
+
+        key_path
+    }
+
+    fn unregistered_cli(portal_url: String, storage_dir: PathBuf, bls_key_path: PathBuf) -> Cli {
+        Cli {
+            portal_url,
+            database_url: "sqlite::memory:".to_string(),
+            storage_dir: Some(storage_dir),
+            portal_polling_interval_secs: 1,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
+            bls_key_path: Some(bls_key_path),
+            admin_password: Some("correct horse battery staple".to_string()),
+            kontor_contract_address: "filestorage_0_0".to_string(),
+            command: Commands::Run,
+        }
+    }
+
+    /// The whole point of the unregistered path: a node the Portal has never
+    /// heard of used to exit here, taking `/admin` — the only place the
+    /// registration can be repaired from — down with it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_serves_admin_when_the_portal_does_not_know_the_key() {
+        let _guard = TempAppDirGuard::new("unregistered");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("unregistered");
+        let bls_key_path = setup_unregistered_fixtures(&storage_dir).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such node"))
+            .mount(&mock_server)
+            .await;
+
+        let cli = unregistered_cli(mock_server.uri(), storage_dir.clone(), bls_key_path);
+        let shutdown = async {
+            sleep(Duration::from_millis(150)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(outcome, Outcome::Shutdown);
+        assert!(
+            output.contains("No node registered with this BLS public key"),
+            "{output}"
+        );
+        assert!(output.contains("Serving /admin only"), "{output}");
+        assert!(
+            !output.contains("Node onboarding complete"),
+            "nothing past the lookup should have run: {output}"
+        );
+        assert!(
+            !storage_dir.join(".portal-daemon.lock").exists(),
+            "no daemon should have started"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The background lookup means a registration made anywhere — this node's
+    /// `/admin`, or somebody else's — brings the node back without a human
+    /// touching the container.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unregistered_node_restarts_once_the_portal_knows_the_key() {
+        let _guard = TempAppDirGuard::new("late_registration");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("late_registration");
+        let bls_key_path = setup_unregistered_fixtures(&storage_dir).await;
+
+        // First mounted mock wins: onboarding gets the 404, the watcher then
+        // sees the node appear.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such node"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "NODE-late",
+                "signer_id": null,
+                "bls_public_key": "00"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let cli = unregistered_cli(mock_server.uri(), storage_dir.clone(), bls_key_path);
+        // Long enough that the watcher, not the signal, is what stops the node.
+        let shutdown = async {
+            sleep(Duration::from_secs(30)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(
+            outcome,
+            Outcome::Restart,
+            "the supervisor has to start a process that can onboard"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Without a password the operator cannot unlock the one page that would
+    /// fix this, so the node has to say so rather than sit there silently.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unregistered_node_without_an_admin_password_says_so() {
+        let _guard = TempAppDirGuard::new("unregistered_nopass");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("unregistered_nopass");
+        let bls_key_path = setup_unregistered_fixtures(&storage_dir).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such node"))
+            .mount(&mock_server)
+            .await;
+
+        let mut cli = unregistered_cli(mock_server.uri(), storage_dir.clone(), bls_key_path);
+        cli.admin_password = None;
+        let shutdown = async {
+            sleep(Duration::from_millis(150)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        cleanup_onboarding_env();
+
+        assert!(output.contains("ADMIN_PASSWORD is unset"), "{output}");
 
         std::fs::remove_dir_all(&storage_dir).ok();
     }
@@ -781,6 +1158,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -918,6 +1297,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -967,7 +1348,8 @@ mod tests {
                 storage_backend,
                 storage_dir: storage_dir.clone(),
                 download_addr: "127.0.0.1:1".parse().unwrap(),
-                node_id: "NODE-TEST".to_string(),
+                node_id: Some("NODE-TEST".to_string()),
+                admin: AdminState::disabled(),
             },
             shutdown,
         )
@@ -980,6 +1362,158 @@ mod tests {
         );
 
         std::fs::remove_file(&lock_path).ok();
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Builds a daemon that binds an ephemeral port and talks to nothing. The
+    /// Portal calls its daemon task makes all fail, which is fine: they are
+    /// logged inside the task, and what these tests watch is the run loop.
+    async fn idle_daemon(label: &str, admin: AdminState) -> (DaemonConfig, PathBuf) {
+        let storage_dir = unique_storage_dir(label);
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let db = DBClient::new("sqlite::memory:").await.unwrap();
+
+        let config = DaemonConfig {
+            client: PortalClient::new("http://localhost:0", storage_dir.clone()),
+            conn: db.connection().clone(),
+            interval: Duration::from_millis(10),
+            lock_path: storage_dir.join(".portal-daemon.lock"),
+            storage_limits: StorageLimits {
+                capacity: None,
+                max_files: Some(0),
+                max_file_size: None,
+            },
+            storage_backend: StorageBackend::local(),
+            storage_dir: storage_dir.clone(),
+            download_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin,
+        };
+        (config, storage_dir)
+    }
+
+    /// The operator UI asks for a restart by flipping a switch the run loop is
+    /// waiting on. Reporting it is what lets `main` pick an exit code the
+    /// supervisor acts on, so a plain `Shutdown` here would leave the node down.
+    #[tokio::test]
+    async fn run_daemon_command_reports_a_restart_the_admin_ui_asked_for() {
+        let restart = RestartHandle::available();
+        let (config, storage_dir) =
+            idle_daemon("admin_restart", AdminState::with_restart(restart.clone())).await;
+
+        let task = tokio::spawn(run_daemon_command(
+            config,
+            future::pending::<io::Result<()>>(),
+        ));
+        restart.request();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the run loop must stop once a restart is requested")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Restart);
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Binds and releases a port so the server can claim it next. A racy way to
+    /// learn a free port, and the usual one: the alternative is plumbing the
+    /// bound address back out of `serve`.
+    fn free_local_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// The whole design rests on the operator getting their report back: the
+    /// restart is requested from inside the handler, and the graceful shutdown
+    /// has to flush that response before the process goes anywhere. Proven over
+    /// a real socket rather than argued about.
+    #[tokio::test]
+    async fn a_restart_is_answered_before_the_node_goes_down() {
+        const PASSWORD: &str = "correct horse battery staple";
+        crate::server::admin::session::reset_throttle_for_tests(Some(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ));
+
+        let addr = free_local_addr();
+        let restart = RestartHandle::available();
+        let (mut config, storage_dir) = idle_daemon(
+            "restart_over_http",
+            AdminState::new(AdminPassword::new(Some(PASSWORD)), restart.clone(), None),
+        )
+        .await;
+        config.download_addr = addr;
+
+        let run_loop = tokio::spawn(run_daemon_command(
+            config,
+            future::pending::<io::Result<()>>(),
+        ));
+
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // The listener comes up asynchronously, so the first connections are
+        // refused until it does.
+        let token = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(response) = http
+                    .post(format!("{base}/api/admin/login"))
+                    .json(&json!({ "password": PASSWORD }))
+                    .send()
+                    .await
+                {
+                    let body: serde_json::Value = response.json().await.unwrap();
+                    break body["token"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the admin API must come up");
+
+        let body: serde_json::Value = http
+            .post(format!("{base}/api/admin/reset-database"))
+            .bearer_auth(&token)
+            .json(&json!({ "confirm": "RESET", "restart": true }))
+            .send()
+            .await
+            .expect("the reset must be answered even though it ends the process")
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(body["restarting"], true);
+        assert_eq!(body["total_rows_deleted"], 0);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_loop)
+            .await
+            .expect("the run loop must stop once the response is out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Outcome::Restart);
+        assert!(restart.is_requested());
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The signal path keeps its meaning: exiting on SIGTERM must not read as
+    /// "start me again".
+    #[tokio::test]
+    async fn run_daemon_command_reports_a_plain_shutdown_as_shutdown() {
+        let (config, storage_dir) = idle_daemon("plain_shutdown", AdminState::disabled()).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_daemon_command(config, future::ready(Ok(()))),
+        )
+        .await
+        .expect("a resolved shutdown signal must stop the run loop")
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Shutdown);
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 

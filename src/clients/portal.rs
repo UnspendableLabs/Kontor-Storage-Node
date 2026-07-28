@@ -1,5 +1,6 @@
 use super::http_helpers::{build_http_client, check_response_status};
 use super::http_signature;
+use super::kontor_op::{build_signing_message, Inst, InstKind, SignerRef, DEFAULT_GAS_LIMIT};
 use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -10,59 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 
-/// Prefix for Kontor operation signing messages.
-const KONTOR_OP_PREFIX: &[u8] = b"KONTOR-OP-V1";
-
 /// Filestorage contract address in Kontor (native contract at genesis).
-const FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
-
-/// Default gas limit for filestorage contract calls.
-const DEFAULT_GAS_LIMIT: u64 = 100_000;
-
-/// Mirror of Kontor's `SignerClaim` enum.
 ///
-/// Variant ordering MUST match Kontor's `indexer-types` exactly so that postcard
-/// encodes the same variant indices.
-#[derive(Serialize)]
-enum SignerClaim {
-    Id(u64),
-    #[allow(dead_code)]
-    PubKey(Vec<u8>), // present only to maintain correct variant indices
-}
-
-/// Mirror of Kontor's `InstKind` enum.
-///
-/// Variant ordering MUST match Kontor's `indexer-types` exactly.
-/// `ContractAddress` is serialized via `DisplayFromStr` in Kontor, so `String` here
-/// produces an identical postcard encoding.
-#[derive(Serialize)]
-enum InstKind {
-    #[allow(dead_code)]
-    Publish {
-        name: String,
-        bytes: Vec<u8>,
-    }, // index 0 — present for correct ordering
-    Call {
-        contract: String,
-        expr: String,
-    }, // index 1
-    #[allow(dead_code)]
-    Issuance, // index 2
-    #[allow(dead_code)]
-    RegisterBlsKey {
-        // index 3
-        bls_pubkey: Vec<u8>,
-        schnorr_sig: Vec<u8>,
-        bls_sig: Vec<u8>,
-    },
-}
-
-/// Mirror of Kontor's `Inst` struct.
-#[derive(Serialize)]
-struct Inst {
-    gas_limit: u64,
-    kind: InstKind,
-}
+/// Mirrors the Portal's `DEFAULT_KONTOR_CONTRACT_ADDRESS`. The address is part
+/// of the signed `Inst`, so a deployment that points the Portal at a different
+/// filestorage instance must point the node at the same one — see
+/// [`PortalClient::with_contract_address`].
+pub const DEFAULT_FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
 
 /// Encode `s` as a Wave string literal, validating it contains only safe
 /// characters.
@@ -89,21 +44,39 @@ fn wave_string_literal(s: &str) -> Result<String> {
 
 /// Build a WASM Wave expression for the `join-agreement` filestorage function.
 ///
-/// Both `agreement_id` and `node_id` MUST consist of only `[A-Za-z0-9_-]`;
-/// otherwise an error is returned to avoid Wave expression injection.
-fn join_agreement_expr(agreement_id: &str, node_id: &str) -> Result<String> {
+/// The joining node is NOT a parameter: the contract takes it from
+/// `ctx.signer()` (one membership slot per signer per agreement), so the only
+/// argument is the agreement id. Must stay byte-identical to the Portal's
+/// `build_join_agreement_expr`, which reconstructs this expression to verify
+/// the BLS signature.
+///
+/// `agreement_id` MUST consist of only `[A-Za-z0-9_-]`; otherwise an error is
+/// returned to avoid Wave expression injection.
+fn join_agreement_expr(agreement_id: &str) -> Result<String> {
     let agreement_lit = wave_string_literal(agreement_id)?;
-    let node_lit = wave_string_literal(node_id)?;
-    Ok(format!("join-agreement({agreement_lit}, {node_lit})"))
+    Ok(format!("join-agreement({agreement_lit})"))
 }
 
 /// Build a WASM Wave expression for the `verify-proof` filestorage function.
 ///
-/// Each byte serializes as its decimal representation, so the input bytes
-/// cannot affect the structure of the expression.
-fn verify_proof_expr(proof_bytes: &[u8]) -> String {
+/// `challenge_ids` are the challenges the submitter claims this proof answers.
+/// kontor-crypto 0.3.0's constant-size proof no longer carries them, so the
+/// contract rebuilds the challenge set from these ids; the SNARK binds the set,
+/// so a wrong or missing id fails verification instead of granting undeserved
+/// credit.
+///
+/// Each proof byte serializes as its decimal representation, so the input bytes
+/// cannot affect the structure of the expression. Challenge ids are validated as
+/// `[A-Za-z0-9_-]` identifiers for the same reason. Must stay byte-identical to
+/// the Portal's `build_verify_proof_expr`.
+fn verify_proof_expr(proof_bytes: &[u8], challenge_ids: &[&str]) -> Result<String> {
     let items: Vec<String> = proof_bytes.iter().map(|b| b.to_string()).collect();
-    format!("verify-proof([{}])", items.join(", "))
+    let ids = challenge_ids
+        .iter()
+        .map(|id| wave_string_literal(id))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(format!("verify-proof([{}], [{}])", items.join(", "), ids))
 }
 
 /// Authentication credentials for Portal API requests.
@@ -135,6 +108,8 @@ pub struct PortalClient {
     http: Client,
     /// Optional authentication for signed requests.
     auth: Option<PortalAuth>,
+    /// Filestorage contract every signed Kontor op targets.
+    contract_address: String,
 }
 
 impl std::fmt::Debug for PortalClient {
@@ -143,6 +118,7 @@ impl std::fmt::Debug for PortalClient {
             .field("base_url", &self.base_url)
             .field("storage_dir", &self.storage_dir)
             .field("auth", &self.auth)
+            .field("contract_address", &self.contract_address)
             .finish()
     }
 }
@@ -168,7 +144,20 @@ impl PortalClient {
             storage_dir: storage_dir.into(),
             http,
             auth: None,
+            contract_address: DEFAULT_FILESTORAGE_CONTRACT.to_string(),
         })
+    }
+
+    /// Point this client at a specific filestorage contract instance.
+    ///
+    /// Defaults to [`DEFAULT_FILESTORAGE_CONTRACT`]. The address is serialized
+    /// into every `InstKind::Call` this client signs, and the Portal rebuilds
+    /// the same `Inst` from its own `KONTOR_CONTRACT_ADDRESS` to verify the
+    /// signature — the two must name the same contract.
+    #[must_use]
+    pub fn with_contract_address(mut self, contract_address: impl Into<String>) -> Self {
+        self.contract_address = contract_address.into();
+        self
     }
 
     /// Create an authenticated client with BLS keypair for signed requests.
@@ -222,6 +211,7 @@ impl PortalClient {
                 token: token.into(),
                 next_nonce: Arc::new(AtomicU64::new(initial_nonce)),
             }),
+            contract_address: DEFAULT_FILESTORAGE_CONTRACT.to_string(),
         })
     }
 
@@ -230,8 +220,11 @@ impl PortalClient {
         self.auth.as_ref().map(|a| a.node_id.as_str())
     }
 
-    /// Get the signer ID if authenticated.
-    #[allow(dead_code)]
+    /// Get the Kontor signer ID if authenticated.
+    ///
+    /// This is the node's on-chain identity: the filestorage contract keys
+    /// agreement membership and `challenge-data.prover-id` on it, and its
+    /// decimal string is what a PoR challenge hashes as `prover_id`.
     pub fn signer_id(&self) -> Option<u64> {
         self.auth.as_ref().map(|a| a.signer_id)
     }
@@ -413,6 +406,29 @@ impl PortalClient {
             .context("failed to deserialize node lookup result")
     }
 
+    /// Register this node's BLS key with the Portal.
+    ///
+    /// Unauthenticated by design: the node has no credential to present until
+    /// this call succeeds. The Portal authenticates the request from the
+    /// signatures in the body instead, and gates it on the operator's Taproot
+    /// address being whitelisted — a `403 ADDRESS_NOT_WHITELISTED` means a
+    /// Portal admin has to act, so the error body is worth surfacing verbatim.
+    ///
+    /// Writing the row is all this does. Getting the key on-chain is the
+    /// Portal daemon's job, and `signer_id` stays `null` in
+    /// [`Self::lookup_node`] until that transaction confirms.
+    pub async fn register_node(
+        &self,
+        request: &RegisterNodeRequest,
+    ) -> Result<RegisterNodeResponse> {
+        let url = format!("{}/api/nodes/register", self.base_url);
+        let resp = self.http.post(&url).json(request).send().await?;
+        let resp = check_response_status(resp, "register node").await?;
+        resp.json::<RegisterNodeResponse>()
+            .await
+            .context("failed to deserialize node registration response")
+    }
+
     /// Request a login challenge for the given user/node ID.
     pub async fn login_challenge(&self, user_id: &str) -> Result<LoginChallenge> {
         let url = format!("{}/api/users/login", self.base_url);
@@ -542,21 +558,19 @@ impl PortalClient {
 
         let nonce = auth.next_nonce.fetch_add(1, Ordering::Relaxed);
 
-        let claim = SignerClaim::Id(auth.signer_id);
+        let claim = SignerRef::SignerId(auth.signer_id);
         let inst = Inst {
             gas_limit: DEFAULT_GAS_LIMIT,
             kind: InstKind::Call {
-                contract: FILESTORAGE_CONTRACT.to_string(),
+                contract: self.contract_address.clone(),
                 expr,
             },
         };
 
-        // `sponsored = false`: node self-pays gas (nodes never use sponsored ops).
-        let op_bytes = postcard::to_allocvec(&(&claim, nonce, false, &inst))
-            .context("failed to serialize signing payload")?;
-        let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
-        msg.extend_from_slice(KONTOR_OP_PREFIX);
-        msg.extend_from_slice(&op_bytes);
+        // `sponsored = false`: a node self-pays gas for its own calls. Only
+        // `RegisterBlsKey`, which the Portal publishes on the node's behalf
+        // before it has an account to pay from, is sponsored.
+        let msg = build_signing_message(&claim, nonce, false, &inst)?;
 
         let sig = auth.keypair.sign_kontor_op_message(&msg)?;
         Ok((sig, nonce))
@@ -567,12 +581,11 @@ impl PortalClient {
     /// Signs a `join-agreement` Kontor operation with BLS and submits it.
     /// Requires authentication via JWT Bearer token.
     pub async fn join_agreement(&self, agreement_id: &str) -> Result<JoinAgreementResponse> {
-        let node_id = self
-            .node_id()
-            .ok_or_else(|| anyhow!("authentication required to join agreement"))?
-            .to_string();
+        if self.node_id().is_none() {
+            return Err(anyhow!("authentication required to join agreement"));
+        }
 
-        let expr = join_agreement_expr(agreement_id, &node_id)?;
+        let expr = join_agreement_expr(agreement_id)?;
         let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
         let url = self.api_path(&format!("/api/agreements/{agreement_id}/join"));
@@ -731,6 +744,12 @@ impl PortalClient {
     /// The proof_hex is decoded to bytes for the Wave expression, then
     /// re-encoded as hex in the request body.
     ///
+    /// `challenge_id` is both the route parameter and part of the signed
+    /// expression: the contract needs the submitter to declare which challenges
+    /// the proof answers (see [`verify_proof_expr`]), and the Portal rebuilds
+    /// the same `verify-proof(bytes, [id])` to check the signature. One
+    /// challenge per submission — the Portal's route is per-challenge.
+    ///
     /// Requires authentication.
     pub async fn submit_proof(
         &self,
@@ -738,7 +757,7 @@ impl PortalClient {
         proof_hex: &str,
     ) -> Result<SubmitProofResponse> {
         let proof_bytes = hex::decode(proof_hex).context("invalid hex in proof for BLS signing")?;
-        let expr = verify_proof_expr(&proof_bytes);
+        let expr = verify_proof_expr(&proof_bytes, &[challenge_id])?;
         let (bls_signature, nonce) = self.sign_kontor_op(expr)?;
 
         let url = self.api_path(&format!("/api/challenges/{challenge_id}"));
@@ -872,8 +891,24 @@ pub struct Agreement {
     pub padded_len: Option<u64>,
     #[allow(dead_code)]
     pub blob_size: Option<u64>,
-    #[allow(dead_code)]
+    /// Content-addressed `obj_<sha256>` id of the file, i.e. the
+    /// `object-id` field of the on-chain file descriptor. Carried through
+    /// verbatim rather than recomputed so the node's `FileMetadata` is the
+    /// descriptor the contract published.
     pub file_hash: Option<String>,
+    /// Stable, append-only ledger slot the filestorage contract assigned this
+    /// file (`agreement-data.ledger-index`).
+    ///
+    /// A public input of the PoR SNARK since kontor-crypto 0.3.0: the prover
+    /// resolves it from its local `FileLedger` and the contract from its own
+    /// registry, so the file must occupy exactly this slot locally or the proof
+    /// will not verify. `None` until the Portal has reconciled the creating
+    /// transaction against Kontor.
+    ///
+    /// Being an `Option`, serde also leaves it `None` when a Portal predating
+    /// the field omits it entirely: such agreements are still downloaded and
+    /// served, only proof computation refuses to proceed without a slot.
+    pub ledger_index: Option<u64>,
     #[allow(dead_code)]
     pub txid: Option<String>,
     #[allow(dead_code)]
@@ -934,6 +969,28 @@ pub struct NodeLookupResult {
     pub bls_public_key: String,
 }
 
+/// Body of `POST /api/nodes/register`.
+///
+/// Built by [`crate::node::registration::build_registration_request`]; every
+/// field is hex except `xpubkey`, which is base58.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterNodeRequest {
+    pub xpubkey: String,
+    pub bls_pubkey: String,
+    pub schnorr_sig: String,
+    pub bls_sig: String,
+    pub registration_signature: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterNodeResponse {
+    pub node_id: String,
+    #[allow(dead_code)]
+    pub x_only_pubkey: String,
+    #[allow(dead_code)]
+    pub bls_public_key: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoginChallenge {
@@ -988,7 +1045,10 @@ pub struct FaucetResponse {
 #[cfg(test)]
 mod tests {
     #![allow(deprecated)]
-    use super::{join_agreement_expr, wave_string_literal, PortalClient};
+    use super::{
+        join_agreement_expr, verify_proof_expr, wave_string_literal, PortalClient,
+        DEFAULT_FILESTORAGE_CONTRACT,
+    };
     use crate::crypto::BlsKeyPair;
     use bytes::Bytes;
     use serde_json::json;
@@ -1052,26 +1112,44 @@ mod tests {
         }
     }
 
+    /// The joining node is taken from `ctx.signer()` by the contract, so the
+    /// expression carries the agreement id alone. Must match the Portal's
+    /// `build_join_agreement_expr` byte for byte, since the Portal rebuilds it
+    /// to verify this node's BLS signature.
     #[test]
-    fn join_agreement_expr_accepts_valid_ids() {
-        let expr = join_agreement_expr("AGREEMENT-test123", "NODE-test").unwrap();
-        assert_eq!(expr, "join-agreement(\"AGREEMENT-test123\", \"NODE-test\")");
+    fn join_agreement_expr_carries_only_the_agreement_id() {
+        let expr = join_agreement_expr("AGREEMENT-test123").unwrap();
+        assert_eq!(expr, "join-agreement(\"AGREEMENT-test123\")");
     }
 
     #[test]
     fn join_agreement_expr_rejects_injection() {
         // Attempt to break out of the string literal and append extra calls.
         let injection = "AGREEMENT-1\", \"evil\"); drop-table(\"";
-        let err = join_agreement_expr(injection, "NODE-test").unwrap_err();
+        let err = join_agreement_expr(injection).unwrap_err();
         assert!(err.to_string().contains("invalid character"));
 
-        // Same check for the node_id position.
-        let err2 = join_agreement_expr("AGREEMENT-1", "NODE\"-evil").unwrap_err();
-        assert!(err2.to_string().contains("invalid character"));
-
         // Backslash-based injection.
-        let err3 = join_agreement_expr("AGREEMENT-1", "NODE\\evil").unwrap_err();
+        let err3 = join_agreement_expr("AGREEMENT-1\\evil").unwrap_err();
         assert!(err3.to_string().contains("invalid character"));
+    }
+
+    /// Mirrors the Portal's `verify_proof_expr_format` /
+    /// `verify_proof_expr_renders_multiple_challenge_ids` tests: the two sides
+    /// must render the same string or the signature check fails.
+    #[test]
+    fn verify_proof_expr_declares_the_challenge_ids() {
+        let expr = verify_proof_expr(&[1, 2, 3], &["chal_1"]).unwrap();
+        assert_eq!(expr, "verify-proof([1, 2, 3], [\"chal_1\"])");
+
+        let expr = verify_proof_expr(&[7], &["chal_1", "chal_2"]).unwrap();
+        assert_eq!(expr, "verify-proof([7], [\"chal_1\", \"chal_2\"])");
+    }
+
+    #[test]
+    fn verify_proof_expr_rejects_injection_in_challenge_ids() {
+        let err = verify_proof_expr(&[1], &["chal\", \"evil"]).unwrap_err();
+        assert!(err.to_string().contains("invalid character"));
     }
 
     fn storage_dir(name: &str) -> PathBuf {
@@ -1090,6 +1168,44 @@ mod tests {
         let client = PortalClient::new("https://example.com/api", "/tmp/storage");
         assert_eq!(client.base_url, "https://example.com/api");
         assert!(client.auth.is_none());
+        assert_eq!(client.contract_address, DEFAULT_FILESTORAGE_CONTRACT);
+    }
+
+    /// The contract address goes into the signed `Inst`, and the Portal
+    /// rebuilds that `Inst` from its own `KONTOR_CONTRACT_ADDRESS` to check the
+    /// signature. Signing the same expression against two different contracts
+    /// must therefore produce two different signatures — otherwise the override
+    /// would be silently ignored and a mis-targeted node would look fine until
+    /// the Portal rejected every op.
+    #[test]
+    fn contract_address_is_bound_into_the_signature() {
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let build = |contract: &str| {
+            PortalClient::with_auth(
+                "https://example.com/api",
+                "/tmp/storage",
+                Arc::clone(&keypair),
+                "NODE-test",
+                42,
+                "test-jwt-token",
+                7,
+            )
+            .with_contract_address(contract)
+        };
+
+        let default_client = build(DEFAULT_FILESTORAGE_CONTRACT);
+        let other_client = build("filestorage_1_0");
+        assert_eq!(other_client.contract_address, "filestorage_1_0");
+
+        let expr = join_agreement_expr("AGREEMENT-test").unwrap();
+        let (default_sig, default_nonce) = default_client.sign_kontor_op(expr.clone()).unwrap();
+        let (other_sig, other_nonce) = other_client.sign_kontor_op(expr).unwrap();
+
+        assert_eq!(default_nonce, other_nonce, "both clients start at nonce 7");
+        assert_ne!(
+            default_sig, other_sig,
+            "a different contract address must change the signed message"
+        );
     }
 
     #[test]

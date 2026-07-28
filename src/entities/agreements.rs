@@ -15,6 +15,19 @@ pub struct Model {
     pub nodes: Json,
     pub root: Option<String>,
     pub padded_len: Option<i64>,
+    /// `object-id` of the on-chain file descriptor (`obj_<sha256>` of the
+    /// contents). Required to be non-empty by `FileMetadata::validate`, and
+    /// mirrored from the Portal rather than recomputed so the node's descriptor
+    /// is the one the contract published.
+    pub object_id: Option<String>,
+    /// Stable, append-only slot the filestorage contract assigned this file in
+    /// the aggregated ledger.
+    ///
+    /// A public input of the PoR SNARK since kontor-crypto 0.3.0: the local
+    /// `FileLedger` must place the file at exactly this index or generated
+    /// proofs will not verify. `None` until the Portal has reconciled the
+    /// creating transaction against Kontor.
+    pub ledger_index: Option<i64>,
     pub downloaded: bool,
     pub transaction_id: Option<String>,
     pub curation: Json,

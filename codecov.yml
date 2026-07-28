@@ -1,0 +1,18 @@
+# Coverage gates.
+#
+# Without this file Codecov's default target is `auto`: a patch has to match
+# the project's own coverage (~99%), so a single defensive branch that cannot
+# be exercised — a poisoned mutex, an unreachable `map_err` — turns the check
+# red. 95% is the line: high enough that untested code still gets caught, low
+# enough that it does not report on branches no test can reach.
+coverage:
+  status:
+    project:
+      default:
+        target: 95%
+        # Absorbs the rounding noise of a small diff without letting the
+        # project drift down release after release.
+        threshold: 1%
+    patch:
+      default:
+        target: 95%

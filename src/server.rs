@@ -2,6 +2,7 @@
 //!
 //! Provides a REST API for downloading stored files and listing available files.
 
+pub mod admin;
 pub mod handlers;
 pub mod routes;
 pub mod state;
@@ -28,10 +29,16 @@ pub async fn serve(
         info!("Download server listening on {}", addr);
     }
 
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("download server failed")
+    // `into_make_service_with_connect_info` is what gives the admin login
+    // throttle a peer address to key on; without it every client would share
+    // one bucket.
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("download server failed")
 }
 
 #[cfg(test)]
@@ -41,6 +48,7 @@ mod tests {
     use crate::app::tasks::downloadagreements::StorageBackend;
     use crate::clients::gcs::GcsClient;
     use crate::entities::agreements;
+    use crate::server::admin::AdminState;
     use crate::server::handlers::{DownloadError, FilesResponse, ListFilesError};
     use crate::testutils::{unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY};
     use axum::body::Body;
@@ -99,6 +107,8 @@ mod tests {
             nodes: serde_json::json!([]),
             root: None,
             padded_len: Some(size),
+            object_id: None,
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: serde_json::json!({}),
@@ -148,7 +158,8 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -187,7 +198,8 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -218,7 +230,8 @@ mod tests {
             db: db.clone(),
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -249,7 +262,8 @@ mod tests {
             db,
             storage_dir: PathBuf::new(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         });
         let response = next
             .oneshot(
@@ -281,7 +295,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -308,7 +323,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -325,6 +341,78 @@ mod tests {
             .expect("serve should succeed");
     }
 
+    /// The admin routes over a real socket rather than `oneshot`, which is the
+    /// only way to exercise `into_make_service_with_connect_info` — the wiring
+    /// the login throttle keys its per-client buckets on.
+    #[tokio::test]
+    async fn serve_exposes_the_admin_ui_over_a_real_socket() {
+        use crate::app::config::AdminPassword;
+
+        const PASSWORD: &str = "correct horse battery";
+
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server-admin");
+        let (tx, rx) = oneshot::channel();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            node_id: Some("NODE-socket".to_string()),
+            admin: AdminState::with_password(AdminPassword::new(Some(PASSWORD))),
+        };
+
+        // Bind first so the test knows the port before the server owns it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = tokio::spawn(serve(addr, state, async move {
+            let _ = rx.await;
+        }));
+
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // The server may not have finished binding yet.
+        let page = loop {
+            match client.get(format!("{base}/admin")).send().await {
+                Ok(response) => break response,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!(page.status(), 200);
+        assert!(page.text().await.unwrap().contains("Kontor Storage Node"));
+
+        let login: serde_json::Value = client
+            .post(format!("{base}/api/admin/login"))
+            .json(&serde_json::json!({ "password": PASSWORD }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = login["token"].as_str().expect("token in response");
+
+        let status = client
+            .get(format!("{base}/api/admin/status"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), 200);
+        let payload: serde_json::Value = status.json().await.unwrap();
+        assert_eq!(payload["node_id"], "NODE-socket");
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server should stop")
+            .expect("server task should complete")
+            .expect("serve should succeed");
+    }
+
     #[tokio::test]
     async fn serve_local_returns_not_found_when_file_missing() {
         let db = setup_db().await;
@@ -337,7 +425,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let response = router(state)
@@ -366,7 +455,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         })
         .oneshot(
             Request::builder()
@@ -390,7 +480,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let response = router(state)
@@ -428,7 +519,8 @@ mod tests {
                 method: StorageMethod::Gcs,
                 gcs_client: None,
             },
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         })
         .oneshot(
             Request::builder()
@@ -452,7 +544,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key("not-a-key").await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         })
         .oneshot(
             Request::builder()
@@ -527,7 +620,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-info-test".to_string(),
+            node_id: Some("NODE-info-test".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -557,7 +651,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-dash".to_string(),
+            node_id: Some("NODE-dash".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let app = router(state);
@@ -604,7 +699,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let response = router(state)
@@ -658,7 +754,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let response = router(state)
@@ -702,7 +799,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         })
         .oneshot(
             Request::builder()
@@ -744,7 +842,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         })
         .oneshot(
             Request::builder()
@@ -793,7 +892,8 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
+            admin: AdminState::disabled(),
         };
 
         let response = router(state)

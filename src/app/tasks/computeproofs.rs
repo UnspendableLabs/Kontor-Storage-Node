@@ -7,12 +7,11 @@
 //! 4. Submit proofs to the Portal and update challenge status
 
 use crate::app::config::StorageMethod;
-use crate::app::tasks::downloadagreements::StorageBackend;
-use crate::app::tasks::{STATUS_ACTIVE, STATUS_PROVED};
+use crate::app::tasks::downloadagreements::{StorageBackend, PORTAL_FILE_NONCE};
+use crate::app::tasks::{field_from_hex, STATUS_ACTIVE, STATUS_PROVED};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, challenges, prelude::Agreements, prelude::Challenges};
 use anyhow::{anyhow, Context, Result};
-use ff::PrimeField;
 use kontor_crypto::{api, Challenge as CryptoChallenge, FileLedger, FileMetadata, PorSystem};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::path::Path;
@@ -49,9 +48,11 @@ impl ProofGenerator for RealProofGenerator {
         _file_metadata: FileMetadata,
         crypto_challenge: CryptoChallenge,
     ) -> Result<Vec<u8>> {
-        // Prepare the file for proving
-        let (prepared, _metadata) =
-            api::prepare_file(file_bytes, filename).context("preparing file for proof")?;
+        // Prepare the file for proving. The nonce must be the one the Portal
+        // published in the on-chain descriptor, otherwise the derived `file_id`
+        // differs from the one the challenge is bound to.
+        let (prepared, _metadata) = api::prepare_file(file_bytes, filename, PORTAL_FILE_NONCE)
+            .context("preparing file for proof")?;
 
         // Create POR system and generate proof
         let system = PorSystem::new(ledger);
@@ -59,8 +60,13 @@ impl ProofGenerator for RealProofGenerator {
             .prove(vec![&prepared], &[crypto_challenge])
             .map_err(|err| anyhow!("proof generation failed: {err}"))?;
 
-        // Serialize proof to bytes
-        postcard::to_allocvec(&proof).context("serializing proof")
+        // Serialize with kontor-crypto's own versioned wire format (`NPOR` magic
+        // + format version + pinned bincode). This is exactly what the
+        // filestorage contract feeds to `proof::from-bytes`, so any other
+        // encoding is rejected before verification even starts.
+        proof
+            .to_bytes()
+            .map_err(|err| anyhow!("serializing proof: {err}"))
     }
 }
 
@@ -195,6 +201,18 @@ async fn process_single_challenge<G: ProofGenerator>(
         ));
     }
 
+    // Without a contract-assigned slot the file was left out of the rebuilt
+    // ledger, so `prove` would fail deep inside kontor-crypto on a lookup miss.
+    // Say why here instead: the Portal has not reconciled the creating
+    // transaction yet, and the next sync cycle may well fix it.
+    if agreement.ledger_index.is_none() {
+        return Err(anyhow!(
+            "agreement {} has no ledger_index yet: the Portal has not reconciled its \
+             creating transaction against Kontor, so no verifiable proof can be built",
+            agreement.agreement_id
+        ));
+    }
+
     // Load file bytes
     let file_bytes = load_file_bytes(storage_backend, storage_dir, &agreement.file_id).await?;
 
@@ -218,12 +236,23 @@ async fn process_single_challenge<G: ProofGenerator>(
         )
     })?;
 
+    // The prover identity bound into the challenge hash is the Kontor
+    // `signer_id` rendered as a decimal string — the contract stores
+    // `challenge-data.prover-id` as a `u64` and the host derives the crypto
+    // `Challenge.prover_id` from it via `prover_challenge_key`. The Portal's
+    // `challenges.prover_id` is a Portal-side node name and must NOT be used
+    // here: it would produce a different `Challenge::id()`, hence a different
+    // SNARK statement than the one the contract verifies.
+    let signer_id = portal_client
+        .signer_id()
+        .ok_or_else(|| anyhow!("authentication required to compute proofs: no signer_id"))?;
+
     let crypto_challenge = CryptoChallenge::new(
         file_metadata.clone(),
         block_height,
         challenge_count,
         seed_field,
-        challenge.prover_id.clone(),
+        prover_challenge_key(signer_id),
     );
 
     // Generate proof using the provided generator
@@ -305,24 +334,45 @@ async fn load_file_bytes(
     }
 }
 
-/// Convert a hex-encoded seed to a FieldElement.
+/// Render a Kontor `signer_id` the way the filestorage host binds it into a
+/// challenge hash: as its decimal string.
 ///
-/// The seed must be exactly 32 bytes (64 hex characters). Seeds of other lengths
-/// are rejected to prevent cryptographic mismatches.
+/// Mirrors `prover_challenge_key` in Kontor's `core/indexer/src/runtime/wit`.
+/// The value feeds `Challenge::id()`, which the SNARK's initial state commits
+/// to, so it must match the host byte for byte.
+fn prover_challenge_key(signer_id: u64) -> String {
+    signer_id.to_string()
+}
+
+/// Convert a hex-encoded challenge seed to a FieldElement.
+///
+/// The filestorage contract derives the seed with HKDF-SHA256 and stores the
+/// full 64-byte output (`derive_challenge_seed_for_file`), which the host maps
+/// into the field with `field_from_uniform_bytes` — an unbiased wide reduction,
+/// not a canonical 32-byte decoding. Reproducing that exactly is what makes the
+/// node's `Challenge.seed` equal the contract's; anything else yields a
+/// different challenge and a proof that cannot verify.
 fn seed_to_field_element(seed_hex: &str) -> Result<kontor_crypto::FieldElement> {
     let seed_bytes = hex::decode(seed_hex).context("decoding seed hex")?;
 
-    // Require exactly 32 bytes for field conversion
-    let seed_array: [u8; 32] = seed_bytes
+    let seed_array: [u8; 64] = seed_bytes
         .try_into()
-        .map_err(|v: Vec<u8>| anyhow!("seed must be exactly 32 bytes, got {} bytes", v.len()))?;
+        .map_err(|v: Vec<u8>| anyhow!("seed must be exactly 64 bytes, got {} bytes", v.len()))?;
 
-    kontor_crypto::FieldElement::from_repr(seed_array.into())
-        .into_option()
-        .ok_or_else(|| anyhow!("seed bytes do not represent a valid field element"))
+    Ok(kontor_crypto::field_from_uniform_bytes(&seed_array))
 }
 
 /// Build FileMetadata from an agreement model.
+///
+/// Every field has to reproduce the on-chain `raw-file-descriptor` exactly: the
+/// contract builds its own `FileMetadata` from `agreement-data`, and
+/// `Challenge::id()` hashes `file_id`, `nonce`, `padded_len`, `original_size`
+/// and `root` on both sides. `nonce` is therefore mirrored from the Portal
+/// rather than invented — see
+/// [`crate::app::tasks::downloadagreements::PORTAL_FILE_NONCE`] for why it is
+/// empty. `object_id` does not enter the challenge hash but is still required
+/// (`FileMetadata::validate` rejects an empty one), so it too comes from the
+/// Portal.
 fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
     let root_hex = agreement
         .root
@@ -331,15 +381,13 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
     let padded_len = agreement
         .padded_len
         .ok_or_else(|| anyhow!("agreement missing padded_len"))?;
+    let object_id = agreement
+        .object_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("agreement missing object_id"))?
+        .clone();
 
-    let root_bytes = hex::decode(root_hex).context("decoding root hex")?;
-    let root_array: [u8; 32] = root_bytes
-        .try_into()
-        .map_err(|_| anyhow!("root hex is not 32 bytes"))?;
-
-    let root = kontor_crypto::FieldElement::from_repr(root_array.into())
-        .into_option()
-        .ok_or_else(|| anyhow!("invalid root field element"))?;
+    let root = field_from_hex(root_hex, "root")?;
 
     let original_size: usize = agreement
         .original_size
@@ -351,7 +399,9 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 
     Ok(FileMetadata {
         root,
+        object_id,
         file_id: agreement.file_id.clone(),
+        nonce: PORTAL_FILE_NONCE.to_vec(),
         padded_len,
         original_size,
         filename: agreement.filename.clone(),
@@ -362,17 +412,28 @@ fn build_file_metadata(agreement: &agreements::Model) -> Result<FileMetadata> {
 mod tests {
     #![allow(deprecated)]
     use super::*;
+    use crate::app::tasks::downloadagreements::rebuild_ledger;
     use crate::clients::GcsClient;
     use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Challenges;
-    use crate::testutils::{setup_in_memory_db, unique_storage_dir};
+    use crate::testutils::{setup_in_memory_db, unique_storage_dir, AgreementFixture};
     use chrono::DateTime;
+    use ff::PrimeField;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use serde_json::json;
     use std::fs as stdfs;
     use std::sync::Arc;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A challenge seed as the filestorage contract publishes it: the full
+    /// 64-byte HKDF-SHA256 output, hex-encoded (128 characters).
+    const TEST_SEED_HEX: &str = "0102030405060708091011121314151617181920212223242526272829303132\
+                                 3334353637383940414243444546474849505152535455565758596061626364";
+
+    /// `object-id` mirrored from the Portal for fixtures that need a complete
+    /// on-chain descriptor.
+    const TEST_OBJECT_ID: &str = "obj_test";
 
     const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnumunEUnoZIs5\nDhEXTNTyJPFxsZMxgRhLs7m6aiVu7GrDgoWFMoLy/B6Ccl2c9ml/RzuK5uKbJKM9\ntcwA90gpp536aLWB0BbQuWtfceU3BmQWFtQRXqCww/o462cujXhcMe5bVPvE9b/5\nyV+oWmKa42tw4x5//Cj8LGAw8aQwlC+OQ19iA+vmKx7xjs0uBFtQHnjGxekT71vp\nLgv53SVi5yUscz9Scy/VuBkNfOCaEz5zV+EUplYuvRMVEJ0Pvk1wOYjby4Gz+OVI\nrp1+1RFBEeTu2zo06E4o23pfz5DbZaBMZ8qK3WkNx6eQOuYK6Zrq+zM5/Uoq6fqQ\nAIuYpCNxAgMBAAECggEAB1pTx9IpNEfcFpc4RpY2q5rU/s/zDPOE1iS92p82nuM8\nVu/M3Kb3OKG20K8kzXG79DlyMcenXXfAtD7Y/53XiwPvGAApHNS7e1D1lQyQKNZd\n4t4DU/ObBcTBnmcrcc3/3cLOmTBjjSHc1Z1vVRkJQ5L+rcc3GhM61Ls5SEv/j6WN\nFw/fnYGtxUUXBz1gVvok0o89qTgW0Pt7SWrUkbAhrsGeTFpzNbicgRsBUXJJdRcl\nvK5rwKSPUhiIVhpQ78usSLdO30X3Bfvf/GQpR56/UgDqkn20ZMpJhKrAxSbmLSu9\nhgkIbLAlABxdYUbGFp5aTALAJ8EyZn8MU9RRuL9DcQKBgQDp263xaTlx8BgbKnq1\nwY+SxuDlGz/LoGYjF6v6FNHM1hQ5v2FpxaxF5EDUm3fdh+Z9yegL/g8GQdQQnelG\nA43VACvGAESw1ilsBDl6TZ+LZY4MTQrWSGUqQxt3APu3lHDAXkipHu2X3cv/3VrO\nDGs2WYWPiMxg1ZkIBojyZQ0SnQKBgQC3m910nvJIJ+WLXeXiG2qN147/5GU7Yma2\n0pEhQ4XVN/f7joGzUXLeB0BXNNbdKuRqEQ1r2VkH3qqY6HAL6/fK01qEhWBLv1hu\ndkEhEruK9WxzA/vLgmqFBsi04IFlnK70RCXckWZEHFjnnoutqAWpl7FTRiTeT8Bv\nHgmX2+lh5QKBgDAuADIiWaFts6m1IL7dd/TnYGITMRuEmkZUlCvbqjWnTVdwZGNk\nRE/J7Mlglltfqk70EAiYeQPy//vEbNDt3oSpmlsapww/sxz76dOWtm4DqDZEkR0A\noUcJuFjWLQXvYSNgyVt+cbi+C09VjWWyDUyPOQMPTfwNRY/vuLsnsn/JAoGBAKrW\n0Ri46DBxRukFJmfbIKr3/etlZTf7GB1WEYnE3RsGZ6vd7hqeV2X1k01RMfc5+Kwk\nT7ug0XE8IroB1HeTSM2lGJ0jyPTSBoNJbtJKLsxeDVl7RGcYYuqB5HBAUMXuIu/P\nFPeFJoWLZsGkyMx9AT/KkEkuhBGCXUhGx6BQE3htAoGAbEGbhHV8oU7NYKEmVyWM\nwfEQXGH2QQpHsj7xkTywOKEneaMkVUzA5GwF7CQEvk/2xXEgze+haaRGxFQJTO5m\nGK2ECeQhTwXvNi+3/MEMCdoPYuckF4hCVzsGwfkVBPf1zcOw0k0+EEsqbWwtXi2l\njIyC7b2m2fgAI0Ltt1btCfo=\n-----END PRIVATE KEY-----";
 
@@ -412,6 +473,8 @@ mod tests {
                 None
             }),
             padded_len: Set(if downloaded { Some(128) } else { None }),
+            object_id: Set(downloaded.then(|| TEST_OBJECT_ID.to_string())),
+            ledger_index: Set(downloaded.then_some(0)),
             downloaded: Set(downloaded),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -426,7 +489,7 @@ mod tests {
             agreement_id: Set(agreement_id.into()),
             block_height: Set(850000),
             challenge_count: Set(5),
-            seed: Set("0102030405060708091011121314151617181920212223242526272829303132".into()),
+            seed: Set(TEST_SEED_HEX.into()),
             prover_id: Set("NODE-test".into()),
             deadline_height: Set(850100),
             status: Set("active".into()),
@@ -503,32 +566,41 @@ mod tests {
 
     #[test]
     fn seed_to_field_element_rejects_short_seeds() {
-        let short_seed = "0102030405";
+        // The old 32-byte form is now too short: the contract publishes the
+        // full 64-byte HKDF output.
+        let short_seed = "0102030405060708091011121314151617181920212223242526272829303132";
         let result = seed_to_field_element(short_seed);
         assert!(result.is_err(), "should reject short seeds");
         assert!(
-            result.unwrap_err().to_string().contains("exactly 32 bytes"),
+            result.unwrap_err().to_string().contains("exactly 64 bytes"),
             "error message should mention expected size"
         );
     }
 
     #[test]
     fn seed_to_field_element_rejects_long_seeds() {
-        // 33 bytes = 66 hex chars
-        let long_seed = "010203040506070809101112131415161718192021222324252627282930313233";
-        let result = seed_to_field_element(long_seed);
+        let long_seed = format!("{TEST_SEED_HEX}ff");
+        let result = seed_to_field_element(&long_seed);
         assert!(result.is_err(), "should reject long seeds");
         assert!(
-            result.unwrap_err().to_string().contains("exactly 32 bytes"),
+            result.unwrap_err().to_string().contains("exactly 64 bytes"),
             "error message should mention expected size"
         );
     }
 
     #[test]
-    fn seed_to_field_element_handles_valid_32_byte_seeds() {
-        let full_seed = "0102030405060708091011121314151617181920212223242526272829303132";
-        let result = seed_to_field_element(full_seed);
-        assert!(result.is_ok(), "should handle exactly 32-byte seeds");
+    fn seed_to_field_element_handles_valid_64_byte_seeds() {
+        assert_eq!(TEST_SEED_HEX.len(), 128, "64 bytes is 128 hex characters");
+        assert!(seed_to_field_element(TEST_SEED_HEX).is_ok());
+    }
+
+    /// `field_from_uniform_bytes` is a wide reduction, so an all-`0xff` seed —
+    /// far above the field modulus — must still map to a valid element rather
+    /// than being rejected the way a canonical 32-byte decoding would.
+    #[test]
+    fn seed_to_field_element_reduces_values_above_the_modulus() {
+        let seed = "ff".repeat(64);
+        assert!(seed_to_field_element(&seed).is_ok());
     }
 
     #[test]
@@ -536,6 +608,16 @@ mod tests {
         let invalid_seed = "not_valid_hex";
         let result = seed_to_field_element(invalid_seed);
         assert!(result.is_err(), "should reject invalid hex");
+    }
+
+    /// The prover identity bound into the challenge hash is the Kontor
+    /// `signer_id` as a decimal string, mirroring Kontor's
+    /// `prover_challenge_key`.
+    #[test]
+    fn prover_challenge_key_renders_the_signer_id_as_decimal() {
+        assert_eq!(prover_challenge_key(0), "0");
+        assert_eq!(prover_challenge_key(42), "42");
+        assert_eq!(prover_challenge_key(u64::MAX), "18446744073709551615");
     }
 
     #[test]
@@ -550,6 +632,8 @@ mod tests {
             nodes: json!(["NODE-1"]),
             root: None, // Missing
             padded_len: Some(128),
+            object_id: None,
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: json!({}),
@@ -574,6 +658,8 @@ mod tests {
             nodes: json!(["NODE-1"]),
             root: Some("0".repeat(64)),
             padded_len: None, // Missing
+            object_id: None,
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: json!({}),
@@ -712,6 +798,8 @@ mod tests {
             nodes: Set(json!(["NODE-test"])),
             root: Set(Some(root_hex)),
             padded_len: Set(Some(128)),
+            object_id: Set(Some(TEST_OBJECT_ID.to_string())),
+            ledger_index: Set(Some(0)),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -745,7 +833,7 @@ mod tests {
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
         // Create challenge with valid 32-byte seed
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
         challenges::ActiveModel {
             challenge_id: Set("chal_local".into()),
             agreement_id: Set(agreement_id.into()),
@@ -827,7 +915,7 @@ mod tests {
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
         // Create challenge with valid 32-byte seed
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
         challenges::ActiveModel {
             challenge_id: Set("chal_gcs".into()),
             agreement_id: Set(agreement_id.into()),
@@ -939,7 +1027,7 @@ mod tests {
         let ledger = FileLedger::new();
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
 
         // Challenge 1 - will succeed
         challenges::ActiveModel {
@@ -1039,7 +1127,7 @@ mod tests {
         let ledger = FileLedger::new();
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
         challenges::ActiveModel {
             challenge_id: Set("chal_rejected".into()),
             agreement_id: Set("agr_rejected".into()),
@@ -1113,6 +1201,8 @@ mod tests {
             nodes: Set(json!(["NODE-test"])),
             root: Set(None), // Missing!
             padded_len: Set(Some(128)),
+            object_id: Set(None),
+            ledger_index: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -1170,6 +1260,8 @@ mod tests {
             nodes: Set(json!(["NODE-test"])),
             root: Set(Some("0".repeat(64))),
             padded_len: Set(None), // Missing!
+            object_id: Set(None),
+            ledger_index: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -1238,6 +1330,8 @@ mod tests {
             nodes: json!(["NODE-1"]),
             root: Some("invalid_hex".into()), // Not valid hex
             padded_len: Some(128),
+            object_id: Some(TEST_OBJECT_ID.to_string()),
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: json!({}),
@@ -1265,6 +1359,8 @@ mod tests {
             nodes: json!(["NODE-1"]),
             root: Some("0102030405".into()), // Too short (5 bytes instead of 32)
             padded_len: Some(128),
+            object_id: Some(TEST_OBJECT_ID.to_string()),
+            ledger_index: None,
             downloaded: true,
             transaction_id: None,
             curation: json!({}),
@@ -1277,23 +1373,27 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not 32 bytes"));
     }
 
+    /// The rebuilt metadata must equal the descriptor the contract holds,
+    /// field for field — `Challenge::id()` hashes over all of it.
     #[test]
-    fn build_file_metadata_succeeds_with_valid_data() {
-        // Use a real field element from prepare_file
+    fn build_file_metadata_reproduces_the_on_chain_descriptor() {
         let file_bytes = b"test content";
-        let (_prepared, real_metadata) = api::prepare_file(file_bytes, "test.bin").unwrap();
+        let (_prepared, real_metadata) =
+            api::prepare_file(file_bytes, "test.bin", PORTAL_FILE_NONCE).unwrap();
         let root_hex = hex::encode(real_metadata.root.to_repr());
 
         let agreement = agreements::Model {
-            agreement_id: "agr_valid".into(),
+            agreement_id: real_metadata.file_id.clone(),
             user_id: "user_1".into(),
-            file_id: "file_1".into(),
+            file_id: real_metadata.file_id.clone(),
             filename: "test.bin".into(),
             mime_type: "application/octet-stream".into(),
             original_size: real_metadata.original_size as i64,
             nodes: json!(["NODE-1"]),
             root: Some(root_hex),
             padded_len: Some(real_metadata.padded_len as i64),
+            object_id: Some(real_metadata.object_id.clone()),
+            ledger_index: Some(3),
             downloaded: true,
             transaction_id: None,
             curation: json!({}),
@@ -1301,25 +1401,42 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
         };
 
-        let result = build_file_metadata(&agreement);
-        assert!(result.is_ok());
-        let metadata = result.unwrap();
-        assert_eq!(metadata.file_id, "file_1");
-        assert_eq!(metadata.filename, "test.bin");
+        let metadata = build_file_metadata(&agreement).expect("descriptor should rebuild");
+        assert_eq!(metadata.file_id, real_metadata.file_id);
+        assert_eq!(metadata.object_id, real_metadata.object_id);
+        assert_eq!(metadata.nonce, real_metadata.nonce);
+        assert_eq!(metadata.root, real_metadata.root);
+        assert_eq!(metadata.padded_len, real_metadata.padded_len);
+        assert_eq!(metadata.original_size, real_metadata.original_size);
+        assert_eq!(metadata.filename, real_metadata.filename);
     }
 
+    /// Without `object_id` the descriptor is incomplete, so the derived
+    /// challenge id would differ from the contract's. Refuse rather than prove
+    /// something unverifiable.
     #[test]
-    fn seed_to_field_element_rejects_non_representable_value() {
-        // A value that is >= the field modulus will fail from_repr
-        // The BLS12-381 scalar field modulus is slightly less than 2^255
-        // Use all 0xff bytes which is definitely larger than the modulus
-        let invalid_seed = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let result = seed_to_field_element(invalid_seed);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("valid field element"));
+    fn build_file_metadata_requires_object_id() {
+        let agreement = agreements::Model {
+            agreement_id: "agr_no_object".into(),
+            user_id: "user_1".into(),
+            file_id: "file_1".into(),
+            filename: "test.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            original_size: 100,
+            nodes: json!(["NODE-1"]),
+            root: Some("0".repeat(64)),
+            padded_len: Some(128),
+            object_id: None,
+            ledger_index: Some(0),
+            downloaded: true,
+            transaction_id: None,
+            curation: json!({}),
+            status: "ready".into(),
+            created_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap(),
+        };
+
+        let err = build_file_metadata(&agreement).unwrap_err();
+        assert!(err.to_string().contains("missing object_id"));
     }
 
     #[tokio::test]
@@ -1344,7 +1461,7 @@ mod tests {
         let ledger = FileLedger::new();
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
         challenges::ActiveModel {
             challenge_id: Set("chal_ret".into()),
             agreement_id: Set("agr_ret".into()),
@@ -1407,39 +1524,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn real_proof_generator_produces_postcard_serialized_proof() {
-        // Exercise the production proof generator end-to-end with a real
-        // ledger entry so the postcard serialization path is covered.
+    /// End-to-end run of the production proof path, at a contract slot that is
+    /// not the one a local append would have picked.
+    ///
+    /// Every input comes from where it comes from in production: the ledger
+    /// from [`rebuild_ledger`] (`add_files` at the absolute on-chain slot, not
+    /// `add_file` at the next free local index), the descriptor from
+    /// [`build_file_metadata`]. Two things are asserted:
+    ///
+    /// - the wire format is kontor-crypto's own `NPOR` container, which
+    ///   `proof::from-bytes` parses — a postcard-encoded proof (what this node
+    ///   used to emit) is rejected before verification even starts;
+    /// - the proof actually *verifies* against the statement the verifier
+    ///   rebuilds. Deserializing only proves the bytes are well-formed; since
+    ///   `ledger_indices` are public inputs even for a single-file proof, a
+    ///   file placed at the wrong slot would round-trip through `from_bytes`
+    ///   just fine and still fail on chain.
+    #[tokio::test]
+    async fn a_real_proof_verifies_against_the_file_at_its_contract_slot() {
+        /// Deliberately not 0: a ledger built by local insertion order would
+        /// put this lone file at index 0 and the test would pass without ever
+        /// exercising the absolute-slot path.
+        const LEDGER_INDEX: i64 = 5;
+
         let file_bytes = b"real proof generator coverage";
         let filename = "real.bin";
+        let (_prepared, prepared) =
+            api::prepare_file(file_bytes, filename, PORTAL_FILE_NONCE).unwrap();
 
-        let (_prepared, metadata) = api::prepare_file(file_bytes, filename).unwrap();
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("real_proof_slot");
+        stdfs::create_dir_all(&storage_dir).ok();
 
-        let mut ledger = FileLedger::new();
-        ledger.add_file(&metadata).unwrap();
-
-        let seed_field = seed_to_field_element(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
+        AgreementFixture {
+            filename: filename.to_string(),
+            original_size: prepared.original_size as i64,
+            root: Some(hex::encode(prepared.root.to_repr())),
+            padded_len: Some(prepared.padded_len as i64),
+            object_id: Some(prepared.object_id.clone()),
+            ledger_index: Some(LEDGER_INDEX),
+            downloaded: true,
+            ..AgreementFixture::new("agr_real", &prepared.file_id)
+        }
+        .into_active_model()
+        .insert(&db)
+        .await
         .unwrap();
 
+        let stats = rebuild_ledger(&db, &storage_dir).await.unwrap();
+        assert_eq!(stats.placed, 1);
+        let ledger = FileLedger::load(&storage_dir.join("ledger.bin")).unwrap();
+
+        let agreement = Agreements::find().one(&db).await.unwrap().unwrap();
+        let metadata = build_file_metadata(&agreement).unwrap();
         let challenge = CryptoChallenge::new(
             metadata.clone(),
-            850000,
+            850_000,
             5,
-            seed_field,
-            "NODE-test".to_string(),
+            seed_to_field_element(TEST_SEED_HEX).unwrap(),
+            prover_challenge_key(42),
         );
 
         let proof_bytes = RealProofGenerator
-            .generate_proof(file_bytes, filename, &ledger, metadata, challenge)
+            .generate_proof(file_bytes, filename, &ledger, metadata, challenge.clone())
             .expect("real proof generator should succeed");
 
-        assert!(
-            !proof_bytes.is_empty(),
-            "real proof generator should produce non-empty bytes"
+        assert_eq!(
+            &proof_bytes[..4],
+            b"NPOR",
+            "proof must carry kontor-crypto's magic bytes"
         );
+        let proof = kontor_crypto::Proof::from_bytes(&proof_bytes)
+            .expect("the contract must be able to deserialize what we emit");
+
+        assert!(
+            PorSystem::new(&ledger)
+                .verify(&proof, &[challenge])
+                .expect("verification should not error"),
+            "a proof built from the rebuilt ledger must satisfy the statement a \
+             verifier reconstructs from the same slot"
+        );
+
+        stdfs::remove_dir_all(&storage_dir).ok();
     }
 
     #[tokio::test]
@@ -1465,7 +1631,7 @@ mod tests {
             agreement_id: Set("agr_overflow".into()),
             block_height: Set(-1),
             challenge_count: Set(5),
-            seed: Set("0000000000000000000000000000000000000000000000000000000000000001".into()),
+            seed: Set(TEST_SEED_HEX.into()),
             prover_id: Set("NODE-test".into()),
             deadline_height: Set(850100),
             status: Set("active".into()),
@@ -1527,7 +1693,7 @@ mod tests {
             agreement_id: Set("agr_count_overflow".into()),
             block_height: Set(850000),
             challenge_count: Set(-5),
-            seed: Set("0000000000000000000000000000000000000000000000000000000000000001".into()),
+            seed: Set(TEST_SEED_HEX.into()),
             prover_id: Set("NODE-test".into()),
             deadline_height: Set(850100),
             status: Set("active".into()),
@@ -1584,7 +1750,7 @@ mod tests {
         let ledger = FileLedger::new();
         ledger.save(&storage_dir.join("ledger.bin")).unwrap();
 
-        let seed = "0000000000000000000000000000000000000000000000000000000000000001";
+        let seed = TEST_SEED_HEX;
         challenges::ActiveModel {
             challenge_id: Set("chal_fb".into()),
             agreement_id: Set("agr_fb".into()),
