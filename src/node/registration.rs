@@ -27,7 +27,7 @@ use crate::clients::kontor_op::{
 };
 use crate::clients::portal::RegisterNodeRequest;
 use crate::clients::PortalClient;
-use crate::crypto::mnemonic::ACCOUNT_INDEX_ENV;
+use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, REGISTER_NEW_ACCOUNT_ENV};
 use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
 
 /// Prefix the Portal signs over to bind a BLS key to a Taproot identity.
@@ -249,7 +249,17 @@ pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNo
 /// Only reached on the failure path, and only until something is found. Ten
 /// covers every account a wallet realistically hands out before an operator
 /// would have noticed something else was wrong.
+///
+/// Past it the scan finds nothing and the node registers, which is the
+/// destructive outcome this whole path exists to avoid — so every message built
+/// from a scan says how far it looked rather than implying it looked everywhere.
 const ACCOUNT_SCAN_MAX: u32 = 10;
+
+/// How the scan describes its own reach, for the messages that report it.
+#[must_use]
+pub fn account_scan_range() -> String {
+    format!("accounts 0-{ACCOUNT_SCAN_MAX}")
+}
 
 /// A node the Portal knows, derived from the same mnemonic as this one.
 #[derive(Debug, Clone)]
@@ -280,6 +290,10 @@ impl std::fmt::Display for RegisteredSibling {
 /// keeps the agreements, and the operator sees a node that works and does
 /// nothing. Since every account of a mnemonic is one derivation away, the node
 /// can simply go and look, and say which account it should have been.
+///
+/// Finding a sibling does not settle it, because one mnemonic legitimately backs
+/// several nodes, one per account. What the scan produces is a list; whether that
+/// list is fatal is [`REGISTER_NEW_ACCOUNT_ENV`]'s decision, and the caller's.
 ///
 /// The configured account's own network is scanned first, then that account on
 /// the other coin type: a wrong `KONTOR_STORAGE_NETWORK` produces exactly the
@@ -315,11 +329,14 @@ pub async fn find_registered_siblings(
     found
 }
 
-/// The error an operator sees when the configured account is not the registered
-/// one.
+/// The error an operator sees when the configured account may not be the
+/// registered one.
 ///
-/// Deliberately fatal. The alternative — carry on and register — is the case
-/// this whole path exists to prevent.
+/// Fatal by default, because the two things it can mean are not equally
+/// recoverable: a mistyped [`ACCOUNT_INDEX_ENV`] strands a running node's
+/// agreements behind a second identity, while a genuine second node is one
+/// environment variable away from starting. So the message names both readings
+/// and the variable that picks between them.
 #[must_use]
 pub fn wrong_account_error(
     identity: &MnemonicIdentity,
@@ -335,17 +352,46 @@ pub fn wrong_account_error(
         "No node is registered for {} = {} ({}).\n  \
            derived BLS key: {}\n  \
            derived address: {}\n\n  \
-         This mnemonic does have registered nodes, on other accounts:\n{}\n\n  \
-         Set {} to the account this node runs as. Registering account {} would \
-         create a second node and leave this one's agreements behind.",
+         This mnemonic does have registered nodes, on other accounts ({} checked):\n{}\n\n  \
+         If this node should be one of those, set {} to its account. Registering \
+         account {} instead would create a second node and leave that one's \
+         agreements behind.\n\n  \
+         If this really is a new node alongside them, set {}=1 to say so and it \
+         will register account {} on the next start.",
         ACCOUNT_INDEX_ENV,
         identity.account,
         identity.network,
         identity.bls_pubkey(),
         identity.taproot_address,
+        account_scan_range(),
         listed,
         ACCOUNT_INDEX_ENV,
         identity.account,
+        REGISTER_NEW_ACCOUNT_ENV,
+        identity.account,
+    )
+}
+
+/// What the node prints when it registers a new account next to existing ones.
+///
+/// The operator has already said this is deliberate, so this is not a warning —
+/// but the siblings are listed anyway, because the one thing that would make the
+/// decision wrong is a list that does not look like the nodes they think they
+/// run.
+#[must_use]
+pub fn new_account_notice(identity: &MnemonicIdentity, siblings: &[RegisteredSibling]) -> String {
+    let listed = siblings
+        .iter()
+        .map(|sibling| format!("    {sibling}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "{REGISTER_NEW_ACCOUNT_ENV} is set, so account {} registers as a new node \
+         alongside this mnemonic's existing ones ({} checked):\n{}",
+        identity.account,
+        account_scan_range(),
+        listed,
     )
 }
 
@@ -514,18 +560,22 @@ mod tests {
         assert_eq!(first.registration_signature, second.registration_signature);
     }
 
+    fn sibling_of(identity: &MnemonicIdentity) -> RegisteredSibling {
+        RegisteredSibling {
+            account: identity.account,
+            network: identity.network,
+            node_id: identity.node_id.clone(),
+            taproot_address: identity.taproot_address.clone(),
+        }
+    }
+
     /// The message an operator acts on. It has to name the variable, the
     /// account they should have used, and its address.
     #[test]
     fn the_wrong_account_error_names_what_to_change() {
         let identity = derived(1);
         let real = derived(3);
-        let siblings = vec![RegisteredSibling {
-            account: real.account,
-            network: real.network,
-            node_id: real.node_id.clone(),
-            taproot_address: real.taproot_address.clone(),
-        }];
+        let siblings = vec![sibling_of(&real)];
 
         let rendered = wrong_account_error(&identity, &siblings).to_string();
 
@@ -534,6 +584,45 @@ mod tests {
         assert!(rendered.contains(&real.taproot_address), "{rendered}");
         assert!(rendered.contains(&identity.taproot_address), "{rendered}");
         assert!(rendered.contains("second node"), "{rendered}");
+    }
+
+    /// The same message has to serve the operator whose account index is right
+    /// and who is simply adding a node — otherwise the only way out of a correct
+    /// refusal is to guess that one exists.
+    #[test]
+    fn the_wrong_account_error_offers_the_way_out() {
+        let rendered = wrong_account_error(&derived(4), &[sibling_of(&derived(2))]).to_string();
+
+        assert!(rendered.contains(REGISTER_NEW_ACCOUNT_ENV), "{rendered}");
+        assert!(rendered.contains("really is a new node"), "{rendered}");
+    }
+
+    /// Neither message may imply the scan looked everywhere: past account 10 it
+    /// finds nothing, and "no siblings" would then read as proof there are none.
+    #[test]
+    fn both_messages_say_how_far_the_scan_looked() {
+        let siblings = [sibling_of(&derived(2))];
+        let range = account_scan_range();
+        assert_eq!(range, "accounts 0-10");
+
+        assert!(wrong_account_error(&derived(4), &siblings)
+            .to_string()
+            .contains(&range));
+        assert!(new_account_notice(&derived(4), &siblings).contains(&range));
+    }
+
+    /// What an opted-in node prints. It is not a warning, but it has to list the
+    /// siblings: a list that does not match the nodes the operator thinks they
+    /// run is the one signal that the opt-in was a mistake.
+    #[test]
+    fn the_new_account_notice_lists_what_it_registers_alongside() {
+        let existing = derived(2);
+        let rendered = new_account_notice(&derived(4), &[sibling_of(&existing)]);
+
+        assert!(rendered.contains(REGISTER_NEW_ACCOUNT_ENV), "{rendered}");
+        assert!(rendered.contains("account 4"), "{rendered}");
+        assert!(rendered.contains(&existing.node_id), "{rendered}");
+        assert!(rendered.contains(&existing.taproot_address), "{rendered}");
     }
 
     /// The two signatures answer different questions — "this BLS key accepts

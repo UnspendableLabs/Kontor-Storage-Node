@@ -42,6 +42,7 @@ The node can be configured via command-line arguments or environment variables:
 | _(env only)_ | `KONTOR_STORAGE_MNEMONIC` | _unset_ | Horizon Wallet seed phrase. Setting it puts the node in [mnemonic mode](#mnemonic-mode): it derives its own keys and registers itself, and `BLS_ENCRYPTED_BLOB` / `BLS_PASSWORD` are ignored. |
 | _(env only)_ | `KONTOR_STORAGE_ACCOUNT_INDEX` | `0` | Which wallet account to derive. Must match the account the node is registered under — see [mnemonic mode](#mnemonic-mode). |
 | _(env only)_ | `KONTOR_STORAGE_NETWORK` | `signet` | `mainnet`, `testnet`, or `signet`. Selects the coin type in both derivation paths, so it changes every derived key. |
+| _(env only)_ | `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT` | `0` | Set to `1` to register this account as a **new** node even though other accounts of the same mnemonic already have one — see [running several nodes from one mnemonic](#running-several-nodes-from-one-mnemonic). |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset (UI disabled)_ | Password for the operator UI at `/admin`. At least 16 characters when set; leave unset to disable the UI entirely. See [Operator UI](#operator-ui). |
 | `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
 
@@ -112,7 +113,40 @@ On startup it prints the identity it derived:
 
 The Taproot address is the one thing a Portal admin still has to act on: node
 registration is gated on a whitelist of addresses. Until it is whitelisted the
-node serves `/admin` and retries; the address is shown there too.
+Portal answers `403 ADDRESS_NOT_WHITELISTED` and the node serves `/admin` — where
+the address is also shown — while re-offering the same registration every 30
+seconds. Nobody else can offer it: the Taproot key that signs it never leaves the
+process. So whitelisting the address is the whole of the operator's work; the
+node comes up on its own within the next tick, no restart needed.
+
+> [!IMPORTANT]
+> `KONTOR_STORAGE_MNEMONIC` is the seed phrase itself, not a key derived from it,
+> so it reaches far beyond this node: the same phrase controls every account of
+> that wallet, on mainnet as well as signet. Anything that can read the node's
+> environment — `docker inspect`, a platform dashboard, `/proc/<pid>/environ`, a
+> core dump — holds the whole wallet, not just this node's identity.
+>
+> Use a wallet dedicated to running nodes, and keep the funds elsewhere. The node
+> itself never logs the phrase, never writes it to disk, and never serves it on
+> `/admin`, but it cannot do anything about where the variable is stored.
+
+#### Running several nodes from one mnemonic
+
+One mnemonic backs as many nodes as it has accounts — one node per
+`KONTOR_STORAGE_ACCOUNT_INDEX`. Because of that, "another account of this
+mnemonic is registered" is ambiguous: it is what a mistyped account index looks
+like, and it is also what a second node legitimately looks like. The node cannot
+tell the two apart, and the first is destructive, so it refuses by default and
+asks:
+
+```
+KONTOR_STORAGE_REGISTER_NEW_ACCOUNT=1
+```
+
+Set that alongside the account index for a genuinely new node, and it registers
+next to the existing ones, listing them as it goes so a list that does not match
+the nodes you think you run is still visible. Leave it unset everywhere else —
+it is the only thing standing between a typo and a second identity.
 
 #### Migrating a running node
 
@@ -131,16 +165,27 @@ No node is registered for KONTOR_STORAGE_ACCOUNT_INDEX = 1 (signet).
   derived BLS key: 84a1c0…
   derived address: tb1p…7k2q
 
-  This mnemonic does have registered nodes, on other accounts:
+  This mnemonic does have registered nodes, on other accounts (accounts 0-10 checked):
     account 2 (signet) -> node-8f3a… (tb1p…q2x)
     account 3 (signet) -> node-1b7c… (tb1p…m4d)
 
-  Set KONTOR_STORAGE_ACCOUNT_INDEX to the account this node runs as. …
+  If this node should be one of those, set KONTOR_STORAGE_ACCOUNT_INDEX to its
+  account. Registering account 1 instead would create a second node and leave
+  that one's agreements behind.
+
+  If this really is a new node alongside them, set
+  KONTOR_STORAGE_REGISTER_NEW_ACCOUNT=1 to say so and it will register account 1
+  on the next start.
 ```
 
 It finds those by deriving the neighbouring accounts and asking the Portal about
 each, which also catches a wrong `KONTOR_STORAGE_NETWORK` — the wrong coin type
 produces a key the Portal has never seen, exactly like a wrong account.
+
+The scan stops at account 10, which is why every message says so. Past it there
+is nothing to find and nothing to refuse, so a node whose real account is 11 or
+beyond registers a second identity without a word — set the account index from
+what the wallet shows rather than relying on being caught.
 
 ### Download and preparation pipeline
 
@@ -284,7 +329,7 @@ That leaves exactly one wallet prompt. Open `/admin` in a browser with the exten
 
 A node in [mnemonic mode](#mnemonic-mode) skips all of this: it holds the Taproot key too, so it fills in all five fields and registers itself during onboarding. The card then shows the account and the Taproot address to whitelist instead of the wallet button, since there is nothing left for a browser to sign.
 
-An unregistered node also re-checks the Portal every 30 seconds, so a registration made anywhere else brings it back without anyone touching the container.
+An unregistered node also re-checks the Portal every 30 seconds, so a registration made anywhere else brings it back without anyone touching the container. On the same tick, a mnemonic node whose registration was refused offers it again — the request carries no nonce and no timestamp, so replaying it is signing nothing new. That is what makes whitelisting an address enough on its own: nobody but this process can register it, so if it stopped asking, the node would sit at `404` until someone restarted the container.
 
 #### Restarting after a reset
 

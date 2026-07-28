@@ -59,6 +59,16 @@ pub const ACCOUNT_INDEX_ENV: &str = "KONTOR_STORAGE_ACCOUNT_INDEX";
 /// Which Bitcoin network the wallet derived against.
 pub const NETWORK_ENV: &str = "KONTOR_STORAGE_NETWORK";
 
+/// Opt in to registering an account while other accounts of the same mnemonic
+/// are already registered.
+///
+/// One mnemonic can back several nodes, one per account, so "a sibling account
+/// is registered" is ambiguous: it is the symptom of a wrong
+/// [`ACCOUNT_INDEX_ENV`] *and* what adding a second node legitimately looks
+/// like. The node refuses by default because the first case is silently
+/// destructive; this variable is how an operator says they meant the second.
+pub const REGISTER_NEW_ACCOUNT_ENV: &str = "KONTOR_STORAGE_REGISTER_NEW_ACCOUNT";
+
 /// EIP-2333's purpose level, from EIP-2334. Shared by every BLS key in the
 /// Ethereum ecosystem and kept here for the same reason.
 const BLS_PURPOSE: u32 = 12381;
@@ -149,6 +159,9 @@ pub struct MnemonicSettings {
     phrase: Zeroizing<String>,
     pub network: BitcoinNetwork,
     pub account: u32,
+    /// Whether this node may register itself even though another account of the
+    /// same mnemonic already has a node. See [`REGISTER_NEW_ACCOUNT_ENV`].
+    pub allow_new_account: bool,
 }
 
 // Manual Debug impl: the phrase is the node's entire identity — every key in
@@ -159,6 +172,7 @@ impl std::fmt::Debug for MnemonicSettings {
             .field("phrase", &"<redacted>")
             .field("network", &self.network)
             .field("account", &self.account)
+            .field("allow_new_account", &self.allow_new_account)
             .finish()
     }
 }
@@ -177,7 +191,16 @@ impl MnemonicSettings {
             phrase: Zeroizing::new(phrase.into()),
             network,
             account,
+            allow_new_account: false,
         }
+    }
+
+    /// The same settings, opted in to registering alongside sibling accounts.
+    #[cfg(test)]
+    #[must_use]
+    pub fn allowing_new_account(mut self) -> Self {
+        self.allow_new_account = true;
+        self
     }
 
     /// Read the mnemonic configuration, or `None` if this node is not in
@@ -188,8 +211,8 @@ impl MnemonicSettings {
     /// the `Debug` output `print_config_info` leans on.
     ///
     /// # Errors
-    /// If the mnemonic is set but blank, or if the account index or network is
-    /// set to something unparseable.
+    /// If the mnemonic is set but blank, or if the account index, the network,
+    /// or the new-account opt-in is set to something unparseable.
     pub fn from_env() -> Result<Option<Self>> {
         let Ok(raw) = std::env::var(MNEMONIC_ENV) else {
             return Ok(None);
@@ -218,10 +241,16 @@ impl MnemonicSettings {
             Err(_) => BitcoinNetwork::Signet,
         };
 
+        let allow_new_account = match std::env::var(REGISTER_NEW_ACCOUNT_ENV) {
+            Ok(value) => parse_flag(&value, REGISTER_NEW_ACCOUNT_ENV)?,
+            Err(_) => false,
+        };
+
         Ok(Some(Self {
             phrase,
             network,
             account,
+            allow_new_account,
         }))
     }
 
@@ -235,7 +264,24 @@ impl MnemonicSettings {
             phrase: self.phrase.clone(),
             network,
             account,
+            allow_new_account: self.allow_new_account,
         }
+    }
+}
+
+/// Parse a boolean environment variable.
+///
+/// Written out rather than `parse::<bool>()` because the values operators
+/// actually type into a deployment console are `1` and `yes` at least as often
+/// as `true`, and silently reading one of those as "off" would disarm the very
+/// guard this flag exists to lift.
+fn parse_flag(value: &str, name: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(anyhow!(
+            "{name} must be one of 1, true, yes, on, 0, false, no, off (got {other:?})"
+        )),
     }
 }
 
@@ -374,6 +420,13 @@ impl MnemonicIdentity {
         self.keypair.public_key_hex()
     }
 
+    /// Whether the operator has said this node is a new node on a mnemonic that
+    /// already backs others. See [`REGISTER_NEW_ACCOUNT_ENV`].
+    #[must_use]
+    pub fn allows_new_account(&self) -> bool {
+        self.settings.allow_new_account
+    }
+
     /// The Schnorr half of the proof of possession: the Taproot key signing off
     /// on the BLS key it is about to be bound to.
     ///
@@ -490,6 +543,7 @@ mod tests {
             phrase: Zeroizing::new(TEST_PHRASE.to_string()),
             network,
             account,
+            allow_new_account: false,
         }
     }
 
@@ -706,11 +760,14 @@ mod tests {
 
     #[test]
     fn at_keeps_the_phrase_and_swaps_the_rest() {
-        let base = settings(2, BitcoinNetwork::Signet);
+        let base = settings(2, BitcoinNetwork::Signet).allowing_new_account();
         let moved = base.at(7, BitcoinNetwork::Mainnet);
 
         assert_eq!(moved.account, 7);
         assert_eq!(moved.network, BitcoinNetwork::Mainnet);
+        // The opt-in belongs to the node, not to the account being probed: a
+        // sibling derived for the scan is the same operator's decision.
+        assert!(moved.allow_new_account);
         assert_eq!(
             MnemonicIdentity::derive(&moved).unwrap().bls_pubkey(),
             MnemonicIdentity::derive(&settings(7, BitcoinNetwork::Mainnet))
@@ -747,7 +804,12 @@ mod tests {
         }
 
         fn clear() {
-            for key in [MNEMONIC_ENV, ACCOUNT_INDEX_ENV, NETWORK_ENV] {
+            for key in [
+                MNEMONIC_ENV,
+                ACCOUNT_INDEX_ENV,
+                NETWORK_ENV,
+                REGISTER_NEW_ACCOUNT_ENV,
+            ] {
                 std::env::remove_var(key);
             }
         }
@@ -805,6 +867,59 @@ mod tests {
         let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (ACCOUNT_INDEX_ENV, "-1")]);
         let err = MnemonicSettings::from_env().unwrap_err().to_string();
         assert!(err.contains(ACCOUNT_INDEX_ENV), "{err}");
+    }
+
+    /// Defaulting this to `false` is what keeps the sibling guard armed on every
+    /// node that has not explicitly asked for a second identity.
+    #[test]
+    #[serial]
+    fn from_env_defaults_to_refusing_a_new_account() {
+        let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE)]);
+        assert!(
+            !MnemonicSettings::from_env()
+                .unwrap()
+                .unwrap()
+                .allow_new_account
+        );
+    }
+
+    /// The values an operator actually types into a deployment console. Reading
+    /// any of them as "off" would leave the node refusing to start with no way
+    /// out, which is the failure this flag exists to fix.
+    #[test]
+    #[serial]
+    fn from_env_accepts_the_usual_spellings_of_yes() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            let _guard = EnvGuard::set(&[
+                (MNEMONIC_ENV, TEST_PHRASE),
+                (REGISTER_NEW_ACCOUNT_ENV, value),
+            ]);
+            let settings = MnemonicSettings::from_env().unwrap().unwrap();
+            assert!(settings.allow_new_account, "{value:?}");
+        }
+
+        for value in ["0", "false", "no", "off", ""] {
+            let _guard = EnvGuard::set(&[
+                (MNEMONIC_ENV, TEST_PHRASE),
+                (REGISTER_NEW_ACCOUNT_ENV, value),
+            ]);
+            let settings = MnemonicSettings::from_env().unwrap().unwrap();
+            assert!(!settings.allow_new_account, "{value:?}");
+        }
+    }
+
+    /// A typo must not read as "off": that would silently re-arm a guard the
+    /// operator believes they lifted, and the node would refuse to start with an
+    /// error naming a variable they have already set.
+    #[test]
+    #[serial]
+    fn from_env_rejects_an_unparseable_new_account_flag() {
+        let _guard = EnvGuard::set(&[
+            (MNEMONIC_ENV, TEST_PHRASE),
+            (REGISTER_NEW_ACCOUNT_ENV, "ouiiii"),
+        ]);
+        let err = MnemonicSettings::from_env().unwrap_err().to_string();
+        assert!(err.contains(REGISTER_NEW_ACCOUNT_ENV), "{err}");
     }
 
     #[test]

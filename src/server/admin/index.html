@@ -546,7 +546,8 @@
       : "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself — " +
         "no wallet needed. It is still unregistered, which almost always means the " +
         "Taproot address above is not on the Portal's whitelist yet. Ask a Portal admin " +
-        "to add it; the node retries on its own.";
+        "to add it: the node keeps offering the same registration every 30 seconds, so " +
+        "it comes up on its own shortly after they do. No restart needed.";
     note.hidden = false;
 
     // Nothing here for a browser to sign.
