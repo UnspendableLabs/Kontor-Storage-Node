@@ -19,7 +19,10 @@ use crate::server::state::DownloadServerState;
 /// Counts of everything the reset would delete.
 ///
 /// `session_expires_at` is echoed back so the page can show when the operator
-/// will be signed out instead of finding out mid-reset.
+/// will be signed out instead of finding out mid-reset. `restart_available`
+/// answers the same question ahead of time for the restart checkbox: the page
+/// disables it rather than letting the operator meet a `RESTART_UNAVAILABLE`
+/// only once they have typed the confirmation phrase.
 ///
 /// # Errors
 /// `500 DATABASE_ERROR` if any of the counts cannot be read.
@@ -66,6 +69,7 @@ pub async fn node_status(
         "challenges": {
             "total": challenges_total,
         },
+        "restart_available": state.admin.restart().is_available(),
         "session_expires_at": session_expires_at,
     }))
 }
@@ -150,6 +154,26 @@ mod tests {
         assert_eq!(
             value["storage"]["directory"],
             state.storage_dir.display().to_string()
+        );
+    }
+
+    /// The page needs this before the operator commits to anything, so the
+    /// restart checkbox can be disabled with a reason rather than rejected.
+    #[tokio::test]
+    async fn status_reports_whether_a_restart_is_available() {
+        let (mut state, _dir) = state_with(&[]).await;
+
+        assert_eq!(
+            node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
+            false,
+            "AdminState::disabled carries a handle that refuses restarts"
+        );
+
+        state.admin = AdminState::with_restart(crate::app::restart::RestartHandle::available());
+
+        assert_eq!(
+            node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
+            true
         );
     }
 

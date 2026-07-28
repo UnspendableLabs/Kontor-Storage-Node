@@ -10,9 +10,9 @@ mod server;
 pub mod testutils;
 
 use anyhow::{anyhow, Context, Result};
-use app::{cli::migrate_legacy_env_vars, run, Cli};
+use app::{cli::migrate_legacy_env_vars, run, Cli, Outcome, RESTART_EXIT_CODE};
 use clap::Parser;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Once;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -23,7 +23,23 @@ async fn main() -> Result<()> {
     migrate_legacy_env_vars();
     let cli = Cli::parse();
     let mut stdout = io::stdout();
-    run(cli, &mut stdout).await
+
+    match run(cli, &mut stdout).await? {
+        Outcome::Shutdown => Ok(()),
+        // Returning would exit `0`, which the on-failure restart policies that
+        // Railway and Docker Compose default to read as "stay down". Exiting
+        // explicitly is also why stdout is flushed by hand here: the process
+        // ends without unwinding, so nothing else will.
+        //
+        // Excluded from coverage: a test that reached this line would end the
+        // test process. What leads here is covered — see the run loop's
+        // `Outcome::Restart` tests in `app::runtime`.
+        // LCOV_EXCL_START
+        Outcome::Restart => {
+            let _ = stdout.flush();
+            std::process::exit(RESTART_EXIT_CODE)
+        } // LCOV_EXCL_STOP
+    }
 }
 
 pub fn load_local_env() -> Result<()> {

@@ -81,6 +81,17 @@ mod tests {
         );
     }
 
+    /// The restart control and the API have to agree on their spellings: the
+    /// field the page posts, and the two flags it reads back. A rename on
+    /// either side would otherwise leave the operator a checkbox that silently
+    /// does nothing.
+    #[test]
+    fn admin_html_speaks_the_same_restart_api_as_the_server() {
+        for key in ["restart_available", "result.restarting", "reset-restart"] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
     #[tokio::test]
     async fn admin_page_sets_security_headers() {
         let response = admin_page().await;

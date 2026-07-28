@@ -303,7 +303,7 @@ mod tests {
     const PASSWORD: &str = "correct horse battery";
 
     fn enabled_state() -> AdminState {
-        AdminState::new(AdminPassword::new(Some(PASSWORD)))
+        AdminState::with_password(AdminPassword::new(Some(PASSWORD)))
     }
 
     /// The `Option` is deliberate: it mirrors the `Option<IpAddr>` `login`
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn login_rejects_same_length_wrong_password() {
         reset_throttle_for_tests(client(5));
-        let state = AdminState::new(AdminPassword::new(Some("abcdefghijklmnop")));
+        let state = AdminState::with_password(AdminPassword::new(Some("abcdefghijklmnop")));
 
         let err = login(&request("ponmlkjihgfedcba"), client(5), &state)
             .await

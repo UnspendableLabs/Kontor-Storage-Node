@@ -92,7 +92,9 @@
   .stack > * + * { margin-top: 12px; }
   .check { display: flex; align-items: flex-start; gap: 8px; }
   .check input { margin-top: 3px; }
+  .check input:disabled { cursor: not-allowed; }
   .check span { flex: 1; }
+  .check .note { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -132,6 +134,7 @@
     <h2>Reset the database</h2>
     <div class="msg err" id="reset-error"></div>
     <div class="msg ok" id="reset-success"></div>
+    <div class="msg warn" id="reset-restarting"></div>
     <p>
       Deletes every agreement and challenge this node holds. Intended for when
       the Kontor signet has been reset and the node's state refers to a chain
@@ -141,14 +144,29 @@
     <p class="muted">
       Preserved: the BLS key, the daemon lock and everything else in the
       storage directory — only blobs named by the rows being deleted are
-      removed, and only if you ask. Downloads already in flight may write a
-      file back after the wipe; a node restart afterwards is the clean way to
-      be sure.
+      removed, and only if you ask.
+    </p>
+    <p class="muted">
+      The wipe does not re-register this node, and cannot: its signer id, token
+      and announced URL are read once at startup, and a signet reset invalidates
+      all three. Re-register the BLS key on the Portal <em>first</em>, then reset
+      with the restart ticked — the node comes back and onboards against the new
+      chain. Restarting also settles any download still in flight, which would
+      otherwise write a file back after the wipe.
     </p>
     <form id="reset-form" class="stack">
       <label class="check">
         <input type="checkbox" id="reset-delete-files">
         <span>Also delete the stored file blobs (irreversible; leave off to keep them as orphans)</span>
+      </label>
+      <label class="check">
+        <!-- Fails closed: enabled only once a status says the node could come
+             back on its own. -->
+        <input type="checkbox" id="reset-restart" disabled>
+        <span>
+          Restart the node after the wipe
+          <span class="note" id="reset-restart-note"></span>
+        </span>
       </label>
       <label class="muted" for="reset-confirm">Type <code>RESET</code> to confirm</label>
       <input type="text" id="reset-confirm" placeholder="RESET" autocomplete="off">
@@ -296,10 +314,14 @@
     });
   }
 
+  function stopPolling() {
+    if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
+  }
+
   function signOut() {
     token = null;
     sessionStorage.removeItem(TOKEN_KEY);
-    if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
+    stopPolling();
     $("app").style.display = "none";
     $("login").style.display = "grid";
     $("password").focus();
@@ -319,10 +341,24 @@
       '</div><div class="label">' + esc(label) + "</div></div>";
   }
 
+  // A node with no BLS password in its environment would stop at the key
+  // prompt on the way back up, so the API refuses to restart it. Saying so
+  // here beats letting the operator find out after typing RESET.
+  function setRestartAvailable(available) {
+    var box = $("reset-restart");
+    box.disabled = !available;
+    if (!available) { box.checked = false; }
+    $("reset-restart-note").textContent = available
+      ? "Re-runs onboarding, so the node picks up its signer id, token and announced URL from the Portal again."
+      : "Unavailable: BLS_PASSWORD is not set, so a restarted node would stop at the key password prompt. Restart it yourself after the wipe.";
+  }
+
   function renderStatus(data) {
     var agreements = data.agreements || {};
     var challenges = data.challenges || {};
     var storage = data.storage || {};
+
+    setRestartAvailable(data.restart_available === true);
 
     $("kpis").innerHTML =
       kpi(num(agreements.total), "Agreements") +
@@ -360,9 +396,11 @@
   function resetDatabase(event) {
     event.preventDefault();
     var deleteFiles = $("reset-delete-files").checked;
+    var restart = $("reset-restart").checked && !$("reset-restart").disabled;
     var warning = deleteFiles
       ? "This permanently deletes every agreement and challenge, and the stored file blobs. Continue?"
       : "This permanently deletes every agreement and challenge. Continue?";
+    if (restart) { warning += "\n\nThe node will then restart and onboard from scratch."; }
     if (!window.confirm(warning)) { return; }
 
     var button = $("reset-submit");
@@ -371,7 +409,7 @@
 
     api("/api/admin/reset-database", {
       method: "POST",
-      body: { confirm: $("reset-confirm").value, delete_files: deleteFiles }
+      body: { confirm: $("reset-confirm").value, delete_files: deleteFiles, restart: restart }
     }).then(function (result) {
       show($("reset-success"), "Database reset — " + result.total_rows_deleted + " rows deleted", true);
 
@@ -399,6 +437,18 @@
       $("reset-report").innerHTML = '<div class="divider"></div>' + rows;
       $("reset-confirm").value = "";
       $("reset-delete-files").checked = false;
+
+      // The node is on its way down. Polling it would only trade the report
+      // the operator is reading for a connection error, and the session dies
+      // with the process anyway — its signing key is generated per startup.
+      if (result.restarting) {
+        $("reset-restart").checked = false;
+        stopPolling();
+        show($("reset-restarting"),
+          "The node is restarting. It will onboard against the Portal from scratch; sign in again once it is back.",
+          true);
+        return;
+      }
       loadStatus();
     }).catch(function (error) {
       if (error.status !== 401 && error.status !== 403) { show($("reset-error"), error.message, true); }

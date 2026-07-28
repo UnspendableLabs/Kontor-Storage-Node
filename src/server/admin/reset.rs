@@ -10,6 +10,12 @@
 //! BLS key, the daemon lock and every other file in the storage directory
 //! survive, because this endpoint deletes objects it can name from the rows it
 //! just read — never the directory.
+//!
+//! The wipe leaves the node's Portal registration alone — it was never in the
+//! database — but after a signet reset that registration is stale in a way the
+//! running process cannot repair. `restart` therefore asks the run loop to
+//! exit once the response is out, so the supervisor starts a process that
+//! onboards from scratch. See [`crate::app::restart`].
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +55,14 @@ pub struct ResetDatabaseRequest {
     /// is selling.
     #[serde(default)]
     pub delete_files: bool,
+    /// Exit after the wipe so the supervisor restarts the node.
+    ///
+    /// The reason to want it is the `signer_id` and JWT frozen in the daemon's
+    /// `PortalClient` at startup: a signet reset invalidates both, and only a
+    /// fresh onboarding picks up their replacements. Refused up front when the
+    /// node could not come back unattended.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 /// Outcome of the blob deletion pass.
@@ -107,6 +121,10 @@ async fn delete_all_rows(
 ///
 /// # Errors
 /// - `400 CONFIRMATION_REQUIRED` when `confirm` is not [`CONFIRMATION_PHRASE`].
+/// - `400 RESTART_UNAVAILABLE` when `restart` is set on a node that could not
+///   come back on its own. Checked before anything is read or deleted: an
+///   operator who asked for a restart is telling us the wipe alone is not what
+///   they want, so half of it is worse than none.
 /// - `500 DATABASE_ERROR` when the transaction cannot be opened or committed.
 ///
 /// Blob deletion never fails the request: the rows are already gone by then, so
@@ -124,8 +142,19 @@ pub async fn reset_database(
         ));
     }
 
+    if request.restart && !state.admin.restart().is_available() {
+        return Err(ApiError::bad_request(
+            error_codes::RESTART_UNAVAILABLE,
+            "This node cannot restart itself: BLS_PASSWORD is unset, so a restarted \
+             process would stop at the key password prompt with no terminal to answer \
+             it. Set the variable, or reset without the restart and restart the node \
+             yourself.",
+        ));
+    }
+
     warn!(
         delete_files = request.delete_files,
+        restart = request.restart,
         "Admin requested a full database reset"
     );
 
@@ -181,11 +210,20 @@ pub async fn reset_database(
         .map(|(table, count)| (table.to_string(), json!(count)))
         .collect();
 
+    // Last, so that a `delete_files` pass is never cut short by the shutdown it
+    // races. The response itself is safe either way: the graceful shutdown
+    // waits for in-flight requests before the process goes.
+    if request.restart {
+        warn!("Restart requested; exiting once the response is out so the supervisor restarts us");
+        state.admin.restart().request();
+    }
+
     Ok(json!({
         "deleted": deleted_map,
         "total_rows_deleted": total,
         "storage_method": state.storage_backend.method.to_string(),
         "files": blobs.as_ref().map(BlobReport::to_json),
+        "restarting": request.restart,
     }))
 }
 
@@ -308,6 +346,7 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::restart::RestartHandle;
     use crate::app::tasks::downloadagreements::StorageBackend;
     use crate::clients::GcsClient;
     use crate::entities::challenges;
@@ -325,6 +364,14 @@ mod tests {
         ResetDatabaseRequest {
             confirm: CONFIRMATION_PHRASE.to_string(),
             delete_files,
+            restart: false,
+        }
+    }
+
+    fn confirmed_with_restart() -> ResetDatabaseRequest {
+        ResetDatabaseRequest {
+            restart: true,
+            ..confirmed(false)
         }
     }
 
@@ -401,6 +448,7 @@ mod tests {
                 &ResetDatabaseRequest {
                     confirm: bad.to_string(),
                     delete_files: true,
+                    restart: false,
                 },
                 &state,
             )
@@ -508,6 +556,99 @@ mod tests {
 
         assert_eq!(second["total_rows_deleted"], 0);
         assert_eq!(second["files"]["requested"], 0);
+    }
+
+    /// The switch is only flipped when asked: a plain reset must leave a node
+    /// that is otherwise healthy running.
+    #[tokio::test]
+    async fn reset_alone_never_asks_for_a_restart() {
+        let (mut state, _dir) = seeded_state().await;
+        let restart = RestartHandle::available();
+        state.admin = AdminState::with_restart(restart.clone());
+
+        let value = reset_database(&confirmed(true), &state).await.unwrap();
+
+        assert_eq!(value["restarting"], false);
+        assert!(!restart.is_requested());
+    }
+
+    #[tokio::test]
+    async fn reset_asks_for_a_restart_when_it_can_deliver_one() {
+        let (mut state, _dir) = seeded_state().await;
+        let restart = RestartHandle::available();
+        state.admin = AdminState::with_restart(restart.clone());
+
+        let value = reset_database(&confirmed_with_restart(), &state)
+            .await
+            .unwrap();
+
+        assert_eq!(value["restarting"], true);
+        assert_eq!(value["total_rows_deleted"], 5, "the wipe still happened");
+        assert!(restart.is_requested());
+    }
+
+    /// Without `BLS_PASSWORD` a restarted process stops at the password prompt,
+    /// so the request is refused whole rather than wiping the node and then
+    /// leaving it up with the stale identity the operator wanted gone.
+    #[tokio::test]
+    async fn reset_refuses_a_restart_it_cannot_deliver_and_wipes_nothing() {
+        let (mut state, _dir) = seeded_state().await;
+        let restart = RestartHandle::unavailable();
+        state.admin = AdminState::with_restart(restart.clone());
+
+        let err = reset_database(&confirmed_with_restart(), &state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, error_codes::RESTART_UNAVAILABLE);
+        assert!(err.message.contains("BLS_PASSWORD"), "{}", err.message);
+        assert_eq!(count_rows(&state).await, (3, 2), "nothing was touched");
+        assert!(!restart.is_requested());
+    }
+
+    /// A node that cannot restart is still a node that can be reset.
+    #[tokio::test]
+    async fn a_node_that_cannot_restart_can_still_be_wiped() {
+        let (mut state, _dir) = seeded_state().await;
+        state.admin = AdminState::with_restart(RestartHandle::unavailable());
+
+        let value = reset_database(&confirmed(false), &state).await.unwrap();
+
+        assert_eq!(value["total_rows_deleted"], 5);
+        assert_eq!(value["restarting"], false);
+    }
+
+    /// The confirmation phrase is checked first: a restart cannot be used to
+    /// smuggle an unconfirmed wipe past it.
+    #[tokio::test]
+    async fn an_unconfirmed_restart_fails_on_the_phrase_not_the_switch() {
+        let (mut state, _dir) = seeded_state().await;
+        let restart = RestartHandle::available();
+        state.admin = AdminState::with_restart(restart.clone());
+
+        let err = reset_database(
+            &ResetDatabaseRequest {
+                confirm: String::new(),
+                delete_files: false,
+                restart: true,
+            },
+            &state,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, error_codes::CONFIRMATION_REQUIRED);
+        assert!(!restart.is_requested());
+    }
+
+    /// Defaults matter: an older page that posts only `confirm` must not be
+    /// read as asking for a restart.
+    #[test]
+    fn a_body_without_the_field_does_not_ask_for_a_restart() {
+        let request: ResetDatabaseRequest = serde_json::from_str(r#"{"confirm":"RESET"}"#).unwrap();
+        assert!(!request.restart);
+        assert!(!request.delete_files);
     }
 
     #[test]

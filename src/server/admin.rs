@@ -49,6 +49,7 @@ use std::net::SocketAddr;
 use tracing::{debug, error, info};
 
 use crate::app::config::AdminPassword;
+use crate::app::restart::RestartHandle;
 use crate::server::state::DownloadServerState;
 use session::AdminSession;
 
@@ -68,12 +69,16 @@ struct Inner {
     /// a persisted secret with, and an ephemeral key means a leaked token dies
     /// with the next restart.
     session_key: [u8; 32],
+    /// Lets a reset ask the run loop to exit so the supervisor restarts the
+    /// node. It lives behind the admin gate because the operator UI is the only
+    /// thing that ever asks.
+    restart: RestartHandle,
 }
 
 impl AdminState {
     /// Builds the admin state, generating a fresh session-signing key.
     #[must_use]
-    pub fn new(password: AdminPassword) -> Self {
+    pub fn new(password: AdminPassword, restart: RestartHandle) -> Self {
         use rand::RngCore;
 
         let mut session_key = [0u8; 32];
@@ -82,6 +87,7 @@ impl AdminState {
             inner: Arc::new(Inner {
                 password,
                 session_key,
+                restart,
             }),
         }
     }
@@ -92,13 +98,34 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn disabled() -> Self {
-        Self::new(AdminPassword::new(None))
+        Self::new(AdminPassword::new(None), RestartHandle::unavailable())
+    }
+
+    /// Test-only: no password, but a live restart switch, for the reset paths
+    /// that assert on it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_restart(restart: RestartHandle) -> Self {
+        Self::new(AdminPassword::new(None), restart)
+    }
+
+    /// Test-only: an unlockable UI on a node that refuses restarts, for the
+    /// session and routing tests that only care about the password.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_password(password: AdminPassword) -> Self {
+        Self::new(password, RestartHandle::unavailable())
     }
 
     /// True when a password is configured.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.inner.password.is_empty()
+    }
+
+    /// The process-restart switch. See [`RestartHandle`].
+    pub(crate) fn restart(&self) -> &RestartHandle {
+        &self.inner.restart
     }
 
     fn password(&self) -> &AdminPassword {
@@ -132,6 +159,8 @@ pub mod error_codes {
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     /// A destructive action was requested without its confirmation phrase.
     pub const CONFIRMATION_REQUIRED: &str = "CONFIRMATION_REQUIRED";
+    /// A restart was asked for on a node that could not come back unattended.
+    pub const RESTART_UNAVAILABLE: &str = "RESTART_UNAVAILABLE";
     /// A database read or write failed.
     pub const DATABASE_ERROR: &str = "DATABASE_ERROR";
     /// The session could not be issued (signing failure).
@@ -260,7 +289,10 @@ mod tests {
     #[test]
     fn state_reports_whether_a_password_is_configured() {
         assert!(!AdminState::disabled().is_enabled());
-        assert!(AdminState::new(AdminPassword::new(Some("correct horse battery"))).is_enabled());
+        assert!(
+            AdminState::with_password(AdminPassword::new(Some("correct horse battery")))
+                .is_enabled()
+        );
     }
 
     /// Two processes must not share a session key, or a token minted by one
@@ -274,7 +306,7 @@ mod tests {
 
     #[test]
     fn debug_output_reveals_neither_password_nor_key() {
-        let state = AdminState::new(AdminPassword::new(Some("correct horse battery")));
+        let state = AdminState::with_password(AdminPassword::new(Some("correct horse battery")));
         let rendered = format!("{state:?}");
         assert!(!rendered.contains("correct horse battery"), "{rendered}");
         assert!(rendered.contains("enabled: true"), "{rendered}");
@@ -360,7 +392,7 @@ mod tests {
                 storage_dir: dir.path().to_path_buf(),
                 storage_backend: StorageBackend::local(),
                 node_id: "NODE-admin".to_string(),
-                admin: AdminState::new(AdminPassword::new(password)),
+                admin: AdminState::with_password(AdminPassword::new(password)),
             };
             (state, dir)
         }

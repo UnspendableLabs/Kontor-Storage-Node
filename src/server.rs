@@ -359,7 +359,7 @@ mod tests {
             storage_dir,
             storage_backend: StorageBackend::local(),
             node_id: "NODE-socket".to_string(),
-            admin: AdminState::new(AdminPassword::new(Some(PASSWORD))),
+            admin: AdminState::with_password(AdminPassword::new(Some(PASSWORD))),
         };
 
         // Bind first so the test knows the port before the server owns it.

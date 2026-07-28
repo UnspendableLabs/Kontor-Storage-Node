@@ -231,10 +231,11 @@ Counts of everything a reset would erase, plus where it is stored.
                 "challenges": {
                     "total": 7
                 },
+                "restart_available": true,
                 "session_expires_at": 1798761600
             }
 
-    `storage.directory` is `null` when the backend is GCS.
+    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when `BLS_PASSWORD` is unset, because a restarted process would stop at the key password prompt.
 
 + Response 401 (application/json)
 
@@ -250,6 +251,8 @@ Deletes every row of `agreements` and `challenges` in a single transaction. Both
 
 With `delete_files`, the stored blobs of the deleted rows are removed too — local files, or objects in the node's GCS bucket. Only blobs named by those rows are touched, so the BLS key and everything else in the storage directory survive. Blob deletion never fails the request: the rows are already gone, and the counts say what happened.
 
+With `restart`, the node answers this request and then exits with code `75` so its supervisor starts it again. The wipe alone leaves the node's Portal registration in place — it was never in the database — but the `signer_id`, JWT and announced URL read during onboarding are stale after a signet reset, and only a fresh start replaces them. Re-register the BLS key on the Portal before asking for this. Refused with `RESTART_UNAVAILABLE` when the node could not come back unattended; check `restart_available` on `GET /api/admin/status` first.
+
 + Request (application/json)
 
     + Headers
@@ -259,6 +262,8 @@ With `delete_files`, the stored blobs of the deleted rows are removed too — lo
     + Attributes
         + confirm: `RESET` (string, required) - Must be exactly `RESET`
         + delete_files: false (boolean, optional) - Also delete the stored file blobs
+            + Default: `false`
+        + restart: false (boolean, optional) - Exit after the wipe so the supervisor restarts the node
             + Default: `false`
 
 + Response 200 (application/json)
@@ -278,14 +283,17 @@ With `delete_files`, the stored blobs of the deleted rows are removed too — lo
                     "missing": 1,
                     "failed": 0,
                     "skipped": 0
-                }
+                },
+                "restarting": false
             }
 
     `files` is `null` when `delete_files` was not set. `missing` covers a local file that had already disappeared or a bucket object GCS answers `404` for — nothing to act on. `failed` is a blob still out there: the row is gone, so only the operator can deal with it now. `skipped` counts file ids that were not plain object names and were therefore never turned into a path.
 
+    `restarting` echoes whether the node is on its way down. The response is flushed before the process exits, so this is the last thing the node says.
+
 + Response 400 (application/json)
 
-    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`). Nothing is deleted.
+    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`), or `restart` was asked for on a node with no `BLS_PASSWORD` in its environment (`RESTART_UNAVAILABLE`). Nothing is deleted in either case.
 
 + Response 401 (application/json)
 

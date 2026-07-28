@@ -162,7 +162,7 @@ Endpoints:
 | `GET /admin` | Operator UI (password-gated, see below) |
 | `POST /api/admin/login` | Exchange `ADMIN_PASSWORD` for an 8-hour session token |
 | `GET /api/admin/status` | JSON: row counts and storage summary (session required) |
-| `POST /api/admin/reset-database` | Wipe the node's database (session required) |
+| `POST /api/admin/reset-database` | Wipe the node's database, optionally restarting the node (session required) |
 
 CORS is permissive (`Access-Control-Allow-Origin: *`) on the serving routes, which are all public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. The `/admin` routes are deliberately outside that CORS layer and carry their own password gate. See [`apiary.apib`](apiary.apib) for the full API specification.
 
@@ -177,7 +177,21 @@ Setting `ADMIN_PASSWORD` (at least 16 characters) enables a single-page operator
 
 The UI shows what the node holds and offers one action: **reset the database**. It deletes every row of `agreements` and `challenges` — both are chain-derived, so after a Kontor signet reset they refer to a chain that no longer exists — and the daemon then re-fetches agreements from the Portal from scratch. It requires typing `RESET` to confirm.
 
-Stored file blobs are kept by default and become orphans; ticking *also delete the stored file blobs* removes them too (local files, or objects in the node's GCS bucket). Only blobs named by the rows being deleted are removed, so the BLS key, the daemon lock and anything else in the storage directory always survive. A node restart after a reset is the clean way to be sure no in-flight download writes a file back.
+Stored file blobs are kept by default and become orphans; ticking *also delete the stored file blobs* removes them too (local files, or objects in the node's GCS bucket). Only blobs named by the rows being deleted are removed, so the BLS key, the daemon lock and anything else in the storage directory always survive.
+
+#### Restarting after a reset
+
+The wipe does not re-register the node, and cannot: the `signer_id`, the JWT and the announced public URL are read once during onboarding and then held for the life of the process, and a signet reset invalidates all three. The full recovery is therefore:
+
+1. re-register the node's BLS key on the Portal — the node never issues `RegisterBlsKey` itself, it only waits for the resulting `signer_id` to appear;
+2. reset the database with **restart the node after the wipe** ticked;
+3. the node exits with code `75` and the supervisor starts it again, which re-runs onboarding, re-announces the URL and reconciles against the new chain.
+
+Restarting also settles any download still in flight, which would otherwise write a file back after the wipe.
+
+The exit code is deliberately non-zero: Railway's default policy and Docker Compose's `restart: on-failure` only bring back a container that failed, so a clean `0` would leave the node stopped.
+
+The restart is offered only when `BLS_PASSWORD` is set. Without it, onboarding prompts for the key password on a terminal a restarted container does not have, so the node would go down and stay down — the checkbox is disabled and the API answers `400 RESTART_UNAVAILABLE`. Reset without it and restart the node yourself.
 
 ## Development
 
