@@ -89,6 +89,10 @@
   .muted { color: var(--muted); }
   .danger-zone { border-color: var(--red); margin-top: 20px; }
   .danger-zone h2 { color: var(--red); }
+  .registration { border-color: var(--amber); margin-bottom: 14px; }
+  .registration h2 { color: var(--amber); }
+  .registration[data-registered="true"] { border-color: var(--border); }
+  .registration[data-registered="true"] h2 { color: var(--muted); }
   .stack > * + * { margin-top: 12px; }
   .check { display: flex; align-items: flex-start; gap: 8px; }
   .check input { margin-top: 3px; }
@@ -120,6 +124,31 @@
   </header>
 
   <div class="msg err" id="status-error"></div>
+
+  <!-- Shown only while the Portal has no node for this BLS key. Until then the
+       node has no signer id, so nothing below it is running. -->
+  <div class="card registration" id="registration" hidden>
+    <h2 id="registration-title">Register this node on the Portal</h2>
+    <div class="msg err" id="register-error"></div>
+    <div class="msg ok" id="register-success"></div>
+    <div class="msg warn" id="register-restarting"></div>
+    <p id="registration-intro">
+      The Portal has no node for this BLS key, so this node cannot join
+      agreements or answer challenges. That is the normal state after the
+      Portal's database has been reset.
+    </p>
+    <div class="row"><span class="k">BLS public key</span><span class="mono trunc" id="register-bls-pubkey">—</span></div>
+    <div class="divider"></div>
+    <p class="muted">
+      Registering needs one signature from Horizon Wallet — the proof that the
+      Taproot key you own vouches for this BLS key. Everything else is signed
+      here with the node's own key. Open this page in a browser with the
+      extension installed and unlocked, on the wallet account this node's key
+      was exported from.
+    </p>
+    <p class="muted" id="register-wallet-state"></p>
+    <button class="primary" id="register-submit" disabled>Register with Horizon Wallet</button>
+  </div>
 
   <div class="grid kpis" id="kpis"></div>
 
@@ -155,10 +184,10 @@
     <p class="muted">
       The wipe does not re-register this node, and cannot: its signer id, token
       and announced URL are read once at startup, and a signet reset invalidates
-      all three. Re-register the BLS key on the Portal <em>first</em>, then reset
-      with the restart ticked — the node comes back and onboards against the new
-      chain. Restarting also settles any download still in flight, which would
-      otherwise write a file back after the wipe.
+      all three. Reset with the restart ticked — the node comes back, and if the
+      Portal no longer knows its BLS key it offers the registration above rather
+      than exiting. Restarting also settles any download still in flight, which
+      would otherwise write a file back after the wipe.
     </p>
     <form id="reset-form" class="stack">
       <label class="check">
@@ -190,8 +219,18 @@
   var STATUS_POLL_MS = 30000;
   var CONFIRMATION_PHRASE = "RESET";
 
+  // The extension injects its provider on its own schedule, so a single check
+  // at load races it. Twenty tries at 250 ms is the same five-second budget the
+  // Horizon Market page allowed.
+  var WALLET_POLL_MS = 250;
+  var WALLET_POLL_TRIES = 20;
+  // A wallet prompt waits on a human, so this only has to outlast a distracted
+  // one; without it a dismissed dialog leaves the button disabled forever.
+  var WALLET_TIMEOUT_MS = 120000;
+
   var token = sessionStorage.getItem(TOKEN_KEY);
   var statusTimer = null;
+  var walletProvider = null;
 
   /* ---------------- helpers ---------------- */
 
@@ -376,6 +415,7 @@
       $("session").textContent =
         "Session until " + new Date(data.session_expires_at * 1000).toLocaleTimeString();
     }
+    renderRegistration(data.registration || {});
     $("node-id").textContent = data.node_id || "—";
     $("storage-method").textContent = storage.method || "—";
     if (storage.directory) {
@@ -421,6 +461,167 @@
     }).catch(function (error) {
       if (error.status === 401 || error.status === 403) { return; }
       show($("status-error"), error.message, true);
+    });
+  }
+
+  /* ---------------- registration ---------------- */
+
+  // A node whose key the Portal never saw is not running: no signer id means
+  // no agreements and no proofs. That state leads the page; a registered node
+  // keeps the card only as a way back to it, since re-registering is how a
+  // rotated key or a half-finished reset gets fixed.
+  function renderRegistration(registration) {
+    var card = $("registration");
+    if (registration.supported !== true) {
+      card.hidden = true;
+      return;
+    }
+
+    var registered = registration.registered === true;
+    card.hidden = false;
+    card.setAttribute("data-registered", registered ? "true" : "false");
+    $("register-bls-pubkey").textContent = registration.bls_pubkey || "—";
+
+    if (registered) {
+      $("registration-title").textContent = "Portal registration";
+      $("registration-intro").textContent = registration.signer_id === null
+        ? "Registered, but the RegisterBlsKey transaction has not confirmed on-chain yet. " +
+          "The node cannot sign operations until it does."
+        : "This node is registered. Register again only to bind a different wallet " +
+          "account, or if the Portal has lost the node's signer id — it restarts either way.";
+      $("register-submit").textContent = "Re-register with Horizon Wallet";
+    } else {
+      $("registration-title").textContent = "Register this node on the Portal";
+      $("registration-intro").textContent =
+        "The Portal has no node for this BLS key, so this node cannot join agreements " +
+        "or answer challenges. That is the normal state after the Portal's database " +
+        "has been reset.";
+      $("register-submit").textContent = "Register with Horizon Wallet";
+    }
+
+    detectWallet();
+  }
+
+  function detectWallet() {
+    if (walletProvider) { return; }
+
+    var tries = 0;
+    var note = $("register-wallet-state");
+    note.textContent = "Looking for Horizon Wallet…";
+
+    var timer = window.setInterval(function () {
+      tries += 1;
+      if (window.HorizonWalletProvider) {
+        window.clearInterval(timer);
+        walletProvider = window.HorizonWalletProvider;
+        note.textContent = "Horizon Wallet detected.";
+        $("register-submit").disabled = false;
+      } else if (tries >= WALLET_POLL_TRIES) {
+        window.clearInterval(timer);
+        note.textContent =
+          "Horizon Wallet was not detected. Install and unlock the extension, then " +
+          "reload this page. The node keeps checking the Portal in the background, so " +
+          "registering from anywhere else also works.";
+        $("register-submit").disabled = true;
+      }
+    }, WALLET_POLL_MS);
+  }
+
+  // The extension answers `{result}` or `{error}` rather than rejecting, and a
+  // dismissed prompt may answer neither, hence the timeout.
+  function walletRequest(name, params) {
+    var pending = params === undefined
+      ? walletProvider.request(name)
+      : walletProvider.request(name, params);
+
+    var timer = null;
+    var timeout = new Promise(function (_, reject) {
+      timer = window.setTimeout(function () {
+        reject(new Error("Horizon Wallet did not respond. Unlock the extension and try again."));
+      }, WALLET_TIMEOUT_MS);
+    });
+
+    return Promise.race([pending, timeout]).then(function (response) {
+      window.clearTimeout(timer);
+      if (response && response.error) {
+        var detail = response.error;
+        throw new Error(typeof detail === "string" ? detail : (detail.message || "Wallet request failed"));
+      }
+      if (!response || !response.result) {
+        throw new Error("Horizon Wallet returned nothing for " + name);
+      }
+      return response.result;
+    }, function (error) {
+      window.clearTimeout(timer);
+      throw error;
+    });
+  }
+
+  // The Portal derives the node's Bitcoin address from the extended key, and
+  // only a Taproot account has one it will accept.
+  function taprootAddress(result) {
+    var addresses = (result && result.addresses) || [];
+    for (var i = 0; i < addresses.length; i += 1) {
+      if (addresses[i] && addresses[i].type === "p2tr" && addresses[i].address) {
+        return addresses[i].address;
+      }
+    }
+    throw new Error("Horizon Wallet returned no Taproot (p2tr) address.");
+  }
+
+  function registerNode() {
+    if (!walletProvider) { return; }
+
+    var button = $("register-submit");
+    var label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Waiting for Horizon Wallet…";
+    show($("register-error"), "");
+
+    walletRequest("getAddresses").then(function (result) {
+      return walletRequest("getBLSPoP", { address: taprootAddress(result) });
+    }).then(function (pop) {
+      button.textContent = "Registering…";
+      // Only the two fields the node cannot derive, plus the wallet's own view
+      // of the BLS key so the node can refuse an account it has no key for.
+      return api("/api/admin/register-node", {
+        method: "POST",
+        body: {
+          xpubkey: pop.xpubkey,
+          bls_pubkey: pop.blsPubkey,
+          schnorr_sig: pop.schnorrSig
+        }
+      });
+    }).then(function (result) {
+      show($("register-success"), "Registered as " + result.node_id, true);
+
+      // Same reasoning as the reset: the process is going away, and its session
+      // key goes with it.
+      if (result.restarting) {
+        stopPolling();
+        show($("register-restarting"),
+          "The node is restarting to onboard. The Portal still has to confirm the " +
+          "RegisterBlsKey transaction on-chain, which the node waits for on the way up. " +
+          "Sign in again once it is back.",
+          true);
+        button.disabled = true;
+        button.textContent = label;
+        return;
+      }
+
+      show($("register-restarting"),
+        "Registered, but this node cannot restart itself: BLS_PASSWORD is not set. " +
+        "Restart it yourself once the Portal has confirmed the key on-chain.",
+        true);
+      button.disabled = false;
+      button.textContent = label;
+      loadStatus();
+    }).catch(function (error) {
+      if (error.status !== 401 && error.status !== 403) {
+        show($("register-error"), error.message, true);
+      }
+      button.disabled = false;
+      button.textContent = label;
     });
   }
 
@@ -495,6 +696,7 @@
   $("login-form").addEventListener("submit", signIn);
   $("logout").addEventListener("click", signOut);
   $("reset-form").addEventListener("submit", resetDatabase);
+  $("register-submit").addEventListener("click", registerNode);
 
   $("reset-confirm").addEventListener("input", function () {
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;

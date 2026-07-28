@@ -1,5 +1,6 @@
 use super::http_helpers::{build_http_client, check_response_status};
 use super::http_signature;
+use super::kontor_op::{build_signing_message, Inst, InstKind, SignerRef, DEFAULT_GAS_LIMIT};
 use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -10,9 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 
-/// Prefix for Kontor operation signing messages.
-const KONTOR_OP_PREFIX: &[u8] = b"KONTOR-OP-V1";
-
 /// Filestorage contract address in Kontor (native contract at genesis).
 ///
 /// Mirrors the Portal's `DEFAULT_KONTOR_CONTRACT_ADDRESS`. The address is part
@@ -20,67 +18,6 @@ const KONTOR_OP_PREFIX: &[u8] = b"KONTOR-OP-V1";
 /// filestorage instance must point the node at the same one — see
 /// [`PortalClient::with_contract_address`].
 pub const DEFAULT_FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
-
-/// Default gas limit for filestorage contract calls.
-const DEFAULT_GAS_LIMIT: u64 = 100_000;
-
-/// Mirror of Kontor's `SignerRef` enum (`indexer-types`).
-///
-/// Variant ordering MUST match Kontor's exactly so that postcard encodes the
-/// same variant indices. Only `SignerId` is ever constructed here — a storage
-/// node always has a `signer_id` by the time it signs an op — but
-/// `XOnlyPubkey` is kept so the index of any future variant stays right.
-#[derive(Serialize)]
-enum SignerRef {
-    SignerId(u64), // index 0
-    #[allow(dead_code)]
-    XOnlyPubkey(Vec<u8>), // index 1 — present only to maintain correct variant indices
-}
-
-/// Mirror of Kontor's `InstKind` enum (`indexer-types`).
-///
-/// Variant ordering MUST match Kontor's exactly: postcard encodes the variant
-/// index, so a variant inserted upstream ahead of `Call` silently changes every
-/// signature this node produces. `ContractAddress` is serialized via
-/// `DisplayFromStr` in Kontor, so `String` here produces an identical postcard
-/// encoding; the same holds for the `BuildProvenance` payloads, which are only
-/// present to keep the indices aligned and are never constructed.
-#[derive(Serialize)]
-enum InstKind {
-    #[allow(dead_code)]
-    Publish {
-        name: String,
-        bytes: Vec<u8>,
-        provenance: (),
-    }, // index 0
-    Call {
-        contract: String,
-        expr: String,
-    }, // index 1
-    #[allow(dead_code)]
-    UpdateProvenance {
-        contract: String,
-        provenance: (),
-    }, // index 2
-    #[allow(dead_code)]
-    Issuance, // index 3
-    #[allow(dead_code)]
-    RegisterBlsKey {
-        // index 4
-        bls_pubkey: Vec<u8>,
-        schnorr_sig: Vec<u8>,
-        bls_sig: Vec<u8>,
-    },
-    #[allow(dead_code)]
-    Sponsor, // index 5
-}
-
-/// Mirror of Kontor's `Inst` struct.
-#[derive(Serialize)]
-struct Inst {
-    gas_limit: u64,
-    kind: InstKind,
-}
 
 /// Encode `s` as a Wave string literal, validating it contains only safe
 /// characters.
@@ -469,6 +406,29 @@ impl PortalClient {
             .context("failed to deserialize node lookup result")
     }
 
+    /// Register this node's BLS key with the Portal.
+    ///
+    /// Unauthenticated by design: the node has no credential to present until
+    /// this call succeeds. The Portal authenticates the request from the
+    /// signatures in the body instead, and gates it on the operator's Taproot
+    /// address being whitelisted — a `403 ADDRESS_NOT_WHITELISTED` means a
+    /// Portal admin has to act, so the error body is worth surfacing verbatim.
+    ///
+    /// Writing the row is all this does. Getting the key on-chain is the
+    /// Portal daemon's job, and `signer_id` stays `null` in
+    /// [`Self::lookup_node`] until that transaction confirms.
+    pub async fn register_node(
+        &self,
+        request: &RegisterNodeRequest,
+    ) -> Result<RegisterNodeResponse> {
+        let url = format!("{}/api/nodes/register", self.base_url);
+        let resp = self.http.post(&url).json(request).send().await?;
+        let resp = check_response_status(resp, "register node").await?;
+        resp.json::<RegisterNodeResponse>()
+            .await
+            .context("failed to deserialize node registration response")
+    }
+
     /// Request a login challenge for the given user/node ID.
     pub async fn login_challenge(&self, user_id: &str) -> Result<LoginChallenge> {
         let url = format!("{}/api/users/login", self.base_url);
@@ -607,12 +567,10 @@ impl PortalClient {
             },
         };
 
-        // `sponsored = false`: node self-pays gas (nodes never use sponsored ops).
-        let op_bytes = postcard::to_allocvec(&(&claim, nonce, false, &inst))
-            .context("failed to serialize signing payload")?;
-        let mut msg = Vec::with_capacity(KONTOR_OP_PREFIX.len() + op_bytes.len());
-        msg.extend_from_slice(KONTOR_OP_PREFIX);
-        msg.extend_from_slice(&op_bytes);
+        // `sponsored = false`: a node self-pays gas for its own calls. Only
+        // `RegisterBlsKey`, which the Portal publishes on the node's behalf
+        // before it has an account to pay from, is sponsored.
+        let msg = build_signing_message(&claim, nonce, false, &inst)?;
 
         let sig = auth.keypair.sign_kontor_op_message(&msg)?;
         Ok((sig, nonce))
@@ -1008,6 +966,28 @@ pub struct NodeLookupResult {
     pub node_id: String,
     /// `None` when the `RegisterBlsKey` transaction has not been confirmed yet.
     pub signer_id: Option<u64>,
+    pub bls_public_key: String,
+}
+
+/// Body of `POST /api/nodes/register`.
+///
+/// Built by [`crate::node::registration::build_registration_request`]; every
+/// field is hex except `xpubkey`, which is base58.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterNodeRequest {
+    pub xpubkey: String,
+    pub bls_pubkey: String,
+    pub schnorr_sig: String,
+    pub bls_sig: String,
+    pub registration_signature: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterNodeResponse {
+    pub node_id: String,
+    #[allow(dead_code)]
+    pub x_only_pubkey: String,
+    #[allow(dead_code)]
     pub bls_public_key: String,
 }
 

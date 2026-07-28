@@ -219,6 +219,13 @@ Counts of everything a reset would erase, plus where it is stored.
 
             {
                 "node_id": "abc123def456",
+                "registration": {
+                    "supported": true,
+                    "registered": true,
+                    "bls_pubkey": "92538f03...",
+                    "node_id": "abc123def456",
+                    "signer_id": 42
+                },
                 "storage": {
                     "method": "local",
                     "directory": "/var/lib/kontor/files"
@@ -243,6 +250,8 @@ Counts of everything a reset would erase, plus where it is stored.
 
     `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when `BLS_PASSWORD` is unset, because a restarted process would stop at the key password prompt.
 
+    `registration` says whether the Portal knows this node's BLS key. `registered: false` means onboarding stopped at the lookup and no daemon is running — the node serves this page and nothing else until the key is registered. `node_id` and `signer_id` are then `null`, and `signer_id` is also `null` on a node whose `RegisterBlsKey` transaction has not confirmed yet. `supported: false` means no BLS key was loaded at all, so there is nothing to register.
+
     `ledger` reports whether the node can still prove. `placed` is how many stored files carry a contract-assigned slot and would enter the rebuilt ledger; `awaiting_ledger_index` is how many are stored and served but not yet provable, because the Portal has not reconciled their creating transaction. `rebuild_blocked` is `true` once `highest_slot + 1` exceeds `placed` by more than kontor-crypto's sparsity gap (1024), at which point the ledger cannot be rebuilt and every proof is skipped — see the README.
 
 + Response 401 (application/json)
@@ -259,7 +268,7 @@ Deletes every row of `agreements` and `challenges` in a single transaction. Both
 
 With `delete_files`, the stored blobs of the deleted rows are removed too — local files, or objects in the node's GCS bucket. Only blobs named by those rows are touched, so the BLS key and everything else in the storage directory survive. Blob deletion never fails the request: the rows are already gone, and the counts say what happened.
 
-With `restart`, the node answers this request and then exits with code `75` so its supervisor starts it again. The wipe alone leaves the node's Portal registration in place — it was never in the database — but the `signer_id`, JWT and announced URL read during onboarding are stale after a signet reset, and only a fresh start replaces them. Re-register the BLS key on the Portal before asking for this. Refused with `RESTART_UNAVAILABLE` when the node could not come back unattended; check `restart_available` on `GET /api/admin/status` first.
+With `restart`, the node answers this request and then exits with code `75` so its supervisor starts it again. The wipe alone leaves the node's Portal registration in place — it was never in the database — but the `signer_id`, JWT and announced URL read during onboarding are stale after a signet reset, and only a fresh start replaces them. If the Portal no longer knows the node's BLS key, the restarted process stops at the registration card rather than exiting; see `POST /api/admin/register-node`. Refused with `RESTART_UNAVAILABLE` when the node could not come back unattended; check `restart_available` on `GET /api/admin/status` first.
 
 + Request (application/json)
 
@@ -310,6 +319,53 @@ With `restart`, the node answers this request and then exits with code `75` so i
 + Response 500 (application/json)
 
     The transaction could not be opened or committed (`DATABASE_ERROR`). The wipe is rolled back.
+
+### Register Node [POST /api/admin/register-node]
+
+Registers this node's BLS key with the Portal, so a node whose key the Portal has forgotten — after a Portal database reset, say — can be brought back without leaving the node's own UI.
+
+The body carries only what the node cannot produce for itself: the extended public key and the Schnorr proof of possession, both from Horizon Wallet's `getBLSPoP`, plus the BLS key the wallet reports. The node derives the x-only pubkey from `xpubkey`, signs the BLS binding and the `RegisterBlsKey` op with its own key, and posts all five fields to the Portal's `POST /api/nodes/register`.
+
+`bls_pubkey` must be this node's own key. Registering any other would write a Portal row the node cannot sign for, leaving the same failed lookup one restart later, so a mismatch is refused before the Portal is called at all.
+
+On success the node asks to restart, since onboarding is what turns a registration into a running node — including waiting for the `RegisterBlsKey` transaction to confirm on-chain. A node with no `BLS_PASSWORD` cannot restart unattended, so it answers `restarting: false` and stays up; restart it yourself once the Portal has confirmed the key.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + xpubkey: `tpubDD5...` (string, required) - Extended public key from `getBLSPoP`
+        + bls_pubkey: `92538f03...` (string, required) - 192 hex characters; must be this node's key
+        + schnorr_sig: `4a1c...` (string, required) - 128 hex characters, from `getBLSPoP`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "node_id": "abc123def456",
+                "bls_pubkey": "92538f03...",
+                "restarting": true
+            }
+
++ Response 400 (application/json)
+
+    A field was malformed, or `bls_pubkey` is not this node's key (`INVALID_REGISTRATION`). Nothing was sent to the Portal.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    No BLS key is loaded, so there is nothing to register (`REGISTRATION_UNAVAILABLE`).
+
++ Response 502 (application/json)
+
+    The Portal refused the registration or could not be reached (`PORTAL_ERROR`). Its own message is forwarded — most usefully `Bitcoin address … is not whitelisted for node registration`, which only a Portal admin can clear.
 
 ## Data Structures
 

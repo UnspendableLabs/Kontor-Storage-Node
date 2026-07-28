@@ -32,6 +32,7 @@
 //!   carry no `Access-Control-Allow-Origin` and a browser refuses to let
 //!   another origin read their responses.
 
+pub mod register;
 pub mod reset;
 pub mod session;
 pub mod status;
@@ -50,8 +51,71 @@ use tracing::{debug, error, info};
 
 use crate::app::config::AdminPassword;
 use crate::app::restart::RestartHandle;
+use crate::clients::PortalClient;
+use crate::crypto::BlsKeyPair;
 use crate::server::state::DownloadServerState;
 use session::AdminSession;
+
+/// The node's Portal identity, as the operator UI needs to see it.
+///
+/// Held by [`AdminState`] rather than read off the daemon's client because the
+/// registration endpoint has to work on a node that has no daemon: an
+/// unregistered node starts the server and nothing else.
+#[derive(Clone)]
+pub struct NodeIdentity {
+    /// The key being registered, and the key that signs the registration op.
+    /// This is the only copy on an unregistered node — the daemon's
+    /// authenticated client, which normally owns it, was never built.
+    keypair: Arc<BlsKeyPair>,
+    /// Unauthenticated Portal client. Registration precedes the JWT by
+    /// definition, so the signed-request client would be no use here.
+    client: PortalClient,
+    /// What the Portal knows about this key, `None` when it knows nothing.
+    registered: Option<RegisteredNode>,
+}
+
+/// The Portal-side identity of a registered node.
+#[derive(Clone, Debug)]
+pub struct RegisteredNode {
+    pub node_id: String,
+    pub signer_id: u64,
+}
+
+impl NodeIdentity {
+    #[must_use]
+    pub fn new(
+        keypair: Arc<BlsKeyPair>,
+        client: PortalClient,
+        registered: Option<RegisteredNode>,
+    ) -> Self {
+        Self {
+            keypair,
+            client,
+            registered,
+        }
+    }
+
+    pub(crate) fn keypair(&self) -> &BlsKeyPair {
+        &self.keypair
+    }
+
+    pub(crate) fn client(&self) -> &PortalClient {
+        &self.client
+    }
+
+    pub(crate) fn registered(&self) -> Option<&RegisteredNode> {
+        self.registered.as_ref()
+    }
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("registered", &self.registered)
+            .field("keypair", &"<BlsKeyPair>")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Credentials and session-signing material for the operator UI.
 ///
@@ -73,12 +137,19 @@ struct Inner {
     /// node. It lives behind the admin gate because the operator UI is the only
     /// thing that ever asks.
     restart: RestartHandle,
+    /// `None` only where no BLS key was ever loaded — every test that does not
+    /// exercise registration, and nothing in production.
+    identity: Option<NodeIdentity>,
 }
 
 impl AdminState {
     /// Builds the admin state, generating a fresh session-signing key.
     #[must_use]
-    pub fn new(password: AdminPassword, restart: RestartHandle) -> Self {
+    pub fn new(
+        password: AdminPassword,
+        restart: RestartHandle,
+        identity: Option<NodeIdentity>,
+    ) -> Self {
         use rand::RngCore;
 
         let mut session_key = [0u8; 32];
@@ -88,6 +159,7 @@ impl AdminState {
                 password,
                 session_key,
                 restart,
+                identity,
             }),
         }
     }
@@ -98,7 +170,7 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn disabled() -> Self {
-        Self::new(AdminPassword::new(None), RestartHandle::unavailable())
+        Self::new(AdminPassword::new(None), RestartHandle::unavailable(), None)
     }
 
     /// Test-only: no password, but a live restart switch, for the reset paths
@@ -106,7 +178,7 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn with_restart(restart: RestartHandle) -> Self {
-        Self::new(AdminPassword::new(None), restart)
+        Self::new(AdminPassword::new(None), restart, None)
     }
 
     /// Test-only: an unlockable UI on a node that refuses restarts, for the
@@ -114,7 +186,15 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn with_password(password: AdminPassword) -> Self {
-        Self::new(password, RestartHandle::unavailable())
+        Self::new(password, RestartHandle::unavailable(), None)
+    }
+
+    /// Test-only: a node whose key and Portal client the registration tests
+    /// need, with a restart switch they can assert on.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_identity(identity: NodeIdentity, restart: RestartHandle) -> Self {
+        Self::new(AdminPassword::new(None), restart, Some(identity))
     }
 
     /// True when a password is configured.
@@ -126,6 +206,10 @@ impl AdminState {
     /// The process-restart switch. See [`RestartHandle`].
     pub(crate) fn restart(&self) -> &RestartHandle {
         &self.inner.restart
+    }
+
+    pub(crate) fn identity(&self) -> Option<&NodeIdentity> {
+        self.inner.identity.as_ref()
     }
 
     fn password(&self) -> &AdminPassword {
@@ -141,6 +225,7 @@ impl std::fmt::Debug for AdminState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminState")
             .field("enabled", &self.is_enabled())
+            .field("identity", &self.inner.identity)
             .finish_non_exhaustive()
     }
 }
@@ -161,6 +246,13 @@ pub mod error_codes {
     pub const CONFIRMATION_REQUIRED: &str = "CONFIRMATION_REQUIRED";
     /// A restart was asked for on a node that could not come back unattended.
     pub const RESTART_UNAVAILABLE: &str = "RESTART_UNAVAILABLE";
+    /// Registration was attempted on a node with no BLS key loaded.
+    pub const REGISTRATION_UNAVAILABLE: &str = "REGISTRATION_UNAVAILABLE";
+    /// The wallet-supplied registration fields were malformed or named the
+    /// wrong BLS key.
+    pub const INVALID_REGISTRATION: &str = "INVALID_REGISTRATION";
+    /// The Portal refused the registration, or could not be reached.
+    pub const PORTAL_ERROR: &str = "PORTAL_ERROR";
     /// A database read or write failed.
     pub const DATABASE_ERROR: &str = "DATABASE_ERROR";
     /// The session could not be issued (signing failure).
@@ -266,6 +358,7 @@ pub fn router() -> Router<DownloadServerState> {
         .route("/api/admin/login", post(login_handler))
         .route("/api/admin/status", get(status_handler))
         .route("/api/admin/reset-database", post(reset_handler))
+        .route("/api/admin/register-node", post(register_handler))
 }
 
 /// `POST /api/admin/login`
@@ -302,6 +395,15 @@ async fn reset_handler(
     reset::reset_database(&request, &state).await.map(Json)
 }
 
+/// `POST /api/admin/register-node`
+async fn register_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<register::RegisterNodeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    register::register_node(&request, &state).await.map(Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +432,31 @@ mod tests {
         let rendered = format!("{state:?}");
         assert!(!rendered.contains("correct horse battery"), "{rendered}");
         assert!(rendered.contains("enabled: true"), "{rendered}");
+    }
+
+    /// The identity is the one thing on this state that carries a secret, and
+    /// it is now printed as part of the admin state — so its `Debug` has to
+    /// redact for the same reason [`BlsKeyPair`]'s does.
+    #[test]
+    fn debug_output_names_the_registration_without_the_key() {
+        use crate::testutils::tempdir;
+
+        let dir = tempdir();
+        let identity = NodeIdentity::new(
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
+            Some(RegisteredNode {
+                node_id: "node-debug".to_string(),
+                signer_id: 7,
+            }),
+        );
+        let rendered = format!(
+            "{:?}",
+            AdminState::with_identity(identity, RestartHandle::unavailable())
+        );
+
+        assert!(rendered.contains("node-debug"), "{rendered}");
+        assert!(rendered.contains("<BlsKeyPair>"), "{rendered}");
     }
 
     #[tokio::test]
@@ -456,7 +583,7 @@ mod tests {
                 db,
                 storage_dir: dir.path().to_path_buf(),
                 storage_backend: StorageBackend::local(),
-                node_id: "NODE-admin".to_string(),
+                node_id: Some("NODE-admin".to_string()),
                 admin: AdminState::with_password(AdminPassword::new(password)),
             };
             (state, dir)
@@ -544,6 +671,23 @@ mod tests {
                 1,
                 "an unauthenticated reset must not delete anything"
             );
+        }
+
+        /// The registration route reaches the Portal with a body the node
+        /// signs, so an unauthenticated caller must not get that far — the
+        /// Portal itself takes the request without any credential.
+        #[tokio::test]
+        async fn registering_requires_a_session() {
+            let (state, _dir) = state_with_password(Some(PASSWORD)).await;
+
+            let (status, payload) = call(
+                &state,
+                post("/api/admin/register-node", json!({"xpubkey": "x"})),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(payload["error"]["code"], error_codes::UNAUTHORIZED);
         }
 
         /// A token signed by some other key is not a session, however

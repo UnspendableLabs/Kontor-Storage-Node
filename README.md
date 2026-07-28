@@ -174,8 +174,9 @@ Endpoints:
 | `GET /static/*` | Static assets (logo, dashboard CSS/JS) |
 | `GET /admin` | Operator UI (password-gated, see below) |
 | `POST /api/admin/login` | Exchange `ADMIN_PASSWORD` for an 8-hour session token |
-| `GET /api/admin/status` | JSON: row counts and storage summary (session required) |
+| `GET /api/admin/status` | JSON: row counts, storage summary and registration state (session required) |
 | `POST /api/admin/reset-database` | Wipe the node's database, optionally restarting the node (session required) |
+| `POST /api/admin/register-node` | Register the node's BLS key on the Portal (session required) |
 
 CORS is permissive (`Access-Control-Allow-Origin: *`) on the serving routes, which are all public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. The `/admin` routes are deliberately outside that CORS layer and carry their own password gate. See [`apiary.apib`](apiary.apib) for the full API specification.
 
@@ -188,17 +189,41 @@ Setting `ADMIN_PASSWORD` (at least 16 characters) enables a single-page operator
 - failed logins are throttled per peer IP (10 per 15 minutes) with a fixed 250 ms delay on each rejection, and the password is compared in constant time;
 - `X-Forwarded-For` is not trusted, so behind a reverse proxy every client shares one throttle bucket (which fails closed, not open).
 
-The UI shows what the node holds and offers one action: **reset the database**. It deletes every row of `agreements` and `challenges` — both are chain-derived, so after a Kontor signet reset they refer to a chain that no longer exists — and the daemon then re-fetches agreements from the Portal from scratch. It requires typing `RESET` to confirm.
+The UI shows what the node holds and offers two actions: **register the node on the Portal** and **reset the database**.
+
+#### Reset the database
+
+Deletes every row of `agreements` and `challenges` — both are chain-derived, so after a Kontor signet reset they refer to a chain that no longer exists — and the daemon then re-fetches agreements from the Portal from scratch. It requires typing `RESET` to confirm.
 
 Stored file blobs are kept by default and become orphans; ticking *also delete the stored file blobs* removes them too (local files, or objects in the node's GCS bucket). Only blobs named by the rows being deleted are removed, so the BLS key, the daemon lock and anything else in the storage directory always survive.
+
+#### Register the node on the Portal
+
+A Portal database reset drops every `nodes` row, so the node's next `GET /api/nodes/lookup` answers `404` and it has no `signer_id` to sign with. Rather than exiting — which would take `/admin` down with it — the node starts the server with the daemon switched off and offers the registration card, so the one page that can fix the problem is the one page still running.
+
+`POST /api/nodes/register` wants five fields, and the node produces three of them itself:
+
+| Field | Source |
+|-------|--------|
+| `xpubkey` | Horizon Wallet (`getBLSPoP`) |
+| `schnorr_sig` | Horizon Wallet — BIP340 over `sha256("KONTOR_XONLY_TO_BLS_V1" ‖ bls_pubkey)`, so it needs the Taproot secret key |
+| `bls_pubkey` | the node's own key |
+| `bls_sig` | the node, over `"KONTOR_BLS_TO_XONLY_V1" ‖ x_only` |
+| `registration_signature` | the node, over the `RegisterBlsKey` op (`nonce = 0`, `sponsored = true`) |
+
+That leaves exactly one wallet prompt. Open `/admin` in a browser with the extension installed and unlocked, on the wallet account this node's BLS key was exported from — the node refuses a `bls_pubkey` that is not its own, since registering one would only produce the same `404` a restart later. The Portal gates registration on the operator's Taproot address being whitelisted; that table survives the Portal's own reset, and a `403 ADDRESS_NOT_WHITELISTED` is forwarded verbatim because only a Portal admin can clear it.
+
+An unregistered node also re-checks the Portal every 30 seconds, so a registration made anywhere else brings it back without anyone touching the container.
 
 #### Restarting after a reset
 
 The wipe does not re-register the node, and cannot: the `signer_id`, the JWT and the announced public URL are read once during onboarding and then held for the life of the process, and a signet reset invalidates all three. The full recovery is therefore:
 
-1. re-register the node's BLS key on the Portal — the node never issues `RegisterBlsKey` itself, it only waits for the resulting `signer_id` to appear;
-2. reset the database with **restart the node after the wipe** ticked;
-3. the node exits with code `75` and the supervisor starts it again, which re-runs onboarding, re-announces the URL and reconciles against the new chain.
+1. reset the database with **restart the node after the wipe** ticked;
+2. the node exits with code `75` and the supervisor starts it again, which re-runs onboarding, re-announces the URL and reconciles against the new chain;
+3. if the Portal no longer knows the node's BLS key, onboarding stops at the registration card above instead of exiting — register from there and the node restarts again, this time onboarding cleanly.
+
+Registering never issues `RegisterBlsKey` on-chain itself: the Portal's daemon batches that transaction, and onboarding waits for the resulting `signer_id` to appear.
 
 Restarting also settles any download still in flight, which would otherwise write a file back after the wipe.
 
