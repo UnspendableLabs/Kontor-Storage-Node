@@ -1,5 +1,5 @@
 use crate::app::tasks::computeproofs::compute_and_submit_proofs;
-use crate::app::tasks::downloadagreements::{download_agreements, StorageBackend};
+use crate::app::tasks::downloadagreements::{download_agreements, rebuild_ledger, StorageBackend};
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::app::tasks::reconcile;
@@ -180,6 +180,19 @@ async fn sync_portal_once(
     failed_count += sync_active_challenges(portal_client, database)
         .await
         .context("syncing active challenges failed")?;
+
+    // Refresh the aggregated ledger before proving: this pass may have
+    // downloaded new files or learned the contract-assigned `ledger_index` of
+    // ones stored earlier, and a proof is only verifiable if the file sits at
+    // that exact slot.
+    //
+    // A failure here is logged rather than propagated: it costs this cycle's
+    // proofs (each challenge fails individually against the previous
+    // `ledger.bin`, which is left untouched) but downloads, agreement sync and
+    // file serving must keep running.
+    if let Err(err) = rebuild_ledger(database, storage_dir).await {
+        warn!("rebuilding the file ledger failed, proofs may be skipped this cycle: {err:#}");
+    }
 
     compute_and_submit_proofs(portal_client, database, storage_backend, storage_dir)
         .await
@@ -366,6 +379,8 @@ mod tests {
             nodes: Set(json!(["NODE-1"])),
             root: Set(None),
             padded_len: Set(None),
+            object_id: Set(None),
+            ledger_index: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),
@@ -791,6 +806,8 @@ mod tests {
             nodes: Set(json!([{"node_id": "NODE-test", "status": "valid"}])),
             root: Set(None),
             padded_len: Set(None),
+            object_id: Set(None),
+            ledger_index: Set(None),
             downloaded: Set(true),
             transaction_id: Set(None),
             curation: Set(json!({})),

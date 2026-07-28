@@ -5,11 +5,13 @@
 use crate::app::cli::{Cli, Commands};
 use crate::app::config::{Config, StorageMethod};
 use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
+use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::clients::PortalClient;
 use crate::database::DBClient;
 use crate::node;
 use crate::server;
+use crate::server::admin::AdminState;
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 use std::future::Future;
@@ -31,6 +33,7 @@ pub struct DaemonConfig {
     pub storage_dir: PathBuf,
     pub download_addr: SocketAddr,
     pub node_id: String,
+    pub admin: AdminState,
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
@@ -52,7 +55,10 @@ async fn shutdown_signal() -> io::Result<()> {
 }
 
 /// Run the application with the default shutdown signal (SIGINT/SIGTERM).
-pub async fn run(cli: Cli, writer: impl Write) -> Result<()> {
+///
+/// The [`Outcome`] tells the caller whether to exit `0` or with
+/// [`crate::app::restart::RESTART_EXIT_CODE`]; see [`crate::app::restart`].
+pub async fn run(cli: Cli, writer: impl Write) -> Result<Outcome> {
     run_with_shutdown(cli, writer, shutdown_signal()).await
 }
 
@@ -89,6 +95,23 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         writer,
         "Portal polling interval: {}s",
         config.portal_polling_interval.as_secs()
+    )?;
+    writeln!(
+        writer,
+        "Filestorage contract: {}",
+        config.kontor_contract_address
+    )?;
+    // Says which way the switch is set without ever naming the value: an
+    // operator who forgot to set ADMIN_PASSWORD sees it here rather than at a
+    // login screen that answers 503.
+    writeln!(
+        writer,
+        "Admin UI: {}",
+        if config.admin_password.is_empty() {
+            "disabled (set ADMIN_PASSWORD to enable /admin)"
+        } else {
+            "enabled at /admin"
+        }
     )?;
 
     Ok(())
@@ -141,6 +164,7 @@ async fn build_daemon_config(
         storage_dir: config.storage_dir.clone(),
         download_addr,
         node_id,
+        admin: AdminState::new(config.admin_password.clone(), RestartHandle::from_env()),
     })
 }
 
@@ -149,18 +173,20 @@ pub async fn run_with_shutdown(
     cli: Cli,
     mut writer: impl Write,
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let config = Config::from_cli(&cli)?;
 
     print_config_info(&config, &mut writer)?;
     setup_storage_directory(&config)?;
 
-    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?;
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
+        .with_contract_address(&config.kontor_contract_address);
 
     match cli.command {
         Commands::Ping => {
             let body = client.ping().await?;
             writeln!(writer, "{body}")?;
+            Ok(Outcome::Shutdown)
         }
         Commands::Run => {
             // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
@@ -191,7 +217,8 @@ pub async fn run_with_shutdown(
                 onboarding_result.signer_id,
                 onboarding_result.token,
                 onboarding_result.next_nonce,
-            )?;
+            )?
+            .with_contract_address(&config.kontor_contract_address);
 
             if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
                 tracing::warn!("Failed to announce node URL: {e}");
@@ -200,19 +227,22 @@ pub async fn run_with_shutdown(
             }
 
             let daemon_config = build_daemon_config(&config, authenticated_client, node_id).await?;
-            run_daemon_command(daemon_config, shutdown).await?;
+            run_daemon_command(daemon_config, shutdown).await
         }
     }
-
-    Ok(())
 }
 
 /// Run the daemon with the download server.
+///
+/// Stops on the shutdown signal, on the download server failing, or on an
+/// operator asking for a restart from `/admin` — the last of which reports
+/// [`Outcome::Restart`] so the caller can exit in a way the supervisor acts on.
 pub async fn run_daemon_command(
     daemon: DaemonConfig,
     shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let daemon_backend = daemon.storage_backend.clone();
+    let restart = daemon.admin.restart().clone();
     let handle = spawn_portal_daemon(
         daemon.client,
         daemon.conn.clone(),
@@ -231,6 +261,7 @@ pub async fn run_daemon_command(
             storage_dir: daemon.storage_dir,
             storage_backend: daemon.storage_backend,
             node_id: daemon.node_id,
+            admin: daemon.admin,
         },
         async move {
             let _ = server_shutdown_rx.await;
@@ -240,13 +271,23 @@ pub async fn run_daemon_command(
     pin!(server);
     pin!(shutdown);
 
+    // The restart arm is woken from inside a request handler, so the server is
+    // necessarily still running when it fires. Everything below is the ordinary
+    // shutdown path: the graceful shutdown flushes the reset's own response
+    // before the process goes anywhere.
+    let mut restart_requested = false;
     let shutdown_result = tokio::select! {
         server_result = &mut server => {
             handle.abort();
             let _ = handle.await;
-            return server_result;
+            return server_result.map(|()| Outcome::Shutdown);
         }
         shutdown_result = &mut shutdown => shutdown_result,
+        () = restart.requested() => {
+            tracing::info!("Restart requested from the admin UI; shutting down");
+            restart_requested = true;
+            Ok(())
+        }
     };
 
     if server_shutdown_tx.send(()).is_err() {
@@ -260,7 +301,11 @@ pub async fn run_daemon_command(
 
     server_result?;
     shutdown_result?;
-    Ok(())
+    Ok(if restart_requested {
+        Outcome::Restart
+    } else {
+        Outcome::Shutdown
+    })
 }
 
 #[cfg(test)]
@@ -268,6 +313,7 @@ mod tests {
     #![allow(deprecated)]
     use super::*;
     use crate::app::cli::{Cli, Commands};
+    use crate::app::config::AdminPassword;
     use crate::crypto::BlsKeyPair;
     use crate::node::BLS_PASSWORD_ENV;
     use futures_util::future;
@@ -367,6 +413,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -426,6 +474,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -474,6 +524,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -522,6 +574,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -575,6 +629,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Ping,
         };
 
@@ -703,6 +759,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -781,6 +839,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -918,6 +978,8 @@ mod tests {
             server_address: "127.0.0.1:0".to_string(),
             public_url: "http://localhost:8081".to_string(),
             bls_key_path: Some(bls_key_path),
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         };
 
@@ -968,6 +1030,7 @@ mod tests {
                 storage_dir: storage_dir.clone(),
                 download_addr: "127.0.0.1:1".parse().unwrap(),
                 node_id: "NODE-TEST".to_string(),
+                admin: AdminState::disabled(),
             },
             shutdown,
         )
@@ -980,6 +1043,158 @@ mod tests {
         );
 
         std::fs::remove_file(&lock_path).ok();
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Builds a daemon that binds an ephemeral port and talks to nothing. The
+    /// Portal calls its daemon task makes all fail, which is fine: they are
+    /// logged inside the task, and what these tests watch is the run loop.
+    async fn idle_daemon(label: &str, admin: AdminState) -> (DaemonConfig, PathBuf) {
+        let storage_dir = unique_storage_dir(label);
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let db = DBClient::new("sqlite::memory:").await.unwrap();
+
+        let config = DaemonConfig {
+            client: PortalClient::new("http://localhost:0", storage_dir.clone()),
+            conn: db.connection().clone(),
+            interval: Duration::from_millis(10),
+            lock_path: storage_dir.join(".portal-daemon.lock"),
+            storage_limits: StorageLimits {
+                capacity: None,
+                max_files: Some(0),
+                max_file_size: None,
+            },
+            storage_backend: StorageBackend::local(),
+            storage_dir: storage_dir.clone(),
+            download_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: "NODE-TEST".to_string(),
+            admin,
+        };
+        (config, storage_dir)
+    }
+
+    /// The operator UI asks for a restart by flipping a switch the run loop is
+    /// waiting on. Reporting it is what lets `main` pick an exit code the
+    /// supervisor acts on, so a plain `Shutdown` here would leave the node down.
+    #[tokio::test]
+    async fn run_daemon_command_reports_a_restart_the_admin_ui_asked_for() {
+        let restart = RestartHandle::available();
+        let (config, storage_dir) =
+            idle_daemon("admin_restart", AdminState::with_restart(restart.clone())).await;
+
+        let task = tokio::spawn(run_daemon_command(
+            config,
+            future::pending::<io::Result<()>>(),
+        ));
+        restart.request();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the run loop must stop once a restart is requested")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Restart);
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// Binds and releases a port so the server can claim it next. A racy way to
+    /// learn a free port, and the usual one: the alternative is plumbing the
+    /// bound address back out of `serve`.
+    fn free_local_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// The whole design rests on the operator getting their report back: the
+    /// restart is requested from inside the handler, and the graceful shutdown
+    /// has to flush that response before the process goes anywhere. Proven over
+    /// a real socket rather than argued about.
+    #[tokio::test]
+    async fn a_restart_is_answered_before_the_node_goes_down() {
+        const PASSWORD: &str = "correct horse battery staple";
+        crate::server::admin::session::reset_throttle_for_tests(Some(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ));
+
+        let addr = free_local_addr();
+        let restart = RestartHandle::available();
+        let (mut config, storage_dir) = idle_daemon(
+            "restart_over_http",
+            AdminState::new(AdminPassword::new(Some(PASSWORD)), restart.clone()),
+        )
+        .await;
+        config.download_addr = addr;
+
+        let run_loop = tokio::spawn(run_daemon_command(
+            config,
+            future::pending::<io::Result<()>>(),
+        ));
+
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // The listener comes up asynchronously, so the first connections are
+        // refused until it does.
+        let token = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(response) = http
+                    .post(format!("{base}/api/admin/login"))
+                    .json(&json!({ "password": PASSWORD }))
+                    .send()
+                    .await
+                {
+                    let body: serde_json::Value = response.json().await.unwrap();
+                    break body["token"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the admin API must come up");
+
+        let body: serde_json::Value = http
+            .post(format!("{base}/api/admin/reset-database"))
+            .bearer_auth(&token)
+            .json(&json!({ "confirm": "RESET", "restart": true }))
+            .send()
+            .await
+            .expect("the reset must be answered even though it ends the process")
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(body["restarting"], true);
+        assert_eq!(body["total_rows_deleted"], 0);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_loop)
+            .await
+            .expect("the run loop must stop once the response is out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Outcome::Restart);
+        assert!(restart.is_requested());
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The signal path keeps its meaning: exiting on SIGTERM must not read as
+    /// "start me again".
+    #[tokio::test]
+    async fn run_daemon_command_reports_a_plain_shutdown_as_shutdown() {
+        let (config, storage_dir) = idle_daemon("plain_shutdown", AdminState::disabled()).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_daemon_command(config, future::ready(Ok(()))),
+        )
+        .await
+        .expect("a resolved shutdown signal must stop the run loop")
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Shutdown);
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 

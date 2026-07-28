@@ -126,8 +126,16 @@ pub(crate) async fn reconcile_from_portal(
     Ok(transitioned_to_failed)
 }
 
-/// Update `status` and `nodes` of agreements already present in DB whose
-/// remote representation has changed. Only those two columns are touched.
+/// Update the mutable columns of agreements already present in DB whose remote
+/// representation has changed: `status`, `nodes`, and the two on-chain
+/// descriptor fields `object_id` / `ledger_index`.
+///
+/// The descriptor fields matter here because an agreement is normally inserted
+/// before its creating transaction is confirmed, at which point the Portal does
+/// not know the contract-assigned `ledger_index` yet and sends `null`. Without
+/// picking it up on a later pass, the node would keep an agreement it can never
+/// prove. Both are treated as write-once: once known they are immutable on
+/// chain, so a remote `null` never clears a stored value.
 ///
 /// Returns the number of agreements that were updated together with the
 /// number of agreements that transitioned to the `failed` status.
@@ -161,10 +169,20 @@ async fn update_existing_agreement_metadata(
         let remote_nodes =
             serde_json::to_value(&remote.nodes).context("serializing remote agreement nodes")?;
 
+        let remote_ledger_index: Option<i64> =
+            remote
+                .ledger_index
+                .map(i64::try_from)
+                .transpose()
+                .context("remote ledger_index does not fit into i64")?;
+
         let status_changed = remote.status != local.status;
         let nodes_changed = remote_nodes != local.nodes;
+        // Write-once: only fill in a descriptor field we do not have yet.
+        let object_id_learned = local.object_id.is_none() && remote.file_hash.is_some();
+        let ledger_index_learned = local.ledger_index.is_none() && remote_ledger_index.is_some();
 
-        if !status_changed && !nodes_changed {
+        if !status_changed && !nodes_changed && !object_id_learned && !ledger_index_learned {
             continue;
         }
 
@@ -194,6 +212,17 @@ async fn update_existing_agreement_metadata(
         }
         if nodes_changed {
             active.nodes = Set(remote_nodes);
+        }
+        if object_id_learned {
+            active.object_id = Set(remote.file_hash.clone());
+        }
+        if ledger_index_learned {
+            info!(
+                "agreement {} ledger_index resolved to {}",
+                local.agreement_id,
+                remote_ledger_index.unwrap_or_default()
+            );
+            active.ledger_index = Set(remote_ledger_index);
         }
 
         // Mark the primary key as Unchanged so SeaORM issues an UPDATE on it
@@ -288,6 +317,7 @@ mod tests {
             padded_len: None,
             blob_size: None,
             file_hash: None,
+            ledger_index: None,
             txid: None,
             block_height: None,
             block_time: None,

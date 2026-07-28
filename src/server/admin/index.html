@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Kontor Storage Node · Admin</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #141922;
+    --panel-2: #1b2230;
+    --border: #263041;
+    --text: #e6edf7;
+    --muted: #8b98ad;
+    --accent: #7c8cff;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --blue: #60a5fa;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  button {
+    font: inherit;
+    cursor: pointer;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 8px 14px;
+    transition: border-color .15s, background .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; font-weight: 600; }
+  button.danger { background: var(--red); border-color: var(--red); color: #2a0a0a; font-weight: 600; }
+  input[type="password"], input[type="text"] {
+    font: inherit;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  a { color: var(--blue); }
+
+  /* ---- login ---- */
+  #login { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  #login .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
+  #login h1 { margin: 0 0 4px; font-size: 20px; }
+  #login p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  #login button { width: 100%; margin-top: 14px; }
+
+  /* ---- shell ---- */
+  #app { display: none; max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
+  header.bar { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+  header.bar h1 { font-size: 18px; margin: 0; }
+  header.bar .spacer { flex: 1; }
+  header.bar .env { color: var(--muted); font-size: 12px; }
+
+  /* ---- cards ---- */
+  .grid { display: grid; gap: 14px; }
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+  .card h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 14px; text-transform: uppercase; letter-spacing: .04em; }
+  .kpi .value { font-size: 32px; font-weight: 700; line-height: 1.1; }
+  .kpi .label { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .divider { border-top: 1px solid var(--border); margin: 14px 0; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .row .k { color: var(--muted); }
+  .trunc { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+
+  /* ---- misc ---- */
+  .msg { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; border: 1px solid; }
+  .msg.err { background: rgba(248,113,113,.1); border-color: var(--red); color: var(--red); }
+  .msg.ok { background: rgba(52,211,153,.1); border-color: var(--green); color: var(--green); }
+  .msg.warn { background: rgba(251,191,36,.1); border-color: var(--amber); color: var(--amber); }
+  .msg:empty { display: none; }
+  .muted { color: var(--muted); }
+  .danger-zone { border-color: var(--red); margin-top: 20px; }
+  .danger-zone h2 { color: var(--red); }
+  .stack > * + * { margin-top: 12px; }
+  .check { display: flex; align-items: flex-start; gap: 8px; }
+  .check input { margin-top: 3px; }
+  .check input:disabled { cursor: not-allowed; }
+  .check span { flex: 1; }
+  .check .note { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form class="card" id="login-form">
+    <h1>Kontor Storage Node</h1>
+    <p class="sub">Operator access</p>
+    <div class="msg err" id="login-error"></div>
+    <input type="password" id="password" placeholder="Password" autocomplete="current-password" autofocus required>
+    <button class="primary" type="submit" id="login-submit">Sign in</button>
+  </form>
+</div>
+
+<div id="app">
+  <header class="bar">
+    <h1>Storage Node · Admin</h1>
+    <span class="spacer"></span>
+    <span class="env" id="session"></span>
+    <span class="env" id="updated"></span>
+    <a href="/">Dashboard</a>
+    <button id="logout">Sign out</button>
+  </header>
+
+  <div class="msg err" id="status-error"></div>
+
+  <div class="grid kpis" id="kpis"></div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>Node</h2>
+    <div class="row"><span class="k">Node ID</span><span class="mono trunc" id="node-id">—</span></div>
+    <div class="row"><span class="k">Storage backend</span><span id="storage-method">—</span></div>
+    <div class="row" id="storage-directory-row"><span class="k">Storage directory</span><span class="mono trunc" id="storage-directory">—</span></div>
+    <div class="row"><span class="k">Provable files</span><span id="ledger-placed">—</span></div>
+  </div>
+
+  <!-- Only shown when there is something to say: a node proving normally has
+       no reason to read about the ledger. -->
+  <div class="msg err" id="ledger-blocked"></div>
+  <div class="msg" id="ledger-awaiting"></div>
+
+  <div class="card danger-zone">
+    <h2>Reset the database</h2>
+    <div class="msg err" id="reset-error"></div>
+    <div class="msg ok" id="reset-success"></div>
+    <div class="msg warn" id="reset-restarting"></div>
+    <p>
+      Deletes every agreement and challenge this node holds. Intended for when
+      the Kontor signet has been reset and the node's state refers to a chain
+      that no longer exists: the daemon then re-fetches agreements from the
+      Portal from scratch.
+    </p>
+    <p class="muted">
+      Preserved: the BLS key, the daemon lock and everything else in the
+      storage directory — only blobs named by the rows being deleted are
+      removed, and only if you ask.
+    </p>
+    <p class="muted">
+      The wipe does not re-register this node, and cannot: its signer id, token
+      and announced URL are read once at startup, and a signet reset invalidates
+      all three. Re-register the BLS key on the Portal <em>first</em>, then reset
+      with the restart ticked — the node comes back and onboards against the new
+      chain. Restarting also settles any download still in flight, which would
+      otherwise write a file back after the wipe.
+    </p>
+    <form id="reset-form" class="stack">
+      <label class="check">
+        <input type="checkbox" id="reset-delete-files">
+        <span>Also delete the stored file blobs (irreversible; leave off to keep them as orphans)</span>
+      </label>
+      <label class="check">
+        <!-- Fails closed: enabled only once a status says the node could come
+             back on its own. -->
+        <input type="checkbox" id="reset-restart" disabled>
+        <span>
+          Restart the node after the wipe
+          <span class="note" id="reset-restart-note"></span>
+        </span>
+      </label>
+      <label class="muted" for="reset-confirm">Type <code>RESET</code> to confirm</label>
+      <input type="text" id="reset-confirm" placeholder="RESET" autocomplete="off">
+      <button class="danger" type="submit" id="reset-submit" disabled>Erase the database</button>
+    </form>
+    <div id="reset-report"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var TOKEN_KEY = "kontor_node_admin_jwt";
+  var STATUS_POLL_MS = 30000;
+  var CONFIRMATION_PHRASE = "RESET";
+
+  var token = sessionStorage.getItem(TOKEN_KEY);
+  var statusTimer = null;
+
+  /* ---------------- helpers ---------------- */
+
+  function $(id) { return document.getElementById(id); }
+
+  // Every value from the API lands in innerHTML somewhere. Escaping is not
+  // optional: the CSP allows inline scripts, so injected markup would run.
+  function esc(value) {
+    if (value === null || value === undefined) { return ""; }
+    return String(value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // The pending timeout is tracked on the element itself: without that, a
+  // second message shown within the 6 s window inherits the first one's
+  // countdown and disappears almost immediately.
+  function show(el, text, keep) {
+    if (el.msgTimer) { window.clearTimeout(el.msgTimer); el.msgTimer = null; }
+    el.textContent = text || "";
+    if (text && !keep) {
+      el.msgTimer = window.setTimeout(function () {
+        el.textContent = "";
+        el.msgTimer = null;
+      }, 6000);
+    }
+  }
+
+  function num(value) {
+    return String(Number(value || 0));
+  }
+
+  function bytes(value) {
+    var n = Number(value || 0);
+    var units = ["B", "KB", "MB", "GB", "TB"];
+    var i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+    return (i === 0 ? n : n.toFixed(2)) + " " + units[i];
+  }
+
+  /* ---------------- API ---------------- */
+
+  function ApiError(message, status, code) {
+    this.message = message; this.status = status; this.code = code;
+  }
+  ApiError.prototype = Object.create(Error.prototype);
+
+  // Not everything that reaches this page is JSON: a malformed body is
+  // rejected in plain text, and a reverse proxy in front of the node returns
+  // an HTML 502. Reading as text and parsing defensively keeps the real status
+  // visible instead of replacing it with a JSON.parse error.
+  function readBody(response) {
+    return response.text().then(function (text) {
+      try { return text ? JSON.parse(text) : null; } catch (e) { return null; }
+    });
+  }
+
+  function apiErrorFrom(response, payload) {
+    var err = (payload && payload.error) || {};
+    return new ApiError(
+      err.message || ("Request failed (" + response.status + ")"),
+      response.status,
+      err.code
+    );
+  }
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = { Accept: "application/json" };
+    if (token) { headers.Authorization = "Bearer " + token; }
+    if (opts.body !== undefined) { headers["Content-Type"] = "application/json"; }
+
+    return fetch(path, {
+      method: opts.method || "GET",
+      headers: headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
+    }).then(function (response) {
+      return readBody(response).then(function (payload) {
+        if (response.ok) { return payload; }
+
+        // The session died (expired, or the node restarted with a new signing
+        // key). Drop straight back to the login screen rather than showing an
+        // error the operator can do nothing about.
+        if (response.status === 401 || response.status === 403) {
+          signOut();
+          throw new ApiError("Session expired", response.status, "UNAUTHORIZED");
+        }
+        throw apiErrorFrom(response, payload);
+      });
+    });
+  }
+
+  /* ---------------- session ---------------- */
+
+  function signIn(event) {
+    event.preventDefault();
+    var button = $("login-submit");
+    var errorBox = $("login-error");
+    errorBox.textContent = "";
+    button.disabled = true;
+
+    // Deliberately not routed through `api()`: that helper treats 401 as a
+    // dead session and signs out, which is the wrong story to tell someone who
+    // simply mistyped their password.
+    fetch("/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ password: $("password").value })
+    }).then(function (response) {
+      return readBody(response).then(function (payload) {
+        if (!response.ok) { throw apiErrorFrom(response, payload); }
+        if (!payload || !payload.token) {
+          throw new ApiError("Sign-in succeeded but no token was returned", response.status);
+        }
+        return payload;
+      });
+    }).then(function (payload) {
+      token = payload.token;
+      sessionStorage.setItem(TOKEN_KEY, token);
+      $("password").value = "";
+      openApp();
+    }).catch(function (error) {
+      errorBox.textContent = error.message;
+    }).then(function () {
+      button.disabled = false;
+    });
+  }
+
+  function stopPolling() {
+    if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
+  }
+
+  function signOut() {
+    token = null;
+    sessionStorage.removeItem(TOKEN_KEY);
+    stopPolling();
+    $("app").style.display = "none";
+    $("login").style.display = "grid";
+    $("password").focus();
+  }
+
+  function openApp() {
+    $("login").style.display = "none";
+    $("app").style.display = "block";
+    loadStatus();
+    if (!statusTimer) { statusTimer = window.setInterval(loadStatus, STATUS_POLL_MS); }
+  }
+
+  /* ---------------- status ---------------- */
+
+  function kpi(value, label) {
+    return '<div class="card kpi"><div class="value">' + esc(value) +
+      '</div><div class="label">' + esc(label) + "</div></div>";
+  }
+
+  // A node with no BLS password in its environment would stop at the key
+  // prompt on the way back up, so the API refuses to restart it. Saying so
+  // here beats letting the operator find out after typing RESET.
+  function setRestartAvailable(available) {
+    var box = $("reset-restart");
+    box.disabled = !available;
+    if (!available) { box.checked = false; }
+    $("reset-restart-note").textContent = available
+      ? "Re-runs onboarding, so the node picks up its signer id, token and announced URL from the Portal again."
+      : "Unavailable: BLS_PASSWORD is not set, so a restarted node would stop at the key password prompt. Restart it yourself after the wipe.";
+  }
+
+  function renderStatus(data) {
+    var agreements = data.agreements || {};
+    var challenges = data.challenges || {};
+    var storage = data.storage || {};
+
+    setRestartAvailable(data.restart_available === true);
+
+    $("kpis").innerHTML =
+      kpi(num(agreements.total), "Agreements") +
+      kpi(num(agreements.downloaded), "Files stored") +
+      kpi(bytes(agreements.stored_bytes), "Stored size") +
+      kpi(num(challenges.total), "Challenges");
+
+    if (data.session_expires_at) {
+      $("session").textContent =
+        "Session until " + new Date(data.session_expires_at * 1000).toLocaleTimeString();
+    }
+    $("node-id").textContent = data.node_id || "—";
+    $("storage-method").textContent = storage.method || "—";
+    if (storage.directory) {
+      $("storage-directory").textContent = storage.directory;
+      $("storage-directory-row").style.display = "flex";
+    } else {
+      $("storage-directory-row").style.display = "none";
+    }
+    renderLedger(data.ledger || {});
+    $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  }
+
+  // The counts above stay healthy while proving is dead — a blocked rebuild is
+  // the one failure this page has to volunteer rather than let an operator
+  // infer. Both messages are kept (`show(.., true)`) because they describe a
+  // standing condition, not an event.
+  function renderLedger(ledger) {
+    $("ledger-placed").textContent = num(ledger.placed);
+
+    if (ledger.rebuild_blocked === true) {
+      show($("ledger-blocked"),
+        "Proving is stopped: this node's files sit at contract slots too sparse to rebuild the " +
+        "ledger (highest slot " + num(ledger.highest_slot) + " for " + num(ledger.placed) +
+        " files). Downloads and file serving are unaffected. See the README.",
+        true);
+    } else {
+      show($("ledger-blocked"), "", true);
+    }
+
+    var awaiting = Number(ledger.awaiting_ledger_index || 0);
+    show($("ledger-awaiting"),
+      awaiting > 0
+        ? awaiting + " stored file(s) have no contract slot yet and cannot be proven until the " +
+          "Portal reconciles their creating transaction. This usually clears on its own."
+        : "",
+      true);
+  }
+
+  function loadStatus() {
+    api("/api/admin/status").then(function (data) {
+      $("status-error").textContent = "";
+      renderStatus(data);
+    }).catch(function (error) {
+      if (error.status === 401 || error.status === 403) { return; }
+      show($("status-error"), error.message, true);
+    });
+  }
+
+  /* ---------------- reset ---------------- */
+
+  function resetDatabase(event) {
+    event.preventDefault();
+    var deleteFiles = $("reset-delete-files").checked;
+    var restart = $("reset-restart").checked && !$("reset-restart").disabled;
+    var warning = deleteFiles
+      ? "This permanently deletes every agreement and challenge, and the stored file blobs. Continue?"
+      : "This permanently deletes every agreement and challenge. Continue?";
+    if (restart) { warning += "\n\nThe node will then restart and onboard from scratch."; }
+    if (!window.confirm(warning)) { return; }
+
+    var button = $("reset-submit");
+    button.disabled = true;
+    $("reset-report").innerHTML = "";
+
+    api("/api/admin/reset-database", {
+      method: "POST",
+      body: { confirm: $("reset-confirm").value, delete_files: deleteFiles, restart: restart }
+    }).then(function (result) {
+      show($("reset-success"), "Database reset — " + result.total_rows_deleted + " rows deleted", true);
+
+      var deleted = result.deleted || {};
+      var rows = Object.keys(deleted).map(function (table) {
+        return '<div class="row"><span class="k mono">' + esc(table) +
+          "</span><span>" + esc(deleted[table]) + "</span></div>";
+      }).join("");
+
+      var files = result.files;
+      if (files) {
+        rows += '<div class="row"><span class="k">stored files deleted</span><span>' +
+          esc(files.deleted) + " of " + esc(files.requested) + "</span></div>";
+        if (files.missing) {
+          rows += '<div class="row"><span class="k">already absent</span><span>' + esc(files.missing) + "</span></div>";
+        }
+        if (files.failed || files.skipped) {
+          rows += '<div class="row"><span class="k">not deleted</span><span>' +
+            esc(Number(files.failed || 0) + Number(files.skipped || 0)) + "</span></div>";
+        }
+      } else {
+        rows += '<div class="row"><span class="k">stored files</span><span>kept</span></div>';
+      }
+
+      $("reset-report").innerHTML = '<div class="divider"></div>' + rows;
+      $("reset-confirm").value = "";
+      $("reset-delete-files").checked = false;
+
+      // The node is on its way down. Polling it would only trade the report
+      // the operator is reading for a connection error, and the session dies
+      // with the process anyway — its signing key is generated per startup.
+      if (result.restarting) {
+        $("reset-restart").checked = false;
+        stopPolling();
+        show($("reset-restarting"),
+          "The node is restarting. It will onboard against the Portal from scratch; sign in again once it is back.",
+          true);
+        return;
+      }
+      loadStatus();
+    }).catch(function (error) {
+      if (error.status !== 401 && error.status !== 403) { show($("reset-error"), error.message, true); }
+    }).then(function () {
+      button.disabled = $("reset-confirm").value !== CONFIRMATION_PHRASE;
+    });
+  }
+
+  /* ---------------- wiring ---------------- */
+
+  $("login-form").addEventListener("submit", signIn);
+  $("logout").addEventListener("click", signOut);
+  $("reset-form").addEventListener("submit", resetDatabase);
+
+  $("reset-confirm").addEventListener("input", function () {
+    $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;
+  });
+
+  // A token in sessionStorage is only a hint — it may be expired or signed
+  // with a key this process no longer has. Show the app optimistically; the
+  // first API call demotes us to the login screen if it is no good.
+  if (token) { openApp(); } else { signOut(); }
+}());
+</script>
+</body>
+</html>

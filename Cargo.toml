@@ -33,8 +33,15 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 byte-unit = "4.0"
-kontor-crypto = { version = "0.1.3" }
+# Must be the SAME crate Kontor's `kontor-indexer` resolves (crates.io
+# `kontor-crypto`, see Kontor `core/indexer/Cargo.toml`) and the same one the
+# Horizon Portal builds against: the node is the prover and the filestorage
+# contract is the verifier, so a version skew means proofs that never verify.
+kontor-crypto = "0.3.0"
 jsonwebtoken = "9"
+# Constant-time comparison for the admin password (already in the tree via
+# aes-gcm; named here because the login path depends on it directly).
+subtle = "2"
 urlencoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

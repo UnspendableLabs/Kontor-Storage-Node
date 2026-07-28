@@ -24,6 +24,26 @@ pub const STATUS_PENDING: &str = "pending";
 /// Item type names for logging and sync operations.
 pub const ITEM_TYPE_CHALLENGES: &str = "challenges";
 pub const ITEM_TYPE_AGREEMENTS: &str = "agreements";
+
+/// Decode a hex-encoded Poseidon field element from its 32-byte canonical
+/// little-endian representation.
+///
+/// `what` names the value for error messages (e.g. `"root"`). Non-canonical
+/// encodings are rejected rather than reduced: these values mirror on-chain
+/// commitments, so anything the contract could not have produced is a bug or
+/// corruption, not something to silently normalize.
+pub fn field_from_hex(hex_str: &str, what: &str) -> Result<kontor_crypto::FieldElement> {
+    use ff::PrimeField;
+
+    let bytes = hex::decode(hex_str).with_context(|| format!("decoding {what} hex"))?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{what} hex is not 32 bytes"))?;
+
+    kontor_crypto::FieldElement::from_repr(array.into())
+        .into_option()
+        .ok_or_else(|| anyhow::anyhow!("invalid {what} field element"))
+}
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, InsertResult, QueryFilter,
     TryInsertResult,

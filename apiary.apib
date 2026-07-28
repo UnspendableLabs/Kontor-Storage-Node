@@ -158,6 +158,159 @@ For local storage, the file content is streamed directly. For GCS storage, a tem
 
             (error details)
 
+## Group Admin
+
+The operator UI at `/admin` and the endpoints behind it.
+
+These are disabled unless `ADMIN_PASSWORD` is configured; without it, login answers `503 ADMIN_UI_DISABLED`. The password is exchanged for a session token that expires after 8 hours and is signed with a key generated at startup, so restarting the node invalidates every session. Errors are returned as `{"error": {"code": ..., "message": ...}}`, where `message` is safe to display — internal causes are logged by the node, never returned.
+
+Unlike the file endpoints, these carry no CORS headers: they are only ever called same-origin by the embedded page.
+
+### Operator UI [GET /admin]
+
+The single-page operator UI. Public — it is the login screen — and contains no secrets. Served with `Content-Security-Policy: default-src 'self'`, `X-Frame-Options: DENY` and `Cache-Control: no-store`. `GET /admin/` resolves the same page.
+
++ Response 200 (text/html; charset=utf-8)
+
+### Sign In [POST /api/admin/login]
+
+Exchange the configured password for a session token.
+
++ Request (application/json)
+
+    + Attributes
+        + password: `correct horse battery staple` (string, required) - Value of `ADMIN_PASSWORD`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "token": "eyJhbGciOiJIUzI1NiJ9...",
+                "expires_at": 1798761600,
+                "expires_in": 28800
+            }
+
++ Response 401 (application/json)
+
+    Wrong password (`INVALID_PASSWORD`). Every rejection costs a fixed 250 ms.
+
++ Response 429 (application/json)
+
+    More than 10 failed attempts from this client in 15 minutes (`TOO_MANY_ATTEMPTS`). The correct password is refused too until the window expires.
+
++ Response 503 (application/json)
+
+    `ADMIN_PASSWORD` is not configured (`ADMIN_UI_DISABLED`).
+
+### Node Status [GET /api/admin/status]
+
+Counts of everything a reset would erase, plus where it is stored.
+
++ Request
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "node_id": "abc123def456",
+                "storage": {
+                    "method": "local",
+                    "directory": "/var/lib/kontor/files"
+                },
+                "agreements": {
+                    "total": 42,
+                    "downloaded": 40,
+                    "stored_bytes": 1048576
+                },
+                "challenges": {
+                    "total": 7
+                },
+                "ledger": {
+                    "placed": 38,
+                    "awaiting_ledger_index": 2,
+                    "highest_slot": 613,
+                    "rebuild_blocked": false
+                },
+                "restart_available": true,
+                "session_expires_at": 1798761600
+            }
+
+    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when `BLS_PASSWORD` is unset, because a restarted process would stop at the key password prompt.
+
+    `ledger` reports whether the node can still prove. `placed` is how many stored files carry a contract-assigned slot and would enter the rebuilt ledger; `awaiting_ledger_index` is how many are stored and served but not yet provable, because the Portal has not reconciled their creating transaction. `rebuild_blocked` is `true` once `highest_slot + 1` exceeds `placed` by more than kontor-crypto's sparsity gap (1024), at which point the ledger cannot be rebuilt and every proof is skipped — see the README.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 503 (application/json)
+
+    `ADMIN_PASSWORD` is not configured (`ADMIN_UI_DISABLED`).
+
+### Reset Database [POST /api/admin/reset-database]
+
+Deletes every row of `agreements` and `challenges` in a single transaction. Both tables are chain-derived, so after a Kontor signet reset they describe a chain that no longer exists; the daemon re-fetches agreements from the Portal afterwards.
+
+With `delete_files`, the stored blobs of the deleted rows are removed too — local files, or objects in the node's GCS bucket. Only blobs named by those rows are touched, so the BLS key and everything else in the storage directory survive. Blob deletion never fails the request: the rows are already gone, and the counts say what happened.
+
+With `restart`, the node answers this request and then exits with code `75` so its supervisor starts it again. The wipe alone leaves the node's Portal registration in place — it was never in the database — but the `signer_id`, JWT and announced URL read during onboarding are stale after a signet reset, and only a fresh start replaces them. Re-register the BLS key on the Portal before asking for this. Refused with `RESTART_UNAVAILABLE` when the node could not come back unattended; check `restart_available` on `GET /api/admin/status` first.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + confirm: `RESET` (string, required) - Must be exactly `RESET`
+        + delete_files: false (boolean, optional) - Also delete the stored file blobs
+            + Default: `false`
+        + restart: false (boolean, optional) - Exit after the wipe so the supervisor restarts the node
+            + Default: `false`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "deleted": {
+                    "challenges": 7,
+                    "agreements": 42
+                },
+                "total_rows_deleted": 49,
+                "storage_method": "local",
+                "files": {
+                    "requested": 40,
+                    "deleted": 39,
+                    "missing": 1,
+                    "failed": 0,
+                    "skipped": 0
+                },
+                "restarting": false
+            }
+
+    `files` is `null` when `delete_files` was not set. `missing` covers a local file that had already disappeared or a bucket object GCS answers `404` for — nothing to act on. `failed` is a blob still out there: the row is gone, so only the operator can deal with it now. `skipped` counts file ids that were not plain object names and were therefore never turned into a path.
+
+    `restarting` echoes whether the node is on its way down. The response is flushed before the process exits, so this is the last thing the node says.
+
++ Response 400 (application/json)
+
+    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`), or `restart` was asked for on a node with no `BLS_PASSWORD` in its environment (`RESTART_UNAVAILABLE`). Nothing is deleted in either case.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 500 (application/json)
+
+    The transaction could not be opened or committed (`DATABASE_ERROR`). The wipe is rolled back.
+
 ## Data Structures
 
 ### FileEntry (object)
