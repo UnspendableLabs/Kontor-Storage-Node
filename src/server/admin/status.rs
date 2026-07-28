@@ -59,6 +59,7 @@ pub async fn node_status(
 
     Ok(json!({
         "node_id": state.node_id,
+        "registration": registration_status(state),
         "storage": {
             "method": state.storage_backend.method.to_string(),
             "directory": directory,
@@ -75,6 +76,29 @@ pub async fn node_status(
         "restart_available": state.admin.restart().is_available(),
         "session_expires_at": session_expires_at,
     }))
+}
+
+/// Whether the Portal knows this node's BLS key.
+///
+/// This is the one status block that matters on a node which never finished
+/// onboarding: `registered: false` is what makes the page offer the wallet
+/// flow at all. The public key is safe to publish — it is the lookup key, and
+/// the node prints it on startup either way — while `supported` says whether
+/// a key was loaded at all, which is the difference between "register it" and
+/// "there is nothing here to register".
+fn registration_status(state: &DownloadServerState) -> Value {
+    let Some(identity) = state.admin.identity() else {
+        return json!({ "supported": false, "registered": false });
+    };
+
+    let registered = identity.registered();
+    json!({
+        "supported": true,
+        "registered": registered.is_some(),
+        "bls_pubkey": identity.keypair().public_key_hex(),
+        "node_id": registered.map(|node| node.node_id.clone()),
+        "signer_id": registered.map(|node| node.signer_id),
+    })
 }
 
 /// Whether this node can still build the ledger its proofs are made against.
@@ -207,7 +231,7 @@ mod tests {
             db,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-status".to_string(),
+            node_id: Some("NODE-status".to_string()),
             admin: AdminState::disabled(),
         };
         (state, dir)
@@ -233,6 +257,81 @@ mod tests {
             value["storage"]["directory"],
             state.storage_dir.display().to_string()
         );
+    }
+
+    /// What the page keys the registration card off. A node that never
+    /// onboarded reports the key an operator has to register, and nothing else
+    /// — there is no node id or signer id to report yet.
+    #[tokio::test]
+    async fn status_reports_an_unregistered_node_and_the_key_to_register() {
+        use crate::app::restart::RestartHandle;
+        use crate::clients::PortalClient;
+        use crate::crypto::BlsKeyPair;
+        use crate::server::admin::NodeIdentity;
+        use std::sync::Arc;
+
+        let (mut state, dir) = state_with(&[]).await;
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let pubkey = keypair.public_key_hex();
+        state.node_id = None;
+        state.admin = AdminState::with_identity(
+            NodeIdentity::new(
+                keypair,
+                PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
+                None,
+            ),
+            RestartHandle::unavailable(),
+        );
+
+        let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
+
+        assert_eq!(value["node_id"], Value::Null);
+        assert_eq!(value["registration"]["supported"], true);
+        assert_eq!(value["registration"]["registered"], false);
+        assert_eq!(value["registration"]["bls_pubkey"], pubkey);
+        assert_eq!(value["registration"]["node_id"], Value::Null);
+        assert_eq!(value["registration"]["signer_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_registered_node_with_its_signer_id() {
+        use crate::app::restart::RestartHandle;
+        use crate::clients::PortalClient;
+        use crate::crypto::BlsKeyPair;
+        use crate::server::admin::{NodeIdentity, RegisteredNode};
+        use std::sync::Arc;
+
+        let (mut state, dir) = state_with(&[]).await;
+        state.admin = AdminState::with_identity(
+            NodeIdentity::new(
+                Arc::new(BlsKeyPair::generate().unwrap()),
+                PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
+                Some(RegisteredNode {
+                    node_id: "node-status".to_string(),
+                    signer_id: 42,
+                }),
+            ),
+            RestartHandle::unavailable(),
+        );
+
+        let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
+
+        assert_eq!(value["registration"]["registered"], true);
+        assert_eq!(value["registration"]["node_id"], "node-status");
+        assert_eq!(value["registration"]["signer_id"], 42);
+    }
+
+    /// Tests that never load a key still read this block, so it has to say
+    /// "nothing to register" rather than omit the field.
+    #[tokio::test]
+    async fn status_reports_registration_as_unsupported_without_a_key() {
+        let (state, _dir) = state_with(&[]).await;
+
+        let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
+
+        assert_eq!(value["registration"]["supported"], false);
+        assert_eq!(value["registration"]["registered"], false);
+        assert_eq!(value["registration"]["bls_pubkey"], Value::Null);
     }
 
     /// The page needs this before the operator commits to anything, so the

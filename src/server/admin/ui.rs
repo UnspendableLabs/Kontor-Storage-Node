@@ -92,6 +92,41 @@ mod tests {
         }
     }
 
+    /// The registration card is the whole point of the page on a node that
+    /// never onboarded, and it is driven entirely by these names: the status
+    /// block it keys off, the route it posts to, and the three wallet fields it
+    /// forwards. A rename on either side leaves an operator with a button that
+    /// does nothing on the one node that needs it.
+    #[test]
+    fn admin_html_speaks_the_same_registration_api_as_the_server() {
+        for key in [
+            "registration.supported",
+            "registration.registered",
+            "registration.bls_pubkey",
+            "/api/admin/register-node",
+            "result.restarting",
+            "pop.xpubkey",
+            "pop.blsPubkey",
+            "pop.schnorrSig",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
+    /// The wallet is reached through the extension's injected global, and only
+    /// these two calls. `signMessageBLS` in particular must not come back: the
+    /// node signs the op itself, which is what keeps this to one prompt.
+    #[test]
+    fn admin_html_asks_the_wallet_only_for_the_proof_of_possession() {
+        assert!(ADMIN_HTML.contains("window.HorizonWalletProvider"));
+        assert!(ADMIN_HTML.contains("getBLSPoP"));
+        assert!(ADMIN_HTML.contains("getAddresses"));
+        assert!(
+            !ADMIN_HTML.contains("signMessageBLS"),
+            "the node signs the registration op with its own BLS key"
+        );
+    }
+
     /// The ledger block is the only place a stopped prover shows up: the row
     /// counts look healthy either way. A rename on the server side must not
     /// leave the page quietly reading `undefined`.

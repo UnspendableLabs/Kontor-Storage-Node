@@ -158,7 +158,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -198,7 +198,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -230,7 +230,7 @@ mod tests {
             db: db.clone(),
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -262,7 +262,7 @@ mod tests {
             db,
             storage_dir: PathBuf::new(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         });
         let response = next
@@ -295,7 +295,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -323,7 +323,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -358,7 +358,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-socket".to_string(),
+            node_id: Some("NODE-socket".to_string()),
             admin: AdminState::with_password(AdminPassword::new(Some(PASSWORD))),
         };
 
@@ -425,7 +425,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -455,7 +455,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -480,7 +480,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -519,7 +519,7 @@ mod tests {
                 method: StorageMethod::Gcs,
                 gcs_client: None,
             },
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -544,7 +544,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key("not-a-key").await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -620,7 +620,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-info-test".to_string(),
+            node_id: Some("NODE-info-test".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -651,7 +651,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-dash".to_string(),
+            node_id: Some("NODE-dash".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -699,7 +699,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -754,7 +754,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 
@@ -799,7 +799,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -842,7 +842,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -892,7 +892,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
 

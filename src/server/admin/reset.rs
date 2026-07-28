@@ -429,7 +429,7 @@ mod tests {
             db,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
         (state, dir)
@@ -815,7 +815,7 @@ mod tests {
             db: setup_challenges_db().await,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
         insert_challenge(&state.db, "CHAL-1").await;
@@ -842,7 +842,7 @@ mod tests {
             db: setup_agreements_db().await,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: "NODE-TEST".to_string(),
+            node_id: Some("NODE-TEST".to_string()),
             admin: AdminState::disabled(),
         };
         insert_agreement(&state.db, "FILE-1", true).await;

@@ -23,7 +23,8 @@ const MAX_LIMIT: u64 = 100;
 
 #[derive(Serialize)]
 pub struct NodeInfoResponse {
-    node_id: String,
+    /// `null` on a node that is not registered with the Portal yet.
+    node_id: Option<String>,
 }
 
 pub async fn node_info(State(state): State<DownloadServerState>) -> Json<NodeInfoResponse> {

@@ -54,6 +54,61 @@ impl std::fmt::Debug for OnboardingResult {
     }
 }
 
+/// How far onboarding got.
+///
+/// The unregistered case is not an error. A Portal that has never seen this BLS
+/// key — or has been reset since it last did — answers the lookup with a 404,
+/// and the only way out is for an operator to register the key from a machine
+/// holding the Horizon Wallet that owns it. Exiting here would take `/admin`
+/// down with the node and leave them nothing to do it from, so the caller
+/// starts the server anyway and waits.
+pub enum OnboardingOutcome {
+    /// Registered, authenticated, and ready to run.
+    Ready(Box<OnboardingResult>),
+    /// The BLS key loaded, but the Portal has no node for it.
+    Unregistered(Box<UnregisteredNode>),
+}
+
+/// A loaded key the Portal does not recognize.
+///
+/// The public key is carried alongside the pair it came from because both
+/// callers need it: one to tell the operator what to register, the other to
+/// keep asking the Portal whether it has appeared.
+pub struct UnregisteredNode {
+    pub keypair: crate::crypto::BlsKeyPair,
+    pub bls_pubkey: String,
+}
+
+impl std::fmt::Debug for UnregisteredNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnregisteredNode")
+            .field("bls_pubkey", &self.bls_pubkey)
+            .field("keypair", &"<BlsKeyPair>")
+            .finish()
+    }
+}
+
+impl OnboardingOutcome {
+    /// The onboarding result, panicking if the node turned out to be
+    /// unregistered.
+    #[cfg(test)]
+    fn expect_ready(self) -> OnboardingResult {
+        match self {
+            Self::Ready(result) => *result,
+            Self::Unregistered(_) => panic!("expected a registered node"),
+        }
+    }
+}
+
+impl std::fmt::Debug for OnboardingOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(result) => f.debug_tuple("Ready").field(result).finish(),
+            Self::Unregistered(node) => f.debug_tuple("Unregistered").field(node).finish(),
+        }
+    }
+}
+
 /// Configuration for the onboarding process.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingConfig {
@@ -74,7 +129,7 @@ pub async fn perform_onboarding(
     client: &PortalClient,
     config: &OnboardingConfig,
     writer: &mut impl Write,
-) -> Result<OnboardingResult> {
+) -> Result<OnboardingOutcome> {
     let password_reader = get_password_reader();
     perform_onboarding_with_reader(client, config, writer, password_reader.as_ref()).await
 }
@@ -86,7 +141,7 @@ pub async fn perform_onboarding_with_reader(
     config: &OnboardingConfig,
     writer: &mut impl Write,
     password_reader: &dyn PasswordReader,
-) -> Result<OnboardingResult> {
+) -> Result<OnboardingOutcome> {
     // Step 1: Load or import BLS keypair
     let key_path = key_management::get_key_path(config)?;
     let keypair = key_management::ensure_bls_keypair(&key_path, writer, password_reader).await?;
@@ -105,11 +160,21 @@ pub async fn perform_onboarding_with_reader(
                     .map(|s| s.status == reqwest::StatusCode::NOT_FOUND)
                     .unwrap_or(false);
                 if is_not_found {
-                    anyhow::bail!(
-                        "No node registered with this BLS public key.\n  \
+                    if waiting {
+                        writeln!(writer)?;
+                    }
+                    writeln!(
+                        writer,
+                        "\nNo node registered with this BLS public key.\n  \
                          BLS public key: {bls_pubkey}\n  \
-                         Register this key on the Portal before starting the node."
-                    );
+                         Open /admin and register this key on the Portal to continue."
+                    )?;
+                    return Ok(OnboardingOutcome::Unregistered(Box::new(
+                        UnregisteredNode {
+                            keypair,
+                            bls_pubkey,
+                        },
+                    )));
                 }
                 return Err(e);
             }
@@ -154,13 +219,13 @@ pub async fn perform_onboarding_with_reader(
     let registry = client.get_registry_entry(signer_id).await?;
     writeln!(writer, "✓ Registry nonce: {}", registry.next_nonce)?;
 
-    Ok(OnboardingResult {
+    Ok(OnboardingOutcome::Ready(Box::new(OnboardingResult {
         keypair,
         node_id,
         signer_id,
         token: login.token,
         next_nonce: registry.next_nonce,
-    })
+    })))
 }
 
 #[cfg(test)]
@@ -248,7 +313,8 @@ mod tests {
 
         let result = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
             .await
-            .unwrap();
+            .unwrap()
+            .expect_ready();
 
         assert_eq!(result.keypair.public_key_hex(), public_key);
         assert_eq!(result.node_id, "node-test123");
@@ -263,8 +329,11 @@ mod tests {
         assert!(output.contains("Registry nonce: 7"));
     }
 
+    /// A 404 is the state a Portal reset leaves every node in. It must not be
+    /// an error: the operator needs `/admin` up to register the key again, and
+    /// the key they need is the one held here.
     #[tokio::test]
-    async fn onboarding_fails_when_lookup_returns_404() {
+    async fn onboarding_reports_unregistered_when_lookup_returns_404() {
         let mock_server = MockServer::start().await;
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("test_bls.enc");
@@ -272,6 +341,7 @@ mod tests {
 
         let password = "testpassword123";
         let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
         keypair.save_encrypted(&key_path, password).await.unwrap();
 
         Mock::given(method("GET"))
@@ -289,15 +359,140 @@ mod tests {
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
 
+        let outcome = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        match outcome {
+            OnboardingOutcome::Unregistered(node) => {
+                assert_eq!(node.bls_pubkey, public_key);
+                assert_eq!(node.keypair.public_key_hex(), public_key);
+            }
+            OnboardingOutcome::Ready(_) => panic!("a 404 lookup cannot produce a ready node"),
+        }
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(
+            output.contains("No node registered with this BLS public key"),
+            "the operator needs to be told which key to register: {output}"
+        );
+        assert!(
+            output.contains(&public_key),
+            "the message must carry the key itself: {output}"
+        );
+        assert!(
+            output.contains("/admin"),
+            "the message must point at where registration happens: {output}"
+        );
+    }
+
+    /// Both arms of the outcome end up in a `tracing` field or a panic message
+    /// sooner or later, and neither may carry the secret key.
+    #[test]
+    fn debug_output_redacts_the_keypair_either_way() {
+        let unregistered = OnboardingOutcome::Unregistered(Box::new(UnregisteredNode {
+            keypair: BlsKeyPair::generate().unwrap(),
+            bls_pubkey: "beef".to_string(),
+        }));
+        let rendered = format!("{unregistered:?}");
+        assert!(rendered.contains("beef"), "{rendered}");
+        assert!(rendered.contains("<BlsKeyPair>"), "{rendered}");
+
+        let ready = OnboardingOutcome::Ready(Box::new(OnboardingResult {
+            keypair: BlsKeyPair::generate().unwrap(),
+            node_id: "node-debug".to_string(),
+            signer_id: 7,
+            token: "super-secret-jwt".to_string(),
+            next_nonce: 1,
+        }));
+        let rendered = format!("{ready:?}");
+        assert!(rendered.contains("node-debug"), "{rendered}");
+        assert!(!rendered.contains("super-secret-jwt"), "{rendered}");
+    }
+
+    /// A node whose registration was still unconfirmed when the Portal was
+    /// reset goes from "waiting" to "gone" mid-poll. The progress line has to
+    /// be closed off before the message, or it runs onto the same line.
+    #[tokio::test]
+    async fn onboarding_reports_unregistered_after_waiting() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("test_bls.enc");
+        let storage_dir = dir.path().join("storage");
+
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "node-pending",
+                "signer_id": null,
+                "bls_public_key": public_key
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("gone"))
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let outcome = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, OnboardingOutcome::Unregistered(_)));
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(
+            output.contains("Waiting for on-chain confirmation\n"),
+            "the progress line must be terminated before the notice: {output}"
+        );
+    }
+
+    /// Anything other than a 404 — the Portal down, a proxy in the way — is a
+    /// real failure, and registering again would not fix it.
+    #[tokio::test]
+    async fn onboarding_fails_when_lookup_errors_for_another_reason() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("test_bls.enc");
+        let storage_dir = dir.path().join("storage");
+
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
         let err = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("No node registered with this BLS public key"),
-            "expected registration error with BLS pubkey, got: {err}"
-        );
+        assert!(err.to_string().contains("502"), "got: {err}");
     }
 
     #[tokio::test]
@@ -347,7 +542,8 @@ mod tests {
 
         let result = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
             .await
-            .unwrap();
+            .unwrap()
+            .expect_ready();
 
         assert_eq!(result.node_id, "node-pending");
         assert_eq!(result.signer_id, 42);
