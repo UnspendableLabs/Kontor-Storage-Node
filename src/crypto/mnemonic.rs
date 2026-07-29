@@ -24,13 +24,25 @@
 //! | | |
 //! |---|---|
 //! | seed | BIP-39, **empty passphrase** — the wallet never passes one |
-//! | BLS path | `m/12381/{coin}/{account}/0` — EIP-2333, four levels, unhardened |
-//! | Taproot path | `m/86'/{coin}'/{account}'/0/0` — BIP86, hardened |
+//! | BLS path | `m/12381/{coin}/{index}/0` — EIP-2333, four levels, unhardened |
+//! | Taproot path | `m/86'/{coin}'/{index}'/0/0` — BIP86, hardened |
 //! | coin type | `0` mainnet, `1` testnet *and* signet |
+//! | `{index}` | `account - 1`: the paths count from 0, the wallet from 1 |
 //!
 //! Note the account index is hardened in one path and not the other. That is not
 //! a typo: EIP-2333 has no hardened/normal distinction at all, so its indices are
 //! written bare, while BIP32 needs the tick.
+//!
+//! # Which account is "account 2"
+//!
+//! Horizon Wallet lists accounts from 1 while deriving them from 0, so its second
+//! account is the one at index 1. Everything here — [`ACCOUNT_INDEX_ENV`], every
+//! log line, `/admin`, the identity record — speaks the wallet's numbering, and
+//! [`MnemonicSettings::derivation_index`] is the single place the offset is
+//! applied. That is the whole reason it exists: an operator reading "Account 2"
+//! off the wallet and typing `2` must get the same keys the wallet shows them,
+//! and a node that resolved the offset anywhere else would derive a valid key
+//! nobody has registered — the failure this module is built to avoid.
 
 use anyhow::{anyhow, Context, Result};
 use bip32::{DerivationPath, Prefix, XPrv};
@@ -51,10 +63,19 @@ use crate::crypto::BlsKeyPair;
 /// The seed phrase this node derives its identity from.
 pub const MNEMONIC_ENV: &str = "KONTOR_STORAGE_MNEMONIC";
 
-/// Which wallet account to derive. Both live nodes run on non-zero accounts, so
-/// this is the variable an operator is most likely to get wrong — hence the
-/// diagnosis in [`crate::node::onboarding`] when the derived key is unknown.
+/// Which wallet account to derive, numbered as Horizon Wallet numbers it: the
+/// first account is `1`, not `0`.
+///
+/// This is the variable an operator is most likely to get wrong — most live
+/// nodes run on something other than the first account — hence the diagnosis in
+/// [`crate::node::onboarding`] when the derived key is unknown, and hence the
+/// refusal of `0` rather than a silent off-by-one derivation.
 pub const ACCOUNT_INDEX_ENV: &str = "KONTOR_STORAGE_ACCOUNT_INDEX";
+
+/// The wallet's first account, and so both the default for
+/// [`ACCOUNT_INDEX_ENV`] and the bottom of the sibling scan in
+/// [`crate::node::registration`].
+pub const FIRST_ACCOUNT: u32 = 1;
 
 /// Which Bitcoin network the wallet derived against.
 pub const NETWORK_ENV: &str = "KONTOR_STORAGE_NETWORK";
@@ -167,6 +188,10 @@ impl std::fmt::Display for BitcoinNetwork {
 pub struct MnemonicSettings {
     phrase: Zeroizing<String>,
     pub network: BitcoinNetwork,
+    /// The wallet's account number, counting from [`FIRST_ACCOUNT`]. Carried in
+    /// the operator's terms rather than the path's so that every message built
+    /// from it names the account the wallet shows; the derivation converts once,
+    /// in [`Self::derivation_index`].
     pub account: u32,
     /// Whether this node may register itself even though another account of the
     /// same mnemonic already has a node. See [`REGISTER_NEW_ACCOUNT_ENV`].
@@ -193,9 +218,17 @@ impl MnemonicSettings {
     /// reads the phrase from the environment and nowhere else, and the tests
     /// that need one would otherwise have to set a process-wide variable and
     /// serialize against every other test that reads it.
+    ///
+    /// # Panics
+    /// If `account` is below [`FIRST_ACCOUNT`], which is not an account any
+    /// operator can configure — see [`Self::from_env`].
     #[cfg(test)]
     #[must_use]
     pub fn new(phrase: impl Into<String>, network: BitcoinNetwork, account: u32) -> Self {
+        assert!(
+            account >= FIRST_ACCOUNT,
+            "accounts count from {FIRST_ACCOUNT}, got {account}"
+        );
         Self {
             phrase: Zeroizing::new(phrase.into()),
             network,
@@ -239,10 +272,25 @@ impl MnemonicSettings {
         }
 
         let account = match std::env::var(ACCOUNT_INDEX_ENV) {
-            Ok(value) => value.trim().parse::<u32>().with_context(|| {
-                format!("{ACCOUNT_INDEX_ENV} must be a non-negative integer (got {value:?})")
-            })?,
-            Err(_) => 0,
+            Ok(value) => {
+                let account = value.trim().parse::<u32>().with_context(|| {
+                    format!("{ACCOUNT_INDEX_ENV} must be a positive integer (got {value:?})")
+                })?;
+                // Refused rather than read as the first account: `0` is what
+                // someone types who believes this counts from 0, and the account
+                // they meant is then one below every account they have. Deriving
+                // *something* would hand them a key the Portal has never seen,
+                // which is indistinguishable from a wrong mnemonic.
+                if account < FIRST_ACCOUNT {
+                    return Err(anyhow!(
+                        "{ACCOUNT_INDEX_ENV} counts from {FIRST_ACCOUNT}, like Horizon Wallet: \
+                         the first account is {FIRST_ACCOUNT}, not 0. Set it to the account \
+                         number the wallet shows."
+                    ));
+                }
+                account
+            }
+            Err(_) => FIRST_ACCOUNT,
         };
 
         let network = match std::env::var(NETWORK_ENV) {
@@ -261,6 +309,18 @@ impl MnemonicSettings {
             account,
             allow_new_account,
         }))
+    }
+
+    /// The 0-based child index [`Self::account`] names, for the two derivation
+    /// paths and nothing else.
+    ///
+    /// Saturating rather than `- 1`: every constructor refuses account 0, so the
+    /// clamp is unreachable, but an underflow here would silently derive account
+    /// `4294967295` — a perfectly valid key that no Portal has ever seen, which
+    /// is the one failure mode this module cannot diagnose.
+    #[must_use]
+    pub fn derivation_index(&self) -> u32 {
+        self.account.saturating_sub(FIRST_ACCOUNT)
     }
 
     /// The same mnemonic, pointed at a different account and network.
@@ -364,9 +424,13 @@ impl MnemonicIdentity {
         let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
 
         let coin = settings.network.coin_type();
-        let keypair = derive_bls_keypair(seed.as_slice(), coin, settings.account)?;
+        // The one place the wallet's numbering becomes the path's: both keys of
+        // an identity have to come from the same index, or the node registers a
+        // BLS key its own Taproot key does not own.
+        let index = settings.derivation_index();
+        let keypair = derive_bls_keypair(seed.as_slice(), coin, index)?;
 
-        let path: DerivationPath = format!("m/86'/{coin}'/{}'/0/0", settings.account)
+        let path: DerivationPath = format!("m/86'/{coin}'/{index}'/0/0")
             .parse()
             .context("building the BIP86 derivation path")?;
         let xprv = XPrv::derive_from_path(seed.as_slice(), &path)
@@ -463,16 +527,19 @@ impl MnemonicIdentity {
     }
 }
 
-/// Derive the BLS secret key at `m/12381/{coin}/{account}/0`.
+/// Derive the BLS secret key at `m/12381/{coin}/{index}/0`.
+///
+/// `index` is the 0-based child index, not the wallet's account number — see
+/// [`MnemonicSettings::derivation_index`].
 ///
 /// `blst` implements EIP-2333 itself, so this is only the path. Note it stops at
 /// four levels: EIP-2334's five-level `m/12381/3600/i/0/0` is an Ethereum
 /// validator convention that Horizon Wallet does not follow.
-fn derive_bls_keypair(seed: &[u8], coin: u32, account: u32) -> Result<BlsKeyPair> {
+fn derive_bls_keypair(seed: &[u8], coin: u32, index: u32) -> Result<BlsKeyPair> {
     let master = SecretKey::derive_master_eip2333(seed)
         .map_err(|e| anyhow!("EIP-2333 master key derivation failed: {e:?}"))?;
 
-    let sk = [BLS_PURPOSE, coin, account, 0]
+    let sk = [BLS_PURPOSE, coin, index, 0]
         .iter()
         .fold(master, |key, index| key.derive_child_eip2333(*index));
 
@@ -617,7 +684,7 @@ mod tests {
     /// wallet's `taprootChild.neutered().toBase58()` returns.
     #[test]
     fn taproot_identity_is_stable() {
-        let identity = MnemonicIdentity::derive(&settings(0, BitcoinNetwork::Mainnet)).unwrap();
+        let identity = MnemonicIdentity::derive(&settings(1, BitcoinNetwork::Mainnet)).unwrap();
 
         assert!(
             identity.xpubkey.starts_with("xpub"),
@@ -634,10 +701,13 @@ mod tests {
         assert_eq!(identity.node_id.len(), "node-".len() + 64);
     }
 
-    /// BIP86's own test vector: this phrase, account 0, first receive address.
+    /// BIP86's own test vector: this phrase, `m/86'/0'/0'/0/0`, first receive
+    /// address. Reached here as the *first* account, which is what pins the
+    /// offset at the bottom of the range where an off-by-one hides best.
     #[test]
     fn taproot_address_matches_bip86_vector() {
-        let identity = MnemonicIdentity::derive(&settings(0, BitcoinNetwork::Mainnet)).unwrap();
+        let identity =
+            MnemonicIdentity::derive(&settings(FIRST_ACCOUNT, BitcoinNetwork::Mainnet)).unwrap();
         assert_eq!(
             identity.taproot_address,
             "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
@@ -646,6 +716,32 @@ mod tests {
             hex::encode(identity.x_only),
             "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
         );
+    }
+
+    /// The offset itself, pinned end to end and in both paths at once: the
+    /// wallet's account 2 is the key at child index 1.
+    ///
+    /// Asserted against the paths spelled out here rather than against a stored
+    /// vector, because what can silently break is the *conversion* — a node that
+    /// applied it to one path and not the other would derive a BLS key its own
+    /// Taproot key does not own, and the Portal would reject the binding with
+    /// nothing in the message pointing back here.
+    #[test]
+    fn the_wallets_second_account_is_the_key_at_index_one() {
+        let identity = MnemonicIdentity::derive(&settings(2, BitcoinNetwork::Mainnet)).unwrap();
+
+        let seed = Mnemonic::parse_in_normalized(bip39::Language::English, TEST_PHRASE)
+            .unwrap()
+            .to_seed_normalized("");
+        let path: DerivationPath = "m/86'/0'/1'/0/0".parse().unwrap();
+        let xprv = XPrv::derive_from_path(seed, &path).unwrap();
+
+        assert_eq!(identity.xpubkey, xprv.public_key().to_string(Prefix::XPUB));
+        assert_eq!(
+            identity.bls_pubkey(),
+            derive_bls_keypair(&seed, 0, 1).unwrap().public_key_hex()
+        );
+        assert_eq!(settings(2, BitcoinNetwork::Mainnet).derivation_index(), 1);
     }
 
     /// Signet and testnet share a coin type, so they must derive the same keys —
@@ -707,7 +803,7 @@ mod tests {
         let mut parities = std::collections::HashSet::new();
 
         for network in [BitcoinNetwork::Mainnet, BitcoinNetwork::Signet] {
-            for account in 0..6 {
+            for account in FIRST_ACCOUNT..FIRST_ACCOUNT + 6 {
                 let identity = MnemonicIdentity::derive(&settings(account, network)).unwrap();
                 let sig_hex = identity.schnorr_binding_sig().unwrap();
                 assert_eq!(sig_hex.len(), 128);
@@ -743,13 +839,13 @@ mod tests {
 
     #[test]
     fn bad_mnemonic_is_rejected() {
-        let mut bad = settings(0, BitcoinNetwork::Signet);
+        let mut bad = settings(1, BitcoinNetwork::Signet);
         bad.phrase = Zeroizing::new("abandon abandon abandon".to_string());
         let err = MnemonicIdentity::derive(&bad).unwrap_err().to_string();
         assert!(err.contains("not a valid BIP-39 mnemonic"), "{err}");
 
         // Right length, wrong checksum: the last word carries it.
-        let mut checksum = settings(0, BitcoinNetwork::Signet);
+        let mut checksum = settings(1, BitcoinNetwork::Signet);
         checksum.phrase = Zeroizing::new(TEST_PHRASE.replace("about", "abandon"));
         let err = MnemonicIdentity::derive(&checksum).unwrap_err().to_string();
         assert!(err.contains("not a valid BIP-39 mnemonic"), "{err}");
@@ -891,11 +987,41 @@ mod tests {
 
     #[test]
     #[serial]
-    fn from_env_defaults_to_signet_account_zero() {
+    fn from_env_defaults_to_signet_and_the_first_account() {
         let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE)]);
         let settings = MnemonicSettings::from_env().unwrap().unwrap();
-        assert_eq!(settings.account, 0);
+        assert_eq!(settings.account, FIRST_ACCOUNT);
+        assert_eq!(settings.derivation_index(), 0);
         assert_eq!(settings.network, BitcoinNetwork::Signet);
+    }
+
+    /// The variable is the wallet's account number, so it must survive the trip
+    /// through the environment unshifted: what an operator reads off Horizon
+    /// Wallet and types here is what the node reports back and derives from.
+    #[test]
+    #[serial]
+    fn from_env_reads_the_account_in_the_wallets_numbering() {
+        let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (ACCOUNT_INDEX_ENV, "2")]);
+        let settings = MnemonicSettings::from_env().unwrap().unwrap();
+
+        assert_eq!(settings.account, 2);
+        assert_eq!(settings.derivation_index(), 1);
+
+        let identity = MnemonicIdentity::derive(&settings).unwrap();
+        assert_eq!(identity.account, 2);
+        assert_eq!(
+            identity.bls_pubkey(),
+            MnemonicIdentity::derive(&settings.at(2, BitcoinNetwork::Signet))
+                .unwrap()
+                .bls_pubkey()
+        );
+        assert_ne!(
+            identity.bls_pubkey(),
+            MnemonicIdentity::derive(&settings.at(FIRST_ACCOUNT, BitcoinNetwork::Signet))
+                .unwrap()
+                .bls_pubkey(),
+            "the account read from the environment must not collapse onto the first one"
+        );
     }
 
     #[test]
@@ -928,6 +1054,19 @@ mod tests {
         let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (ACCOUNT_INDEX_ENV, "-1")]);
         let err = MnemonicSettings::from_env().unwrap_err().to_string();
         assert!(err.contains(ACCOUNT_INDEX_ENV), "{err}");
+    }
+
+    /// `0` is the one wrong value that would otherwise derive something: it is
+    /// what an operator types who believes this counts from 0, and reading it as
+    /// the first account would shift their whole deployment down by one.
+    #[test]
+    #[serial]
+    fn from_env_rejects_account_zero_rather_than_shifting_it() {
+        let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (ACCOUNT_INDEX_ENV, "0")]);
+        let err = MnemonicSettings::from_env().unwrap_err().to_string();
+
+        assert!(err.contains(ACCOUNT_INDEX_ENV), "{err}");
+        assert!(err.contains("first account is 1"), "{err}");
     }
 
     /// Defaulting this to `false` is what keeps the sibling guard armed on every
