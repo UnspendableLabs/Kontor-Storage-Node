@@ -20,7 +20,7 @@
 //! Portal's database has been reset.
 
 use anyhow::{anyhow, Context, Result};
-use sha2::{Digest, Sha256};
+use bip32::ExtendedKey;
 
 use crate::clients::kontor_op::{
     build_signing_message, Inst, InstKind, SignerRef, REGISTER_BLS_KEY_GAS_LIMIT,
@@ -42,23 +42,19 @@ const BLS_PUBKEY_HEX_LEN: usize = 192;
 /// Hex length of a BIP340 Schnorr signature (64 bytes).
 const SCHNORR_SIG_HEX_LEN: usize = 128;
 
-/// Serialized length of a BIP32 extended key: version, depth, parent
-/// fingerprint, child number, chain code, key.
-const XPUB_PAYLOAD_LEN: usize = 4 + 1 + 4 + 4 + 32 + 33;
-
-/// Offset of the 33-byte compressed public key inside that payload.
-const XPUB_KEY_OFFSET: usize = 45;
-
-const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
 /// Derive the 32-byte x-only public key from an extended public key.
 ///
 /// The Portal does this with `Xpub::from_str(..).public_key.x_only_public_key()`
 /// and puts the result inside the message it verifies, so the two derivations
 /// have to agree. For a well-formed xpub they do trivially: the serialized key
 /// is already a compressed secp256k1 point, and x-only is that point minus its
-/// `02`/`03` parity byte. Doing it by hand keeps `bitcoin` and its secp256k1
-/// C bindings out of the node's dependency tree.
+/// `02`/`03` parity byte.
+///
+/// `bip32::ExtendedKey` is what does the base58check and the 78-byte length
+/// check, which is also how `crate::crypto::mnemonic` serializes the xpub in the
+/// first place — the two stay in step by construction. It is parsed rather than
+/// `XPub`: this only needs the serialized bytes, and stopping short of a curve
+/// point is what leaves room for the diagnosis below.
 ///
 /// The derivation path is deliberately ignored — the account-level key *is* the
 /// identity, exactly as the Portal treats it.
@@ -67,75 +63,24 @@ const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghij
 /// If `xpub` is not valid base58check, is the wrong length, or does not carry a
 /// compressed public key (an `xprv`, say, whose key field starts with `00`).
 pub fn x_only_from_xpub(xpub: &str) -> Result<[u8; 32]> {
-    let payload = base58check_decode(xpub).context("invalid extended public key")?;
+    let key: ExtendedKey = xpub
+        .parse()
+        .map_err(|e| anyhow!("invalid extended public key: {e}"))?;
 
-    if payload.len() != XPUB_PAYLOAD_LEN {
-        return Err(anyhow!(
-            "extended public key must decode to {XPUB_PAYLOAD_LEN} bytes, got {}",
-            payload.len()
-        ));
-    }
-
-    let key = &payload[XPUB_KEY_OFFSET..];
-    if key[0] != 0x02 && key[0] != 0x03 {
+    // The one malformed input worth naming. An `xprv` is the same length and
+    // carries the same checksum rules, so everything above accepts it and the
+    // 32 bytes below would be a secret key read as a public one.
+    if key.key_bytes[0] != 0x02 && key.key_bytes[0] != 0x03 {
         return Err(anyhow!(
             "extended key does not hold a compressed public key (prefix {:#04x}); \
              an extended *private* key was probably passed",
-            key[0]
+            key.key_bytes[0]
         ));
     }
 
-    let mut x_only = [0u8; 32];
-    x_only.copy_from_slice(&key[1..]);
-    Ok(x_only)
-}
-
-/// Decode a base58check string, verifying and stripping its 4-byte checksum.
-fn base58check_decode(input: &str) -> Result<Vec<u8>> {
-    if input.is_empty() {
-        return Err(anyhow!("empty base58 string"));
-    }
-
-    // Big-endian base conversion: each character shifts the accumulator by one
-    // base-58 digit. Inputs here are ~111 characters, so the quadratic cost is
-    // irrelevant next to the Argon2 hash this runs alongside.
-    let mut bytes: Vec<u8> = Vec::with_capacity(input.len());
-    for ch in input.bytes() {
-        let digit = BASE58_ALPHABET
-            .iter()
-            .position(|c| *c == ch)
-            .ok_or_else(|| anyhow!("invalid base58 character {:?}", ch as char))?;
-
-        let mut carry = digit;
-        for byte in bytes.iter_mut().rev() {
-            carry += 58 * (*byte as usize);
-            *byte = (carry % 256) as u8;
-            carry /= 256;
-        }
-        while carry > 0 {
-            bytes.insert(0, (carry % 256) as u8);
-            carry /= 256;
-        }
-    }
-
-    // A leading '1' is a zero digit, which the loop above cannot represent
-    // because it carries nothing; base58check encodes each leading zero byte as
-    // one such character.
-    for _ in input.bytes().take_while(|c| *c == b'1') {
-        bytes.insert(0, 0);
-    }
-
-    if bytes.len() < 5 {
-        return Err(anyhow!("base58check payload is too short"));
-    }
-
-    let (payload, checksum) = bytes.split_at(bytes.len() - 4);
-    let expected = Sha256::digest(Sha256::digest(payload));
-    if checksum != &expected[..4] {
-        return Err(anyhow!("base58check checksum mismatch"));
-    }
-
-    Ok(payload.to_vec())
+    Ok(key.key_bytes[1..]
+        .try_into()
+        .expect("a compressed secp256k1 point is 33 bytes"))
 }
 
 /// The message whose BLS signature proves the BLS key agrees to be bound to
@@ -259,6 +204,14 @@ pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNo
 /// through it is what lets whitelisting an address be the whole of the
 /// operator's work. Timeouts, rate limits and `5xx` are out for the neighbouring
 /// reason: nothing about them says the registration was read and rejected.
+///
+/// `401` is out too, for a reason particular to this endpoint: registration is
+/// unauthenticated by design — the node has no credential until it succeeds — so
+/// the Portal itself has no way to answer `401`. One that arrives came from
+/// something in front of it (an auth proxy, a staging gate, a WAF), which is a
+/// deployment problem a human fixes without the request changing. Treating it as
+/// final would strand the node until someone restarted the container, on exactly
+/// the unattended deployments this path exists for.
 #[must_use]
 pub fn refusal_is_final(error: &anyhow::Error) -> bool {
     error
@@ -267,7 +220,6 @@ pub fn refusal_is_final(error: &anyhow::Error) -> bool {
             matches!(
                 e.status,
                 reqwest::StatusCode::BAD_REQUEST
-                    | reqwest::StatusCode::UNAUTHORIZED
                     | reqwest::StatusCode::CONFLICT
                     | reqwest::StatusCode::UNPROCESSABLE_ENTITY
             )
@@ -513,52 +465,45 @@ mod tests {
         assert_eq!(hex::encode(x_only), BIP32_X_ONLY);
     }
 
+    /// Every shape of malformed input an operator can paste into the field.
+    ///
+    /// Asserted as one property — refused, and named as the extended key it
+    /// failed to be — rather than on the wording of each case, which belongs to
+    /// `bip32` now. What matters here is that none of them reaches the Portal.
     #[test]
-    fn surrounding_whitespace_is_not_accepted_by_the_decoder() {
-        let err = x_only_from_xpub(&format!(" {BIP32_XPUB}")).unwrap_err();
-        assert!(format!("{err:#}").contains("invalid base58 character"));
-    }
+    fn malformed_extended_keys_are_refused() {
+        let flipped = {
+            let mut broken = BIP32_XPUB.to_string();
+            broken.pop();
+            broken.push('9');
+            broken
+        };
 
-    #[test]
-    fn a_flipped_character_fails_the_checksum() {
-        let mut broken = BIP32_XPUB.to_string();
-        broken.pop();
-        broken.push('9');
-        let err = x_only_from_xpub(&broken).unwrap_err();
-        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
-    }
-
-    #[test]
-    fn a_character_outside_the_alphabet_is_rejected() {
-        let err = x_only_from_xpub("xpub0OIl").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("invalid base58 character"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn an_empty_string_is_rejected() {
-        let err = x_only_from_xpub("").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("empty base58 string"),
-            "{err:#}"
-        );
-    }
-
-    /// A valid base58check string that simply is not 78 bytes — a Bitcoin
-    /// address, here — must not be read as an extended key.
-    #[test]
-    fn a_short_payload_is_rejected() {
-        let err = x_only_from_xpub("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("must decode to 78 bytes"),
-            "{err:#}"
-        );
+        for (label, input) in [
+            ("surrounding whitespace", format!(" {BIP32_XPUB}")),
+            ("a flipped character", flipped),
+            ("characters outside the alphabet", "xpub0OIl".to_string()),
+            ("an empty string", String::new()),
+            // Valid base58check, but 25 bytes rather than 78: a plain address.
+            (
+                "a payload that is not 78 bytes",
+                "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".to_string(),
+            ),
+        ] {
+            let err = x_only_from_xpub(&input)
+                .expect_err(&format!("{label} must not parse as an extended key"));
+            assert!(
+                format!("{err:#}").contains("invalid extended public key"),
+                "{label}: {err:#}"
+            );
+        }
     }
 
     /// The xprv counterpart of the vector above: same length, same checksum
-    /// rules, but its key field starts with the `00` padding byte.
+    /// rules, but its key field starts with the `00` padding byte. The one
+    /// malformed input that gets its own message, because the 32 bytes past
+    /// that byte are a *secret* key and reading them as a public one would be
+    /// silent.
     #[test]
     fn an_extended_private_key_is_rejected() {
         let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
@@ -567,15 +512,6 @@ mod tests {
             format!("{err:#}").contains("compressed public key"),
             "{err:#}"
         );
-    }
-
-    /// Leading zero bytes are encoded as leading '1' characters and have to
-    /// survive the round trip, or the payload comes back short.
-    #[test]
-    fn leading_zero_bytes_are_preserved() {
-        // 0x00 0x00 0x61 plus its checksum, encoded.
-        let decoded = base58check_decode("11C33fie4").unwrap();
-        assert_eq!(decoded, vec![0x00, 0x00, 0x61]);
     }
 
     #[test]
@@ -727,7 +663,6 @@ mod tests {
 
         for status in [
             reqwest::StatusCode::BAD_REQUEST,
-            reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::CONFLICT,
             reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         ] {
@@ -737,6 +672,10 @@ mod tests {
         for status in [
             // The whitelist: cleared by a human, without the request changing.
             reqwest::StatusCode::FORBIDDEN,
+            // Registration takes no credential, so this came from a proxy in
+            // front of the Portal — a deployment problem, not a verdict on the
+            // request. Giving up on it would strand the node until a restart.
+            reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::REQUEST_TIMEOUT,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,

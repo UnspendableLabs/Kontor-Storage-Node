@@ -236,6 +236,10 @@
   var token = sessionStorage.getItem(TOKEN_KEY);
   var statusTimer = null;
   var walletProvider = null;
+  // Whether the detection poll below has already run. It only ever runs once:
+  // the extension injects its provider early or not at all, and the note it
+  // leaves behind tells the operator to reload.
+  var walletSearched = false;
 
   /* ---------------- helpers ---------------- */
 
@@ -558,6 +562,19 @@
 
   function detectWallet() {
     if (walletProvider) { return; }
+
+    // The status refresh calls this every 30s. Adopt a provider that turned up
+    // since the last look, but never start a second search: without this the
+    // note would cycle "looking…" → "not detected" forever on a browser that
+    // simply has no extension.
+    if (window.HorizonWalletProvider) {
+      walletProvider = window.HorizonWalletProvider;
+      $("register-wallet-state").textContent = "Horizon Wallet detected.";
+      $("register-submit").disabled = false;
+      return;
+    }
+    if (walletSearched) { return; }
+    walletSearched = true;
 
     var tries = 0;
     var note = $("register-wallet-state");

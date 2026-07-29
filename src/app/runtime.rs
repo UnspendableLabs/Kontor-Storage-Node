@@ -258,9 +258,11 @@ async fn run_unregistered(
     let watcher = tokio::spawn({
         let restart = restart.clone();
         async move {
-            // Only the first refusal is worth a warning. After that the node is
-            // waiting on a human, and repeating ourselves every 30s would bury
-            // the line that says which address they have to whitelist.
+            // The last outcome reported, so a Portal that keeps giving the same
+            // answer is logged once rather than every 30s — which would bury the
+            // line that says which address has to be whitelisted. An acceptance
+            // takes the same slot: the Portal can accept and still not show the
+            // node, and repeating *that* every tick is no more useful.
             let mut announced: Option<String> = None;
             loop {
                 tokio::time::sleep(UNREGISTERED_LOOKUP_INTERVAL).await;
@@ -279,11 +281,15 @@ async fn run_unregistered(
                 // actually decides the node is through.
                 match client.register_node(request).await {
                     Ok(response) => {
-                        tracing::info!(
-                            node_id = %response.node_id,
-                            "The Portal accepted the registration it had refused"
-                        );
-                        announced = None;
+                        let reason = format!("accepted as {}", response.node_id);
+                        if announced.as_ref() != Some(&reason) {
+                            tracing::info!(
+                                node_id = %response.node_id,
+                                "The Portal accepted the registration it had refused; \
+                                 waiting for the node to appear in its lookup"
+                            );
+                            announced = Some(reason);
+                        }
                     }
                     Err(e) if crate::node::registration::refusal_is_final(&e) => {
                         tracing::error!(
