@@ -40,7 +40,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
 | `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. Ignored entirely when `KONTOR_STORAGE_MNEMONIC` is set. |
 | _(env only)_ | `KONTOR_STORAGE_MNEMONIC` | _unset_ | Horizon Wallet seed phrase. Setting it puts the node in [mnemonic mode](#mnemonic-mode): it derives its own keys and registers itself. `BLS_ENCRYPTED_BLOB` / `BLS_PASSWORD` no longer supply the key, but are still read when present, to check the derivation against the key this node was using — see [migrating a running node](#migrating-a-running-node). |
-| _(env only)_ | `KONTOR_STORAGE_ACCOUNT_INDEX` | `0` | Which wallet account to derive. Must match the account the node is registered under — see [mnemonic mode](#mnemonic-mode). |
+| _(env only)_ | `KONTOR_STORAGE_ACCOUNT_INDEX` | `1` | Which wallet account to derive, **numbered as Horizon Wallet numbers it: the first account is `1`**. Set it to the account number the wallet shows; `0` is refused rather than read as the first account. Must match the account the node is registered under — see [mnemonic mode](#mnemonic-mode). |
 | _(env only)_ | `KONTOR_STORAGE_NETWORK` | `signet` | `mainnet`, `testnet`, `signet`, or `regtest`. Selects the coin type in both derivation paths, so it changes every derived key, and the address prefix, which must match the Portal's own `PORTAL_BITCOIN_NETWORK` or the derived address will never match its whitelist. |
 | _(env only)_ | `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT` | `0` | Set to `1` to register this account as a **new** node even though other accounts of the same mnemonic already have one — see [running several nodes from one mnemonic](#running-several-nodes-from-one-mnemonic). |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset (UI disabled)_ | Password for the operator UI at `/admin`. At least 16 characters when set; leave unset to disable the UI entirely. See [Operator UI](#operator-ui). |
@@ -96,10 +96,19 @@ sign a complete registration — which also means it re-registers itself unatten
 after the Portal's database is reset, instead of waiting for someone to open
 `/admin`.
 
+`KONTOR_STORAGE_ACCOUNT_INDEX` is the account number the wallet displays, so
+"Account 2" in Horizon Wallet is `2` here. The derivation paths count from 0 —
+account 2 is the key at child index 1 — but that offset is the node's business,
+not the operator's, and it is applied in one place. Setting it to `0` is an
+error rather than a synonym for the first account, since it is what someone
+types who believes this counts from 0, and every account they meant would then
+be off by one.
+
 Derivation matches Horizon Wallet exactly (BIP-39 with an empty passphrase, then
-`m/12381/{coin}/{account}/0` for the BLS key via EIP-2333 and
-`m/86'/{coin}'/{account}'/0/0` for the Taproot key), so a mnemonic node and a
-wallet-exported one with the same account are the same node.
+`m/12381/{coin}/{index}/0` for the BLS key via EIP-2333 and
+`m/86'/{coin}'/{index}'/0/0` for the Taproot key, where `{index}` is
+`KONTOR_STORAGE_ACCOUNT_INDEX - 1`), so a mnemonic node and a wallet-exported one
+on the same account are the same node.
 
 On startup it prints the identity it derived:
 
@@ -221,7 +230,7 @@ No node is registered for KONTOR_STORAGE_ACCOUNT_INDEX = 1 (signet).
   derived BLS key: 84a1c0…
   derived address: tb1p…7k2q
 
-  This mnemonic does have registered nodes, on other accounts (accounts 0-10 checked):
+  This mnemonic does have registered nodes, on other accounts (accounts 1-10 checked):
     account 2 (signet) -> node-8f3a… (tb1p…q2x)
     account 3 (signet) -> node-1b7c… (tb1p…m4d)
 
