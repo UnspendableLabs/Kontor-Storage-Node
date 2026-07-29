@@ -29,6 +29,7 @@ use crate::clients::portal::RegisterNodeRequest;
 use crate::clients::PortalClient;
 use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, REGISTER_NEW_ACCOUNT_ENV};
 use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
+use crate::node::known_identity::KnownIdentity;
 
 /// Prefix the Portal signs over to bind a BLS key to a Taproot identity.
 ///
@@ -337,16 +338,47 @@ pub async fn find_registered_siblings(
 /// agreements behind a second identity, while a genuine second node is one
 /// environment variable away from starting. So the message names both readings
 /// and the variable that picks between them.
+///
+/// `known` is the identity this node last onboarded under, when there is one.
+/// Reaching this error with a record that does not match means the account
+/// index changed under a node that was already running as something else, which
+/// is the most actionable thing that can be said here — so it is said first.
 #[must_use]
 pub fn wrong_account_error(
     identity: &MnemonicIdentity,
     siblings: &[RegisteredSibling],
+    known: Option<&KnownIdentity>,
 ) -> anyhow::Error {
     let listed = siblings
         .iter()
         .map(|sibling| format!("    {sibling}"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    if let Some(record) = known {
+        return anyhow!(
+            "This node has already run as {} (account {}, {}), and {} = {} derives a \
+             different identity.\n  \
+               derived BLS key: {}\n  \
+               derived address: {}\n\n  \
+             Set {} back to {} — the account this node is registered under. Registering \
+             account {} instead would create a second node and leave this one's \
+             agreements behind.\n\n  \
+             If you really mean to move this node to another account, delete its \
+             storage directory's .node-identity.json and set {}=1.",
+            record.node_id,
+            record.account,
+            record.network,
+            ACCOUNT_INDEX_ENV,
+            identity.account,
+            identity.bls_pubkey(),
+            identity.taproot_address,
+            ACCOUNT_INDEX_ENV,
+            record.account,
+            identity.account,
+            REGISTER_NEW_ACCOUNT_ENV,
+        );
+    }
 
     anyhow!(
         "No node is registered for {} = {} ({}).\n  \
@@ -577,7 +609,7 @@ mod tests {
         let real = derived(3);
         let siblings = vec![sibling_of(&real)];
 
-        let rendered = wrong_account_error(&identity, &siblings).to_string();
+        let rendered = wrong_account_error(&identity, &siblings, None).to_string();
 
         assert!(rendered.contains(ACCOUNT_INDEX_ENV), "{rendered}");
         assert!(rendered.contains("account 3"), "{rendered}");
@@ -591,7 +623,8 @@ mod tests {
     /// refusal is to guess that one exists.
     #[test]
     fn the_wrong_account_error_offers_the_way_out() {
-        let rendered = wrong_account_error(&derived(4), &[sibling_of(&derived(2))]).to_string();
+        let rendered =
+            wrong_account_error(&derived(4), &[sibling_of(&derived(2))], None).to_string();
 
         assert!(rendered.contains(REGISTER_NEW_ACCOUNT_ENV), "{rendered}");
         assert!(rendered.contains("really is a new node"), "{rendered}");
@@ -605,7 +638,7 @@ mod tests {
         let range = account_scan_range();
         assert_eq!(range, "accounts 0-10");
 
-        assert!(wrong_account_error(&derived(4), &siblings)
+        assert!(wrong_account_error(&derived(4), &siblings, None)
             .to_string()
             .contains(&range));
         assert!(new_account_notice(&derived(4), &siblings).contains(&range));

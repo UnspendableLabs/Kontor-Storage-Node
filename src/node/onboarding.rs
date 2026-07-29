@@ -9,6 +9,7 @@ use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::portal::RegisterNodeRequest;
 use crate::clients::PortalClient;
 use crate::crypto::mnemonic::{DerivedIdentityInfo, MnemonicIdentity, MnemonicSettings};
+use crate::node::known_identity::{self, KnownIdentity};
 use crate::node::registration;
 use anyhow::{anyhow, Result};
 use std::io::Write;
@@ -158,6 +159,12 @@ pub struct OnboardingConfig {
     /// Read from the environment by the caller rather than in here, so the
     /// whole flow stays a function of its arguments.
     pub mnemonic: Option<MnemonicSettings>,
+    /// Where to keep the record of the identity this node onboards under.
+    ///
+    /// `storage_dir` in production. `None` disables the record entirely, which
+    /// costs a node the automatic recovery described in
+    /// [`crate::node::known_identity`] and nothing else.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Perform the node onboarding process.
@@ -192,6 +199,10 @@ struct SelfRegistration {
 /// Register a mnemonic-derived node with the Portal, after checking that doing
 /// so is the right move.
 ///
+/// `known` is the identity this node last onboarded under, when it has one. It
+/// is what tells a Portal that forgot us apart from an account index that was
+/// never right — see [`crate::node::known_identity`].
+///
 /// # Errors
 /// If the configured account is not the one this node is registered under, and
 /// the operator has not said otherwise. That is fatal on purpose: see
@@ -199,6 +210,7 @@ struct SelfRegistration {
 async fn self_register(
     client: &PortalClient,
     identity: &crate::crypto::MnemonicIdentity,
+    known: Option<&KnownIdentity>,
     writer: &mut impl Write,
 ) -> Result<SelfRegistration> {
     writeln!(
@@ -241,19 +253,37 @@ async fn self_register(
         Err(_) => {}
     }
 
-    let siblings = registration::find_registered_siblings(client, identity).await;
-    match (siblings.is_empty(), identity.allows_new_account()) {
-        (false, false) => return Err(registration::wrong_account_error(identity, &siblings)),
-        (false, true) => writeln!(
+    // Have we been this node before? Then the Portal forgot us rather than the
+    // account index being wrong, and the sibling scan below cannot tell the
+    // difference: after a Portal reset every node of a multi-node deployment
+    // sees its neighbours re-register, which is exactly what a typo looks like.
+    // Nothing the Portal can be asked settles that — only our own past can.
+    if known.is_some_and(|record| record.matches(identity)) {
+        writeln!(
             writer,
-            "\n{}",
-            registration::new_account_notice(identity, &siblings)
-        )?,
-        (true, _) => writeln!(
-            writer,
-            "No node is registered on any account of this mnemonic ({} checked).",
-            registration::account_scan_range()
-        )?,
+            "This node has already run as {}, so the Portal has forgotten it rather \
+             than the account being wrong. Re-registering.",
+            identity.node_id
+        )?;
+    } else {
+        let siblings = registration::find_registered_siblings(client, identity).await;
+        match (siblings.is_empty(), identity.allows_new_account()) {
+            (false, false) => {
+                return Err(registration::wrong_account_error(
+                    identity, &siblings, known,
+                ))
+            }
+            (false, true) => writeln!(
+                writer,
+                "\n{}",
+                registration::new_account_notice(identity, &siblings)
+            )?,
+            (true, _) => writeln!(
+                writer,
+                "No node is registered on any account of this mnemonic ({} checked).",
+                registration::account_scan_range()
+            )?,
+        }
     }
 
     writeln!(writer, "Registering account {}...", identity.account)?;
@@ -308,6 +338,14 @@ pub async fn perform_onboarding_with_reader(
     let bls_pubkey = keys.keypair().public_key_hex();
     writeln!(writer, "✓ BLS key loaded")?;
 
+    // Read before the lookup rather than inside the 404 branch: the record is
+    // what makes a re-registration distinguishable from a wrong account, and
+    // reading it once keeps that decision out of the retry path.
+    let known = match (&config.state_dir, keys.identity()) {
+        (Some(dir), Some(_)) => KnownIdentity::load(dir).await,
+        _ => None,
+    };
+
     // Step 2: Look up node by BLS public key
     writeln!(writer, "Looking up node identity...")?;
     let mut waiting = false;
@@ -331,7 +369,8 @@ pub async fn perform_onboarding_with_reader(
                     match (keys.identity(), self_registered) {
                         (Some(identity), false) => {
                             self_registered = true;
-                            let attempt = self_register(client, identity, writer).await?;
+                            let attempt =
+                                self_register(client, identity, known.as_ref(), writer).await?;
                             pending_registration = Some(attempt.request);
                             if attempt.accepted {
                                 continue;
@@ -397,6 +436,20 @@ pub async fn perform_onboarding_with_reader(
         writer.flush()?;
         tokio::time::sleep(REGISTRATION_POLL_INTERVAL).await;
     };
+
+    // The Portal knows this node under the identity just derived, which is the
+    // one fact a later 404 needs to read as "the Portal forgot me" rather than
+    // "this account index was never right". Written here rather than after a
+    // successful registration: a node that onboarded against a row somebody
+    // else created has just as much claim to re-register it.
+    if let (Some(dir), Some(identity)) = (&config.state_dir, keys.identity()) {
+        if !known
+            .as_ref()
+            .is_some_and(|record| record.matches(identity))
+        {
+            known_identity::remember(dir, identity).await;
+        }
+    }
 
     // Step 3: Login (challenge/response)
     let derived = keys.identity().map(MnemonicIdentity::info);
@@ -494,6 +547,9 @@ mod tests {
     const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                                abandon abandon abandon about";
 
+    /// Named here so the assertions read as what an operator would grep for.
+    const ACCOUNT_INDEX_ENV_NAME: &str = crate::crypto::mnemonic::ACCOUNT_INDEX_ENV;
+
     fn derived_identity(account: u32) -> MnemonicIdentity {
         MnemonicIdentity::derive(&MnemonicSettings::new(
             TEST_PHRASE,
@@ -513,6 +569,17 @@ mod tests {
                 crate::crypto::BitcoinNetwork::Signet,
                 account,
             )),
+            // No record by default: these tests are about a node meeting the
+            // Portal for the first time. The ones about recovery set it.
+            state_dir: None,
+        }
+    }
+
+    /// The same node, having already onboarded once in `state_dir`.
+    fn returning_config(account: u32, state_dir: &std::path::Path) -> OnboardingConfig {
+        OnboardingConfig {
+            state_dir: Some(state_dir.to_path_buf()),
+            ..mnemonic_config(account)
         }
     }
 
@@ -782,6 +849,226 @@ mod tests {
         assert!(err.contains("accounts 0-10"), "{err}");
     }
 
+    /// The scenario the identity record exists for. Two nodes, accounts 2 and
+    /// 3, one mnemonic; the Portal's database is reset. Account 3 restarts
+    /// first and re-registers, so account 2 now sees a registered sibling —
+    /// which is byte-for-byte what a mistyped account index looks like. Without
+    /// the record it refuses, and unattended recovery works for exactly one node
+    /// of any deployment.
+    #[tokio::test]
+    async fn a_portal_reset_lets_a_returning_node_register_beside_its_siblings() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let identity = derived_identity(2);
+        let sibling = derived_identity(3);
+        let public_key = identity.bls_pubkey();
+
+        // This node came up as account 2 before the reset.
+        crate::node::known_identity::KnownIdentity::store(state.path(), &identity)
+            .await
+            .unwrap();
+
+        // The sibling got there first.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", sibling.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": sibling.node_id,
+                "signer_id": 7,
+                "bls_public_key": sibling.bls_pubkey()
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+
+        mount_check_404(&mock_server, &identity.node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "x_only_pubkey": hex::encode(identity.x_only),
+                "bls_public_key": public_key
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+        mount_all_mocks_except_lookup(&mock_server, &identity.node_id, &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let result = perform_onboarding_with_reader(
+            &client,
+            &returning_config(2, state.path()),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap()
+        .expect_ready();
+
+        assert_eq!(result.keypair.public_key_hex(), public_key);
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("has already run as"), "{output}");
+        assert!(output.contains(&identity.node_id), "{output}");
+    }
+
+    /// The record must not become a blanket exemption: it vouches for one
+    /// identity, and the account index this node is now pointed at is not it.
+    #[tokio::test]
+    async fn a_record_for_another_account_still_refuses_and_names_it() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let previous = derived_identity(2);
+
+        crate::node::known_identity::KnownIdentity::store(state.path(), &previous)
+            .await
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", previous.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": previous.node_id,
+                "signer_id": 7,
+                "bls_public_key": previous.bls_pubkey()
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_check_404(&mock_server, &derived_identity(4).node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let err = perform_onboarding_with_reader(
+            &client,
+            &returning_config(4, state.path()),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        // The local record is more actionable than the Portal scan: it says
+        // what this node *was*, not merely what else exists.
+        assert!(err.contains("has already run as"), "{err}");
+        assert!(err.contains(&previous.node_id), "{err}");
+        assert!(err.contains("account 2"), "{err}");
+        assert!(err.contains(ACCOUNT_INDEX_ENV_NAME), "{err}");
+    }
+
+    /// Recovery only works if the first successful start writes the record, so
+    /// that is worth asserting rather than assuming.
+    #[tokio::test]
+    async fn onboarding_records_the_identity_it_came_up_with() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let identity = derived_identity(2);
+        let public_key = identity.bls_pubkey();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_all_mocks_except_lookup(&mock_server, &identity.node_id, &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        perform_onboarding_with_reader(
+            &client,
+            &returning_config(2, state.path()),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap()
+        .expect_ready();
+
+        let record = crate::node::known_identity::KnownIdentity::load(state.path())
+            .await
+            .expect("a node that onboarded has to remember what it onboarded as");
+        assert!(record.matches(&identity));
+    }
+
+    /// A node importing its key from a wallet has no derived identity, so there
+    /// is nothing to record and nothing the record could permit.
+    #[tokio::test]
+    async fn an_imported_node_writes_no_identity_record() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let key_path = dir.path().join("test_bls.enc");
+
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        mount_all_mocks(&mock_server, "node-imported", &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let config = OnboardingConfig {
+            bls_key_path: Some(key_path),
+            mnemonic: None,
+            state_dir: Some(state.path().to_path_buf()),
+        };
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
+            .await
+            .unwrap()
+            .expect_ready();
+
+        assert!(
+            crate::node::known_identity::KnownIdentity::load(state.path())
+                .await
+                .is_none()
+        );
+    }
+
     /// The other way the same mistake shows up: the address is registered, but
     /// against a BLS key this mnemonic does not derive. Registering again would
     /// not fix it — the Portal keys nodes by the xpub.
@@ -1011,6 +1298,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -1060,6 +1348,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -1154,6 +1443,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -1194,6 +1484,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -1247,6 +1538,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();
@@ -1318,6 +1610,7 @@ mod tests {
         let config = OnboardingConfig {
             bls_key_path: Some(key_path),
             mnemonic: None,
+            state_dir: None,
         };
         let reader = MockPasswordReader::new(password);
         let mut buffer = Vec::new();

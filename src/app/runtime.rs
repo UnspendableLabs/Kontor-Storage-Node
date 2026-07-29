@@ -347,6 +347,10 @@ pub async fn run_with_shutdown(
             let onboarding_config = node::OnboardingConfig {
                 bls_key_path: config.bls_key_path.clone(),
                 mnemonic: crate::crypto::MnemonicSettings::from_env()?,
+                // `storage_dir` is the one directory a node has to keep across
+                // restarts to be worth running, which is exactly the lifetime
+                // the identity record needs.
+                state_dir: Some(config.storage_dir.clone()),
             };
             let onboarding_result =
                 match node::perform_onboarding(&client, &onboarding_config, &mut writer).await? {

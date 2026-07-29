@@ -33,6 +33,15 @@ pub trait PasswordReader {
     /// Wait for the user to press Enter.
     #[allow(dead_code)]
     fn wait_for_enter(&self) -> Result<()>;
+
+    /// Whether reading anything from this reader stops at a human.
+    ///
+    /// The mnemonic cross-check in [`ensure_node_keys`] opens the legacy key
+    /// material to compare it against the derived key. That is worth doing when
+    /// it is free, and never worth stopping a node at a password prompt for a
+    /// file it is about to ignore — so on a terminal the check is skipped
+    /// rather than asked for.
+    fn is_interactive(&self) -> bool;
 }
 
 /// Default implementation that reads from the terminal using rpassword.
@@ -95,6 +104,10 @@ impl PasswordReader for TerminalPasswordReader {
             .map_err(|e| anyhow!("failed to read input: {e}"))?;
         Ok(())
     }
+
+    fn is_interactive(&self) -> bool {
+        true
+    }
 }
 // LCOV_EXCL_STOP
 
@@ -151,6 +164,10 @@ impl PasswordReader for EnvPasswordReader {
     fn wait_for_enter(&self) -> Result<()> {
         // In non-interactive mode, we don't wait for user input
         Ok(())
+    }
+
+    fn is_interactive(&self) -> bool {
+        false
     }
 }
 
@@ -260,13 +277,7 @@ pub async fn ensure_node_keys(
         )?;
         writeln!(writer, "  Node id:         {}", identity.node_id)?;
 
-        if BlsKeyPair::key_file_exists(key_path).await? {
-            writeln!(
-                writer,
-                "  ({} is left untouched; the mnemonic is the key now)",
-                key_path.display()
-            )?;
-        }
+        cross_check_legacy_key(key_path, &identity, writer, password_reader).await?;
 
         return Ok(NodeKeys::Derived(Box::new(identity)));
     }
@@ -274,6 +285,144 @@ pub async fn ensure_node_keys(
     ensure_bls_keypair(key_path, writer, password_reader)
         .await
         .map(|keypair| NodeKeys::Imported(Box::new(keypair)))
+}
+
+/// The BLS key this node used before the mnemonic, when one can be read.
+enum LegacyKey {
+    /// Opened. Carries the public key it holds and where it came from.
+    Found { pubkey: String, source: String },
+    /// Present, but not readable here — wrong password, corrupt file, or a
+    /// terminal we must not stop at. The comparison did not happen.
+    Unreadable { source: String, reason: String },
+    /// Nothing to compare against.
+    Absent,
+}
+
+/// Read whatever BLS key this node held before the mnemonic, without ever
+/// blocking on a human.
+///
+/// The exported blob is preferred over the key file: it is the wallet's own
+/// output, one decryption away from the key the Portal knows, whereas the file
+/// is a local re-encryption of it. Either answers the only question being
+/// asked — which key was this node actually using.
+async fn legacy_bls_pubkey(key_path: &Path, reader: &dyn PasswordReader) -> LegacyKey {
+    if let Ok(blob) = reader.read_blob() {
+        let source = BLS_BLOB_ENV.to_string();
+        return match reader
+            .read_password()
+            .and_then(|password| crate::crypto::decrypt_wallet_blob(&blob, &password))
+            .and_then(|secret| BlsKeyPair::from_secret_key_hex(&secret))
+        {
+            Ok(keypair) => LegacyKey::Found {
+                pubkey: keypair.public_key_hex(),
+                source,
+            },
+            Err(e) => LegacyKey::Unreadable {
+                source,
+                reason: format!("{e:#}"),
+            },
+        };
+    }
+
+    if !matches!(BlsKeyPair::key_file_exists(key_path).await, Ok(true)) {
+        return LegacyKey::Absent;
+    }
+
+    let source = key_path.display().to_string();
+    match reader.read_password() {
+        Ok(password) => match BlsKeyPair::load_encrypted(key_path, &password).await {
+            Ok(keypair) => LegacyKey::Found {
+                pubkey: keypair.public_key_hex(),
+                source,
+            },
+            Err(e) => LegacyKey::Unreadable {
+                source,
+                reason: format!("{e:#}"),
+            },
+        },
+        Err(e) => LegacyKey::Unreadable {
+            source,
+            reason: format!("{e:#}"),
+        },
+    }
+}
+
+/// Compare the derived key against the one this node used before, and refuse to
+/// continue if they disagree.
+///
+/// # Why this is the only guard that can catch a wrong derivation
+///
+/// Every other check on this path — the `node_id` lookup, the sibling scan —
+/// asks the Portal about keys derived from the *same* constants it is trying to
+/// validate. If any of them is wrong, the derived identity is simply unknown
+/// everywhere, which is indistinguishable from a new node: the node registers a
+/// second identity and the original keeps its agreements. The guards are blind
+/// to it by construction.
+///
+/// The legacy key material is the one thing on the machine that does not come
+/// from the mnemonic. Comparing against it is the whole compatibility claim in
+/// one assertion, checked on exactly the nodes where being wrong is expensive —
+/// the ones migrating from a wallet export.
+///
+/// Best-effort in one direction only: it can refuse, never permit. When the key
+/// cannot be read the node says so and carries on, because a guard that did not
+/// run must not read like a guard that passed.
+///
+/// # Errors
+/// If the legacy key opens and holds a different public key.
+async fn cross_check_legacy_key(
+    key_path: &Path,
+    identity: &MnemonicIdentity,
+    writer: &mut impl Write,
+    reader: &dyn PasswordReader,
+) -> Result<()> {
+    // On a terminal, opening the legacy key means prompting for a password to
+    // check a file we are about to ignore. Not worth stopping a start for.
+    if reader.is_interactive() {
+        if BlsKeyPair::key_file_exists(key_path).await? {
+            writeln!(
+                writer,
+                "  ({} is left untouched; the mnemonic is the key now)",
+                key_path.display()
+            )?;
+        }
+        return Ok(());
+    }
+
+    match legacy_bls_pubkey(key_path, reader).await {
+        LegacyKey::Absent => Ok(()),
+        LegacyKey::Found { pubkey, source } if pubkey == identity.bls_pubkey() => {
+            writeln!(
+                writer,
+                "  (matches the key in {source}; the mnemonic is the key now)"
+            )?;
+            Ok(())
+        }
+        LegacyKey::Found { pubkey, source } => Err(anyhow!(
+            "the key derived from {MNEMONIC_ENV} is not the key this node was using.\n  \
+               derived ({}, account {}): {}\n  \
+               held by {source}: {pubkey}\n\
+             Registering the derived key would create a second node and leave this one's \
+             agreements behind.\n\
+             Check {} and {}, and that the mnemonic is the wallet this node's key was \
+             exported from. Note that Horizon Wallet can also derive a seed by \
+             `mnemonicToEntropy` or the legacy counterwallet scheme rather than BIP-39; \
+             a wallet created that way cannot be migrated with {MNEMONIC_ENV}.",
+            identity.network,
+            identity.account,
+            identity.bls_pubkey(),
+            crate::crypto::mnemonic::ACCOUNT_INDEX_ENV,
+            crate::crypto::mnemonic::NETWORK_ENV,
+        )),
+        LegacyKey::Unreadable { source, reason } => {
+            writeln!(
+                writer,
+                "  (could not open {source} to check the derived key against it: {reason} \
+                 — continuing with the mnemonic)"
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// Ensure a BLS keypair exists, either by loading it or importing from Horizon Wallet.
@@ -373,6 +522,10 @@ impl PasswordReader for MockPasswordReader {
     fn wait_for_enter(&self) -> Result<()> {
         Ok(())
     }
+
+    fn is_interactive(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +539,7 @@ mod tests {
         let custom_path = PathBuf::from("/custom/path/key.enc");
         let config = OnboardingConfig {
             bls_key_path: Some(custom_path.clone()),
-            mnemonic: None,
+            ..Default::default()
         };
         assert_eq!(get_key_path(&config).unwrap(), custom_path);
     }
@@ -539,14 +692,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon about";
+
+    fn mnemonic_settings(account: u32) -> MnemonicSettings {
+        MnemonicSettings::new(TEST_PHRASE, crate::crypto::BitcoinNetwork::Signet, account)
+    }
+
     /// The migration in one test: a node that bootstrapped from a blob still has
-    /// `bls_key.enc` on disk, and its `BLS_PASSWORD` is gone. The mnemonic has
-    /// to win outright — reading the file would stop at a password prompt no
-    /// container can answer, and preferring it would ignore the account index
-    /// the operator just set.
+    /// `bls_key.enc` on disk, and the password it was written with is gone. The
+    /// mnemonic has to win outright — reading the file would stop at a password
+    /// prompt no container can answer, and preferring it would ignore the
+    /// account index the operator just set.
+    ///
+    /// The cross-check cannot run here, and that has to be said: a guard that
+    /// did not run reads afterwards exactly like a guard that passed.
     #[tokio::test]
     async fn a_mnemonic_wins_over_a_key_file_it_cannot_open() {
-        use crate::crypto::BitcoinNetwork;
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
@@ -557,12 +719,7 @@ mod tests {
             .await
             .unwrap();
 
-        let settings = MnemonicSettings::new(
-            "abandon abandon abandon abandon abandon abandon abandon abandon \
-             abandon abandon abandon about",
-            BitcoinNetwork::Signet,
-            2,
-        );
+        let settings = mnemonic_settings(2);
         let expected = MnemonicIdentity::derive(&settings).unwrap();
 
         // Any password this reader offers is wrong for the file above, so
@@ -581,6 +738,188 @@ mod tests {
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains(&expected.taproot_address), "{output}");
+        assert!(output.contains("could not open"), "{output}");
+    }
+
+    /// The check this exists for. Every other guard on the mnemonic path asks
+    /// the Portal about keys derived from the same constants it is validating,
+    /// so a wrong derivation is invisible to all of them and the node quietly
+    /// registers a second identity. The key file is the one thing on the
+    /// machine that did not come from the mnemonic.
+    #[tokio::test]
+    async fn a_derivation_that_disagrees_with_the_existing_key_is_fatal() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let password = "testpassword123";
+
+        // The key this node is actually registered with — from some other
+        // wallet, or the same wallet under a seed derivation the node does not
+        // implement. Either way the mnemonic does not reproduce it.
+        let registered = BlsKeyPair::generate().unwrap();
+        registered
+            .save_encrypted(&key_path, password)
+            .await
+            .unwrap();
+
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let err = ensure_node_keys(&key_path, Some(&mnemonic_settings(2)), &mut buffer, &reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not the key this node was using"), "{err}");
+        assert!(err.contains(&registered.public_key_hex()), "{err}");
+        assert!(err.contains("second node"), "{err}");
+        assert!(
+            err.contains(crate::crypto::mnemonic::ACCOUNT_INDEX_ENV),
+            "{err}"
+        );
+    }
+
+    /// The happy migration: the mnemonic reproduces the key the node already
+    /// had. Saying so is the whole point — it is the one moment the
+    /// compatibility claim is actually tested on the operator's own machine.
+    #[tokio::test]
+    async fn a_derivation_matching_the_existing_key_is_confirmed() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let password = "testpassword123";
+
+        let settings = mnemonic_settings(2);
+        let identity = MnemonicIdentity::derive(&settings).unwrap();
+        identity
+            .keypair
+            .save_encrypted(&key_path, password)
+            .await
+            .unwrap();
+
+        let reader = MockPasswordReader::new(password);
+        let mut buffer = Vec::new();
+
+        let keys = ensure_node_keys(&key_path, Some(&settings), &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert_eq!(keys.keypair().public_key_hex(), identity.bls_pubkey());
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("matches the key in"), "{output}");
+    }
+
+    /// The same check against the wallet's own export, which is the form the
+    /// key arrives in and one decryption away from what the Portal knows.
+    #[tokio::test]
+    async fn a_derivation_that_disagrees_with_the_wallet_blob_is_fatal() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wallet_password = "walletpass123";
+        let foreign_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let blob = crate::crypto::wallet_import::encrypt_test_blob(
+            foreign_secret,
+            wallet_password,
+            &[1u8; 16],
+            &[2u8; 16],
+        );
+
+        let reader = MockPasswordReader::with_blob(wallet_password, blob);
+        let mut buffer = Vec::new();
+
+        let err = ensure_node_keys(
+            &dir.path().join("absent.enc"),
+            Some(&mnemonic_settings(2)),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("is not the key this node was using"), "{err}");
+        assert!(err.contains(BLS_BLOB_ENV), "{err}");
+        // The wallet supports seed derivations this node does not implement,
+        // which is a mismatch no amount of re-checking the account index fixes.
+        assert!(err.contains("mnemonicToEntropy"), "{err}");
+    }
+
+    /// A fresh mnemonic node has nothing to compare against, and that is not a
+    /// problem to report — it is the ordinary case.
+    #[tokio::test]
+    async fn a_node_with_no_previous_key_is_left_alone() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let keys = ensure_node_keys(
+            &dir.path().join("absent.enc"),
+            Some(&mnemonic_settings(2)),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap();
+
+        assert!(keys.identity().is_some());
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(!output.contains("could not open"), "{output}");
+        assert!(!output.contains("matches the key in"), "{output}");
+    }
+
+    /// On a terminal the check would cost a password prompt for a file the node
+    /// is about to ignore, which is exactly the prompt mnemonic mode exists to
+    /// remove. It is skipped, and the file is simply reported as untouched.
+    #[tokio::test]
+    async fn an_interactive_start_is_never_stopped_by_the_cross_check() {
+        use tempfile::tempdir;
+
+        struct InteractiveReader;
+        impl PasswordReader for InteractiveReader {
+            fn read_password(&self) -> Result<String> {
+                panic!("mnemonic mode must never prompt for the legacy key");
+            }
+            fn read_new_password(&self, _writer: &mut dyn Write) -> Result<String> {
+                panic!("mnemonic mode must never prompt");
+            }
+            fn read_blob(&self) -> Result<String> {
+                panic!("mnemonic mode must never prompt");
+            }
+            fn wait_for_enter(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_interactive(&self) -> bool {
+                true
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        BlsKeyPair::generate()
+            .unwrap()
+            .save_encrypted(&key_path, "testpassword123")
+            .await
+            .unwrap();
+
+        let mut buffer = Vec::new();
+        let keys = ensure_node_keys(
+            &key_path,
+            Some(&mnemonic_settings(2)),
+            &mut buffer,
+            &InteractiveReader,
+        )
+        .await
+        .unwrap();
+
+        assert!(keys.identity().is_some());
+        let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("left untouched"), "{output}");
     }
 

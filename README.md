@@ -148,13 +148,58 @@ next to the existing ones, listing them as it goes so a list that does not match
 the nodes you think you run is still visible. Leave it unset everywhere else —
 it is the only thing standing between a typo and a second identity.
 
+It is needed **once**, to bring a new node up. It is not needed again after a
+Portal reset: on its first successful start each node records the identity it
+came up with in `<storage_dir>/.node-identity.json`, and a later `404` on that
+same identity reads as "the Portal forgot me" rather than "this account index
+was never right". Without that record, whichever node of a multi-node deployment
+restarted second would see its neighbour re-register and refuse — unattended
+recovery would work for exactly one node.
+
+The record only ever permits a registration the node would otherwise refuse, and
+only for the exact `node_id` it names: point a node at another account and the
+refusal comes back, now naming the identity it used to run as. A node whose
+`storage_dir` does not survive restarts simply gets the old behaviour.
+
 #### Migrating a running node
 
-Add `KONTOR_STORAGE_MNEMONIC` and `KONTOR_STORAGE_ACCOUNT_INDEX`, remove
-`BLS_ENCRYPTED_BLOB` and `BLS_PASSWORD`, and restart. The mnemonic is checked
-before the key file, so the `bls_key.enc` left over from the export is ignored
-rather than prompting for a password the container cannot supply — leave it or
-delete it, it makes no difference.
+Add `KONTOR_STORAGE_MNEMONIC` and `KONTOR_STORAGE_ACCOUNT_INDEX`, and restart.
+The mnemonic is checked before the key file, so the `bls_key.enc` left over from
+the export is ignored rather than prompting for a password the container cannot
+supply.
+
+**Keep `BLS_PASSWORD` (or `BLS_ENCRYPTED_BLOB`) set for that first restart.**
+With it, the node opens the key it was using and compares it to the one it just
+derived, and refuses to start if they differ:
+
+```
+the key derived from KONTOR_STORAGE_MNEMONIC is not the key this node was using.
+  derived (signet, account 2): 84a1c0…
+  held by /data/bls_key.enc:   9251e0…
+Registering the derived key would create a second node and leave this one's
+agreements behind.
+```
+
+That comparison is worth arranging, because it is the only check that can catch
+a wrong derivation at all. Every other guard on this path — the node-id lookup,
+the sibling scan — asks the Portal about keys derived from the same constants it
+is trying to validate, so if any of them is wrong the derived identity is
+unknown *everywhere*, which is indistinguishable from a new node. The old key is
+the one thing on the machine that did not come from the mnemonic.
+
+Once the node has confirmed the match (`✓ … (matches the key in …)`), remove
+`BLS_ENCRYPTED_BLOB` and `BLS_PASSWORD`; from then on the mnemonic is the key
+and the file can be left or deleted. If you drop them before the first restart
+the node still starts, but it says the check could not run rather than pretending
+it passed.
+
+> [!NOTE]
+> Horizon Wallet can derive its seed three ways — BIP-39 `mnemonicToSeed`,
+> `mnemonicToEntropy`, and the legacy counterwallet scheme — and only the first
+> is implemented here. The wallet's Taproot path also preserves the `change` and
+> `index` of the address the key was exported from, while this node always uses
+> `.../0/0`. A node registered from any of those variants derives a different key
+> from the same phrase, which is precisely what the comparison above catches.
 
 The account index has to be the one the node is already registered under. If it
 is not, the node **refuses to start** rather than registering a second identity
