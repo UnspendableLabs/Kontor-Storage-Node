@@ -225,7 +225,7 @@ async fn run_unregistered(
         keypair,
         bls_pubkey,
         derived,
-        pending_registration,
+        mut pending_registration,
     } = node;
 
     let parts = build_server_parts(config).await?;
@@ -284,6 +284,15 @@ async fn run_unregistered(
                             "The Portal accepted the registration it had refused"
                         );
                         announced = None;
+                    }
+                    Err(e) if crate::node::registration::refusal_is_final(&e) => {
+                        tracing::error!(
+                            error = %format!("{e:#}"),
+                            "The Portal rejected this node's registration outright, so offering \
+                             it again cannot help; giving up on it. Still watching for a \
+                             registration made elsewhere."
+                        );
+                        pending_registration = None;
                     }
                     Err(e) => {
                         let reason = format!("{e:#}");
@@ -1254,6 +1263,93 @@ mod tests {
             output.contains("retrying the registration in the background"),
             "the node has to say what it will do, since nobody else can do it: {output}"
         );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The other half of the retry rule. A `409` means the Portal has already
+    /// given this node's xpub to a different BLS key, and the request carries
+    /// no nonce — so the same bytes get the same answer forever. Offering them
+    /// every 30s for the life of the process would bury the one line that says
+    /// what actually went wrong.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_registration_the_portal_rejects_outright_is_not_replayed() {
+        let _guard = TempAppDirGuard::new("final_refusal");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("final_refusal");
+        fs::create_dir_all(&storage_dir).unwrap();
+
+        let identity = MnemonicIdentity::derive(&MnemonicSettings::new(
+            TEST_PHRASE,
+            BitcoinNetwork::Signet,
+            2,
+        ))
+        .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", identity.node_id)))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Twice and no more: once from onboarding, once from the watcher's
+        // first tick, after which it must stop offering it.
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {
+                    "code": "NODE_ALREADY_REGISTERED",
+                    "message": "this xpubkey is registered with another BLS key"
+                }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        // Nothing is ever registered, so the watcher keeps ticking to the end.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        env::set_var(MNEMONIC_ENV, TEST_PHRASE);
+        env::set_var(ACCOUNT_INDEX_ENV, "2");
+        env::set_var(NETWORK_ENV, "signet");
+
+        let cli = unregistered_cli(
+            mock_server.uri(),
+            storage_dir.clone(),
+            storage_dir.join("unused_bls_key.enc"),
+        );
+        // Many ticks at the test interval, so a loop that kept retrying would
+        // blow past the expectation above rather than pass by being too short.
+        let shutdown = async {
+            sleep(Duration::from_millis(1500)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(outcome, Outcome::Shutdown, "{output}");
+        assert!(
+            output.contains("rejected the registration outright"),
+            "the operator must not be sent away to wait for a retry that will never \
+             happen: {output}"
+        );
+
+        // Verified on drop by wiremock: exactly the two calls above.
+        drop(mock_server);
 
         std::fs::remove_dir_all(&storage_dir).ok();
     }

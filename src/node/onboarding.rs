@@ -162,8 +162,9 @@ pub struct OnboardingConfig {
     /// Where to keep the record of the identity this node onboards under.
     ///
     /// `storage_dir` in production. `None` disables the record entirely, which
-    /// costs a node the automatic recovery described in
-    /// [`crate::node::known_identity`] and nothing else.
+    /// puts the node back on the behaviour it had before the record existed:
+    /// no automatic recovery after a Portal reset, and no refusal on the
+    /// strength of what it used to be. See [`crate::node::known_identity`].
     pub state_dir: Option<PathBuf>,
 }
 
@@ -266,23 +267,39 @@ async fn self_register(
             identity.node_id
         )?;
     } else {
+        // Two independent reasons this might not be a new node: it has already
+        // run as some other identity, or another account of this mnemonic is
+        // registered. The record settles it on its own — a Portal that has
+        // forgotten the original does not make *this* account the right one —
+        // so it is honoured even where the scan would come back empty, which is
+        // exactly what a reset plus a mistyped account index produces.
+        //
+        // And it is honoured before the scan runs, not after: the branch of
+        // `wrong_account_error` a record feeds never reads the sibling list, so
+        // scanning first would spend a dozen round trips on an answer nothing
+        // goes on to use — once per restart of a container that is, by
+        // definition, about to be restarted again.
+        if known.is_some() && !identity.allows_new_account() {
+            return Err(registration::wrong_account_error(identity, &[], known));
+        }
+
         let siblings = registration::find_registered_siblings(client, identity).await;
-        match (siblings.is_empty(), identity.allows_new_account()) {
-            (false, false) => {
-                return Err(registration::wrong_account_error(
-                    identity, &siblings, known,
-                ))
-            }
-            (false, true) => writeln!(
-                writer,
-                "\n{}",
-                registration::new_account_notice(identity, &siblings)
-            )?,
-            (true, _) => writeln!(
+        if known.is_none() && siblings.is_empty() {
+            writeln!(
                 writer,
                 "No node is registered on any account of this mnemonic ({} checked).",
                 registration::account_scan_range()
-            )?,
+            )?;
+        } else if identity.allows_new_account() {
+            writeln!(
+                writer,
+                "\n{}",
+                registration::new_account_notice(identity, &siblings, known)
+            )?;
+        } else {
+            return Err(registration::wrong_account_error(
+                identity, &siblings, known,
+            ));
         }
     }
 
@@ -294,6 +311,26 @@ async fn self_register(
             writeln!(writer, "✓ Registered as {}", response.node_id)?;
             Ok(SelfRegistration {
                 accepted: true,
+                request,
+            })
+        }
+        // Read and rejected, so the same bytes will be rejected again. Still not
+        // fatal — `/admin` is worth serving, and someone may yet register this
+        // key elsewhere — but promising a retry that will not happen would send
+        // the operator away to wait for nothing.
+        Err(e) if registration::refusal_is_final(&e) => {
+            writeln!(
+                writer,
+                "\nThe Portal rejected the registration outright: {e:#}\n  \
+                   node id:         {}\n  \
+                   Taproot address: {}\n  \
+                 Offering the same registration again cannot change this — it carries no \
+                 nonce, so the answer is the same every time. Serving /admin and watching \
+                 in case this key is registered elsewhere.",
+                identity.node_id, identity.taproot_address
+            )?;
+            Ok(SelfRegistration {
+                accepted: false,
                 request,
             })
         }
@@ -988,6 +1025,126 @@ mod tests {
         assert!(err.contains(&previous.node_id), "{err}");
         assert!(err.contains("account 2"), "{err}");
         assert!(err.contains(ACCOUNT_INDEX_ENV_NAME), "{err}");
+    }
+
+    /// The case the sibling scan is blind to: the Portal was reset *and* the
+    /// account index is wrong, so nothing is registered anywhere and the scan
+    /// comes back empty. Recovery makes a 404 unremarkable here, which is
+    /// exactly why the record has to be the one thing still objecting —
+    /// otherwise the node registers account 4 as a second identity while
+    /// account 2 is the one waiting to be restored.
+    #[tokio::test]
+    async fn a_record_refuses_a_new_account_even_when_the_portal_is_empty() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let previous = derived_identity(2);
+
+        crate::node::known_identity::KnownIdentity::store(state.path(), &previous)
+            .await
+            .unwrap();
+
+        mount_check_404(&mock_server, &derived_identity(4).node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        // Nothing at all is registered, on any account.
+        mount_lookup_catch_all_404(&mock_server).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let err = perform_onboarding_with_reader(
+            &client,
+            &returning_config(4, state.path()),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("has already run as"), "{err}");
+        assert!(err.contains(&previous.node_id), "{err}");
+        assert!(err.contains("account 2"), "{err}");
+    }
+
+    /// The way out of the refusal above, and the reason it is safe to make the
+    /// record decisive: an operator genuinely moving a node to another account
+    /// says so, and the notice repeats what is being left behind.
+    #[tokio::test]
+    async fn the_opt_in_moves_a_recorded_node_to_another_account() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let previous = derived_identity(2);
+        let moving_to = derived_identity(4);
+
+        crate::node::known_identity::KnownIdentity::store(state.path(), &previous)
+            .await
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", moving_to.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", moving_to.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": moving_to.node_id,
+                "signer_id": 42,
+                "bls_public_key": moving_to.bls_pubkey()
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_check_404(&mock_server, &moving_to.node_id).await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": moving_to.node_id,
+                "x_only_pubkey": hex::encode(moving_to.x_only),
+                "bls_public_key": moving_to.bls_pubkey()
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_lookup_catch_all_404(&mock_server).await;
+        mount_all_mocks_except_lookup(&mock_server, &moving_to.node_id, &moving_to.bls_pubkey())
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        let config = OnboardingConfig {
+            mnemonic: new_account_config(4).mnemonic,
+            ..returning_config(4, state.path())
+        };
+        let outcome = perform_onboarding_with_reader(&client, &config, &mut buffer, &reader)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, OnboardingOutcome::Ready(_)));
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains(&previous.node_id), "{output}");
+        assert!(output.contains("leaves behind"), "{output}");
+
+        // The record now names where the node actually is.
+        let record = crate::node::known_identity::KnownIdentity::load(state.path())
+            .await
+            .unwrap();
+        assert_eq!(record.account, 4);
     }
 
     /// Recovery only works if the first successful start writes the record, so

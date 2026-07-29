@@ -245,6 +245,35 @@ pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNo
     )
 }
 
+/// Whether a refusal is one that offering the same registration again cannot
+/// lift.
+///
+/// A registration is a pure function of this node's two keys — no nonce, no
+/// timestamp, no challenge — so the same bytes go out every time. A Portal that
+/// has judged those bytes malformed, or that has already given this node's xpub
+/// to a different BLS key, answers identically forever; offering it again only
+/// buries the line that says so.
+///
+/// `403` is deliberately not in this set. It is `ADDRESS_NOT_WHITELISTED`, the
+/// one refusal a human clears without the request changing, and replaying
+/// through it is what lets whitelisting an address be the whole of the
+/// operator's work. Timeouts, rate limits and `5xx` are out for the neighbouring
+/// reason: nothing about them says the registration was read and rejected.
+#[must_use]
+pub fn refusal_is_final(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::clients::http_helpers::HttpStatusError>()
+        .is_some_and(|e| {
+            matches!(
+                e.status,
+                reqwest::StatusCode::BAD_REQUEST
+                    | reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::CONFLICT
+                    | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            )
+        })
+}
+
 /// How many wallet accounts to probe when the configured one is unknown.
 ///
 /// Only reached on the failure path, and only until something is found. Ten
@@ -342,19 +371,15 @@ pub async fn find_registered_siblings(
 /// `known` is the identity this node last onboarded under, when there is one.
 /// Reaching this error with a record that does not match means the account
 /// index changed under a node that was already running as something else, which
-/// is the most actionable thing that can be said here — so it is said first.
+/// is the most actionable thing that can be said here — so it is said first,
+/// and it stands on its own: that branch never reads `siblings`, which is what
+/// lets the caller raise this on a record alone when the scan came back empty.
 #[must_use]
 pub fn wrong_account_error(
     identity: &MnemonicIdentity,
     siblings: &[RegisteredSibling],
     known: Option<&KnownIdentity>,
 ) -> anyhow::Error {
-    let listed = siblings
-        .iter()
-        .map(|sibling| format!("    {sibling}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     if let Some(record) = known {
         return anyhow!(
             "This node has already run as {} (account {}, {}), and {} = {} derives a \
@@ -380,6 +405,12 @@ pub fn wrong_account_error(
         );
     }
 
+    let listed = siblings
+        .iter()
+        .map(|sibling| format!("    {sibling}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     anyhow!(
         "No node is registered for {} = {} ({}).\n  \
            derived BLS key: {}\n  \
@@ -404,27 +435,48 @@ pub fn wrong_account_error(
     )
 }
 
-/// What the node prints when it registers a new account next to existing ones.
+/// What the node prints when it registers an account the guards would otherwise
+/// have refused.
 ///
 /// The operator has already said this is deliberate, so this is not a warning —
-/// but the siblings are listed anyway, because the one thing that would make the
-/// decision wrong is a list that does not look like the nodes they think they
-/// run.
+/// but whatever the node was refusing over is spelled out anyway, because the
+/// one thing that would make the decision wrong is a picture that does not look
+/// like the deployment they think they have.
+///
+/// Either half can be absent: a node can be moving off a recorded identity with
+/// no sibling registered anywhere (the case a Portal reset produces), or
+/// joining siblings having never run before.
 #[must_use]
-pub fn new_account_notice(identity: &MnemonicIdentity, siblings: &[RegisteredSibling]) -> String {
-    let listed = siblings
-        .iter()
-        .map(|sibling| format!("    {sibling}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+pub fn new_account_notice(
+    identity: &MnemonicIdentity,
+    siblings: &[RegisteredSibling],
+    known: Option<&KnownIdentity>,
+) -> String {
+    let mut notice = format!(
+        "{REGISTER_NEW_ACCOUNT_ENV} is set, so account {} registers as a new node.",
+        identity.account
+    );
 
-    format!(
-        "{REGISTER_NEW_ACCOUNT_ENV} is set, so account {} registers as a new node \
-         alongside this mnemonic's existing ones ({} checked):\n{}",
-        identity.account,
-        account_scan_range(),
-        listed,
-    )
+    if let Some(record) = known {
+        notice.push_str(&format!(
+            "\n  This node last ran as {} (account {}, {}), which it now leaves behind.",
+            record.node_id, record.account, record.network
+        ));
+    }
+
+    if !siblings.is_empty() {
+        let listed = siblings
+            .iter()
+            .map(|sibling| format!("    {sibling}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        notice.push_str(&format!(
+            "\n  It joins this mnemonic's existing nodes ({} checked):\n{listed}",
+            account_scan_range(),
+        ));
+    }
+
+    notice
 }
 
 /// Reject a hex field before it reaches the Portal, so a typo reads as a
@@ -641,7 +693,7 @@ mod tests {
         assert!(wrong_account_error(&derived(4), &siblings, None)
             .to_string()
             .contains(&range));
-        assert!(new_account_notice(&derived(4), &siblings).contains(&range));
+        assert!(new_account_notice(&derived(4), &siblings, None).contains(&range));
     }
 
     /// What an opted-in node prints. It is not a warning, but it has to list the
@@ -650,12 +702,94 @@ mod tests {
     #[test]
     fn the_new_account_notice_lists_what_it_registers_alongside() {
         let existing = derived(2);
-        let rendered = new_account_notice(&derived(4), &[sibling_of(&existing)]);
+        let rendered = new_account_notice(&derived(4), &[sibling_of(&existing)], None);
 
         assert!(rendered.contains(REGISTER_NEW_ACCOUNT_ENV), "{rendered}");
         assert!(rendered.contains("account 4"), "{rendered}");
         assert!(rendered.contains(&existing.node_id), "{rendered}");
         assert!(rendered.contains(&existing.taproot_address), "{rendered}");
+    }
+
+    /// The line between "come back later" and "this will never work". Getting
+    /// `403` on the wrong side of it would strand every node waiting on a
+    /// whitelist entry, which is the ordinary way a node comes up.
+    #[test]
+    fn only_a_read_and_rejected_registration_is_final() {
+        use crate::clients::http_helpers::HttpStatusError;
+
+        let refusal = |status: reqwest::StatusCode| {
+            anyhow::Error::new(HttpStatusError {
+                status,
+                body: String::new(),
+                context: "register node".to_string(),
+            })
+        };
+
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(refusal_is_final(&refusal(status)), "{status}");
+        }
+
+        for status in [
+            // The whitelist: cleared by a human, without the request changing.
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!refusal_is_final(&refusal(status)), "{status}");
+        }
+
+        // A transport failure never reached the Portal at all, so it says
+        // nothing about the request.
+        assert!(!refusal_is_final(&anyhow!("connection refused")));
+    }
+
+    fn record_of(identity: &MnemonicIdentity) -> KnownIdentity {
+        KnownIdentity {
+            node_id: identity.node_id.clone(),
+            account: identity.account,
+            network: identity.network.to_string(),
+            bls_pubkey: identity.bls_pubkey(),
+        }
+    }
+
+    /// A record on its own has to be enough to refuse. The scan cannot see a
+    /// Portal that was reset, so pairing a reset with a mistyped account index
+    /// leaves the record as the only evidence that this node is not new.
+    #[test]
+    fn a_record_alone_is_enough_to_name_the_wrong_account() {
+        let was = derived(2);
+        let now = derived(5);
+
+        let rendered = wrong_account_error(&now, &[], Some(&record_of(&was))).to_string();
+
+        assert!(rendered.contains(&was.node_id), "{rendered}");
+        assert!(rendered.contains("account 2"), "{rendered}");
+        assert!(rendered.contains(ACCOUNT_INDEX_ENV), "{rendered}");
+        assert!(rendered.contains("second node"), "{rendered}");
+        // Nothing was found, so nothing may be listed as if it had been.
+        assert!(!rendered.contains(&account_scan_range()), "{rendered}");
+    }
+
+    /// The opted-in counterpart: the notice still has to say what is being left
+    /// behind, even with no sibling to list.
+    #[test]
+    fn the_new_account_notice_names_a_record_with_no_siblings() {
+        let was = derived(2);
+        let rendered = new_account_notice(&derived(5), &[], Some(&record_of(&was)));
+
+        assert!(rendered.contains(REGISTER_NEW_ACCOUNT_ENV), "{rendered}");
+        assert!(rendered.contains(&was.node_id), "{rendered}");
+        assert!(rendered.contains("leaves behind"), "{rendered}");
+        // No siblings were found, so the notice must not gesture at a list.
+        assert!(!rendered.contains("It joins"), "{rendered}");
     }
 
     /// The two signatures answer different questions — "this BLS key accepts

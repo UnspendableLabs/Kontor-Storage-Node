@@ -26,8 +26,15 @@
 //! In `storage_dir`, alongside the files the node serves — the one directory a
 //! node must already keep across restarts to be worth anything. A node whose
 //! `storage_dir` is ephemeral gets the old behaviour (refuse and ask), which is
-//! the safe direction: the record only ever *permits* a registration the node
-//! would otherwise refuse, and only for the exact identity it names.
+//! the safe direction.
+//!
+//! The record speaks for exactly one `node_id`. On that one it permits a
+//! registration the node would otherwise refuse; on any other it does the
+//! opposite and *causes* the refusal, including where the sibling scan comes
+//! back empty — a reset plus a mistyped account index erases the Portal-side
+//! evidence, leaving the record as the only thing that still knows this node is
+//! not new. Either way [`crate::crypto::mnemonic::REGISTER_NEW_ACCOUNT_ENV`]
+//! remains the operator's override.
 //!
 //! It holds nothing secret. Every field is either public on the Portal or
 //! derivable from the mnemonic, so a leaked copy tells an attacker what
@@ -67,9 +74,10 @@ impl KnownIdentity {
     /// Read the recorded identity, or `None` if this node has never onboarded
     /// here.
     ///
-    /// A corrupt or unreadable file is `None` rather than an error. Its only
-    /// power is to permit a registration, so failing to read it costs a node
-    /// the automatic recovery and nothing else — whereas failing *closed* on a
+    /// A corrupt or unreadable file is `None` rather than an error. `None` is
+    /// the state every node was in before this file existed, so failing to read
+    /// it falls back to the old behaviour — the node loses the automatic
+    /// recovery and the extra refusal alike — whereas failing *closed* on a
     /// truncated write would strand a node that is otherwise perfectly fine.
     #[must_use]
     pub async fn load(storage_dir: &Path) -> Option<Self> {

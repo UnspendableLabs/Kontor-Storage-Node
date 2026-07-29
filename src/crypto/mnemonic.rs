@@ -84,14 +84,18 @@ const TAP_TWEAK_TAG: &[u8] = b"TapTweak";
 
 /// The network the wallet derived against.
 ///
-/// Signet and testnet share everything that matters here — coin type, extended
-/// key prefix, address HRP — but they are kept apart so the startup banner can
-/// echo back what the operator actually configured.
+/// Every network but mainnet shares a coin type and an extended key prefix, and
+/// all but regtest share an address HRP as well — but they are kept apart so the
+/// startup banner can echo back what the operator actually configured, and
+/// because the Portal computes the whitelist address with *its* own
+/// `PORTAL_BITCOIN_NETWORK`. A node whose HRP disagrees derives an address the
+/// Portal will never look for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitcoinNetwork {
     Mainnet,
     Testnet,
     Signet,
+    Regtest,
 }
 
 impl BitcoinNetwork {
@@ -100,7 +104,7 @@ impl BitcoinNetwork {
     pub fn coin_type(self) -> u32 {
         match self {
             Self::Mainnet => 0,
-            Self::Testnet | Self::Signet => 1,
+            Self::Testnet | Self::Signet | Self::Regtest => 1,
         }
     }
 
@@ -108,7 +112,9 @@ impl BitcoinNetwork {
     fn xpub_prefix(self) -> Prefix {
         match self {
             Self::Mainnet => Prefix::XPUB,
-            Self::Testnet | Self::Signet => Prefix::TPUB,
+            // Regtest included: rust-bitcoin serializes it with the testnet
+            // version bytes too, and `node_id` hashes this text.
+            Self::Testnet | Self::Signet | Self::Regtest => Prefix::TPUB,
         }
     }
 
@@ -117,6 +123,7 @@ impl BitcoinNetwork {
         match self {
             Self::Mainnet => bech32::hrp::BC,
             Self::Testnet | Self::Signet => bech32::hrp::TB,
+            Self::Regtest => bech32::hrp::BCRT,
         }
     }
 
@@ -126,7 +133,7 @@ impl BitcoinNetwork {
     pub fn counterpart(self) -> Self {
         match self {
             Self::Mainnet => Self::Signet,
-            Self::Testnet | Self::Signet => Self::Mainnet,
+            Self::Testnet | Self::Signet | Self::Regtest => Self::Mainnet,
         }
     }
 
@@ -135,8 +142,9 @@ impl BitcoinNetwork {
             "mainnet" | "bitcoin" => Ok(Self::Mainnet),
             "testnet" | "testnet4" => Ok(Self::Testnet),
             "signet" => Ok(Self::Signet),
+            "regtest" => Ok(Self::Regtest),
             other => Err(anyhow!(
-                "{NETWORK_ENV} must be one of mainnet, testnet, signet (got {other:?})"
+                "{NETWORK_ENV} must be one of mainnet, testnet, signet, regtest (got {other:?})"
             )),
         }
     }
@@ -148,6 +156,7 @@ impl std::fmt::Display for BitcoinNetwork {
             Self::Mainnet => "mainnet",
             Self::Testnet => "testnet",
             Self::Signet => "signet",
+            Self::Regtest => "regtest",
         };
         f.write_str(name)
     }
@@ -683,19 +692,46 @@ mod tests {
     }
 
     /// The signature the Portal's `verify_schnorr_binding` checks.
+    ///
+    /// Swept across accounts and both coin types rather than pinned to one
+    /// identity, because BIP340 signs with the even-`y` half of the key: half
+    /// the derived keys need their scalar negated first, and a single vector
+    /// exercises only one of those two paths. Which one it lands on is a
+    /// property of the phrase, so a one-identity test can pass while the other
+    /// half of every real deployment fails at the Portal.
     #[test]
     fn schnorr_binding_verifies_against_the_x_only_key() {
+        use bip32::XPub;
         use k256::schnorr::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 
-        let identity = MnemonicIdentity::derive(&settings(2, BitcoinNetwork::Signet)).unwrap();
-        let sig_hex = identity.schnorr_binding_sig().unwrap();
-        assert_eq!(sig_hex.len(), 128);
+        let mut parities = std::collections::HashSet::new();
 
-        let digest = tagged_preimage_digest(&identity);
-        let verifying = VerifyingKey::from_bytes(&identity.x_only).unwrap();
-        let sig = Signature::try_from(hex::decode(&sig_hex).unwrap().as_slice()).unwrap();
+        for network in [BitcoinNetwork::Mainnet, BitcoinNetwork::Signet] {
+            for account in 0..6 {
+                let identity = MnemonicIdentity::derive(&settings(account, network)).unwrap();
+                let sig_hex = identity.schnorr_binding_sig().unwrap();
+                assert_eq!(sig_hex.len(), 128);
 
-        verifying.verify_prehash(&digest, &sig).unwrap();
+                let digest = tagged_preimage_digest(&identity);
+                let verifying = VerifyingKey::from_bytes(&identity.x_only).unwrap();
+                let sig = Signature::try_from(hex::decode(&sig_hex).unwrap().as_slice()).unwrap();
+
+                verifying
+                    .verify_prehash(&digest, &sig)
+                    .unwrap_or_else(|e| panic!("{network} account {account}: {e}"));
+
+                // The compressed prefix of the derived point: `02` even, `03`
+                // odd. Only the odd ones exercise the negation.
+                let xpub: XPub = identity.xpubkey.parse().unwrap();
+                parities.insert(xpub.to_bytes()[0]);
+            }
+        }
+
+        assert_eq!(
+            parities.len(),
+            2,
+            "the sweep must land on both key parities, or it says nothing about the negation"
+        );
     }
 
     fn tagged_preimage_digest(identity: &MnemonicIdentity) -> [u8; 32] {
@@ -733,8 +769,31 @@ mod tests {
             BitcoinNetwork::parse("testnet4").unwrap(),
             BitcoinNetwork::Testnet
         );
-        let err = BitcoinNetwork::parse("regtest").unwrap_err().to_string();
-        assert!(err.contains("mainnet, testnet, signet"), "{err}");
+        assert_eq!(
+            BitcoinNetwork::parse("regtest").unwrap(),
+            BitcoinNetwork::Regtest
+        );
+        let err = BitcoinNetwork::parse("mainet").unwrap_err().to_string();
+        assert!(err.contains("mainnet, testnet, signet, regtest"), "{err}");
+    }
+
+    /// Regtest derives the same keys as signet — same coin type — and differs
+    /// only in the address, which is the one field the Portal matches against
+    /// its whitelist. Getting that wrong would make a regtest node's
+    /// registration unwhitelistable rather than merely wrong.
+    #[test]
+    fn regtest_shares_signet_keys_and_differs_only_in_the_address() {
+        let regtest = MnemonicIdentity::derive(&settings(2, BitcoinNetwork::Regtest)).unwrap();
+        let signet = MnemonicIdentity::derive(&settings(2, BitcoinNetwork::Signet)).unwrap();
+
+        assert_eq!(regtest.bls_pubkey(), signet.bls_pubkey());
+        assert_eq!(regtest.xpubkey, signet.xpubkey);
+        assert!(
+            regtest.taproot_address.starts_with("bcrt1p"),
+            "expected a regtest P2TR address, got {}",
+            regtest.taproot_address
+        );
+        assert_ne!(regtest.taproot_address, signet.taproot_address);
     }
 
     /// The banner and the `/admin` status both echo this back, and the string
@@ -745,6 +804,7 @@ mod tests {
             (BitcoinNetwork::Mainnet, "mainnet"),
             (BitcoinNetwork::Testnet, "testnet"),
             (BitcoinNetwork::Signet, "signet"),
+            (BitcoinNetwork::Regtest, "regtest"),
         ] {
             assert_eq!(network.to_string(), name);
             assert_eq!(BitcoinNetwork::parse(name).unwrap(), network);
@@ -756,6 +816,7 @@ mod tests {
         assert_eq!(BitcoinNetwork::Mainnet.counterpart().coin_type(), 1);
         assert_eq!(BitcoinNetwork::Signet.counterpart().coin_type(), 0);
         assert_eq!(BitcoinNetwork::Testnet.counterpart().coin_type(), 0);
+        assert_eq!(BitcoinNetwork::Regtest.counterpart().coin_type(), 0);
     }
 
     #[test]
@@ -925,7 +986,7 @@ mod tests {
     #[test]
     #[serial]
     fn from_env_rejects_an_unknown_network() {
-        let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (NETWORK_ENV, "regtest")]);
+        let _guard = EnvGuard::set(&[(MNEMONIC_ENV, TEST_PHRASE), (NETWORK_ENV, "mainet")]);
         let err = MnemonicSettings::from_env().unwrap_err().to_string();
         assert!(err.contains(NETWORK_ENV), "{err}");
     }

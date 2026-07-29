@@ -39,9 +39,9 @@ The node can be configured via command-line arguments or environment variables:
 | `--server-address` | `SERVER_ADDRESS` | `0.0.0.0:8081` | Address the public HTTP server binds to |
 | `--public-url` | `PUBLIC_URL` | `http://localhost:8081` | Public URL where this node is reachable for file downloads |
 | `--bls-key-path` | `BLS_KEY_PATH` | `<data_dir>/Kontor-Storage-Node/bls_key.enc` | Path to the encrypted BLS key file. For non-interactive mode, also set `BLS_PASSWORD`. Ignored entirely when `KONTOR_STORAGE_MNEMONIC` is set. |
-| _(env only)_ | `KONTOR_STORAGE_MNEMONIC` | _unset_ | Horizon Wallet seed phrase. Setting it puts the node in [mnemonic mode](#mnemonic-mode): it derives its own keys and registers itself, and `BLS_ENCRYPTED_BLOB` / `BLS_PASSWORD` are ignored. |
+| _(env only)_ | `KONTOR_STORAGE_MNEMONIC` | _unset_ | Horizon Wallet seed phrase. Setting it puts the node in [mnemonic mode](#mnemonic-mode): it derives its own keys and registers itself. `BLS_ENCRYPTED_BLOB` / `BLS_PASSWORD` no longer supply the key, but are still read when present, to check the derivation against the key this node was using — see [migrating a running node](#migrating-a-running-node). |
 | _(env only)_ | `KONTOR_STORAGE_ACCOUNT_INDEX` | `0` | Which wallet account to derive. Must match the account the node is registered under — see [mnemonic mode](#mnemonic-mode). |
-| _(env only)_ | `KONTOR_STORAGE_NETWORK` | `signet` | `mainnet`, `testnet`, or `signet`. Selects the coin type in both derivation paths, so it changes every derived key. |
+| _(env only)_ | `KONTOR_STORAGE_NETWORK` | `signet` | `mainnet`, `testnet`, `signet`, or `regtest`. Selects the coin type in both derivation paths, so it changes every derived key, and the address prefix, which must match the Portal's own `PORTAL_BITCOIN_NETWORK` or the derived address will never match its whitelist. |
 | _(env only)_ | `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT` | `0` | Set to `1` to register this account as a **new** node even though other accounts of the same mnemonic already have one — see [running several nodes from one mnemonic](#running-several-nodes-from-one-mnemonic). |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset (UI disabled)_ | Password for the operator UI at `/admin`. At least 16 characters when set; leave unset to disable the UI entirely. See [Operator UI](#operator-ui). |
 | `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
@@ -156,10 +156,15 @@ was never right". Without that record, whichever node of a multi-node deployment
 restarted second would see its neighbour re-register and refuse — unattended
 recovery would work for exactly one node.
 
-The record only ever permits a registration the node would otherwise refuse, and
-only for the exact `node_id` it names: point a node at another account and the
-refusal comes back, now naming the identity it used to run as. A node whose
-`storage_dir` does not survive restarts simply gets the old behaviour.
+The record vouches for exactly one `node_id`, and for nothing else. Point a node
+at another account and it stops being an exemption and becomes the objection:
+the node refuses, now naming the identity it used to run as — which it can do
+even when the scan finds nothing, the state a Portal reset leaves behind. That
+is the one thing no amount of asking the Portal can establish, since the reset
+erased the evidence on its side too. `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT=1` is
+still how you say you meant it; the node then reports what it is leaving behind
+and rewrites the record on its next successful start. A node whose `storage_dir`
+does not survive restarts simply gets the old behaviour.
 
 #### Migrating a running node
 
@@ -168,9 +173,15 @@ The mnemonic is checked before the key file, so the `bls_key.enc` left over from
 the export is ignored rather than prompting for a password the container cannot
 supply.
 
-**Keep `BLS_PASSWORD` (or `BLS_ENCRYPTED_BLOB`) set for that first restart.**
-With it, the node opens the key it was using and compares it to the one it just
-derived, and refuses to start if they differ:
+**Keep `BLS_PASSWORD` set for that first restart** — and `BLS_ENCRYPTED_BLOB`
+too, if you still have it. `BLS_PASSWORD` is what arms the check: without it the
+node has no password it may use without asking a human, and it skips the
+comparison rather than prompting for a file it is about to ignore. With it, the
+node opens the key it was using and compares it to the one it just derived, and
+refuses to start if they differ. It tries `BLS_ENCRYPTED_BLOB` first, since that
+is the wallet's own output, and falls back to `bls_key.enc` when the blob will
+not open — which it will not if `BLS_PASSWORD` is the local password rather than
+the wallet's export password, the usual case:
 
 ```
 the key derived from KONTOR_STORAGE_MNEMONIC is not the key this node was using.
@@ -375,6 +386,8 @@ That leaves exactly one wallet prompt. Open `/admin` in a browser with the exten
 A node in [mnemonic mode](#mnemonic-mode) skips all of this: it holds the Taproot key too, so it fills in all five fields and registers itself during onboarding. The card then shows the account and the Taproot address to whitelist instead of the wallet button, since there is nothing left for a browser to sign.
 
 An unregistered node also re-checks the Portal every 30 seconds, so a registration made anywhere else brings it back without anyone touching the container. On the same tick, a mnemonic node whose registration was refused offers it again — the request carries no nonce and no timestamp, so replaying it is signing nothing new. That is what makes whitelisting an address enough on its own: nobody but this process can register it, so if it stopped asking, the node would sit at `404` until someone restarted the container.
+
+The same property bounds the retry. Identical bytes get an identical answer, so a Portal that read the registration and rejected it — `400`, `401`, `409`, `422` — will say the same thing forever; the node logs that once at `error` level and stops offering it, while continuing to watch for a registration made elsewhere. Only refusals the request itself cannot be blamed for are replayed: `403 ADDRESS_NOT_WHITELISTED` above all, plus timeouts, rate limits and `5xx`.
 
 #### Restarting after a reset
 

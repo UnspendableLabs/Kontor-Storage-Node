@@ -301,14 +301,39 @@ enum LegacyKey {
 /// Read whatever BLS key this node held before the mnemonic, without ever
 /// blocking on a human.
 ///
-/// The exported blob is preferred over the key file: it is the wallet's own
-/// output, one decryption away from the key the Portal knows, whereas the file
-/// is a local re-encryption of it. Either answers the only question being
-/// asked — which key was this node actually using.
+/// The exported blob is tried first: it is the wallet's own output, one
+/// decryption away from the key the Portal knows, whereas the file is a local
+/// re-encryption of it. Either answers the only question being asked — which
+/// key was this node actually using — so a blob that will not open falls
+/// through to the file rather than ending the check there.
+///
+/// That fallback is not hypothetical. Both readers take one password, and for
+/// the blob it has to be the wallet's *export* password while the file wants
+/// the local one. Whenever those differ — the common case, since the operator
+/// chose the second themselves — the blob is undecryptable and the file is
+/// sitting right there, readable. Stopping at the blob would skip the only
+/// guard that can catch a wrong derivation on exactly the nodes it was written
+/// for.
 async fn legacy_bls_pubkey(key_path: &Path, reader: &dyn PasswordReader) -> LegacyKey {
-    if let Ok(blob) = reader.read_blob() {
-        let source = BLS_BLOB_ENV.to_string();
-        return match reader
+    match blob_bls_pubkey(reader) {
+        Some(found @ LegacyKey::Found { .. }) => found,
+        // Either no blob at all, or one that would not open. Both leave the
+        // file as the remaining source; a blob failure is still worth
+        // reporting if the file turns out to have nothing to say.
+        from_blob => match key_file_bls_pubkey(key_path, reader).await {
+            LegacyKey::Absent => from_blob.unwrap_or(LegacyKey::Absent),
+            from_file => from_file,
+        },
+    }
+}
+
+/// The key inside `BLS_ENCRYPTED_BLOB`, or `None` when none is configured.
+fn blob_bls_pubkey(reader: &dyn PasswordReader) -> Option<LegacyKey> {
+    let blob = reader.read_blob().ok()?;
+    let source = BLS_BLOB_ENV.to_string();
+
+    Some(
+        match reader
             .read_password()
             .and_then(|password| crate::crypto::decrypt_wallet_blob(&blob, &password))
             .and_then(|secret| BlsKeyPair::from_secret_key_hex(&secret))
@@ -321,9 +346,13 @@ async fn legacy_bls_pubkey(key_path: &Path, reader: &dyn PasswordReader) -> Lega
                 source,
                 reason: format!("{e:#}"),
             },
-        };
-    }
+        },
+    )
+}
 
+/// The key inside the on-disk key file, or [`LegacyKey::Absent`] if there is no
+/// such file.
+async fn key_file_bls_pubkey(key_path: &Path, reader: &dyn PasswordReader) -> LegacyKey {
     if !matches!(BlsKeyPair::key_file_exists(key_path).await, Ok(true)) {
         return LegacyKey::Absent;
     }
@@ -846,6 +875,86 @@ mod tests {
         // The wallet supports seed derivations this node does not implement,
         // which is a mismatch no amount of re-checking the account index fixes.
         assert!(err.contains("mnemonicToEntropy"), "{err}");
+    }
+
+    /// A blob that will not open must not cost the node the check.
+    ///
+    /// One reader, one password, two different secrets behind it: the blob
+    /// wants the wallet's export password and the file wants the local one, so
+    /// a node that still has both routinely fails the first and passes the
+    /// second. Stopping at the blob would silently skip the only guard that
+    /// catches a wrong derivation — on precisely the nodes migrating from a
+    /// wallet export, which is what it was written for.
+    #[tokio::test]
+    async fn an_unopenable_blob_falls_through_to_the_key_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let local_password = "localpass123";
+
+        // The key this node is really registered with, readable with the
+        // reader's password.
+        let registered = BlsKeyPair::generate().unwrap();
+        registered
+            .save_encrypted(&key_path, local_password)
+            .await
+            .unwrap();
+
+        // A blob from the same wallet, sealed with a password the reader does
+        // not have.
+        let blob = crate::crypto::wallet_import::encrypt_test_blob(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "a-different-export-password",
+            &[1u8; 16],
+            &[2u8; 16],
+        );
+
+        let reader = MockPasswordReader::with_blob(local_password, blob);
+        let mut buffer = Vec::new();
+
+        let err = ensure_node_keys(&key_path, Some(&mnemonic_settings(2)), &mut buffer, &reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // Fatal, and blamed on the file: proof the fallback ran rather than the
+        // blob's failure being taken for the end of the check.
+        assert!(err.contains("is not the key this node was using"), "{err}");
+        assert!(err.contains(&registered.public_key_hex()), "{err}");
+        assert!(err.contains(&key_path.display().to_string()), "{err}");
+    }
+
+    /// With nothing to fall through to, the blob's failure is what gets
+    /// reported: a check that did not run must not read like one that passed.
+    #[tokio::test]
+    async fn an_unopenable_blob_is_reported_when_there_is_no_key_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let blob = crate::crypto::wallet_import::encrypt_test_blob(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "a-different-export-password",
+            &[1u8; 16],
+            &[2u8; 16],
+        );
+
+        let reader = MockPasswordReader::with_blob("not-the-export-password", blob);
+        let mut buffer = Vec::new();
+
+        let keys = ensure_node_keys(
+            &dir.path().join("absent.enc"),
+            Some(&mnemonic_settings(2)),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap();
+
+        assert!(keys.identity().is_some());
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("could not open"), "{output}");
+        assert!(output.contains(BLS_BLOB_ENV), "{output}");
     }
 
     /// A fresh mnemonic node has nothing to compare against, and that is not a
