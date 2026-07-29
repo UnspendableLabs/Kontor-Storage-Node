@@ -192,7 +192,7 @@ mod tests {
         let dir = tempdir();
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = PortalClient::try_new(portal_uri, dir.path()).unwrap();
-        let identity = NodeIdentity::new(keypair.clone(), client, registered);
+        let identity = NodeIdentity::new(keypair.clone(), client, registered, None);
 
         let state = DownloadServerState {
             db: setup_in_memory_db().await,

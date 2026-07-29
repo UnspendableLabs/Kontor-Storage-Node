@@ -224,7 +224,13 @@ Counts of everything a reset would erase, plus where it is stored.
                     "registered": true,
                     "bls_pubkey": "92538f03...",
                     "node_id": "abc123def456",
-                    "signer_id": 42
+                    "signer_id": 42,
+                    "derived": {
+                        "account": 2,
+                        "network": "signet",
+                        "taproot_address": "tb1p...",
+                        "node_id": "node-8f3a..."
+                    }
                 },
                 "storage": {
                     "method": "local",
@@ -248,9 +254,11 @@ Counts of everything a reset would erase, plus where it is stored.
                 "session_expires_at": 1798761600
             }
 
-    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when `BLS_PASSWORD` is unset, because a restarted process would stop at the key password prompt.
+    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when neither `BLS_PASSWORD` nor `KONTOR_STORAGE_MNEMONIC` is set, because a restarted process would stop at the key password prompt.
 
     `registration` says whether the Portal knows this node's BLS key. `registered: false` means onboarding stopped at the lookup and no daemon is running — the node serves this page and nothing else until the key is registered. `node_id` and `signer_id` are then `null`, and `signer_id` is also `null` on a node whose `RegisterBlsKey` transaction has not confirmed yet. `supported: false` means no BLS key was loaded at all, so there is nothing to register.
+
+    `registration.derived` is present only on a node running from `KONTOR_STORAGE_MNEMONIC`, and is `null` otherwise. Such a node registers itself during onboarding and has no use for the wallet flow, so what the page shows instead is the account it derived and the Taproot address a Portal admin has to whitelist. `derived.network` is one of `mainnet`, `testnet`, `signet`, `regtest`, and decides the address prefix as well as the coin type. Its `node_id` is the identifier derived from the xpub, which equals the outer `node_id` once the Portal has the row. While `registered` is `false` such a node re-offers its registration every 30 seconds, so `derived.taproot_address` being whitelisted is the only action left — this endpoint starts reporting `registered: true` on its own once it is. The exception is a registration the Portal read and rejected outright (`400`, `401`, `409`, `422`): replaying identical bytes cannot change that answer, so the node logs it and stops, and `registered` then only turns `true` if somebody registers the key elsewhere.
 
     `ledger` reports whether the node can still prove. `placed` is how many stored files carry a contract-assigned slot and would enter the rebuilt ledger; `awaiting_ledger_index` is how many are stored and served but not yet provable, because the Portal has not reconciled their creating transaction. `rebuild_blocked` is `true` once `highest_slot + 1` exceeds `placed` by more than kontor-crypto's sparsity gap (1024), at which point the ledger cannot be rebuilt and every proof is skipped — see the README.
 

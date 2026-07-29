@@ -406,6 +406,30 @@ impl PortalClient {
             .context("failed to deserialize node lookup result")
     }
 
+    /// Look up a node by its `node_id`.
+    ///
+    /// The mirror image of [`Self::lookup_node`]: that one asks "which node owns
+    /// this BLS key", this one asks "which BLS key does this Taproot identity
+    /// hold". A node deriving itself from a mnemonic knows its own `node_id`
+    /// before it knows anything else — it is a hash of the xpub — so this is how
+    /// it tells "nobody has registered me yet" apart from "somebody registered
+    /// this address with a different key".
+    ///
+    /// Unauthenticated, like the lookup: both are public on the Portal so a node
+    /// holding nothing but keys can find its own footing.
+    pub async fn check_node(&self, node_id: &str) -> Result<NodeCheckResult> {
+        let url = format!(
+            "{}/api/nodes/{}/check",
+            self.base_url,
+            urlencoding::encode(node_id)
+        );
+        let resp = self.http.get(&url).send().await?;
+        let resp = check_response_status(resp, "check node by id").await?;
+        resp.json::<NodeCheckResult>()
+            .await
+            .context("failed to deserialize node check result")
+    }
+
     /// Register this node's BLS key with the Portal.
     ///
     /// Unauthenticated by design: the node has no credential to present until
@@ -969,6 +993,21 @@ pub struct NodeLookupResult {
     pub bls_public_key: String,
 }
 
+/// Result of `GET /api/nodes/{node_id}/check`.
+///
+/// `bls_public_key` is `null` on a row the Portal created without one, so it
+/// stays optional here rather than becoming an empty string.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeCheckResult {
+    pub node_id: String,
+    /// The whitelisted P2TR address this node registered from.
+    pub address: String,
+    pub xpubkey: String,
+    pub bls_public_key: Option<String>,
+    pub signer_id: Option<u64>,
+}
+
 /// Body of `POST /api/nodes/register`.
 ///
 /// Built by [`crate::node::registration::build_registration_request`]; every
@@ -1247,6 +1286,50 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "OK");
+    }
+
+    /// The Portal leaves `bls_public_key` null on a node row it wrote without
+    /// one, and the guard in onboarding branches on exactly that, so it must
+    /// arrive as `None` rather than failing to deserialize.
+    #[tokio::test]
+    async fn check_node_accepts_a_row_without_a_bls_key() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/node-abc/check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "node-abc",
+                "address": "tb1pexample",
+                "xpubkey": "tpubExample",
+                "bls_public_key": null,
+                "signer_id": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("check_node_null"));
+        let result = client.check_node("node-abc").await.unwrap();
+
+        assert_eq!(result.node_id, "node-abc");
+        assert_eq!(result.address, "tb1pexample");
+        assert!(result.bls_public_key.is_none());
+        assert!(result.signer_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_node_surfaces_a_404_as_an_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/node-missing/check"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("check_node_404"));
+        assert!(client.check_node("node-missing").await.is_err());
     }
 
     #[tokio::test]

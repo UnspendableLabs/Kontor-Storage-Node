@@ -207,17 +207,30 @@ const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
 /// only offered when a restarted process could get back up unattended, so a
 /// node without `BLS_PASSWORD` stays here until a human intervenes — which is
 /// the same node that would have stopped at a password prompt anyway.
+///
+/// A mnemonic node whose registration was refused has nobody to wait for. It
+/// signed a complete registration during onboarding and the Portal declined it,
+/// almost always because its address is not whitelisted yet; whitelisting it
+/// does not register anything, and no browser can, since the Taproot key never
+/// left this process. So `pending_registration` is replayed on the same tick as
+/// the lookup, and the node comes up on its own the moment the Portal relents.
 async fn run_unregistered(
     config: &Config,
     client: PortalClient,
-    keypair: Arc<crate::crypto::BlsKeyPair>,
-    bls_pubkey: String,
+    node: node::UnregisteredNode,
     writer: &mut impl Write,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Outcome> {
+    let node::UnregisteredNode {
+        keypair,
+        bls_pubkey,
+        derived,
+        mut pending_registration,
+    } = node;
+
     let parts = build_server_parts(config).await?;
     let restart = RestartHandle::from_env();
-    let identity = NodeIdentity::new(keypair, client.clone(), None);
+    let identity = NodeIdentity::new(Arc::new(keypair), client.clone(), None, derived);
     let admin = AdminState::new(
         config.admin_password.clone(),
         restart.clone(),
@@ -245,12 +258,60 @@ async fn run_unregistered(
     let watcher = tokio::spawn({
         let restart = restart.clone();
         async move {
+            // The last outcome reported, so a Portal that keeps giving the same
+            // answer is logged once rather than every 30s — which would bury the
+            // line that says which address has to be whitelisted. An acceptance
+            // takes the same slot: the Portal can accept and still not show the
+            // node, and repeating *that* every tick is no more useful.
+            let mut announced: Option<String> = None;
             loop {
                 tokio::time::sleep(UNREGISTERED_LOOKUP_INTERVAL).await;
                 if client.lookup_node(&bls_pubkey).await.is_ok() {
                     tracing::info!("The Portal now knows this BLS key; restarting to onboard");
                     restart.request();
                     return;
+                }
+
+                let Some(request) = pending_registration.as_deref() else {
+                    continue;
+                };
+                // Replaying costs nothing to get wrong: the request carries no
+                // nonce and no timestamp, so a Portal that already has it
+                // answers the same way twice, and the lookup above is what
+                // actually decides the node is through.
+                match client.register_node(request).await {
+                    Ok(response) => {
+                        let reason = format!("accepted as {}", response.node_id);
+                        if announced.as_ref() != Some(&reason) {
+                            tracing::info!(
+                                node_id = %response.node_id,
+                                "The Portal accepted the registration it had refused; \
+                                 waiting for the node to appear in its lookup"
+                            );
+                            announced = Some(reason);
+                        }
+                    }
+                    Err(e) if crate::node::registration::refusal_is_final(&e) => {
+                        tracing::error!(
+                            error = %format!("{e:#}"),
+                            "The Portal rejected this node's registration outright, so offering \
+                             it again cannot help; giving up on it. Still watching for a \
+                             registration made elsewhere."
+                        );
+                        pending_registration = None;
+                    }
+                    Err(e) => {
+                        let reason = format!("{e:#}");
+                        if announced.as_ref() != Some(&reason) {
+                            tracing::warn!(
+                                error = %reason,
+                                "The Portal is still refusing this node's registration; retrying \
+                                 every {}s",
+                                UNREGISTERED_LOOKUP_INTERVAL.as_secs()
+                            );
+                            announced = Some(reason);
+                        }
+                    }
                 }
             }
         }
@@ -300,20 +361,18 @@ pub async fn run_with_shutdown(
             // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
             let onboarding_config = node::OnboardingConfig {
                 bls_key_path: config.bls_key_path.clone(),
+                mnemonic: crate::crypto::MnemonicSettings::from_env()?,
+                // `storage_dir` is the one directory a node has to keep across
+                // restarts to be worth running, which is exactly the lifetime
+                // the identity record needs.
+                state_dir: Some(config.storage_dir.clone()),
             };
             let onboarding_result =
                 match node::perform_onboarding(&client, &onboarding_config, &mut writer).await? {
                     node::OnboardingOutcome::Ready(result) => *result,
                     node::OnboardingOutcome::Unregistered(node) => {
-                        return run_unregistered(
-                            &config,
-                            client,
-                            Arc::new(node.keypair),
-                            node.bls_pubkey,
-                            &mut writer,
-                            shutdown,
-                        )
-                        .await;
+                        return run_unregistered(&config, client, *node, &mut writer, shutdown)
+                            .await;
                     }
                 };
 
@@ -358,6 +417,7 @@ pub async fn run_with_shutdown(
                     node_id: node_id.clone(),
                     signer_id: onboarding_result.signer_id,
                 }),
+                onboarding_result.derived,
             );
 
             let daemon_config =
@@ -462,7 +522,8 @@ mod tests {
     use super::*;
     use crate::app::cli::{Cli, Commands};
     use crate::app::config::AdminPassword;
-    use crate::crypto::BlsKeyPair;
+    use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, MNEMONIC_ENV, NETWORK_ENV};
+    use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, MnemonicSettings};
     use crate::node::BLS_PASSWORD_ENV;
     use futures_util::future;
     use serde_json::json;
@@ -866,6 +927,9 @@ mod tests {
     /// Cleanup onboarding environment after test.
     fn cleanup_onboarding_env() {
         env::remove_var(BLS_PASSWORD_ENV);
+        for key in [MNEMONIC_ENV, ACCOUNT_INDEX_ENV, NETWORK_ENV] {
+            env::remove_var(key);
+        }
     }
 
     #[tokio::test]
@@ -1080,6 +1144,218 @@ mod tests {
             Outcome::Restart,
             "the supervisor has to start a process that can onboard"
         );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The canonical BIP-39 phrase; the derivation itself is pinned in
+    /// `crypto::mnemonic`, so this test only cares that the retry reaches the
+    /// Portal.
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon about";
+
+    /// A mnemonic node that the Portal refused has nobody to wait for: nothing
+    /// but this process holds the Taproot key, so if it stops offering the
+    /// registration, whitelisting the address later changes nothing and the node
+    /// sits at 404 until a human restarts the container.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_mnemonic_node_retries_until_the_portal_relents() {
+        let _guard = TempAppDirGuard::new("whitelist_retry");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("whitelist_retry");
+        fs::create_dir_all(&storage_dir).unwrap();
+
+        let identity = MnemonicIdentity::derive(&MnemonicSettings::new(
+            TEST_PHRASE,
+            BitcoinNetwork::Signet,
+            2,
+        ))
+        .unwrap();
+        let public_key = identity.bls_pubkey();
+
+        // Onboarding's lookup and the watcher's first one both 404; the third
+        // finds the row the retried registration wrote.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "signer_id": null,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", identity.node_id)))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // The address is not whitelisted during onboarding, and is by the time
+        // the watcher tries again — which is the whole scenario.
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": {
+                    "code": "ADDRESS_NOT_WHITELISTED",
+                    "message": "Bitcoin address is not whitelisted for node registration"
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "x_only_pubkey": hex::encode(identity.x_only),
+                "bls_public_key": public_key
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Mounted last so the sibling scan's probes fall through to it.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        env::set_var(MNEMONIC_ENV, TEST_PHRASE);
+        env::set_var(ACCOUNT_INDEX_ENV, "2");
+        env::set_var(NETWORK_ENV, "signet");
+
+        let cli = unregistered_cli(
+            mock_server.uri(),
+            storage_dir.clone(),
+            storage_dir.join("unused_bls_key.enc"),
+        );
+        // Long enough that the watcher, not the signal, is what stops the node.
+        let shutdown = async {
+            sleep(Duration::from_secs(30)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(
+            outcome,
+            Outcome::Restart,
+            "the retry has to end in a process that can onboard: {output}"
+        );
+        assert!(output.contains("ADDRESS_NOT_WHITELISTED"), "{output}");
+        assert!(
+            output.contains("retrying the registration in the background"),
+            "the node has to say what it will do, since nobody else can do it: {output}"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The other half of the retry rule. A `409` means the Portal has already
+    /// given this node's xpub to a different BLS key, and the request carries
+    /// no nonce — so the same bytes get the same answer forever. Offering them
+    /// every 30s for the life of the process would bury the one line that says
+    /// what actually went wrong.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_registration_the_portal_rejects_outright_is_not_replayed() {
+        let _guard = TempAppDirGuard::new("final_refusal");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("final_refusal");
+        fs::create_dir_all(&storage_dir).unwrap();
+
+        let identity = MnemonicIdentity::derive(&MnemonicSettings::new(
+            TEST_PHRASE,
+            BitcoinNetwork::Signet,
+            2,
+        ))
+        .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", identity.node_id)))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Twice and no more: once from onboarding, once from the watcher's
+        // first tick, after which it must stop offering it.
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {
+                    "code": "NODE_ALREADY_REGISTERED",
+                    "message": "this xpubkey is registered with another BLS key"
+                }
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        // Nothing is ever registered, so the watcher keeps ticking to the end.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        env::set_var(MNEMONIC_ENV, TEST_PHRASE);
+        env::set_var(ACCOUNT_INDEX_ENV, "2");
+        env::set_var(NETWORK_ENV, "signet");
+
+        let cli = unregistered_cli(
+            mock_server.uri(),
+            storage_dir.clone(),
+            storage_dir.join("unused_bls_key.enc"),
+        );
+        // Many ticks at the test interval, so a loop that kept retrying would
+        // blow past the expectation above rather than pass by being too short.
+        let shutdown = async {
+            sleep(Duration::from_millis(1500)).await;
+            Ok(())
+        };
+
+        let mut buffer = Vec::new();
+        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(outcome, Outcome::Shutdown, "{output}");
+        assert!(
+            output.contains("rejected the registration outright"),
+            "the operator must not be sent away to wait for a retry that will never \
+             happen: {output}"
+        );
+
+        // Verified on drop by wiremock: exactly the two calls above.
+        drop(mock_server);
 
         std::fs::remove_dir_all(&storage_dir).ok();
     }
