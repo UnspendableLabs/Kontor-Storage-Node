@@ -86,6 +86,10 @@ pub async fn node_status(
 /// the node prints it on startup either way — while `supported` says whether
 /// a key was loaded at all, which is the difference between "register it" and
 /// "there is nothing here to register".
+///
+/// A mnemonic node adds `derived`. It needs no wallet flow at all — it
+/// registers itself at startup — so what an operator wants from this page is
+/// the Taproot address to whitelist, and which account it came from.
 fn registration_status(state: &DownloadServerState) -> Value {
     let Some(identity) = state.admin.identity() else {
         return json!({ "supported": false, "registered": false });
@@ -98,6 +102,12 @@ fn registration_status(state: &DownloadServerState) -> Value {
         "bls_pubkey": identity.keypair().public_key_hex(),
         "node_id": registered.map(|node| node.node_id.clone()),
         "signer_id": registered.map(|node| node.signer_id),
+        "derived": identity.derived().map(|derived| json!({
+            "account": derived.account,
+            "network": derived.network.to_string(),
+            "taproot_address": derived.taproot_address,
+            "node_id": derived.node_id,
+        })),
     })
 }
 
@@ -279,6 +289,7 @@ mod tests {
                 keypair,
                 PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
                 None,
+                None,
             ),
             RestartHandle::unavailable(),
         );
@@ -310,6 +321,7 @@ mod tests {
                     node_id: "node-status".to_string(),
                     signer_id: 42,
                 }),
+                None,
             ),
             RestartHandle::unavailable(),
         );
@@ -319,6 +331,72 @@ mod tests {
         assert_eq!(value["registration"]["registered"], true);
         assert_eq!(value["registration"]["node_id"], "node-status");
         assert_eq!(value["registration"]["signer_id"], 42);
+    }
+
+    /// On a mnemonic node the address is the whole message: it is what a Portal
+    /// admin has to whitelist, and the page exists so nobody has to grep a
+    /// container's logs for it.
+    #[tokio::test]
+    async fn status_reports_the_derived_account_and_address() {
+        use crate::app::restart::RestartHandle;
+        use crate::clients::PortalClient;
+        use crate::crypto::mnemonic::DerivedIdentityInfo;
+        use crate::crypto::{BitcoinNetwork, BlsKeyPair};
+        use crate::server::admin::NodeIdentity;
+        use std::sync::Arc;
+
+        let (mut state, dir) = state_with(&[]).await;
+        state.admin = AdminState::with_identity(
+            NodeIdentity::new(
+                Arc::new(BlsKeyPair::generate().unwrap()),
+                PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
+                None,
+                Some(DerivedIdentityInfo {
+                    account: 2,
+                    network: BitcoinNetwork::Signet,
+                    taproot_address: "tb1pexample".to_string(),
+                    node_id: "node-derived".to_string(),
+                }),
+            ),
+            RestartHandle::unavailable(),
+        );
+
+        let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
+
+        assert_eq!(value["registration"]["registered"], false);
+        assert_eq!(value["registration"]["derived"]["account"], 2);
+        assert_eq!(value["registration"]["derived"]["network"], "signet");
+        assert_eq!(
+            value["registration"]["derived"]["taproot_address"],
+            "tb1pexample"
+        );
+        assert_eq!(value["registration"]["derived"]["node_id"], "node-derived");
+    }
+
+    /// An imported node has no account to report, and the page keys the wallet
+    /// flow off this being null.
+    #[tokio::test]
+    async fn status_reports_no_derived_block_for_an_imported_key() {
+        use crate::app::restart::RestartHandle;
+        use crate::clients::PortalClient;
+        use crate::crypto::BlsKeyPair;
+        use crate::server::admin::NodeIdentity;
+        use std::sync::Arc;
+
+        let (mut state, dir) = state_with(&[]).await;
+        state.admin = AdminState::with_identity(
+            NodeIdentity::new(
+                Arc::new(BlsKeyPair::generate().unwrap()),
+                PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
+                None,
+                None,
+            ),
+            RestartHandle::unavailable(),
+        );
+
+        let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
+
+        assert_eq!(value["registration"]["derived"], Value::Null);
     }
 
     /// Tests that never load a key still read this block, so it has to say

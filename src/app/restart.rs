@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+use crate::crypto::mnemonic::MNEMONIC_ENV;
 use crate::node::onboarding::key_management::BLS_PASSWORD_ENV;
 
 /// Exit code the process uses when an operator asked for a restart.
@@ -75,17 +76,19 @@ impl RestartHandle {
 
     /// Reads the environment to decide whether restarting can be offered.
     ///
-    /// Onboarding decrypts the BLS key on every startup, and
-    /// `get_password_reader` only takes that password from the environment when
-    /// `BLS_PASSWORD` is set — otherwise it prompts on the terminal. A
-    /// container has no terminal to prompt at, so restarting without the
+    /// Onboarding gets the BLS key on every startup, and only two of the three
+    /// ways it can do that come back without a human. `get_password_reader`
+    /// takes the key file's password from the environment when `BLS_PASSWORD` is
+    /// set and prompts on the terminal otherwise; a node with
+    /// `KONTOR_STORAGE_MNEMONIC` re-derives the key and never asks at all. A
+    /// container has no terminal to prompt at, so restarting with neither
     /// variable would take the node down and leave it down. Nothing else in
     /// startup blocks on a human: the key file itself always exists by the time
     /// a node is running (onboarding writes it), and the KOR faucet step polls
     /// rather than asks.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::new(std::env::var(BLS_PASSWORD_ENV).is_ok())
+        Self::new(std::env::var(BLS_PASSWORD_ENV).is_ok() || std::env::var(MNEMONIC_ENV).is_ok())
     }
 
     /// A handle that refuses restarts, for callers that have no run loop to
@@ -230,6 +233,39 @@ mod tests {
             Some(value) => std::env::set_var(BLS_PASSWORD_ENV, value),
             None => std::env::remove_var(BLS_PASSWORD_ENV),
         }
+    }
+
+    /// A mnemonic node never reaches a password prompt: it re-derives the key on
+    /// the way up. Restarting has to be offered to it even with no
+    /// `BLS_PASSWORD`, or the `/admin` reset would be a one-way door on exactly
+    /// the nodes that need it most.
+    #[test]
+    #[serial_test::serial]
+    fn a_mnemonic_also_makes_restarting_available() {
+        let original_password = std::env::var(BLS_PASSWORD_ENV).ok();
+        let original_mnemonic = std::env::var(MNEMONIC_ENV).ok();
+
+        std::env::remove_var(BLS_PASSWORD_ENV);
+        std::env::set_var(MNEMONIC_ENV, "abandon abandon about");
+        let with_mnemonic = RestartHandle::from_env().is_available();
+
+        std::env::remove_var(MNEMONIC_ENV);
+        let without_either = RestartHandle::from_env().is_available();
+
+        match original_password {
+            Some(value) => std::env::set_var(BLS_PASSWORD_ENV, value),
+            None => std::env::remove_var(BLS_PASSWORD_ENV),
+        }
+        match original_mnemonic {
+            Some(value) => std::env::set_var(MNEMONIC_ENV, value),
+            None => std::env::remove_var(MNEMONIC_ENV),
+        }
+
+        assert!(
+            with_mnemonic,
+            "a node that derives its key needs nothing from a terminal"
+        );
+        assert!(!without_either);
     }
 
     #[test]

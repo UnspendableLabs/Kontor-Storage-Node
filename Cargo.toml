@@ -58,6 +58,16 @@ ctr = "0.9"
 argon2 = "0.5"
 zeroize = { version = "1.8", features = ["derive"] }
 rpassword = "7.3"
+# Mnemonic-derived identity, byte-compatible with Horizon Wallet. All pure Rust:
+# the node deliberately keeps `bitcoin` and its secp256k1 C bindings out of the
+# tree (see `node::registration::x_only_from_xpub`).
+# `bip32`'s own mnemonic type only accepts 24-word phrases (it hardcodes 256-bit
+# entropy), and Horizon Wallet issues 12-word ones, so BIP-39 comes from `bip39`
+# and `bip32` is used only for BIP32 derivation and xpub serialization.
+bip39 = "2"
+bip32 = { version = "0.5", default-features = false, features = ["std", "secp256k1"] }
+k256 = { version = "0.13", features = ["schnorr"] }
+bech32 = "0.11"
 # HTTP signature (RFC 9421)
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
