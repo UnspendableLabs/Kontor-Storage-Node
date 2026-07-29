@@ -27,7 +27,7 @@ use crate::clients::kontor_op::{
 };
 use crate::clients::portal::RegisterNodeRequest;
 use crate::clients::PortalClient;
-use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, REGISTER_NEW_ACCOUNT_ENV};
+use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, FIRST_ACCOUNT, REGISTER_NEW_ACCOUNT_ENV};
 use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
 use crate::node::known_identity::KnownIdentity;
 
@@ -240,7 +240,7 @@ const ACCOUNT_SCAN_MAX: u32 = 10;
 /// How the scan describes its own reach, for the messages that report it.
 #[must_use]
 pub fn account_scan_range() -> String {
-    format!("accounts 0-{ACCOUNT_SCAN_MAX}")
+    format!("accounts {FIRST_ACCOUNT}-{ACCOUNT_SCAN_MAX}")
 }
 
 /// A node the Portal knows, derived from the same mnemonic as this one.
@@ -288,7 +288,7 @@ pub async fn find_registered_siblings(
     client: &PortalClient,
     identity: &MnemonicIdentity,
 ) -> Vec<RegisteredSibling> {
-    let mut candidates: Vec<(u32, BitcoinNetwork)> = (0..=ACCOUNT_SCAN_MAX)
+    let mut candidates: Vec<(u32, BitcoinNetwork)> = (FIRST_ACCOUNT..=ACCOUNT_SCAN_MAX)
         .filter(|account| *account != identity.account)
         .map(|account| (account, identity.network))
         .collect();
@@ -624,7 +624,9 @@ mod tests {
     fn both_messages_say_how_far_the_scan_looked() {
         let siblings = [sibling_of(&derived(2))];
         let range = account_scan_range();
-        assert_eq!(range, "accounts 0-10");
+        // Named from the first account, not from 0: the range an operator reads
+        // has to be one they could type into `KONTOR_STORAGE_ACCOUNT_INDEX`.
+        assert_eq!(range, "accounts 1-10");
 
         assert!(wrong_account_error(&derived(4), &siblings, None)
             .to_string()

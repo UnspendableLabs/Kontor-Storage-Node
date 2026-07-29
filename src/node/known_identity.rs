@@ -122,6 +122,24 @@ impl KnownIdentity {
     pub fn matches(&self, identity: &MnemonicIdentity) -> bool {
         self.node_id == identity.node_id
     }
+
+    /// Whether the record agrees with that identity in every field, not just the
+    /// one that decides.
+    ///
+    /// [`Self::matches`] is the decision; the rest of the record is only ever
+    /// quoted back to an operator. That does not make it free to leave stale: a
+    /// record written before [`crate::crypto::mnemonic::ACCOUNT_INDEX_ENV`]
+    /// moved to Horizon Wallet's numbering names an account one below the one to
+    /// set, inside the very message whose job is to say which account to set.
+    /// So a record that matches but disagrees is rewritten on the way up, and
+    /// nothing has to be migrated by hand.
+    #[must_use]
+    pub fn describes(&self, identity: &MnemonicIdentity) -> bool {
+        self.matches(identity)
+            && self.account == identity.account
+            && self.network == identity.network.to_string()
+            && self.bls_pubkey == identity.bls_pubkey()
+    }
 }
 
 /// Record the identity, logging rather than failing if it cannot be written.

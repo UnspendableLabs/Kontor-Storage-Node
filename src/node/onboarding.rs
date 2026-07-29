@@ -479,10 +479,14 @@ pub async fn perform_onboarding_with_reader(
     // "this account index was never right". Written here rather than after a
     // successful registration: a node that onboarded against a row somebody
     // else created has just as much claim to re-register it.
+    //
+    // Rewritten on a stale record as well as a missing one — see
+    // [`KnownIdentity::describes`]: the fields it quotes back to the operator
+    // are worth no less than the one it decides on.
     if let (Some(dir), Some(identity)) = (&config.state_dir, keys.identity()) {
         if !known
             .as_ref()
-            .is_some_and(|record| record.matches(identity))
+            .is_some_and(|record| record.describes(identity))
         {
             known_identity::remember(dir, identity).await;
         }
@@ -883,7 +887,7 @@ mod tests {
                 .to_string();
 
         assert!(err.contains("KONTOR_STORAGE_REGISTER_NEW_ACCOUNT"), "{err}");
-        assert!(err.contains("accounts 0-10"), "{err}");
+        assert!(err.contains(&registration::account_scan_range()), "{err}");
     }
 
     /// The scenario the identity record exists for. Two nodes, accounts 2 and
@@ -1187,6 +1191,69 @@ mod tests {
             .await
             .expect("a node that onboarded has to remember what it onboarded as");
         assert!(record.matches(&identity));
+    }
+
+    /// A record written before `KONTOR_STORAGE_ACCOUNT_INDEX` moved to Horizon
+    /// Wallet's numbering names the same node by an account number that is now
+    /// one too low. It still matches — the `node_id` is what decides, and the
+    /// keys did not move — so nothing refuses; but leaving it would have the
+    /// wrong-account error tell an operator to set the index one below the
+    /// account it means. The node brings it up to date instead.
+    #[tokio::test]
+    async fn a_record_from_the_old_account_numbering_is_brought_up_to_date() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let identity = derived_identity(2);
+        let public_key = identity.bls_pubkey();
+
+        crate::node::known_identity::KnownIdentity::store(state.path(), &identity)
+            .await
+            .unwrap();
+        let stale = crate::node::known_identity::KnownIdentity {
+            account: identity.account - 1,
+            ..crate::node::known_identity::KnownIdentity::load(state.path())
+                .await
+                .unwrap()
+        };
+        tokio::fs::write(
+            state.path().join(".node-identity.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", public_key.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": identity.node_id,
+                "signer_id": 42,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_all_mocks_except_lookup(&mock_server, &identity.node_id, &public_key).await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), dir.path().join("s"));
+        let reader = MockPasswordReader::new("unused");
+        let mut buffer = Vec::new();
+
+        perform_onboarding_with_reader(
+            &client,
+            &returning_config(2, state.path()),
+            &mut buffer,
+            &reader,
+        )
+        .await
+        .unwrap()
+        .expect_ready();
+
+        let record = crate::node::known_identity::KnownIdentity::load(state.path())
+            .await
+            .unwrap();
+        assert_eq!(record.account, 2);
+        assert!(record.describes(&identity));
     }
 
     /// A node importing its key from a wallet has no derived identity, so there
