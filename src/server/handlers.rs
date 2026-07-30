@@ -29,7 +29,7 @@ pub struct NodeInfoResponse {
 
 pub async fn node_info(State(state): State<DownloadServerState>) -> Json<NodeInfoResponse> {
     Json(NodeInfoResponse {
-        node_id: state.node_id.clone(),
+        node_id: state.runtime.node_id(),
     })
 }
 

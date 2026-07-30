@@ -2,10 +2,12 @@
 //!
 //! Handles loading, generating, and encrypting BLS keys.
 
+use crate::crypto::keystore::{self, SealKey, SealKeySource};
 use crate::crypto::mnemonic::MNEMONIC_ENV;
-use crate::crypto::{BlsKeyPair, MnemonicIdentity, MnemonicSettings, BLS_KEY_FILENAME};
+use crate::crypto::{
+    BlsKeyPair, Keystore, MnemonicIdentity, MnemonicSettings, PublicIdentity, BLS_KEY_FILENAME,
+};
 use crate::database::default_app_dir;
-use crate::node::onboarding::OnboardingConfig;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -182,10 +184,13 @@ pub fn get_password_reader() -> Box<dyn PasswordReader> {
     }
 }
 
-/// Get the path to the BLS key file.
-pub fn get_key_path(config: &OnboardingConfig) -> Result<PathBuf> {
-    if let Some(ref path) = config.bls_key_path {
-        return Ok(path.clone());
+/// Where the legacy `bls_key.enc` lives.
+///
+/// # Errors
+/// If no override is given and no application data directory can be determined.
+pub fn get_key_path(configured: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = configured {
+        return Ok(path.to_path_buf());
     }
     let app_dir = default_app_dir().ok_or_else(|| {
         anyhow!("unable to determine application data directory for storing BLS keys")
@@ -193,17 +198,41 @@ pub fn get_key_path(config: &OnboardingConfig) -> Result<PathBuf> {
     Ok(app_dir.join(BLS_KEY_FILENAME))
 }
 
+/// A BLS key opened from [`crate::crypto::keystore`], with whatever public
+/// identity the keystore filed it under.
+///
+/// `public` is `None` only for a keystore provisioned from material that never
+/// carried a Taproot account — a migrated `bls_key.enc`, a wallet blob. Such a
+/// node still runs; it just cannot register itself, and needs the browser flow
+/// for that one field.
+pub struct SealedKeys {
+    pub keypair: BlsKeyPair,
+    pub public: Option<PublicIdentity>,
+}
+
 /// This node's key material, and where it came from.
 ///
-/// The distinction matters past onboarding: a mnemonic node holds the Taproot
-/// key as well, so it can sign its own registration, while an imported one has
-/// only the BLS half and needs a browser for the rest.
-// Both variants are boxed: a `MnemonicIdentity` is several times the size of a
-// bare keypair, and this value is built once per start, so the indirection costs
-// nothing worth measuring.
+/// Three sources, and what separates them is not the BLS key — that is the same
+/// in all three — but how much of the *Taproot* side came with it:
+///
+/// - [`Self::Sealed`] is the production path. It has the public identity,
+///   including the precomputed Schnorr binding signature, so it can register
+///   itself. It does not have the seed, so it cannot derive a sibling account.
+/// - [`Self::Derived`] has the seed, and exists now only for the moment the
+///   setup wizard holds one and for a node still on the legacy environment
+///   variable. It can do everything, including the sibling scan.
+/// - [`Self::Imported`] is a bare BLS key from `bls_key.enc`. It needs a browser
+///   to supply the Taproot half of a registration.
+// The larger variants are boxed: a `MnemonicIdentity` is several times the size
+// of a bare keypair, and this value is built once per start, so the indirection
+// costs nothing worth measuring.
 pub enum NodeKeys {
-    /// Derived from [`MNEMONIC_ENV`]. Self-sufficient.
+    /// Derived from a seed phrase. Self-sufficient, and the only variant that
+    /// can look at neighbouring accounts.
     Derived(Box<MnemonicIdentity>),
+    /// Opened from the keystore. Self-sufficient for everything but the sibling
+    /// scan.
+    Sealed(Box<SealedKeys>),
     /// Decrypted from Horizon Wallet's export and kept on disk under a password.
     Imported(Box<BlsKeyPair>),
 }
@@ -213,16 +242,35 @@ impl NodeKeys {
     pub fn keypair(&self) -> &BlsKeyPair {
         match self {
             Self::Derived(identity) => &identity.keypair,
+            Self::Sealed(sealed) => &sealed.keypair,
             Self::Imported(keypair) => keypair,
         }
     }
 
-    /// The mnemonic-derived identity, if this node has one.
+    /// What this node can say about its Taproot account without unsealing
+    /// anything further.
+    ///
+    /// # Errors
+    /// Only on the [`Self::Derived`] path, if the binding signature cannot be
+    /// produced.
+    pub fn public(&self) -> Result<Option<PublicIdentity>> {
+        match self {
+            Self::Derived(identity) => identity.public().map(Some),
+            Self::Sealed(sealed) => Ok(sealed.public.clone()),
+            Self::Imported(_) => Ok(None),
+        }
+    }
+
+    /// The seed-backed identity, if this node still holds one.
+    ///
+    /// The one thing it is for is [`crate::node::registration::find_registered_siblings`],
+    /// which has to derive neighbouring accounts. Everything else works from
+    /// [`Self::public`], which is why a sealed node needs no seed.
     #[must_use]
-    pub fn identity(&self) -> Option<&MnemonicIdentity> {
+    pub fn seed(&self) -> Option<&MnemonicIdentity> {
         match self {
             Self::Derived(identity) => Some(identity),
-            Self::Imported(_) => None,
+            Self::Sealed(_) | Self::Imported(_) => None,
         }
     }
 
@@ -230,6 +278,7 @@ impl NodeKeys {
     pub fn into_keypair(self) -> BlsKeyPair {
         match self {
             Self::Derived(identity) => identity.keypair,
+            Self::Sealed(sealed) => sealed.keypair,
             Self::Imported(keypair) => *keypair,
         }
     }
@@ -239,6 +288,11 @@ impl std::fmt::Debug for NodeKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Derived(identity) => f.debug_tuple("Derived").field(identity).finish(),
+            Self::Sealed(sealed) => f
+                .debug_struct("Sealed")
+                .field("public", &sealed.public)
+                .field("keypair", &sealed.keypair)
+                .finish(),
             Self::Imported(keypair) => f.debug_tuple("Imported").field(keypair).finish(),
         }
     }
@@ -285,6 +339,178 @@ pub async fn ensure_node_keys(
     ensure_bls_keypair(key_path, writer, password_reader)
         .await
         .map(|keypair| NodeKeys::Imported(Box::new(keypair)))
+}
+
+/// Where this node's keys stand at boot.
+pub enum KeySource {
+    /// The keystore opened. The node can onboard.
+    Open {
+        keystore: Box<Keystore>,
+        keys: Box<NodeKeys>,
+        /// Which slot this boot came in through. `/admin` needs it to know
+        /// whether dropping the file slot is safe yet, and it is carried rather
+        /// than re-derived so the answer cannot drift from what actually
+        /// happened.
+        seal_key: SealKey,
+        seal_source: SealKeySource,
+    },
+    /// A keystore exists, but nothing on this machine can open it.
+    Sealed { keystore: Box<Keystore> },
+    /// No keystore and nothing to migrate. The setup wizard has the work.
+    Uninitialized,
+}
+
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open {
+                keys, seal_source, ..
+            } => f
+                .debug_struct("Open")
+                .field("keys", keys)
+                .field("seal_source", seal_source)
+                .finish_non_exhaustive(),
+            Self::Sealed { keystore } => f
+                .debug_struct("Sealed")
+                .field("slots", &keystore.slots())
+                .finish_non_exhaustive(),
+            Self::Uninitialized => f.write_str("Uninitialized"),
+        }
+    }
+}
+
+/// Open the keystore, migrating a legacy node into one on the way if that is
+/// what it turns out to be.
+///
+/// # The three shapes a volume can be in
+///
+/// 1. **A keystore is there.** It is the answer, unconditionally. A
+///    `KONTOR_STORAGE_MNEMONIC` still sitting in the environment is a leftover
+///    from before the migration, and honouring it over the file would let a
+///    stale variable silently move a running node to another identity. The
+///    disagreement is reported loudly and the keystore still wins — refusing to
+///    start would strand a working node over a variable somebody forgot to
+///    delete.
+/// 2. **No keystore, but something to migrate** — a mnemonic in the
+///    environment, or a `bls_key.enc` this process can open. The key is sealed
+///    into a keystore on the spot and the node comes up on the new path. The
+///    legacy material is left exactly where it is; deleting an operator's key
+///    file is not this function's call to make.
+/// 3. **Neither.** [`KeySource::Uninitialized`], and `/admin` does the rest.
+///
+/// # Errors
+/// If the keystore is unreadable, if a present seal key does not open it, or if
+/// legacy material is present but cannot be read.
+pub async fn open_or_migrate(
+    app_dir: &Path,
+    key_path: &Path,
+    mnemonic: Option<&MnemonicSettings>,
+    writer: &mut impl Write,
+    password_reader: &dyn PasswordReader,
+) -> Result<KeySource> {
+    if let Some(keystore) = Keystore::load(app_dir).await? {
+        warn_about_a_stale_mnemonic(&keystore, mnemonic);
+
+        let Some((seal_key, seal_source)) = keystore::resolve_seal_key(app_dir, false)? else {
+            return Ok(KeySource::Sealed {
+                keystore: Box::new(keystore),
+            });
+        };
+
+        let keypair = keystore.unseal(&seal_key)?;
+        let public = keystore.public().cloned();
+
+        writeln!(
+            writer,
+            "✓ Keystore opened ({} slot, fingerprint {})",
+            seal_source.kind(),
+            seal_key.fingerprint()
+        )?;
+        return Ok(KeySource::Open {
+            keystore: Box::new(keystore),
+            keys: Box::new(NodeKeys::Sealed(Box::new(SealedKeys { keypair, public }))),
+            seal_key,
+            seal_source,
+        });
+    }
+
+    // Nothing to migrate is the ordinary case now: a fresh node has an empty
+    // volume, and the wizard is how it gets a key. Checking before calling
+    // `ensure_node_keys` is what keeps it out of the interactive blob-import
+    // prompt, which no unattended container can answer.
+    if mnemonic.is_none() && !BlsKeyPair::key_file_exists(key_path).await? {
+        return Ok(KeySource::Uninitialized);
+    }
+
+    writeln!(
+        writer,
+        "\nNo keystore yet, but this node has key material from an older release. \
+         Migrating it into one."
+    )?;
+
+    let keys = ensure_node_keys(key_path, mnemonic, writer, password_reader).await?;
+    let public = keys.public()?;
+    let secret = keys.keypair().secret_key_hex();
+
+    // Generated here and only here: a node that already has a keystore must
+    // never make a fresh key, because a fresh key does not open the old file.
+    let (seal_key, seal_source) = keystore::resolve_seal_key(app_dir, true)?
+        .ok_or_else(|| anyhow!("no seal key could be resolved or generated"))?;
+
+    let keystore = Keystore::provision(app_dir, &secret, public, &seal_key)?;
+
+    writeln!(
+        writer,
+        "✓ Sealed into {} ({} slot, fingerprint {})",
+        Keystore::path_in(app_dir).display(),
+        seal_source.kind(),
+        seal_key.fingerprint()
+    )?;
+    if mnemonic.is_some() {
+        writeln!(
+            writer,
+            "  {MNEMONIC_ENV} is no longer needed and should be removed from this \
+             deployment. The node now derives nothing: it holds only the sealed BLS key."
+        )?;
+    }
+
+    Ok(KeySource::Open {
+        keystore: Box::new(keystore),
+        keys: Box::new(keys),
+        seal_key,
+        seal_source,
+    })
+}
+
+/// Report an environment that disagrees with the keystore, without acting on it.
+fn warn_about_a_stale_mnemonic(keystore: &Keystore, mnemonic: Option<&MnemonicSettings>) {
+    let Some(settings) = mnemonic else { return };
+    let Some(recorded) = keystore.public() else {
+        tracing::warn!(
+            "{MNEMONIC_ENV} is set but this node already has a keystore, which takes \
+             precedence. Remove the variable."
+        );
+        return;
+    };
+
+    match MnemonicIdentity::derive(settings) {
+        Ok(identity) if identity.node_id == recorded.node_id => tracing::warn!(
+            "{MNEMONIC_ENV} is set and derives the identity this node already holds. \
+             It is doing nothing; remove it."
+        ),
+        Ok(identity) => tracing::error!(
+            keystore = %recorded.node_id,
+            environment = %identity.node_id,
+            "{MNEMONIC_ENV} derives a DIFFERENT identity from the one in this node's \
+             keystore. The keystore wins and the node keeps its identity, but the \
+             variable is now actively misleading — remove it."
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "{MNEMONIC_ENV} is set but unusable. The keystore is what this node runs on; \
+             remove the variable."
+        ),
+    }
 }
 
 /// The BLS key this node used before the mnemonic, when one can be read.
@@ -563,21 +789,256 @@ mod tests {
     use crate::crypto::BlsKeyPair;
     use std::path::PathBuf;
 
+    /* ---------------- the migration matrix ---------------- */
+
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                               abandon abandon abandon about";
+
+    /// Both variables `open_or_migrate` consults, cleared and restored around a
+    /// case. Every test in this group is `#[serial]` for the same reason.
+    struct MigrationEnv {
+        mnemonic: Option<String>,
+        seal: Option<String>,
+        password: Option<String>,
+    }
+
+    impl MigrationEnv {
+        fn capture() -> Self {
+            let guard = Self {
+                mnemonic: std::env::var(MNEMONIC_ENV).ok(),
+                seal: std::env::var(keystore::SEAL_KEY_ENV).ok(),
+                password: std::env::var(BLS_PASSWORD_ENV).ok(),
+            };
+            std::env::remove_var(MNEMONIC_ENV);
+            std::env::remove_var(keystore::SEAL_KEY_ENV);
+            std::env::remove_var(BLS_PASSWORD_ENV);
+            guard
+        }
+    }
+
+    impl Drop for MigrationEnv {
+        fn drop(&mut self) {
+            for (name, value) in [
+                (MNEMONIC_ENV, self.mnemonic.take()),
+                (keystore::SEAL_KEY_ENV, self.seal.take()),
+                (BLS_PASSWORD_ENV, self.password.take()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn settings(account: u32) -> MnemonicSettings {
+        MnemonicSettings::new(TEST_PHRASE, crate::crypto::BitcoinNetwork::Signet, account)
+    }
+
+    async fn migrate(
+        app_dir: &Path,
+        key_path: &Path,
+        mnemonic: Option<&MnemonicSettings>,
+    ) -> Result<KeySource> {
+        let mut buffer = Vec::new();
+        open_or_migrate(
+            app_dir,
+            key_path,
+            mnemonic,
+            &mut buffer,
+            &MockPasswordReader::new("legacy-password"),
+        )
+        .await
+    }
+
+    /// The ordinary case now: an empty volume is a node waiting for its wizard,
+    /// not an error and not something to prompt about.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nothing_on_the_volume_means_uninitialized() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+
+        let source = migrate(dir.path(), &dir.path().join("bls_key.enc"), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(source, KeySource::Uninitialized));
+        assert!(!Keystore::path_in(dir.path()).exists());
+    }
+
+    /// The migration an existing mnemonic node takes: same identity, now sealed,
+    /// and the variable is no longer load-bearing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_mnemonic_node_is_sealed_into_a_keystore() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let expected = MnemonicIdentity::derive(&settings(2)).unwrap();
+
+        let source = migrate(
+            dir.path(),
+            &dir.path().join("bls_key.enc"),
+            Some(&settings(2)),
+        )
+        .await
+        .unwrap();
+
+        let KeySource::Open { keystore, keys, .. } = source else {
+            panic!("a mnemonic must migrate into an open keystore");
+        };
+        let public = keystore.public().expect("the identity must be recorded");
+        assert_eq!(public.node_id, expected.node_id);
+        assert_eq!(public.account, 2);
+        assert_eq!(keys.keypair().public_key_hex(), expected.bls_pubkey());
+
+        // And it comes back the same way on the next boot, with no mnemonic.
+        let again = migrate(dir.path(), &dir.path().join("bls_key.enc"), None)
+            .await
+            .unwrap();
+        let KeySource::Open { keystore, keys, .. } = again else {
+            panic!("the keystore must reopen on its own");
+        };
+        assert_eq!(keystore.public().unwrap().node_id, expected.node_id);
+        assert!(keys.seed().is_none(), "the seed must not survive migration");
+    }
+
+    /// A node from the wallet-blob era. It has no Taproot account, so it
+    /// migrates without one and still runs — it just needs a browser to
+    /// register.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_legacy_key_file_is_sealed_without_an_identity() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+        let keypair = BlsKeyPair::generate().unwrap();
+        let expected = keypair.public_key_hex();
+        keypair
+            .save_encrypted(&key_path, "legacy-password")
+            .await
+            .unwrap();
+
+        let source = migrate(dir.path(), &key_path, None).await.unwrap();
+
+        let KeySource::Open { keystore, keys, .. } = source else {
+            panic!("a key file must migrate into an open keystore");
+        };
+        assert_eq!(keys.keypair().public_key_hex(), expected);
+        assert!(keystore.public().is_none());
+        // Left where it was: deleting an operator's key file is not this
+        // function's call to make.
+        assert!(key_path.exists());
+    }
+
+    /// The keystore is the answer, unconditionally. A variable left behind must
+    /// not be able to move a running node to another identity.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stale_mnemonic_never_overrides_the_keystore() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        let sealed = MnemonicIdentity::derive(&settings(2)).unwrap();
+
+        // A different account entirely, still set in the environment.
+        let source = migrate(dir.path(), &key_path, Some(&settings(5)))
+            .await
+            .unwrap();
+
+        let KeySource::Open { keystore, .. } = source else {
+            panic!("the keystore must still open");
+        };
+        assert_eq!(keystore.public().unwrap().node_id, sealed.node_id);
+    }
+
+    /// A keystore with no key to open it is its own state, not a failure and not
+    /// an invitation to provision a second identity over the top.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_keystore_with_no_seal_key_reports_itself_sealed() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
+
+        let source = migrate(dir.path(), &key_path, None).await.unwrap();
+
+        let KeySource::Sealed { keystore } = source else {
+            panic!("a keystore nothing can open must report itself sealed");
+        };
+        assert_eq!(keystore.slots(), vec![crate::crypto::SlotKind::File]);
+    }
+
+    /// Hardening, end to end: the env slot opens the same keystore the file slot
+    /// sealed, and the node reports which one it came up through.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_env_seal_key_opens_a_keystore_sealed_by_the_file_one() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        let KeySource::Open {
+            mut keystore,
+            seal_key,
+            ..
+        } = source
+        else {
+            panic!("the migration must open");
+        };
+
+        let env_key = SealKey::generate(crate::crypto::SlotKind::Env);
+        keystore.add_slot(&seal_key, &env_key).unwrap();
+        std::env::set_var(keystore::SEAL_KEY_ENV, env_key.encode().as_str());
+        std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
+
+        let source = migrate(dir.path(), &key_path, None).await.unwrap();
+        let KeySource::Open { seal_source, .. } = source else {
+            panic!("the env slot must open it");
+        };
+        assert_eq!(seal_source, SealKeySource::Env);
+    }
+
+    /// A corrupt keystore must stop the node rather than look like a fresh one:
+    /// provisioning over it would replace a key that is merely unreadable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_corrupt_keystore_stops_the_node() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(Keystore::path_in(dir.path()), b"{ not json").unwrap();
+
+        let err = migrate(dir.path(), &dir.path().join("bls_key.enc"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("parsing the keystore"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn get_key_path_returns_custom_path_when_configured() {
         let custom_path = PathBuf::from("/custom/path/key.enc");
-        let config = OnboardingConfig {
-            bls_key_path: Some(custom_path.clone()),
-            ..Default::default()
-        };
-        assert_eq!(get_key_path(&config).unwrap(), custom_path);
+        assert_eq!(get_key_path(Some(&custom_path)).unwrap(), custom_path);
     }
 
     #[test]
     fn get_key_path_returns_default_path_when_not_configured() {
-        let config = OnboardingConfig::default();
-        // This test may fail if run in an environment without a data directory
-        if let Ok(path) = get_key_path(&config) {
+        // This test may fail in an environment without a data directory.
+        if let Ok(path) = get_key_path(None) {
             assert!(path.to_string_lossy().contains(BLS_KEY_FILENAME));
         }
     }
@@ -721,9 +1182,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
-                               abandon abandon abandon about";
-
     fn mnemonic_settings(account: u32) -> MnemonicSettings {
         MnemonicSettings::new(TEST_PHRASE, crate::crypto::BitcoinNetwork::Signet, account)
     }
@@ -762,7 +1220,7 @@ mod tests {
 
         assert_eq!(keys.keypair().public_key_hex(), expected.bls_pubkey());
         assert_ne!(keys.keypair().public_key_hex(), stale.public_key_hex());
-        let identity = keys.identity().expect("mnemonic mode yields an identity");
+        let identity = keys.seed().expect("mnemonic mode yields an identity");
         assert_eq!(identity.account, 2);
 
         let output = String::from_utf8(buffer).unwrap();
@@ -951,7 +1409,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(keys.identity().is_some());
+        assert!(keys.seed().is_some());
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("could not open"), "{output}");
         assert!(output.contains(BLS_BLOB_ENV), "{output}");
@@ -976,7 +1434,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(keys.identity().is_some());
+        assert!(keys.seed().is_some());
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(!output.contains("could not open"), "{output}");
@@ -1027,7 +1485,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(keys.identity().is_some());
+        assert!(keys.seed().is_some());
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("left untouched"), "{output}");
     }
@@ -1074,7 +1532,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(keys.keypair().public_key_hex(), keypair.public_key_hex());
-        assert!(keys.identity().is_none());
+        assert!(keys.seed().is_none());
     }
 
     #[tokio::test]

@@ -63,8 +63,10 @@ struct Inner {
 }
 
 impl RestartHandle {
+    /// `available` says whether a restarted process could get back up without a
+    /// human. See [`Self::from_env`] for why that is not always true.
     #[must_use]
-    fn new(available: bool) -> Self {
+    pub fn new(available: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 available,
@@ -76,17 +78,15 @@ impl RestartHandle {
 
     /// Reads the environment to decide whether restarting can be offered.
     ///
-    /// Onboarding gets the BLS key on every startup, and only two of the three
-    /// ways it can do that come back without a human. `get_password_reader`
-    /// takes the key file's password from the environment when `BLS_PASSWORD` is
-    /// set and prompts on the terminal otherwise; a node with
-    /// `KONTOR_STORAGE_MNEMONIC` re-derives the key and never asks at all. A
-    /// container has no terminal to prompt at, so restarting with neither
-    /// variable would take the node down and leave it down. Nothing else in
-    /// startup blocks on a human: the key file itself always exists by the time
-    /// a node is running (onboarding writes it), and the KOR faucet step polls
-    /// rather than asks.
+    /// **Legacy.** A node on [`crate::crypto::keystore`] answers this from its
+    /// slots instead — [`crate::crypto::Keystore::can_boot_unattended`] — which
+    /// is the same question asked of the thing that actually decides it. This
+    /// remains for a node that has not been migrated yet, where the key still
+    /// comes from `BLS_PASSWORD` or `KONTOR_STORAGE_MNEMONIC` and a container
+    /// with neither would come back to a password prompt it has no terminal to
+    /// answer.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_env() -> Self {
         Self::new(std::env::var(BLS_PASSWORD_ENV).is_ok() || std::env::var(MNEMONIC_ENV).is_ok())
     }

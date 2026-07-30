@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -232,6 +232,13 @@ impl LockFileGuard {
                 .with_context(|| format!("unable to create lock directory {}", parent.display()))?;
         }
 
+        if let Err(e) = Self::reclaim_if_stale(&path) {
+            warn!(
+                error = %format!("{e:#}"),
+                "could not check whether the daemon lock is stale; treating it as held"
+            );
+        }
+
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -249,6 +256,90 @@ impl LockFileGuard {
 
         Ok(Self { path, _file: file })
     }
+
+    /// Remove a lock left behind by a process that is no longer running.
+    ///
+    /// The lock releases in [`Drop`], which never runs for a `SIGKILL` — the
+    /// shape of an out-of-memory kill on a hosting platform. Without this the
+    /// file outlives the process that made it and the daemon can never start
+    /// again: every subsequent boot reads "another daemon may already be
+    /// running" about a daemon that died days ago, and the node serves files
+    /// while quietly proving nothing.
+    ///
+    /// Deliberately conservative. Anything short of "this pid is definitely not
+    /// alive" leaves the lock alone, because two daemons polling the same Portal
+    /// with the same key is a worse failure than one that will not start: a
+    /// missing lock is loud, and a duplicated one desynchronises the nonce.
+    fn reclaim_if_stale(path: &Path) -> Result<()> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).context("reading the daemon lock"),
+        };
+
+        let Some(pid) = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pid="))
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+        else {
+            // A lock with no readable pid predates this check or was truncated
+            // mid-write. Nothing to test, so nothing to reclaim.
+            return Ok(());
+        };
+
+        if pid == process::id() || process_is_alive(pid) {
+            return Ok(());
+        }
+
+        warn!(
+            pid,
+            lock = %path.display(),
+            "reclaiming a daemon lock left by a process that is gone; it was almost \
+             certainly killed rather than shut down"
+        );
+        fs::remove_file(path).context("removing the stale daemon lock")?;
+        Ok(())
+    }
+}
+
+/// Whether a process with this pid exists.
+///
+/// `kill(pid, 0)` is the portable Unix answer: it performs the permission checks
+/// and existence lookup of a signal without delivering one. `EPERM` counts as
+/// alive — the process is there, it just is not ours, which is still every
+/// reason to leave its lock alone.
+///
+/// The range check is not defensive noise. `kill` gives zero and negative pids
+/// entirely different meanings — `0` is the caller's own process group, negative
+/// values are other process groups, and `-1` is *every process the caller may
+/// signal*. A lock file holding a pid above `i32::MAX` would wrap to a negative
+/// `pid_t` and make `kill` succeed against something unrelated, so a nonsense
+/// pid is answered "alive", which is the conservative direction: it leaves the
+/// lock alone rather than reclaiming one that may be held.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+
+    // SAFETY: `kill` with signal 0 delivers nothing and only inspects process
+    // state. `pid` has been checked to be a positive `pid_t`, so it names one
+    // process rather than a process group, and no memory is shared with the
+    // call.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Off Unix, assume the holder is alive. Reclaiming wrongly is the expensive
+/// mistake, and the platform this runs on in production is Linux.
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 impl Drop for LockFileGuard {
@@ -261,6 +352,87 @@ impl Drop for LockFileGuard {
 mod tests {
     #![allow(deprecated)]
     use super::*;
+
+    /// The failure this check exists for. A `SIGKILL` — an out-of-memory kill on
+    /// a hosting platform — skips `Drop`, so the lock file outlives the process
+    /// that made it. Without reclaiming, every later boot reads "another daemon
+    /// may already be running" about a daemon that died days ago, and the node
+    /// serves files while quietly proving nothing.
+    #[test]
+    fn a_lock_left_by_a_dead_process_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+
+        // A pid that was real and is not any more. Spawning and reaping a child
+        // is the portable way to get one: made up numbers are either in use or,
+        // if large enough, not valid pids at all.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(&path, format!("pid={dead}\n")).unwrap();
+
+        let guard = LockFileGuard::acquire(path.clone()).expect("a stale lock must be reclaimed");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&format!("pid={}", process::id())));
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    /// The other direction, which matters more: two daemons on one key would
+    /// desynchronise the nonce. A lock whose holder is alive is left alone.
+    #[test]
+    fn a_lock_held_by_a_live_process_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+
+        // This process is definitively alive.
+        std::fs::write(&path, format!("pid={}\n", process::id())).unwrap();
+
+        assert!(
+            LockFileGuard::acquire(path.clone()).is_err(),
+            "a lock held by a live process must not be reclaimed"
+        );
+        assert!(path.exists(), "and it must be left where it is");
+    }
+
+    /// A lock with nothing to test — written by an older build, or truncated
+    /// mid-write — is treated as held. Reclaiming wrongly is the expensive
+    /// mistake.
+    /// `kill` reads zero and negative pids as process *groups*, and `-1` as
+    /// every process the caller may signal — so a pid that wraps to one of those
+    /// must never be tested against the running system.
+    #[cfg(unix)]
+    #[test]
+    fn a_nonsense_pid_is_treated_as_held_rather_than_signalled() {
+        assert!(process_is_alive(0));
+        assert!(process_is_alive(u32::MAX), "this would wrap to kill(-1, 0)");
+        assert!(process_is_alive(process::id()));
+    }
+
+    #[test]
+    fn a_lock_with_no_readable_pid_is_treated_as_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        std::fs::write(&path, b"").unwrap();
+
+        assert!(LockFileGuard::acquire(path.clone()).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn a_lock_nobody_holds_is_taken_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+
+        let guard = LockFileGuard::acquire(path.clone()).unwrap();
+        assert!(path.exists());
+        // And a second acquisition is refused while the first is alive.
+        assert!(LockFileGuard::acquire(path.clone()).is_err());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
     use crate::testutils::{setup_in_memory_db, unique_test_path};

@@ -67,12 +67,23 @@ rpassword = "7.3"
 bip39 = "2"
 bip32 = { version = "0.5", default-features = false, features = ["std", "secp256k1"] }
 k256 = { version = "0.13", features = ["schnorr"] }
+# P-256 ECDH + HKDF: the sealed envelope the setup wizard posts a mnemonic
+# through. P-256 rather than X25519 because WebCrypto supports it in every
+# browser, and the page must run with no external script at all.
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
 bech32 = "0.11"
 # HTTP signature (RFC 9421)
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 postcard = { version = "1.1", features = ["alloc"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Only for `kill(pid, 0)`, which is how the daemon tells a lock held by a live
+# process from one left behind by a SIGKILL. Already in the tree via tokio, so
+# naming it here costs nothing to build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

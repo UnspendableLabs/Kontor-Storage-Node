@@ -58,7 +58,12 @@ pub async fn node_status(
     };
 
     Ok(json!({
-        "node_id": state.node_id,
+        "node_id": state.runtime.node_id(),
+        "phase": state.runtime.phase().as_str(),
+        "serving": state.runtime.phase().is_serving(),
+        // Why the node is where it is, when that needs saying. The one thing an
+        // operator cannot infer from the counters below.
+        "notice": state.runtime.notice(),
         "registration": registration_status(state),
         "storage": {
             "method": state.storage_backend.method.to_string(),
@@ -87,9 +92,9 @@ pub async fn node_status(
 /// a key was loaded at all, which is the difference between "register it" and
 /// "there is nothing here to register".
 ///
-/// A mnemonic node adds `derived`. It needs no wallet flow at all — it
-/// registers itself at startup — so what an operator wants from this page is
-/// the Taproot address to whitelist, and which account it came from.
+/// A node that knows its Taproot account adds `derived`. It needs no wallet
+/// flow at all — it registers itself at startup — so what an operator wants from
+/// this page is the address to whitelist, and which account it came from.
 fn registration_status(state: &DownloadServerState) -> Value {
     let Some(identity) = state.admin.identity() else {
         return json!({ "supported": false, "registered": false });
@@ -102,11 +107,11 @@ fn registration_status(state: &DownloadServerState) -> Value {
         "bls_pubkey": identity.keypair().public_key_hex(),
         "node_id": registered.map(|node| node.node_id.clone()),
         "signer_id": registered.map(|node| node.signer_id),
-        "derived": identity.derived().map(|derived| json!({
-            "account": derived.account,
-            "network": derived.network.to_string(),
-            "taproot_address": derived.taproot_address,
-            "node_id": derived.node_id,
+        "derived": identity.public().map(|public| json!({
+            "account": public.account,
+            "network": public.network.to_string(),
+            "taproot_address": public.taproot_address,
+            "node_id": public.node_id,
         })),
     })
 }
@@ -241,7 +246,7 @@ mod tests {
             db,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-status".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-status"), None),
             admin: AdminState::disabled(),
         };
         (state, dir)
@@ -283,7 +288,7 @@ mod tests {
         let (mut state, dir) = state_with(&[]).await;
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let pubkey = keypair.public_key_hex();
-        state.node_id = None;
+        state.runtime = crate::app::lifecycle::NodeRuntime::for_tests(None, None);
         state.admin = AdminState::with_identity(
             NodeIdentity::new(
                 keypair,
@@ -340,22 +345,25 @@ mod tests {
     async fn status_reports_the_derived_account_and_address() {
         use crate::app::restart::RestartHandle;
         use crate::clients::PortalClient;
-        use crate::crypto::mnemonic::DerivedIdentityInfo;
-        use crate::crypto::{BitcoinNetwork, BlsKeyPair};
+        use crate::crypto::{BitcoinNetwork, BlsKeyPair, PublicIdentity};
         use crate::server::admin::NodeIdentity;
         use std::sync::Arc;
 
         let (mut state, dir) = state_with(&[]).await;
+        let keypair = BlsKeyPair::generate().unwrap();
         state.admin = AdminState::with_identity(
             NodeIdentity::new(
-                Arc::new(BlsKeyPair::generate().unwrap()),
+                Arc::new(BlsKeyPair::from_secret_key_hex(&keypair.secret_key_hex()).unwrap()),
                 PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
                 None,
-                Some(DerivedIdentityInfo {
+                Some(PublicIdentity {
                     account: 2,
                     network: BitcoinNetwork::Signet,
+                    xpubkey: "tpubExample".to_string(),
                     taproot_address: "tb1pexample".to_string(),
                     node_id: "node-derived".to_string(),
+                    bls_pubkey: keypair.public_key_hex(),
+                    schnorr_binding_sig: "bb".repeat(64),
                 }),
             ),
             RestartHandle::unavailable(),

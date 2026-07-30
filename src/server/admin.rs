@@ -32,13 +32,17 @@
 //!   carry no `Access-Control-Allow-Origin` and a browser refuses to let
 //!   another origin read their responses.
 
+pub mod credentials;
 pub mod register;
 pub mod reset;
+pub mod seal;
 pub mod session;
+pub mod setup;
 pub mod status;
 pub mod ui;
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -49,12 +53,14 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use tracing::{debug, error, info};
 
+#[cfg(test)]
 use crate::app::config::AdminPassword;
+use crate::app::lifecycle::NodeRuntime;
 use crate::app::restart::RestartHandle;
 use crate::clients::PortalClient;
-use crate::crypto::mnemonic::DerivedIdentityInfo;
-use crate::crypto::BlsKeyPair;
+use crate::crypto::{BlsKeyPair, PublicIdentity};
 use crate::server::state::DownloadServerState;
+use credentials::AdminCredential;
 use session::AdminSession;
 
 /// The node's Portal identity, as the operator UI needs to see it.
@@ -73,10 +79,10 @@ pub struct NodeIdentity {
     client: PortalClient,
     /// What the Portal knows about this key, `None` when it knows nothing.
     registered: Option<RegisteredNode>,
-    /// Set when the key was derived from a mnemonic. Its Taproot address is
-    /// what an unregistered node is waiting on, so the page can name it instead
-    /// of sending the operator to the logs.
-    derived: Option<DerivedIdentityInfo>,
+    /// The Taproot account this node speaks for, when it knows one. Its
+    /// address is what an unregistered node is waiting on, so the page can name
+    /// it instead of sending the operator to the logs.
+    public: Option<PublicIdentity>,
 }
 
 /// The Portal-side identity of a registered node.
@@ -92,13 +98,13 @@ impl NodeIdentity {
         keypair: Arc<BlsKeyPair>,
         client: PortalClient,
         registered: Option<RegisteredNode>,
-        derived: Option<DerivedIdentityInfo>,
+        public: Option<PublicIdentity>,
     ) -> Self {
         Self {
             keypair,
             client,
             registered,
-            derived,
+            public,
         }
     }
 
@@ -114,8 +120,8 @@ impl NodeIdentity {
         self.registered.as_ref()
     }
 
-    pub(crate) fn derived(&self) -> Option<&DerivedIdentityInfo> {
-        self.derived.as_ref()
+    pub(crate) fn public(&self) -> Option<&PublicIdentity> {
+        self.public.as_ref()
     }
 }
 
@@ -123,7 +129,7 @@ impl std::fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeIdentity")
             .field("registered", &self.registered)
-            .field("derived", &self.derived)
+            .field("public", &self.public)
             .field("keypair", &"<BlsKeyPair>")
             .finish_non_exhaustive()
     }
@@ -138,8 +144,18 @@ pub struct AdminState {
 }
 
 struct Inner {
-    /// Empty means "no admin UI".
-    password: AdminPassword,
+    /// What guards the UI. Behind a lock because claiming a node replaces it
+    /// while the server is already answering requests — that is the whole point
+    /// of a node configured through its own UI.
+    credential: RwLock<AdminCredential>,
+    /// Where `admin.json`, `.setup-token` and the keystore live.
+    app_dir: PathBuf,
+    /// The live setup envelope, if one has been issued.
+    ///
+    /// One slot, not a map. A node is set up by one operator in one browser; a
+    /// second `GET` invalidating the first is the correct behaviour, and it is
+    /// also what keeps a stale key from lingering after an abandoned attempt.
+    envelope: Mutex<Option<setup::EnvelopeSession>>,
     /// HMAC key for session tokens. Generated per process and never written
     /// anywhere: a node runs as a single process, so there is nothing to share
     /// a persisted secret with, and an ephemeral key means a leaked token dies
@@ -149,18 +165,21 @@ struct Inner {
     /// node. It lives behind the admin gate because the operator UI is the only
     /// thing that ever asks.
     restart: RestartHandle,
-    /// `None` only where no BLS key was ever loaded — every test that does not
-    /// exercise registration, and nothing in production.
-    identity: Option<NodeIdentity>,
+    /// The node's live state. The identity lives here rather than in this
+    /// struct because it appears *after* the server starts on every path that
+    /// matters now — a node provisioned through the wizard has no key when its
+    /// `/admin` first answers.
+    runtime: NodeRuntime,
 }
 
 impl AdminState {
     /// Builds the admin state, generating a fresh session-signing key.
     #[must_use]
     pub fn new(
-        password: AdminPassword,
+        credential: AdminCredential,
+        app_dir: PathBuf,
         restart: RestartHandle,
-        identity: Option<NodeIdentity>,
+        runtime: NodeRuntime,
     ) -> Self {
         use rand::RngCore;
 
@@ -168,10 +187,12 @@ impl AdminState {
         rand::thread_rng().fill_bytes(&mut session_key);
         Self {
             inner: Arc::new(Inner {
-                password,
+                credential: RwLock::new(credential),
+                app_dir,
+                envelope: Mutex::new(None),
                 session_key,
                 restart,
-                identity,
+                runtime,
             }),
         }
     }
@@ -182,7 +203,12 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn disabled() -> Self {
-        Self::new(AdminPassword::new(None), RestartHandle::unavailable(), None)
+        Self::new(
+            AdminCredential::Disabled,
+            PathBuf::new(),
+            RestartHandle::unavailable(),
+            NodeRuntime::for_tests(None, None),
+        )
     }
 
     /// Test-only: no password, but a live restart switch, for the reset paths
@@ -190,7 +216,12 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn with_restart(restart: RestartHandle) -> Self {
-        Self::new(AdminPassword::new(None), restart, None)
+        Self::new(
+            AdminCredential::Disabled,
+            PathBuf::new(),
+            restart,
+            NodeRuntime::for_tests(None, None),
+        )
     }
 
     /// Test-only: an unlockable UI on a node that refuses restarts, for the
@@ -198,7 +229,12 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn with_password(password: AdminPassword) -> Self {
-        Self::new(password, RestartHandle::unavailable(), None)
+        Self::new(
+            AdminCredential::Env(password),
+            PathBuf::new(),
+            RestartHandle::unavailable(),
+            NodeRuntime::for_tests(None, None),
+        )
     }
 
     /// Test-only: a node whose key and Portal client the registration tests
@@ -206,13 +242,66 @@ impl AdminState {
     #[cfg(test)]
     #[must_use]
     pub fn with_identity(identity: NodeIdentity, restart: RestartHandle) -> Self {
-        Self::new(AdminPassword::new(None), restart, Some(identity))
+        Self::new(
+            AdminCredential::Disabled,
+            PathBuf::new(),
+            restart,
+            NodeRuntime::for_tests(None, Some(identity)),
+        )
     }
 
-    /// True when a password is configured.
+    /// True when there is a password to check, i.e. the UI can be unlocked.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.inner.password.is_empty()
+        self.credential().is_enabled()
+    }
+
+    /// True when this node is still waiting to be claimed.
+    #[must_use]
+    pub fn is_unclaimed(&self) -> bool {
+        self.credential().is_unclaimed()
+    }
+
+    /// What a `/admin` page needs to know before it has a session: which pane to
+    /// render, and — on an unclaimed node — which token is live.
+    #[must_use]
+    pub fn bootstrap(&self) -> (bool, Option<String>) {
+        let credential = self.credential();
+        (credential.is_unclaimed(), credential.token_fingerprint())
+    }
+
+    /// Trade a setup token for a password, replacing the live credential.
+    ///
+    /// # Errors
+    /// If the node is already claimed, the token is wrong, the password is too
+    /// short, or the credential cannot be written.
+    pub fn claim(&self, token: &str, password: &str) -> Result<(), anyhow::Error> {
+        let claimed = {
+            let current = self.credential();
+            credentials::claim(&self.inner.app_dir, &current, token, password)?
+        };
+        *self.credential_mut() = claimed;
+        Ok(())
+    }
+
+    fn credential(&self) -> RwLockReadGuard<'_, AdminCredential> {
+        self.inner
+            .credential
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn credential_mut(&self) -> RwLockWriteGuard<'_, AdminCredential> {
+        self.inner
+            .credential
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a submitted password is this node's.
+    #[must_use]
+    pub(crate) fn verify_password(&self, submitted: &str) -> bool {
+        self.credential().verify(submitted)
     }
 
     /// The process-restart switch. See [`RestartHandle`].
@@ -220,12 +309,36 @@ impl AdminState {
         &self.inner.restart
     }
 
-    pub(crate) fn identity(&self) -> Option<&NodeIdentity> {
-        self.inner.identity.as_ref()
+    /// The node's key and Portal client, when it has them.
+    ///
+    /// Owned so a handler can hold it across an await — `register` does exactly
+    /// that — without keeping the state lock for a Portal round trip.
+    pub(crate) fn identity(&self) -> Option<Arc<NodeIdentity>> {
+        self.inner.runtime.identity()
     }
 
-    fn password(&self) -> &AdminPassword {
-        &self.inner.password
+    /// Where this node keeps its keystore and credentials.
+    pub(crate) fn app_dir(&self) -> &std::path::Path {
+        &self.inner.app_dir
+    }
+
+    /// Hold a freshly issued setup envelope, replacing any previous one.
+    pub(crate) fn store_envelope(&self, session: setup::EnvelopeSession) {
+        *self
+            .inner
+            .envelope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+    }
+
+    /// Consume the live envelope. An envelope is good for one attempt, whether
+    /// or not that attempt succeeds.
+    pub(crate) fn take_envelope(&self) -> Option<setup::EnvelopeSession> {
+        self.inner
+            .envelope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn session_key(&self) -> &[u8; 32] {
@@ -237,7 +350,8 @@ impl std::fmt::Debug for AdminState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminState")
             .field("enabled", &self.is_enabled())
-            .field("identity", &self.inner.identity)
+            .field("unclaimed", &self.is_unclaimed())
+            .field("runtime", &self.inner.runtime)
             .finish_non_exhaustive()
     }
 }
@@ -246,8 +360,16 @@ impl std::fmt::Debug for AdminState {
 ///
 /// The page keys its behaviour off these rather than off message text.
 pub mod error_codes {
-    /// `ADMIN_PASSWORD` is unset, so the admin UI is turned off.
+    /// The admin UI is turned off outright.
     pub const ADMIN_UI_DISABLED: &str = "ADMIN_UI_DISABLED";
+    /// Nobody has claimed this node yet, so there is no password to check.
+    pub const ADMIN_NOT_CLAIMED: &str = "ADMIN_NOT_CLAIMED";
+    /// The submitted setup token did not match.
+    pub const INVALID_SETUP_TOKEN: &str = "INVALID_SETUP_TOKEN";
+    /// A claim arrived for a node that already has a password.
+    pub const ALREADY_CLAIMED: &str = "ALREADY_CLAIMED";
+    /// The password offered at claim time was too short.
+    pub const WEAK_PASSWORD: &str = "WEAK_PASSWORD";
     /// The submitted password did not match.
     pub const INVALID_PASSWORD: &str = "INVALID_PASSWORD";
     /// Too many failed logins from this client; retry later.
@@ -269,6 +391,15 @@ pub mod error_codes {
     pub const DATABASE_ERROR: &str = "DATABASE_ERROR";
     /// The session could not be issued (signing failure).
     pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    /// Setup was asked for on a node that already has a key.
+    pub const SETUP_UNAVAILABLE: &str = "SETUP_UNAVAILABLE";
+    /// The setup envelope is unknown, expired, or its payload did not
+    /// authenticate.
+    pub const INVALID_ENVELOPE: &str = "INVALID_ENVELOPE";
+    /// The decrypted setup payload was not a usable seed phrase.
+    pub const INVALID_SETUP: &str = "INVALID_SETUP";
+    /// A seal change was asked for that this node is not in a position to make.
+    pub const SEAL_UNAVAILABLE: &str = "SEAL_UNAVAILABLE";
 }
 
 /// An error rendered as `{"error": {"code": ..., "message": ...}}`.
@@ -367,10 +498,25 @@ pub fn router() -> Router<DownloadServerState> {
         // as often as not, and axum does not treat them as the same route.
         .route("/admin", get(ui::admin_page))
         .route("/admin/", get(ui::admin_page))
+        .route("/api/admin/bootstrap", get(bootstrap_handler))
+        .route("/api/admin/claim", post(claim_handler))
         .route("/api/admin/login", post(login_handler))
         .route("/api/admin/status", get(status_handler))
         .route("/api/admin/reset-database", post(reset_handler))
         .route("/api/admin/register-node", post(register_handler))
+        .route("/api/admin/setup/envelope", get(envelope_handler))
+        .route("/api/admin/setup/provision", post(provision_handler))
+        .route("/api/admin/seal", get(seal_handler))
+        .route("/api/admin/seal/env-slot", post(add_env_slot_handler))
+        .route(
+            "/api/admin/seal/drop-file-slot",
+            post(drop_file_slot_handler),
+        )
+        .route(
+            "/api/admin/seal/passphrase",
+            post(add_passphrase_slot_handler),
+        )
+        .route("/api/admin/unseal", post(unseal_handler))
 }
 
 /// `POST /api/admin/login`
@@ -386,6 +532,99 @@ async fn login_handler(
     session::login(&request, client, &state.admin)
         .await
         .map(Json)
+}
+
+/// `GET /api/admin/claim`'s sibling: what the page needs before it has a session.
+///
+/// Unauthenticated, and it has to be: the whole question it answers is which
+/// screen to render for someone who cannot yet log in. It gives away nothing
+/// `POST /api/admin/login` does not already give away through its status code —
+/// whether the node is claimed, and what phase it is in — and saying so out loud
+/// here is cheaper than an argument at review time.
+///
+/// The setup token is *not* included, only its fingerprint. An operator who has
+/// the token can confirm they have the right one; an operator who does not
+/// learns nothing.
+async fn bootstrap_handler(State(state): State<DownloadServerState>) -> Json<Value> {
+    let (unclaimed, fingerprint) = state.admin.bootstrap();
+    Json(json!({
+        "phase": state.runtime.phase().as_str(),
+        "claimed": !unclaimed,
+        "enabled": state.admin.is_enabled(),
+        "setup_token_fingerprint": fingerprint,
+    }))
+}
+
+/// `POST /api/admin/claim`
+async fn claim_handler(
+    State(state): State<DownloadServerState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    Json(request): Json<session::AdminClaimRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let client = client.map(|ConnectInfo(addr)| addr.ip());
+    session::claim(&request, client, &state.admin)
+        .await
+        .map(Json)
+}
+
+/// `GET /api/admin/setup/envelope`
+async fn envelope_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+) -> Result<Json<Value>, ApiError> {
+    setup::issue_envelope(&state).map(Json)
+}
+
+/// `POST /api/admin/setup/provision`
+async fn provision_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<setup::ProvisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    setup::provision(&request, &state).map(Json)
+}
+
+/// `GET /api/admin/seal`
+async fn seal_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+) -> Json<Value> {
+    Json(seal::status(&state))
+}
+
+/// `POST /api/admin/seal/env-slot`
+async fn add_env_slot_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+) -> Result<Json<Value>, ApiError> {
+    seal::add_env_slot(&state).await.map(Json)
+}
+
+/// `POST /api/admin/seal/drop-file-slot`
+async fn drop_file_slot_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<seal::SealRequest>,
+) -> Result<Json<Value>, ApiError> {
+    seal::drop_file_slot(&request, &state).await.map(Json)
+}
+
+/// `POST /api/admin/seal/passphrase`
+async fn add_passphrase_slot_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<seal::PassphraseRequest>,
+) -> Result<Json<Value>, ApiError> {
+    seal::add_passphrase_slot(&request, &state).await.map(Json)
+}
+
+/// `POST /api/admin/unseal`
+async fn unseal_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<seal::PassphraseRequest>,
+) -> Result<Json<Value>, ApiError> {
+    seal::unseal(&request, &state).await.map(Json)
 }
 
 /// `GET /api/admin/status`
@@ -446,9 +685,9 @@ mod tests {
         assert!(rendered.contains("enabled: true"), "{rendered}");
     }
 
-    /// The identity is the one thing on this state that carries a secret, and
-    /// it is now printed as part of the admin state — so its `Debug` has to
-    /// redact for the same reason [`BlsKeyPair`]'s does.
+    /// The identity is the one thing reachable from this state that carries a
+    /// secret, and it is printed as part of the admin state — so its `Debug`
+    /// has to redact for the same reason [`BlsKeyPair`]'s does.
     #[test]
     fn debug_output_names_the_registration_without_the_key() {
         use crate::testutils::tempdir;
@@ -596,7 +835,7 @@ mod tests {
                 db,
                 storage_dir: dir.path().to_path_buf(),
                 storage_backend: StorageBackend::local(),
-                node_id: Some("NODE-admin".to_string()),
+                runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-admin"), None),
                 admin: AdminState::with_password(AdminPassword::new(password)),
             };
             (state, dir)
@@ -637,6 +876,289 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{payload}");
             payload["token"].as_str().unwrap().to_string()
+        }
+
+        /// State for a node nobody has claimed, over a real application
+        /// directory so the claim actually writes a credential.
+        async fn unclaimed_state() -> (DownloadServerState, tempfile::TempDir, String) {
+            let (mut state, _dir) = state_with_password(None).await;
+            let app_dir = tempfile::tempdir().unwrap();
+
+            let credential = credentials::AdminCredential::load_or_bootstrap(
+                app_dir.path(),
+                &AdminPassword::new(None),
+            )
+            .await
+            .unwrap();
+            let token = std::fs::read_to_string(app_dir.path().join(credentials::SETUP_TOKEN_FILE))
+                .unwrap()
+                .trim()
+                .to_string();
+
+            state.admin = AdminState::new(
+                credential,
+                app_dir.path().to_path_buf(),
+                RestartHandle::unavailable(),
+                crate::app::lifecycle::NodeRuntime::for_tests(None, None),
+            );
+            (state, app_dir, token)
+        }
+
+        /// The bootstrap endpoint is what a browser with no session asks first,
+        /// so it has to answer without one.
+        #[tokio::test]
+        async fn bootstrap_is_public_and_says_whether_the_node_is_claimed() {
+            let (state, _app_dir, _token) = unclaimed_state().await;
+
+            let (status, payload) = call(
+                &state,
+                Request::builder()
+                    .uri("/api/admin/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(payload["claimed"], false);
+            assert_eq!(payload["enabled"], false);
+            // The fingerprint, never the token.
+            assert!(payload["setup_token_fingerprint"].is_string());
+        }
+
+        /// Unclaimed and disabled are different answers, and the page renders a
+        /// different screen for each.
+        #[tokio::test]
+        async fn login_on_an_unclaimed_node_says_so_rather_than_unavailable() {
+            let (state, _app_dir, _token) = unclaimed_state().await;
+            session::reset_throttle_for_tests(None);
+
+            let (status, payload) = call(
+                &state,
+                post("/api/admin/login", json!({"password": PASSWORD})),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::ADMIN_NOT_CLAIMED);
+        }
+
+        /// The whole zero-configuration entry point: a token off the logs
+        /// becomes a password and a session, in one request.
+        #[tokio::test]
+        async fn claiming_sets_a_password_and_signs_the_operator_in() {
+            let (state, app_dir, token) = unclaimed_state().await;
+            session::reset_throttle_for_tests(None);
+
+            let (status, payload) = call(
+                &state,
+                post(
+                    "/api/admin/claim",
+                    json!({"token": token, "password": PASSWORD}),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK, "{payload}");
+            assert!(payload["token"].is_string());
+            assert!(app_dir.path().join(credentials::ADMIN_FILE).exists());
+            assert!(!app_dir.path().join(credentials::SETUP_TOKEN_FILE).exists());
+
+            // And the password now works.
+            session::reset_throttle_for_tests(None);
+            let (status, payload) = call(
+                &state,
+                post("/api/admin/login", json!({"password": PASSWORD})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{payload}");
+        }
+
+        #[tokio::test]
+        async fn a_claim_with_the_wrong_token_is_rejected_and_changes_nothing() {
+            let (state, app_dir, _token) = unclaimed_state().await;
+            session::reset_throttle_for_tests(None);
+
+            let (status, payload) = call(
+                &state,
+                post(
+                    "/api/admin/claim",
+                    json!({"token": "f".repeat(64), "password": PASSWORD}),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::INVALID_SETUP_TOKEN);
+            assert!(!app_dir.path().join(credentials::ADMIN_FILE).exists());
+        }
+
+        /// The password floor is checked before the token, so someone who typed
+        /// a short password is told that rather than sent to re-check a token
+        /// that was fine.
+        #[tokio::test]
+        async fn a_claim_with_a_short_password_says_which_rule_it_broke() {
+            let (state, _app_dir, token) = unclaimed_state().await;
+            session::reset_throttle_for_tests(None);
+
+            let (status, payload) = call(
+                &state,
+                post(
+                    "/api/admin/claim",
+                    json!({"token": token, "password": "short"}),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::WEAK_PASSWORD);
+        }
+
+        #[tokio::test]
+        async fn a_claimed_node_refuses_a_second_claim() {
+            let (state, _app_dir, token) = unclaimed_state().await;
+            session::reset_throttle_for_tests(None);
+            call(
+                &state,
+                post(
+                    "/api/admin/claim",
+                    json!({"token": token.clone(), "password": PASSWORD}),
+                ),
+            )
+            .await;
+
+            session::reset_throttle_for_tests(None);
+            let (status, payload) = call(
+                &state,
+                post(
+                    "/api/admin/claim",
+                    json!({"token": token, "password": PASSWORD}),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::ALREADY_CLAIMED);
+        }
+
+        /// Setup is only ever available on a node with no key. A node that is
+        /// merely sealed must be refused too: provisioning over a keystore
+        /// nobody can currently open would replace an identity that is only
+        /// temporarily out of reach.
+        #[tokio::test]
+        async fn setup_is_refused_on_a_node_that_already_has_a_key() {
+            let (state, _dir) = state_with_password(Some(PASSWORD)).await;
+            let token = sign_in(&state).await;
+
+            for phase in [
+                crate::app::lifecycle::Phase::Running,
+                crate::app::lifecycle::Phase::Sealed,
+                crate::app::lifecycle::Phase::Unregistered,
+            ] {
+                state.runtime.enter(phase);
+
+                let (status, payload) = call(
+                    &state,
+                    authorized(Request::builder().uri("/api/admin/setup/envelope"), &token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+
+                assert_eq!(status, StatusCode::CONFLICT, "{phase}: {payload}");
+                assert_eq!(payload["error"]["code"], error_codes::SETUP_UNAVAILABLE);
+            }
+        }
+
+        /// An envelope is good for exactly one attempt. A second request must
+        /// find nothing to open with, whether or not the first succeeded.
+        #[tokio::test]
+        async fn a_setup_envelope_is_consumed_by_the_first_attempt() {
+            let (state, _dir) = state_with_password(Some(PASSWORD)).await;
+            state
+                .runtime
+                .enter(crate::app::lifecycle::Phase::Uninitialized);
+            let token = sign_in(&state).await;
+
+            let (status, envelope) = call(
+                &state,
+                authorized(Request::builder().uri("/api/admin/setup/envelope"), &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{envelope}");
+
+            let attempt = json!({
+                "session_id": envelope["session_id"],
+                "client_pubkey": "00",
+                "nonce": "00",
+                "ciphertext": "00",
+            });
+
+            // The first attempt fails on the payload, not on the envelope.
+            let (status, payload) = call(
+                &state,
+                authorized(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/admin/setup/provision")
+                        .header(header::CONTENT_TYPE, "application/json"),
+                    &token,
+                )
+                .body(Body::from(attempt.to_string()))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::INVALID_ENVELOPE);
+
+            // The second finds the envelope already spent.
+            let (status, payload) = call(
+                &state,
+                authorized(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/admin/setup/provision")
+                        .header(header::CONTENT_TYPE, "application/json"),
+                    &token,
+                )
+                .body(Body::from(attempt.to_string()))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+            assert_eq!(payload["error"]["code"], error_codes::INVALID_ENVELOPE);
+        }
+
+        /// Every setup and seal route is behind a session. The one exception is
+        /// `bootstrap`, which is covered above and has to be public.
+        #[tokio::test]
+        async fn the_setup_and_seal_routes_require_a_session() {
+            let (state, _dir) = state_with_password(Some(PASSWORD)).await;
+
+            for (method, uri) in [
+                ("GET", "/api/admin/setup/envelope"),
+                ("POST", "/api/admin/setup/provision"),
+                ("GET", "/api/admin/seal"),
+                ("POST", "/api/admin/seal/env-slot"),
+                ("POST", "/api/admin/seal/drop-file-slot"),
+                ("POST", "/api/admin/seal/passphrase"),
+                ("POST", "/api/admin/unseal"),
+            ] {
+                let (status, payload) = call(
+                    &state,
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await;
+
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {payload}");
+            }
         }
 
         /// The page is the login screen, so gating it would make the node

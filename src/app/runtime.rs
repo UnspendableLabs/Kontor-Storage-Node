@@ -1,40 +1,50 @@
 //! Application runtime and shutdown logic.
 //!
-//! Contains the main run loop, daemon configuration, and graceful shutdown handling.
+//! # The order things happen in, and why it changed
+//!
+//! A node used to answer every question about itself before it served anything:
+//! load the key, ask the Portal who we are, build the daemon, and only then open
+//! a socket. That works exactly as long as the answers are already on the
+//! machine. It stops working the moment the answers are supposed to *arrive
+//! through* the server — which is what a node configured from its own `/admin`
+//! requires.
+//!
+//! So the order is inverted. [`serve`] starts the HTTP server first,
+//! unconditionally, before any Portal contact and possibly before the node has a
+//! key at all. A [`Supervisor`] task runs alongside it and moves the node
+//! through [`Phase`]s as the material appears: an operator claims the UI,
+//! provisions a key, unlocks a sealed one, gets an address whitelisted. Each of
+//! those is an [`Activation`] the supervisor carries out **in this process** —
+//! no exit, no restart, no supervisor-level bounce.
+//!
+//! That in-process activation is also what retires the old special case. Serving
+//! `/admin` on an unregistered node used to need its own daemon-less run
+//! function and an exit code to get back out of; it is now just a phase the
+//! supervisor leaves when the Portal changes its mind.
 
 use crate::app::cli::{Cli, Commands};
 use crate::app::config::{Config, StorageMethod};
 use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
+use crate::app::lifecycle::{Activation, NodeRuntime, Phase, SealStatus};
+use crate::app::output::SharedWriter;
 use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::clients::PortalClient;
+use crate::crypto::keystore::{Keystore, SealKey, SealKeySource};
 use crate::database::DBClient;
-use crate::node;
+use crate::node::{self, KeySource, NodeKeys};
 use crate::server;
+use crate::server::admin::credentials::AdminCredential;
 use crate::server::admin::{AdminState, NodeIdentity, RegisteredNode};
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::{pin, signal, sync::oneshot};
-
-/// Configuration for the daemon process.
-pub struct DaemonConfig {
-    pub client: PortalClient,
-    pub conn: DatabaseConnection,
-    pub interval: Duration,
-    pub lock_path: PathBuf,
-    pub storage_limits: StorageLimits,
-    pub storage_backend: StorageBackend,
-    pub storage_dir: PathBuf,
-    pub download_addr: SocketAddr,
-    pub node_id: Option<String>,
-    pub admin: AdminState,
-}
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
 /// On Unix, this handles both signals; on other platforms, only SIGINT.
@@ -58,7 +68,10 @@ async fn shutdown_signal() -> io::Result<()> {
 ///
 /// The [`Outcome`] tells the caller whether to exit `0` or with
 /// [`crate::app::restart::RESTART_EXIT_CODE`]; see [`crate::app::restart`].
-pub async fn run(cli: Cli, writer: impl Write) -> Result<Outcome> {
+///
+/// # Errors
+/// If the configuration is invalid, or the server cannot be started.
+pub async fn run(cli: Cli, writer: SharedWriter) -> Result<Outcome> {
     run_with_shutdown(cli, writer, shutdown_signal()).await
 }
 
@@ -66,6 +79,7 @@ pub async fn run(cli: Cli, writer: impl Write) -> Result<Outcome> {
 fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
     writeln!(writer, "Database URL: {}", config.database_url)?;
+    writeln!(writer, "App directory: {}", config.app_dir.display())?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
 
     if config.storage_method == StorageMethod::Gcs {
@@ -101,18 +115,6 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Filestorage contract: {}",
         config.kontor_contract_address
     )?;
-    // Says which way the switch is set without ever naming the value: an
-    // operator who forgot to set ADMIN_PASSWORD sees it here rather than at a
-    // login screen that answers 503.
-    writeln!(
-        writer,
-        "Admin UI: {}",
-        if config.admin_password.is_empty() {
-            "disabled (set ADMIN_PASSWORD to enable /admin)"
-        } else {
-            "enabled at /admin"
-        }
-    )?;
 
     Ok(())
 }
@@ -127,11 +129,8 @@ fn setup_storage_directory(config: &Config) -> Result<()> {
     })
 }
 
-/// What the HTTP server needs, independent of whether the node is registered.
-///
-/// Split out because an unregistered node still serves `/admin` — that is the
-/// only place its registration can be repaired from — and so needs all of this
-/// without ever building a daemon.
+/// What the HTTP server needs, independent of what the node knows about itself.
+#[derive(Clone)]
 struct ServerParts {
     conn: DatabaseConnection,
     storage_backend: StorageBackend,
@@ -155,120 +154,386 @@ async fn build_server_parts(config: &Config) -> Result<ServerParts> {
     })
 }
 
-/// Build the daemon configuration from the app config and onboarding result.
-async fn build_daemon_config(
-    config: &Config,
-    authenticated_client: PortalClient,
-    node_id: String,
-    identity: NodeIdentity,
-) -> Result<DaemonConfig> {
-    let parts = build_server_parts(config).await?;
-
-    let storage_limits = StorageLimits {
-        capacity: config.storage_capacity,
-        max_file_size: config.storage_max_file_size,
-        max_files: config.storage_max_files,
-    };
-
-    Ok(DaemonConfig {
-        client: authenticated_client,
-        conn: parts.conn,
-        interval: config.portal_polling_interval,
-        lock_path: config.storage_dir.join(".portal-daemon.lock"),
-        storage_limits,
-        storage_backend: parts.storage_backend,
-        storage_dir: config.storage_dir.clone(),
-        download_addr: parts.download_addr,
-        node_id: Some(node_id),
-        admin: AdminState::new(
-            config.admin_password.clone(),
-            RestartHandle::from_env(),
-            Some(identity),
-        ),
-    })
-}
-
 /// How often an unregistered node re-checks whether the Portal has heard of it.
 #[cfg(not(test))]
 const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Serve `/admin` on a node the Portal has never heard of.
+/// Run the application with a custom shutdown signal.
 ///
-/// No daemon, no announce, no faucet: none of them mean anything without a
-/// `signer_id`. The server is up for one reason, which is to let an operator
-/// register the BLS key from a browser that has Horizon Wallet — see
-/// [`crate::server::admin::register`].
-///
-/// A background lookup runs alongside it so the node also recovers from a
-/// registration made anywhere else. Either way the fix is the same: exit, and
-/// let the supervisor start a process that onboards properly. Restarting is
-/// only offered when a restarted process could get back up unattended, so a
-/// node without `BLS_PASSWORD` stays here until a human intervenes — which is
-/// the same node that would have stopped at a password prompt anyway.
-///
-/// A mnemonic node whose registration was refused has nobody to wait for. It
-/// signed a complete registration during onboarding and the Portal declined it,
-/// almost always because its address is not whitelisted yet; whitelisting it
-/// does not register anything, and no browser can, since the Taproot key never
-/// left this process. So `pending_registration` is replayed on the same tick as
-/// the lookup, and the node comes up on its own the moment the Portal relents.
-async fn run_unregistered(
-    config: &Config,
-    client: PortalClient,
-    node: node::UnregisteredNode,
-    writer: &mut impl Write,
+/// # Errors
+/// If the configuration is invalid, or the server cannot be started.
+pub async fn run_with_shutdown(
+    cli: Cli,
+    mut writer: SharedWriter,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> Result<Outcome> {
-    let node::UnregisteredNode {
-        keypair,
-        bls_pubkey,
-        derived,
-        mut pending_registration,
-    } = node;
+    let config = Config::from_cli(&cli)?;
 
-    let parts = build_server_parts(config).await?;
-    let restart = RestartHandle::from_env();
-    let identity = NodeIdentity::new(Arc::new(keypair), client.clone(), None, derived);
+    print_config_info(&config, &mut writer)?;
+    setup_storage_directory(&config)?;
+
+    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
+        .with_contract_address(&config.kontor_contract_address);
+
+    match cli.command {
+        Commands::Ping => {
+            let body = client.ping().await?;
+            writeln!(writer, "{body}")?;
+            Ok(Outcome::Shutdown)
+        }
+        Commands::Run => serve(config, client, writer, shutdown).await,
+    }
+}
+
+/// Bring the node up: server first, then whatever the volume allows.
+async fn serve(
+    config: Config,
+    client: PortalClient,
+    mut writer: SharedWriter,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> Result<Outcome> {
+    let parts = build_server_parts(&config).await?;
+
+    // Reading the keys can fail — a corrupt keystore, a seal key that does not
+    // open it — and that failure is fatal by design: it means there *is* an
+    // identity here and we cannot reach it, which is the one situation where
+    // carrying on and offering the setup wizard would provision a second one
+    // over the top of the first.
+    let source = resolve_keys(&config, &mut writer).await?;
+
+    let (phase, seal, opened) = match source {
+        KeySource::Open {
+            keystore,
+            keys,
+            seal_key,
+            seal_source,
+        } => (
+            Phase::Activating,
+            SealStatus::opened(&keystore, &seal_key, seal_source),
+            Some((keystore, keys, seal_key, seal_source)),
+        ),
+        KeySource::Sealed { keystore } => {
+            writeln!(
+                writer,
+                "\nThis node has a keystore but nothing here can open it.\n  \
+                   slots: {}\n  \
+                 Set {} to the key for one of them, restore the seal key file, or unlock \
+                 it from /admin.",
+                keystore
+                    .slots()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                crate::crypto::keystore::SEAL_KEY_ENV,
+            )?;
+            (Phase::Sealed, SealStatus::locked(&keystore), None)
+        }
+        KeySource::Uninitialized => {
+            writeln!(
+                writer,
+                "\nThis node has no keys yet. Open /admin to set it up."
+            )?;
+            (Phase::Uninitialized, SealStatus::default(), None)
+        }
+    };
+
+    let runtime = NodeRuntime::new(phase, seal);
+
+    // A restart is only ever offered where a restarted process could come back
+    // on its own. That used to mean "a password is in the environment"; it now
+    // means the keystore has a slot the machine can supply. A node whose only
+    // slot is a passphrase would come back up sealed and wait for a human, so
+    // restarting it is not a recovery, it is an outage.
+    let restart = RestartHandle::new(
+        opened
+            .as_ref()
+            .is_some_and(|(keystore, ..)| keystore.can_boot_unattended()),
+    );
+    let credential =
+        AdminCredential::load_or_bootstrap(&config.app_dir, &config.admin_password).await?;
+    let setup_notice = credential.startup_notice();
     let admin = AdminState::new(
-        config.admin_password.clone(),
+        credential,
+        config.app_dir.clone(),
         restart.clone(),
-        Some(identity),
+        runtime.clone(),
     );
 
-    if admin.is_enabled() {
-        writeln!(
+    // Printed after everything else, so on a fresh node the last thing an
+    // operator sees is the one action that unblocks all the others.
+    match setup_notice {
+        Some(notice) => writeln!(writer, "\n{notice}\n")?,
+        None => writeln!(
             writer,
-            "Serving /admin only until this node is registered.\n"
-        )?;
-    } else {
-        writeln!(
-            writer,
-            "ADMIN_PASSWORD is unset, so /admin cannot be unlocked to register this key.\n\
-             Set it and restart, or register the key from elsewhere — this node re-checks \
-             every {}s.\n",
-            UNREGISTERED_LOOKUP_INTERVAL.as_secs()
-        )?;
+            "\nAdmin UI: {}",
+            if admin.is_enabled() {
+                "enabled at /admin"
+            } else {
+                "disabled"
+            }
+        )?,
     }
 
-    // Nothing stops this loop but the abort below: a restart asked for from
-    // `/admin` already woke the run loop, and one more lookup on the way out
-    // costs less than a second flag to check.
-    let watcher = tokio::spawn({
-        let restart = restart.clone();
-        async move {
+    let config = Arc::new(config);
+    let supervisor = tokio::spawn(
+        Supervisor {
+            config: config.clone(),
+            client,
+            parts: parts.clone(),
+            runtime: runtime.clone(),
+            writer,
+            daemon: None,
+            watcher: None,
+            keystore: None,
+        }
+        .run(opened),
+    );
+
+    let outcome = serve_until_shutdown(
+        parts.download_addr,
+        server::DownloadServerState {
+            db: parts.conn,
+            storage_dir: config.storage_dir.clone(),
+            storage_backend: parts.storage_backend,
+            runtime,
+            admin,
+        },
+        restart,
+        shutdown,
+    )
+    .await;
+
+    supervisor.abort();
+    let _ = supervisor.await;
+
+    outcome
+}
+
+/// Open the keystore, migrating a legacy node into one if that is what this
+/// volume turns out to be.
+async fn resolve_keys(config: &Config, writer: &mut SharedWriter) -> Result<KeySource> {
+    let key_path = node::onboarding::key_management::get_key_path(config.bls_key_path.as_deref())?;
+    let password_reader = node::onboarding::get_password_reader();
+
+    node::open_or_migrate(
+        &config.app_dir,
+        &key_path,
+        crate::crypto::MnemonicSettings::from_env()?.as_ref(),
+        writer,
+        password_reader.as_ref(),
+    )
+    .await
+}
+
+/// The task that moves the node between phases.
+///
+/// It owns everything activation needs, so a test can drive it against a mock
+/// Portal without going near [`run_with_shutdown`] or a real socket.
+struct Supervisor {
+    config: Arc<Config>,
+    /// Unauthenticated client. Onboarding builds the signed one.
+    client: PortalClient,
+    parts: ServerParts,
+    runtime: NodeRuntime,
+    writer: SharedWriter,
+    daemon: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<()>>,
+    /// Kept so the node can be onboarded again without the operator supplying
+    /// anything: unsealing a raw slot is one AEAD open, so re-deriving the keys
+    /// is cheaper than keeping a `NodeKeys` alive across every await.
+    keystore: Option<(Box<Keystore>, SealKey, SealKeySource)>,
+}
+
+type Opened = (Box<Keystore>, Box<NodeKeys>, SealKey, SealKeySource);
+
+impl Supervisor {
+    async fn run(mut self, opened: Option<Opened>) {
+        if let Some((keystore, keys, seal_key, seal_source)) = opened {
+            self.keystore = Some((keystore, seal_key, seal_source));
+            self.activate(*keys).await;
+        }
+
+        loop {
+            match self.runtime.next().await {
+                Activation::Open {
+                    keystore,
+                    seal_key,
+                    source,
+                } => {
+                    self.runtime
+                        .set_seal(SealStatus::opened(&keystore, &seal_key, source));
+                    match keystore.unseal(&seal_key) {
+                        Ok(keypair) => {
+                            let keys = NodeKeys::Sealed(Box::new(node::SealedKeys {
+                                keypair,
+                                public: keystore.public().cloned(),
+                            }));
+                            self.keystore = Some((keystore, seal_key, source));
+                            self.activate(keys).await;
+                        }
+                        Err(e) => self.fail("could not open the keystore", &e),
+                    }
+                }
+                Activation::Reonboard => match self.reopen() {
+                    Ok(keys) => self.activate(keys).await,
+                    Err(e) => self.fail("could not reopen the keystore", &e),
+                },
+            }
+        }
+    }
+
+    /// Derive the keys again from the keystore this node was opened with.
+    fn reopen(&self) -> Result<NodeKeys> {
+        let (keystore, seal_key, _) = self
+            .keystore
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this node has no keystore to reopen"))?;
+
+        Ok(NodeKeys::Sealed(Box::new(node::SealedKeys {
+            keypair: keystore.unseal(seal_key)?,
+            public: keystore.public().cloned(),
+        })))
+    }
+
+    /// Onboard, then start serving — or land in a phase that says why not.
+    async fn activate(&mut self, keys: NodeKeys) {
+        self.stop_daemon().await;
+        self.stop_watcher().await;
+        self.runtime.set_notice(None);
+        self.runtime.enter(Phase::Activating);
+
+        let outcome = node::perform_onboarding(
+            &self.client,
+            keys,
+            Some(&self.config.storage_dir),
+            &mut self.writer,
+        )
+        .await;
+
+        match outcome {
+            Ok(node::OnboardingOutcome::Ready(result)) => {
+                if let Err(e) = self.start_running(*result).await {
+                    self.fail("the node onboarded but could not start serving", &e);
+                }
+            }
+            Ok(node::OnboardingOutcome::Unregistered(node)) => self.wait_for_registration(*node),
+            Err(e) => self.fail("onboarding failed", &e),
+        }
+    }
+
+    /// Announce, fund, publish the identity, and start the daemon.
+    async fn start_running(&mut self, result: node::OnboardingResult) -> Result<()> {
+        let node::OnboardingResult {
+            keypair,
+            node_id,
+            signer_id,
+            token,
+            next_nonce,
+            public,
+        } = result;
+
+        let keypair = Arc::new(keypair);
+        let authenticated = PortalClient::try_with_auth(
+            &self.config.portal_url,
+            &self.config.storage_dir,
+            keypair.clone(),
+            &node_id,
+            signer_id,
+            token,
+            next_nonce,
+        )?
+        .with_contract_address(&self.config.kontor_contract_address);
+
+        if let Err(e) = authenticated.announce_node(&self.config.public_url).await {
+            tracing::warn!("Failed to announce node URL: {e}");
+        } else {
+            writeln!(
+                self.writer,
+                "✓ Announced public URL: {}",
+                self.config.public_url
+            )?;
+        }
+
+        node::ensure_kor_balance(&authenticated, signer_id, &mut self.writer).await?;
+
+        // The admin UI can re-register an already-registered node, so it gets
+        // the same key and an unauthenticated client here as it would on a node
+        // that never onboarded.
+        self.runtime.set_identity(NodeIdentity::new(
+            keypair,
+            self.client.clone(),
+            Some(RegisteredNode { node_id, signer_id }),
+            public,
+        ));
+
+        self.daemon = Some(spawn_portal_daemon(
+            authenticated,
+            self.parts.conn.clone(),
+            self.config.portal_polling_interval,
+            self.config.storage_dir.join(".portal-daemon.lock"),
+            StorageLimits {
+                capacity: self.config.storage_capacity,
+                max_file_size: self.config.storage_max_file_size,
+                max_files: self.config.storage_max_files,
+            },
+            self.parts.storage_backend.clone(),
+            self.config.storage_dir.clone(),
+        ));
+
+        writeln!(
+            self.writer,
+            "\nNode onboarding complete. Services started.\n"
+        )?;
+        self.runtime.enter(Phase::Running);
+        Ok(())
+    }
+
+    /// Sit in [`Phase::Unregistered`], watching for the Portal to change its
+    /// mind.
+    ///
+    /// Two things can end this wait and the loop covers both: a registration
+    /// made somewhere else, which the lookup notices, and this node's own
+    /// pending registration finally being accepted once an admin whitelists its
+    /// address. Neither needs the process to exit any more — the watcher asks
+    /// the supervisor to onboard again, in place.
+    fn wait_for_registration(&mut self, node: node::UnregisteredNode) {
+        let node::UnregisteredNode {
+            keypair,
+            bls_pubkey,
+            public,
+            mut pending_registration,
+        } = node;
+
+        self.runtime.set_identity(NodeIdentity::new(
+            Arc::new(keypair),
+            self.client.clone(),
+            None,
+            public,
+        ));
+        self.runtime.set_notice(Some(
+            "The Portal does not know this node's key yet. If its Taproot address is not \
+             whitelisted, ask a Portal admin to whitelist it — the node keeps offering its \
+             registration and starts on its own once they have."
+                .to_string(),
+        ));
+        self.runtime.enter(Phase::Unregistered);
+
+        let client = self.client.clone();
+        let runtime = self.runtime.clone();
+        self.watcher = Some(tokio::spawn(async move {
             // The last outcome reported, so a Portal that keeps giving the same
-            // answer is logged once rather than every 30s — which would bury the
-            // line that says which address has to be whitelisted. An acceptance
-            // takes the same slot: the Portal can accept and still not show the
-            // node, and repeating *that* every tick is no more useful.
+            // answer is logged once rather than every tick — which would bury
+            // the line that says which address has to be whitelisted.
             let mut announced: Option<String> = None;
             loop {
                 tokio::time::sleep(UNREGISTERED_LOOKUP_INTERVAL).await;
+
                 if client.lookup_node(&bls_pubkey).await.is_ok() {
-                    tracing::info!("The Portal now knows this BLS key; restarting to onboard");
-                    restart.request();
+                    tracing::info!("The Portal now knows this BLS key; onboarding");
+                    runtime.request(Activation::Reonboard);
                     return;
                 }
 
@@ -291,12 +556,12 @@ async fn run_unregistered(
                             announced = Some(reason);
                         }
                     }
-                    Err(e) if crate::node::registration::refusal_is_final(&e) => {
+                    Err(e) if node::registration::refusal_is_final(&e) => {
                         tracing::error!(
                             error = %format!("{e:#}"),
-                            "The Portal rejected this node's registration outright, so offering \
-                             it again cannot help; giving up on it. Still watching for a \
-                             registration made elsewhere."
+                            "The Portal rejected this node's registration outright, so \
+                             offering it again cannot help; giving up on it. Still \
+                             watching for a registration made elsewhere."
                         );
                         pending_registration = None;
                     }
@@ -305,8 +570,8 @@ async fn run_unregistered(
                         if announced.as_ref() != Some(&reason) {
                             tracing::warn!(
                                 error = %reason,
-                                "The Portal is still refusing this node's registration; retrying \
-                                 every {}s",
+                                "The Portal is still refusing this node's registration; \
+                                 retrying every {}s",
                                 UNREGISTERED_LOOKUP_INTERVAL.as_secs()
                             );
                             announced = Some(reason);
@@ -314,164 +579,46 @@ async fn run_unregistered(
                     }
                 }
             }
+        }));
+    }
+
+    /// Land in [`Phase::Failed`] with the reason on record.
+    ///
+    /// Never fatal to the process. The server is the only way an operator can
+    /// see the reason or do anything about it, so taking it down with the
+    /// activation would remove the fix along with the problem.
+    fn fail(&self, what: &str, error: &anyhow::Error) {
+        let detail = format!("{error:#}");
+        tracing::error!(error = %detail, "{what}");
+        let _ = writeln!(self.writer.clone(), "\n{what}: {detail}\n");
+        self.runtime.set_notice(Some(format!("{what}: {detail}")));
+        self.runtime.enter(Phase::Failed);
+    }
+
+    /// Stop the daemon and **wait for it to be gone**.
+    ///
+    /// The await is the whole point. `abort()` only schedules cancellation, and
+    /// the daemon holds its lock file until its guard drops; re-spawning before
+    /// that lands means the new daemon finds the old one's lock, reports
+    /// "another daemon may already be running" into a log line, and quietly
+    /// never runs. A node that serves files while proving nothing looks healthy
+    /// from outside, which is the worst way to fail.
+    async fn stop_daemon(&mut self) {
+        if let Some(handle) = self.daemon.take() {
+            handle.abort();
+            let _ = handle.await;
         }
-    });
+    }
 
-    let outcome = serve_until_shutdown(
-        parts.download_addr,
-        server::DownloadServerState {
-            db: parts.conn,
-            storage_dir: config.storage_dir.clone(),
-            storage_backend: parts.storage_backend,
-            node_id: None,
-            admin,
-        },
-        restart,
-        shutdown,
-    )
-    .await;
-
-    watcher.abort();
-    let _ = watcher.await;
-
-    outcome
-}
-
-/// Run the application with a custom shutdown signal.
-pub async fn run_with_shutdown(
-    cli: Cli,
-    mut writer: impl Write,
-    shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<Outcome> {
-    let config = Config::from_cli(&cli)?;
-
-    print_config_info(&config, &mut writer)?;
-    setup_storage_directory(&config)?;
-
-    let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
-        .with_contract_address(&config.kontor_contract_address);
-
-    match cli.command {
-        Commands::Ping => {
-            let body = client.ping().await?;
-            writeln!(writer, "{body}")?;
-            Ok(Outcome::Shutdown)
-        }
-        Commands::Run => {
-            // Onboard: load BLS key, Portal lookup by pubkey, challenge login, registry nonce
-            let onboarding_config = node::OnboardingConfig {
-                bls_key_path: config.bls_key_path.clone(),
-                mnemonic: crate::crypto::MnemonicSettings::from_env()?,
-                // `storage_dir` is the one directory a node has to keep across
-                // restarts to be worth running, which is exactly the lifetime
-                // the identity record needs.
-                state_dir: Some(config.storage_dir.clone()),
-            };
-            let onboarding_result =
-                match node::perform_onboarding(&client, &onboarding_config, &mut writer).await? {
-                    node::OnboardingOutcome::Ready(result) => *result,
-                    node::OnboardingOutcome::Unregistered(node) => {
-                        return run_unregistered(&config, client, *node, &mut writer, shutdown)
-                            .await;
-                    }
-                };
-
-            tracing::debug!(
-                next_nonce = onboarding_result.next_nonce,
-                "onboarding registry nonce"
-            );
-
-            writeln!(writer)?;
-            writeln!(writer, "Node onboarding complete. Starting services...")?;
-            writeln!(writer)?;
-
-            node::ensure_kor_balance(&client, onboarding_result.signer_id, &mut writer).await?;
-
-            let node_id = onboarding_result.node_id;
-            let keypair = Arc::new(onboarding_result.keypair);
-
-            let authenticated_client = PortalClient::try_with_auth(
-                &config.portal_url,
-                &config.storage_dir,
-                keypair.clone(),
-                &node_id,
-                onboarding_result.signer_id,
-                onboarding_result.token,
-                onboarding_result.next_nonce,
-            )?
-            .with_contract_address(&config.kontor_contract_address);
-
-            if let Err(e) = authenticated_client.announce_node(&config.public_url).await {
-                tracing::warn!("Failed to announce node URL: {e}");
-            } else {
-                writeln!(writer, "✓ Announced public URL: {}", config.public_url)?;
-            }
-
-            // The admin UI can re-register an already-registered node, so it
-            // gets the same key and an unauthenticated client here as it would
-            // on a node that never onboarded.
-            let identity = NodeIdentity::new(
-                keypair,
-                client,
-                Some(RegisteredNode {
-                    node_id: node_id.clone(),
-                    signer_id: onboarding_result.signer_id,
-                }),
-                onboarding_result.derived,
-            );
-
-            let daemon_config =
-                build_daemon_config(&config, authenticated_client, node_id, identity).await?;
-            run_daemon_command(daemon_config, shutdown).await
+    async fn stop_watcher(&mut self) {
+        if let Some(handle) = self.watcher.take() {
+            handle.abort();
+            let _ = handle.await;
         }
     }
 }
 
-/// Run the daemon with the download server.
-///
-/// Stops on the shutdown signal, on the download server failing, or on an
-/// operator asking for a restart from `/admin` — the last of which reports
-/// [`Outcome::Restart`] so the caller can exit in a way the supervisor acts on.
-pub async fn run_daemon_command(
-    daemon: DaemonConfig,
-    shutdown: impl Future<Output = io::Result<()>>,
-) -> Result<Outcome> {
-    let daemon_backend = daemon.storage_backend.clone();
-    let restart = daemon.admin.restart().clone();
-    let handle = spawn_portal_daemon(
-        daemon.client,
-        daemon.conn.clone(),
-        daemon.interval,
-        daemon.lock_path,
-        daemon.storage_limits,
-        daemon_backend,
-        daemon.storage_dir.clone(),
-    );
-
-    let outcome = serve_until_shutdown(
-        daemon.download_addr,
-        server::DownloadServerState {
-            db: daemon.conn,
-            storage_dir: daemon.storage_dir,
-            storage_backend: daemon.storage_backend,
-            node_id: daemon.node_id,
-            admin: daemon.admin,
-        },
-        restart,
-        shutdown,
-    )
-    .await;
-
-    handle.abort();
-    let _ = handle.await;
-
-    outcome
-}
-
 /// Run the HTTP server until something asks it to stop.
-///
-/// Shared by the daemon and by an unregistered node, which differ only in
-/// whether there is a daemon alongside the server.
 async fn serve_until_shutdown(
     addr: SocketAddr,
     state: server::DownloadServerState,
@@ -515,7 +662,6 @@ async fn serve_until_shutdown(
         Outcome::Shutdown
     })
 }
-
 #[cfg(test)]
 mod tests {
     #![allow(deprecated)]
@@ -611,6 +757,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
@@ -627,9 +774,9 @@ mod tests {
             command: Commands::Ping,
         };
 
-        let mut buffer = Vec::new();
-        run(cli, &mut buffer).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        run(cli, writer).await.unwrap();
+        let output = captured.text();
 
         assert!(
             output.contains("Portal URL:"),
@@ -672,6 +819,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
@@ -688,8 +836,8 @@ mod tests {
             command: Commands::Ping,
         };
 
-        let mut buffer = Vec::new();
-        let err = run(cli, &mut buffer).await.unwrap_err();
+        let (writer, _captured) = SharedWriter::buffer();
+        let err = run(cli, writer).await.unwrap_err();
 
         assert!(
             err.to_string().contains("portal ping failed"),
@@ -720,6 +868,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(PathBuf::from("/tmp/storage")),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
@@ -738,9 +887,9 @@ mod tests {
             command: Commands::Ping,
         };
 
-        let mut buffer = Vec::new();
-        run(cli, &mut buffer).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        run(cli, writer).await.unwrap();
+        let output = captured.text();
 
         assert!(
             output.contains("Storage method: gcs"),
@@ -772,6 +921,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 3,
             storage_capacity: Some("2GB".into()),
@@ -788,9 +938,9 @@ mod tests {
             command: Commands::Ping,
         };
 
-        let mut buffer = Vec::new();
-        run(cli, &mut buffer).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        run(cli, writer).await.unwrap();
+        let output = captured.text();
 
         assert!(
             output.contains("Storage capacity: 2000000000 bytes"),
@@ -827,6 +977,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_file.clone()),
             portal_polling_interval_secs: 5,
             storage_capacity: None,
@@ -843,8 +994,8 @@ mod tests {
             command: Commands::Ping,
         };
 
-        let mut buffer = Vec::new();
-        let err = run(cli, &mut buffer).await.unwrap_err();
+        let (writer, _captured) = SharedWriter::buffer();
+        let err = run(cli, writer).await.unwrap_err();
 
         assert!(
             err.to_string()
@@ -960,6 +1111,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: Some("1GB".into()),
@@ -981,9 +1133,9 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
 
         // Cleanup
         cleanup_onboarding_env();
@@ -1031,6 +1183,7 @@ mod tests {
         Cli {
             portal_url,
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_dir),
             portal_polling_interval_secs: 1,
             storage_capacity: None,
@@ -1072,9 +1225,9 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
 
         cleanup_onboarding_env();
 
@@ -1083,7 +1236,7 @@ mod tests {
             output.contains("No node registered with this BLS public key"),
             "{output}"
         );
-        assert!(output.contains("Serving /admin only"), "{output}");
+        assert!(output.contains("Open /admin"), "{output}");
         assert!(
             !output.contains("Node onboarding complete"),
             "nothing past the lookup should have run: {output}"
@@ -1128,21 +1281,31 @@ mod tests {
             .await;
 
         let cli = unregistered_cli(mock_server.uri(), storage_dir.clone(), bls_key_path);
-        // Long enough that the watcher, not the signal, is what stops the node.
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Stopped by the assertion below rather than by a timer: what is being
+        // tested is that the node gets there at all, in one process.
         let shutdown = async {
-            sleep(Duration::from_secs(30)).await;
+            let onboarded = captured
+                .wait_for("Looking up node identity", Duration::from_secs(30))
+                .await;
+            assert!(onboarded, "the watcher must onboard without a restart");
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
 
         cleanup_onboarding_env();
 
+        // The point of in-process activation: a node whose registration finally
+        // lands comes up without the supervisor having to restart it. Before
+        // this, the only way out of the unregistered phase was `Outcome::Restart`
+        // and an exit code — which meant a container bounce for a state change
+        // the process was perfectly able to make on its own.
         assert_eq!(
             outcome,
-            Outcome::Restart,
-            "the supervisor has to start a process that can onboard"
+            Outcome::Shutdown,
+            "the node must onboard in place rather than exiting to be restarted"
         );
 
         std::fs::remove_dir_all(&storage_dir).ok();
@@ -1247,22 +1410,38 @@ mod tests {
             storage_dir.clone(),
             storage_dir.join("unused_bls_key.enc"),
         );
-        // Long enough that the watcher, not the signal, is what stops the node.
-        let shutdown = async {
-            sleep(Duration::from_secs(30)).await;
-            Ok(())
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Stopped by the retry succeeding, not by a timer.
+        let shutdown = {
+            let captured = captured.clone();
+            async move {
+                // The line only a *successful* lookup produces, so seeing it
+                // proves the replayed registration was accepted and the node
+                // onboarded again — in this process, with no restart.
+                let onboarded = captured
+                    .wait_for("not yet confirmed", Duration::from_secs(30))
+                    .await;
+                assert!(
+                    onboarded,
+                    "the retry has to end in a node that onboards: {}",
+                    captured.text()
+                );
+                Ok(())
+            }
         };
 
-        let mut buffer = Vec::new();
-        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
 
         cleanup_onboarding_env();
 
+        // No restart: the whitelisting lands, the node's own retry is accepted,
+        // and it onboards in the process that was already waiting.
         assert_eq!(
             outcome,
-            Outcome::Restart,
-            "the retry has to end in a process that can onboard: {output}"
+            Outcome::Shutdown,
+            "the retry must not need a restart: {output}"
         );
         assert!(output.contains("ADDRESS_NOT_WHITELISTED"), "{output}");
         assert!(
@@ -1341,9 +1520,9 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        let outcome = run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
 
         cleanup_onboarding_env();
 
@@ -1360,11 +1539,14 @@ mod tests {
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 
-    /// Without a password the operator cannot unlock the one page that would
-    /// fix this, so the node has to say so rather than sit there silently.
+    /// Without `ADMIN_PASSWORD` an unregistered node used to be a dead end: the
+    /// one page that could fix it could not be unlocked, and all the node could
+    /// do was say so. It now mints a setup token instead, which is the whole
+    /// point of the claim flow — the operator gets in with what the node itself
+    /// printed, having configured nothing.
     #[tokio::test]
     #[serial_test::serial]
-    async fn an_unregistered_node_without_an_admin_password_says_so() {
+    async fn an_unregistered_node_without_an_admin_password_can_still_be_claimed() {
         let _guard = TempAppDirGuard::new("unregistered_nopass");
         cleanup_onboarding_env();
         let mock_server = MockServer::start().await;
@@ -1384,13 +1566,24 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        run_with_shutdown(cli, &mut buffer, shutdown).await.unwrap();
-        let output = String::from_utf8(buffer).unwrap();
+        let (writer, captured) = SharedWriter::buffer();
+        run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
 
         cleanup_onboarding_env();
 
-        assert!(output.contains("ADMIN_PASSWORD is unset"), "{output}");
+        assert!(output.contains("has not been claimed yet"), "{output}");
+        assert!(output.contains("setup token"), "{output}");
+
+        // The token is on the volume as well as in the logs, so an operator who
+        // scrolled past it is not locked out.
+        let recorded = std::fs::read_to_string(
+            _guard
+                .dir
+                .join(crate::server::admin::credentials::SETUP_TOKEN_FILE),
+        )
+        .expect("the token must be written down too");
+        assert!(output.contains(recorded.trim()), "{output}");
 
         std::fs::remove_dir_all(&storage_dir).ok();
     }
@@ -1423,6 +1616,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: None,
@@ -1441,10 +1635,8 @@ mod tests {
 
         let shutdown = async { Err(io::Error::other("ctrlc failure")) };
 
-        let mut buffer = Vec::new();
-        let err = run_with_shutdown(cli, &mut buffer, shutdown)
-            .await
-            .unwrap_err();
+        let (writer, _captured) = SharedWriter::buffer();
+        let err = run_with_shutdown(cli, writer, shutdown).await.unwrap_err();
 
         // Cleanup
         cleanup_onboarding_env();
@@ -1562,6 +1754,7 @@ mod tests {
         let cli = Cli {
             portal_url: mock_server.uri(),
             database_url: "sqlite::memory:".to_string(),
+            app_dir: None,
             storage_dir: Some(storage_dir.clone()),
             portal_polling_interval_secs: 1,
             storage_capacity: None,
@@ -1583,10 +1776,10 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = Vec::new();
-        let result = run_with_shutdown(cli, &mut buffer, shutdown).await;
+        let (writer, captured) = SharedWriter::buffer();
+        let result = run_with_shutdown(cli, writer, shutdown).await;
         cleanup_onboarding_env();
-        let output = String::from_utf8(buffer).unwrap();
+        let output = captured.text();
 
         assert!(
             result.is_ok(),
@@ -1600,34 +1793,17 @@ mod tests {
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 
+    /// A server that cannot bind must report that, rather than sitting in a
+    /// phase nobody is watching.
     #[tokio::test]
-    async fn run_daemon_command_returns_server_error_when_binding_fails() {
-        let storage_dir = unique_storage_dir("bind_error");
-        let lock_path = storage_dir.join(".portal-daemon.lock");
-        let db = DBClient::new("sqlite::memory:").await.unwrap();
-        let storage_backend = StorageBackend::local();
-        let portal_client = PortalClient::new("http://localhost:0", storage_dir.clone());
-        let storage_limits = StorageLimits {
-            capacity: None,
-            max_files: Some(0),
-            max_file_size: None,
-        };
-        let shutdown = future::pending::<io::Result<()>>();
+    async fn serving_returns_the_bind_error() {
+        let (state, storage_dir) = idle_state("bind_error", AdminState::disabled()).await;
 
-        let err = run_daemon_command(
-            DaemonConfig {
-                client: portal_client,
-                conn: db.connection().clone(),
-                interval: Duration::from_millis(10),
-                lock_path: lock_path.clone(),
-                storage_limits,
-                storage_backend,
-                storage_dir: storage_dir.clone(),
-                download_addr: "127.0.0.1:1".parse().unwrap(),
-                node_id: Some("NODE-TEST".to_string()),
-                admin: AdminState::disabled(),
-            },
-            shutdown,
+        let err = serve_until_shutdown(
+            "127.0.0.1:1".parse().unwrap(),
+            state,
+            RestartHandle::unavailable(),
+            future::pending::<io::Result<()>>(),
         )
         .await
         .unwrap_err();
@@ -1637,48 +1813,40 @@ mod tests {
             "expected download server bind error, got {err}"
         );
 
-        std::fs::remove_file(&lock_path).ok();
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 
-    /// Builds a daemon that binds an ephemeral port and talks to nothing. The
-    /// Portal calls its daemon task makes all fail, which is fine: they are
-    /// logged inside the task, and what these tests watch is the run loop.
-    async fn idle_daemon(label: &str, admin: AdminState) -> (DaemonConfig, PathBuf) {
+    /// Server state for a node that talks to nothing. The Portal calls anything
+    /// downstream might make all fail, which is fine: what these tests watch is
+    /// the run loop's outcome.
+    async fn idle_state(label: &str, admin: AdminState) -> (server::DownloadServerState, PathBuf) {
         let storage_dir = unique_storage_dir(label);
         std::fs::create_dir_all(&storage_dir).unwrap();
         let db = DBClient::new("sqlite::memory:").await.unwrap();
 
-        let config = DaemonConfig {
-            client: PortalClient::new("http://localhost:0", storage_dir.clone()),
-            conn: db.connection().clone(),
-            interval: Duration::from_millis(10),
-            lock_path: storage_dir.join(".portal-daemon.lock"),
-            storage_limits: StorageLimits {
-                capacity: None,
-                max_files: Some(0),
-                max_file_size: None,
-            },
-            storage_backend: StorageBackend::local(),
+        let state = server::DownloadServerState {
+            db: db.connection().clone(),
             storage_dir: storage_dir.clone(),
-            download_addr: "127.0.0.1:0".parse().unwrap(),
-            node_id: Some("NODE-TEST".to_string()),
+            storage_backend: StorageBackend::local(),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin,
         };
-        (config, storage_dir)
+        (state, storage_dir)
     }
 
     /// The operator UI asks for a restart by flipping a switch the run loop is
     /// waiting on. Reporting it is what lets `main` pick an exit code the
     /// supervisor acts on, so a plain `Shutdown` here would leave the node down.
     #[tokio::test]
-    async fn run_daemon_command_reports_a_restart_the_admin_ui_asked_for() {
+    async fn serving_reports_a_restart_the_admin_ui_asked_for() {
         let restart = RestartHandle::available();
-        let (config, storage_dir) =
-            idle_daemon("admin_restart", AdminState::with_restart(restart.clone())).await;
+        let (state, storage_dir) =
+            idle_state("admin_restart", AdminState::with_restart(restart.clone())).await;
 
-        let task = tokio::spawn(run_daemon_command(
-            config,
+        let task = tokio::spawn(serve_until_shutdown(
+            "127.0.0.1:0".parse().unwrap(),
+            state,
+            restart.clone(),
             future::pending::<io::Result<()>>(),
         ));
         restart.request();
@@ -1716,15 +1884,23 @@ mod tests {
 
         let addr = free_local_addr();
         let restart = RestartHandle::available();
-        let (mut config, storage_dir) = idle_daemon(
+        let (state, storage_dir) = idle_state(
             "restart_over_http",
-            AdminState::new(AdminPassword::new(Some(PASSWORD)), restart.clone(), None),
+            AdminState::new(
+                crate::server::admin::credentials::AdminCredential::Env(AdminPassword::new(Some(
+                    PASSWORD,
+                ))),
+                PathBuf::new(),
+                restart.clone(),
+                crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
+            ),
         )
         .await;
-        config.download_addr = addr;
 
-        let run_loop = tokio::spawn(run_daemon_command(
-            config,
+        let run_loop = tokio::spawn(serve_until_shutdown(
+            addr,
+            state,
+            restart.clone(),
             future::pending::<io::Result<()>>(),
         ));
 
@@ -1778,12 +1954,17 @@ mod tests {
     /// The signal path keeps its meaning: exiting on SIGTERM must not read as
     /// "start me again".
     #[tokio::test]
-    async fn run_daemon_command_reports_a_plain_shutdown_as_shutdown() {
-        let (config, storage_dir) = idle_daemon("plain_shutdown", AdminState::disabled()).await;
+    async fn serving_reports_a_plain_shutdown_as_shutdown() {
+        let (state, storage_dir) = idle_state("plain_shutdown", AdminState::disabled()).await;
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            run_daemon_command(config, future::ready(Ok(()))),
+            serve_until_shutdown(
+                "127.0.0.1:0".parse().unwrap(),
+                state,
+                RestartHandle::unavailable(),
+                future::ready(Ok(())),
+            ),
         )
         .await
         .expect("a resolved shutdown signal must stop the run loop")

@@ -113,6 +113,24 @@
   </form>
 </div>
 
+<div id="claim" hidden>
+  <form class="card" id="claim-form">
+    <h1>Kontor Storage Node</h1>
+    <p class="sub">First-time setup</p>
+    <div class="msg err" id="claim-error"></div>
+    <p class="muted">
+      Nobody has claimed this node yet. Paste the setup token it printed on
+      startup and choose an admin password.
+    </p>
+    <p class="muted" id="claim-fingerprint" hidden></p>
+    <input type="text" id="claim-token" placeholder="Setup token" autocomplete="off"
+           spellcheck="false" autofocus required>
+    <input type="password" id="claim-password" placeholder="New admin password (16+ characters)"
+           autocomplete="new-password" required>
+    <button class="primary" type="submit" id="claim-submit">Claim this node</button>
+  </form>
+</div>
+
 <div id="app">
   <header class="bar">
     <h1>Storage Node · Admin</h1>
@@ -124,6 +142,71 @@
   </header>
 
   <div class="msg err" id="status-error"></div>
+  <div class="msg warn" id="phase-notice"></div>
+
+  <!-- Shown on a node with no key at all. The seed phrase is encrypted in the
+       browser before it leaves it; see `server::admin::setup` for what that
+       does and does not defend against. -->
+  <div class="card" id="setup" hidden>
+    <h2>Set up this node's identity</h2>
+    <div class="msg err" id="setup-error"></div>
+    <div class="msg ok" id="setup-success"></div>
+    <div class="msg err" id="setup-insecure" hidden>
+      This page is not running in a secure context, so the browser will not
+      provide the cryptography needed to encrypt your seed phrase before sending
+      it. Open this node over TLS, or through localhost, before setting it up.
+    </div>
+    <p class="muted">
+      Your seed phrase is encrypted in this browser and decrypted only inside the
+      node process. The node derives its BLS key from it, writes down the public
+      identity, and discards the phrase — it is never stored, in any form.
+    </p>
+    <textarea id="setup-mnemonic" rows="3" spellcheck="false" autocomplete="off"
+              placeholder="Your 12-word seed phrase"></textarea>
+    <div class="row">
+      <span class="k">Wallet account</span>
+      <input type="number" id="setup-account" min="1" step="1" value="1">
+    </div>
+    <div class="row">
+      <span class="k">Network</span>
+      <select id="setup-network">
+        <option value="signet" selected>signet</option>
+        <option value="mainnet">mainnet</option>
+        <option value="testnet">testnet</option>
+        <option value="regtest">regtest</option>
+      </select>
+    </div>
+    <p class="muted" id="setup-envelope"></p>
+    <button class="primary" id="setup-submit">Encrypt and set up</button>
+  </div>
+
+  <!-- The exit from a sealed node. Without it, a lost seal key is permanent. -->
+  <div class="card" id="unseal" hidden>
+    <h2>This node is sealed</h2>
+    <div class="msg err" id="unseal-error"></div>
+    <p class="muted">
+      This node has a key it cannot open: neither the seal key file nor
+      <span class="mono">KONTOR_SEAL_KEY</span> is available. Restore either of
+      them and restart, or unlock it with a seal passphrase if one was added.
+    </p>
+    <input type="password" id="unseal-passphrase" placeholder="Seal passphrase"
+           autocomplete="off">
+    <button class="primary" id="unseal-submit">Unseal</button>
+  </div>
+
+  <!-- How the key is sealed, and the two-step hardening flow. -->
+  <div class="card" id="seal" hidden>
+    <h2>Key sealing</h2>
+    <div class="msg err" id="seal-error"></div>
+    <div class="msg ok" id="seal-success"></div>
+    <div class="msg warn" id="seal-key-reveal" hidden></div>
+    <div class="row"><span class="k">Slots</span><span class="mono" id="seal-slots">—</span></div>
+    <div class="row"><span class="k">Opened with</span><span class="mono" id="seal-opened">—</span></div>
+    <div class="row"><span class="k">Fingerprint</span><span class="mono" id="seal-fingerprint">—</span></div>
+    <p class="muted" id="seal-note"></p>
+    <button id="seal-add-env" hidden>Generate a key for KONTOR_SEAL_KEY</button>
+    <button id="seal-drop-file" hidden>Remove the seal key file</button>
+  </div>
 
   <!-- Shown only while the Portal has no node for this BLS key. Until then the
        node has no signer id, so nothing below it is running. -->
@@ -762,10 +845,300 @@
     });
   }
 
+
+  /* ---------------- sealed setup envelope ---------------- */
+
+  // The browser half of `server::admin::setup`. WebCrypto only: the page's CSP
+  // forbids loading anything, so every primitive here has to be one the browser
+  // already has. ECDH P-256, HKDF-SHA256 and AES-GCM all are.
+  var ENVELOPE_INFO = "KONTOR_ADMIN_SETUP_V1";
+
+  function hexToBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i += 1) {
+      out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return out;
+  }
+
+  function bytesToHex(bytes) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i += 1) {
+      out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    }
+    return out;
+  }
+
+  function utf8(text) { return new TextEncoder().encode(text); }
+
+  // `crypto.subtle` only exists in a secure context. Saying so up front beats
+  // an undefined-property error at the moment the operator submits a seed
+  // phrase.
+  function cryptoAvailable() {
+    return typeof crypto !== "undefined" && !!crypto.subtle;
+  }
+
+  function sealForNode(envelope, payload) {
+    var sessionId = hexToBytes(envelope.session_id);
+    var subtle = crypto.subtle;
+
+    return Promise.all([
+      subtle.importKey("raw", hexToBytes(envelope.node_pubkey),
+                       { name: "ECDH", namedCurve: "P-256" }, false, []),
+      subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])
+    ]).then(function (keys) {
+      var nodeKey = keys[0];
+      var pair = keys[1];
+      return Promise.all([
+        subtle.deriveBits({ name: "ECDH", public: nodeKey }, pair.privateKey, 256),
+        subtle.exportKey("raw", pair.publicKey)
+      ]);
+    }).then(function (parts) {
+      var shared = new Uint8Array(parts[0]);
+      var clientPublic = new Uint8Array(parts[1]);
+
+      return subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"])
+        .then(function (ikm) {
+          return subtle.deriveBits(
+            { name: "HKDF", hash: "SHA-256", salt: sessionId, info: utf8(ENVELOPE_INFO) },
+            ikm, 256);
+        })
+        .then(function (okm) {
+          return subtle.importKey("raw", okm, { name: "AES-GCM" }, false, ["encrypt"]);
+        })
+        .then(function (key) {
+          var nonce = crypto.getRandomValues(new Uint8Array(12));
+          // The session id as additional authenticated data is what binds this
+          // ciphertext to the one envelope it was made for.
+          return subtle.encrypt(
+            { name: "AES-GCM", iv: nonce, additionalData: sessionId, tagLength: 128 },
+            key, utf8(JSON.stringify(payload))
+          ).then(function (sealed) {
+            return {
+              session_id: envelope.session_id,
+              client_pubkey: bytesToHex(clientPublic),
+              nonce: bytesToHex(nonce),
+              ciphertext: bytesToHex(new Uint8Array(sealed))
+            };
+          });
+        });
+    });
+  }
+
+  function provisionNode() {
+    var button = $("setup-submit");
+    var phrase = $("setup-mnemonic").value;
+
+    show($("setup-error"), "");
+    show($("setup-success"), "");
+
+    if (!cryptoAvailable()) {
+      show($("setup-error"), "This browser will not encrypt the phrase here; see above.", true);
+      return;
+    }
+    if (!phrase.trim()) {
+      show($("setup-error"), "Enter your seed phrase.", true);
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Encrypting…";
+
+    api("/api/admin/setup/envelope").then(function (envelope) {
+      $("setup-envelope").textContent =
+        "Envelope fingerprint " + envelope.fingerprint +
+        " — it appears in the node's own logs; compare them if you want to be sure " +
+        "this page is talking to the node itself.";
+
+      return sealForNode(envelope, {
+        mnemonic: phrase,
+        account: parseInt($("setup-account").value, 10) || 1,
+        network: $("setup-network").value
+      });
+    }).then(function (body) {
+      button.textContent = "Setting up…";
+      return api("/api/admin/setup/provision", { method: "POST", body: body });
+    }).then(function (result) {
+      // Cleared as soon as it has been sent: there is no reason for it to stay
+      // in a field on a page that may be left open.
+      $("setup-mnemonic").value = "";
+      show($("setup-success"),
+        "Set up as " + result.node_id + " (account " + result.account + ", " +
+        result.network + "). Whitelist " + result.taproot_address +
+        " on the Portal if it is not already. The node is onboarding now.",
+        true);
+      loadStatus();
+    }).catch(function (error) {
+      if (error.status !== 401 && error.status !== 403) {
+        show($("setup-error"), error.message, true);
+      }
+    }).then(function () {
+      button.disabled = false;
+      button.textContent = "Encrypt and set up";
+    });
+  }
+
+  /* ---------------- sealing ---------------- */
+
+  function loadSeal() {
+    return api("/api/admin/seal").then(function (seal) {
+      $("seal-slots").textContent = (seal.slots || []).join(", ") || "—";
+      $("seal-opened").textContent = seal.opened_with || "—";
+      $("seal-fingerprint").textContent = seal.fingerprint || "—";
+      $("seal-add-env").hidden = !seal.can_add_env_slot;
+      $("seal-drop-file").hidden = !seal.can_drop_file_slot;
+
+      var note;
+      if (seal.can_drop_file_slot) {
+        note = "This node started through the environment slot, so the seal key file " +
+               "is no longer needed. Removing it means the key can only be opened with " +
+               seal.env_var + ".";
+      } else if (seal.can_add_env_slot) {
+        note = "The key is sealed under a file next to it, which protects against the " +
+               "environment leaking but not against the volume leaking. Generating a key " +
+               "for " + seal.env_var + " adds the other half; the file stays until the " +
+               "node has actually started through it.";
+      } else {
+        note = "An environment slot exists. Set " + seal.env_var + " and restart, and " +
+               "the file slot can then be removed.";
+      }
+      $("seal-note").textContent = note;
+      $("seal").hidden = false;
+    });
+  }
+
+  function addEnvSlot() {
+    var button = $("seal-add-env");
+    button.disabled = true;
+    show($("seal-error"), "");
+    show($("seal-success"), "");
+
+    api("/api/admin/seal/env-slot", { method: "POST", body: {} }).then(function (result) {
+      // Shown once and never retrievable again: the node does not keep it.
+      show($("seal-key-reveal"),
+        "Copy this now — it is not shown again and the node did not keep it.\n\n" +
+        result.env_var + "=" + result.key + "\n\n" + result.next,
+        true);
+      return loadSeal();
+    }).catch(function (error) {
+      if (error.status !== 401 && error.status !== 403) {
+        show($("seal-error"), error.message, true);
+      }
+    }).then(function () { button.disabled = false; });
+  }
+
+  function dropFileSlot() {
+    var button = $("seal-drop-file");
+    button.disabled = true;
+    show($("seal-error"), "");
+    show($("seal-success"), "");
+
+    api("/api/admin/seal/drop-file-slot", { method: "POST", body: { confirm: "DROP" } })
+      .then(function () {
+        show($("seal-success"), "The seal key file is gone. This node now opens only from its environment.", true);
+        return loadSeal();
+      })
+      .catch(function (error) {
+        if (error.status !== 401 && error.status !== 403) {
+          show($("seal-error"), error.message, true);
+        }
+      })
+      .then(function () { button.disabled = false; });
+  }
+
+  function unsealNode() {
+    var button = $("unseal-submit");
+    button.disabled = true;
+    show($("unseal-error"), "");
+
+    api("/api/admin/unseal", {
+      method: "POST",
+      body: { passphrase: $("unseal-passphrase").value }
+    }).then(function () {
+      $("unseal-passphrase").value = "";
+      loadStatus();
+    }).catch(function (error) {
+      if (error.status !== 401 && error.status !== 403) {
+        show($("unseal-error"), error.message, true);
+      }
+    }).then(function () { button.disabled = false; });
+  }
+
+  /* ---------------- claiming ---------------- */
+
+  function claimNode(event) {
+    event.preventDefault();
+    var button = $("claim-submit");
+    var errorBox = $("claim-error");
+    errorBox.textContent = "";
+    button.disabled = true;
+
+    // Same reasoning as `signIn`: a 401 here is a mistyped token, not a dead
+    // session, so it must not route through `api()` and sign the operator out.
+    fetch("/api/admin/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        token: $("claim-token").value.trim(),
+        password: $("claim-password").value
+      })
+    }).then(function (response) {
+      return readBody(response).then(function (payload) {
+        if (!response.ok) { throw apiErrorFrom(response, payload); }
+        return payload;
+      });
+    }).then(function (payload) {
+      token = payload.token;
+      sessionStorage.setItem(TOKEN_KEY, token);
+      $("claim-token").value = "";
+      $("claim-password").value = "";
+      $("claim").hidden = true;
+      openApp();
+    }).catch(function (error) {
+      errorBox.textContent = error.message;
+    }).then(function () {
+      button.disabled = false;
+    });
+  }
+
+  /* ---------------- which screen ---------------- */
+
+  // Asked before anything else, because it is the only question a browser with
+  // no session can get an answer to: is there a password to type at all.
+  function chooseScreen() {
+    return fetch("/api/admin/bootstrap", { headers: { Accept: "application/json" } })
+      .then(readBody)
+      .then(function (info) {
+        if (info && info.claimed === false) {
+          $("login").hidden = true;
+          $("app").hidden = true;
+          $("claim").hidden = false;
+          if (info.setup_token_fingerprint) {
+            var note = $("claim-fingerprint");
+            note.textContent = "Token fingerprint " + info.setup_token_fingerprint +
+              " — the node logs the same one, so you can check you have the right token.";
+            note.hidden = false;
+          }
+          return;
+        }
+        if (token) { openApp(); } else { signOut(); }
+      })
+      .catch(function () {
+        // The node may simply not be up yet. The login screen is the safe
+        // fallback: its first request will say what is really wrong.
+        if (token) { openApp(); } else { signOut(); }
+      });
+  }
+
   /* ---------------- wiring ---------------- */
 
   $("login-form").addEventListener("submit", signIn);
+  $("claim-form").addEventListener("submit", claimNode);
   $("logout").addEventListener("click", signOut);
+  $("setup-submit").addEventListener("click", provisionNode);
+  $("unseal-submit").addEventListener("click", unsealNode);
+  $("seal-add-env").addEventListener("click", addEnvSlot);
+  $("seal-drop-file").addEventListener("click", dropFileSlot);
   $("reset-form").addEventListener("submit", resetDatabase);
   $("register-submit").addEventListener("click", registerNode);
 
@@ -773,10 +1146,13 @@
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;
   });
 
+  if (!cryptoAvailable()) { $("setup-insecure").hidden = false; }
+
   // A token in sessionStorage is only a hint — it may be expired or signed
-  // with a key this process no longer has. Show the app optimistically; the
-  // first API call demotes us to the login screen if it is no good.
-  if (token) { openApp(); } else { signOut(); }
+  // with a key this process no longer has. `chooseScreen` decides between the
+  // claim, login and app screens; the first API call after that demotes us to
+  // the login screen if the token is no good.
+  chooseScreen();
 }());
 </script>
 </body>

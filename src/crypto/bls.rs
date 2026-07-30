@@ -2,21 +2,31 @@
 //!
 //! Provides functionality for generating, storing (encrypted), and loading BLS keypairs.
 //! The private key is encrypted using Argon2id for key derivation and AES-256-GCM for encryption.
+//!
+//! # Status
+//!
+//! `bls_key.enc` is the **legacy** at-rest format, kept so a node that predates
+//! [`crate::crypto::keystore`] still comes up and can be migrated. New nodes
+//! seal their key in `keystore.json` instead. The format below is therefore
+//! frozen: the Argon2id parameters, the empty AAD, and the field names are all
+//! load-bearing for reading files that already exist on operators' volumes.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use anyhow::{anyhow, Context, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
 #[cfg(test)]
 use blst::min_sig::Signature;
 use blst::min_sig::{PublicKey, SecretKey};
+#[cfg(test)]
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
 use zeroize::Zeroizing;
+
+use crate::crypto::aead::{self, Kdf};
+
+/// This format predates any notion of AAD and must keep sealing with none, or
+/// every `bls_key.enc` already on disk stops opening.
+const LEGACY_AAD: &[u8] = b"";
 
 /// Domain Separation Tag for HTTP Message Signatures (RFC 9421).
 pub const HTTP_SIGNATURE_DST: &[u8] = b"HORIZON_PORTAL_HTTP_SIG";
@@ -26,17 +36,6 @@ pub const KONTOR_BLS_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"
 
 /// BLS key file name stored in app data directory.
 pub const BLS_KEY_FILENAME: &str = "bls_key.enc";
-
-/// Salt size for Argon2id (16 bytes recommended).
-const SALT_SIZE: usize = 16;
-
-/// Nonce size for AES-256-GCM (12 bytes).
-const NONCE_SIZE: usize = 12;
-
-/// Argon2id parameters (following OWASP recommendations for sensitive keys).
-const ARGON2_M_COST: u32 = 65536; // 64 MiB
-const ARGON2_T_COST: u32 = 3; // 3 iterations
-const ARGON2_P_COST: u32 = 4; // 4 lanes
 
 /// Encrypted BLS key file format.
 #[derive(Serialize, Deserialize)]
@@ -126,6 +125,18 @@ impl BlsKeyPair {
         hex::encode(self.public_key.to_bytes())
     }
 
+    /// The private key, in the same hex form [`Self::from_secret_key_hex`]
+    /// accepts.
+    ///
+    /// This exists so a key can be moved between at-rest formats — a legacy
+    /// `bls_key.enc` into [`crate::crypto::keystore`] — without a second
+    /// representation of the secret being invented for the trip. `Zeroizing` so
+    /// the caller cannot forget to scrub it; nothing else should be calling this.
+    #[must_use]
+    pub fn secret_key_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.secret_key.as_slice()))
+    }
+
     /// Get the raw public key bytes (48 bytes for BLS12-381 MinSig scheme).
     #[cfg(test)]
     fn public_key_bytes(&self) -> Vec<u8> {
@@ -190,20 +201,14 @@ impl BlsKeyPair {
 
     /// Save the keypair to an encrypted file.
     pub async fn save_encrypted(&self, path: &Path, password: &str) -> Result<()> {
-        let derived_key = derive_key(password, None)?;
-
-        let cipher = Aes256Gcm::new_from_slice(derived_key.key.as_slice())
-            .map_err(|e| anyhow!("failed to create cipher: {e}"))?;
-
-        let nonce = Nonce::from_slice(&derived_key.nonce);
-        let ciphertext = cipher
-            .encrypt(nonce, self.secret_key.as_slice())
-            .map_err(|e| anyhow!("failed to encrypt private key: {e}"))?;
+        let salt = aead::random_salt();
+        let key = aead::derive_kek(password.as_bytes(), &salt, &Kdf::AT_REST)?;
+        let (nonce, ciphertext) = aead::seal(&key, LEGACY_AAD, self.secret_key.as_slice())?;
 
         let key_file = EncryptedKeyFile {
             version: 1,
-            salt: derived_key.salt,
-            nonce: derived_key.nonce.to_vec(),
+            salt,
+            nonce,
             ciphertext,
         };
 
@@ -239,24 +244,24 @@ impl BlsKeyPair {
             ));
         }
 
-        let derived_key = derive_key_with_salt(password, &key_file.salt, &key_file.nonce)?;
+        let key = aead::derive_kek(password.as_bytes(), &key_file.salt, &Kdf::AT_REST)?;
 
-        let cipher = Aes256Gcm::new_from_slice(derived_key.key.as_slice())
-            .map_err(|e| anyhow!("failed to create cipher: {e}"))?;
-
-        let nonce = Nonce::from_slice(&key_file.nonce);
-        let plaintext = cipher
-            .decrypt(nonce, key_file.ciphertext.as_slice())
-            .map_err(|_| {
-                anyhow!("failed to decrypt private key: incorrect password or corrupted file")
-            })?;
+        let plaintext = aead::open(
+            &key,
+            LEGACY_AAD,
+            &key_file.nonce,
+            key_file.ciphertext.as_slice(),
+        )
+        .map_err(|_| {
+            anyhow!("failed to decrypt private key: incorrect password or corrupted file")
+        })?;
 
         let sk = SecretKey::from_bytes(&plaintext)
             .map_err(|_| anyhow!("failed to deserialize decrypted secret key"))?;
         let pk = sk.sk_to_pk();
 
         Ok(Self {
-            secret_key: Zeroizing::new(plaintext),
+            secret_key: plaintext,
             public_key: pk,
         })
     }
@@ -272,59 +277,6 @@ impl BlsKeyPair {
             }
         }
     }
-}
-
-struct DerivedKey {
-    key: Zeroizing<[u8; 32]>,
-    salt: Vec<u8>,
-    nonce: [u8; NONCE_SIZE],
-}
-
-fn derive_key(password: &str, existing_salt: Option<&[u8]>) -> Result<DerivedKey> {
-    let salt = match existing_salt {
-        Some(s) => s.to_vec(),
-        None => {
-            let mut salt = vec![0u8; SALT_SIZE];
-            rand::thread_rng().fill_bytes(&mut salt);
-            salt
-        }
-    };
-
-    let mut nonce = [0u8; NONCE_SIZE];
-    rand::thread_rng().fill_bytes(&mut nonce);
-
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .map_err(|e| anyhow!("invalid Argon2 params: {e}"))?;
-
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
-    let mut key = Zeroizing::new([0u8; 32]);
-    argon2
-        .hash_password_into(password.as_bytes(), &salt, key.as_mut())
-        .map_err(|e| anyhow!("failed to derive key: {e}"))?;
-
-    Ok(DerivedKey { key, salt, nonce })
-}
-
-fn derive_key_with_salt(password: &str, salt: &[u8], nonce: &[u8]) -> Result<DerivedKey> {
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .map_err(|e| anyhow!("invalid Argon2 params: {e}"))?;
-
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-
-    let mut key = Zeroizing::new([0u8; 32]);
-    argon2
-        .hash_password_into(password.as_bytes(), salt, key.as_mut())
-        .map_err(|e| anyhow!("failed to derive key: {e}"))?;
-
-    let mut nonce_arr = [0u8; NONCE_SIZE];
-    nonce_arr.copy_from_slice(nonce);
-
-    Ok(DerivedKey {
-        key,
-        salt: salt.to_vec(),
-        nonce: nonce_arr,
-    })
 }
 
 #[cfg(test)]
@@ -453,14 +405,35 @@ mod tests {
             .contains("invalid signature"));
     }
 
-    #[test]
-    fn derive_key_with_existing_salt_uses_provided_salt() {
-        let salt = vec![42u8; SALT_SIZE];
-        let result = derive_key("test-password", Some(&salt)).unwrap();
-        assert_eq!(result.salt, salt, "should use the provided salt");
+    /// Pins the on-disk format. `bls_key.enc` files already exist on operators'
+    /// volumes, so the parameters this test spells out — Argon2id at
+    /// [`Kdf::AT_REST`], AES-256-GCM with no AAD, the raw secret as plaintext —
+    /// are a compatibility contract, not an implementation detail. A file built
+    /// by hand from the primitives must open through the real loader.
+    #[tokio::test]
+    async fn load_encrypted_reads_the_frozen_wire_format() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(unique_filename());
+        let password = "test-password-123";
 
-        let result2 = derive_key("test-password", Some(&salt)).unwrap();
-        assert_eq!(*result.key, *result2.key, "same salt + password → same key");
+        let keypair = BlsKeyPair::generate().unwrap();
+        let expected_pk = keypair.public_key_hex();
+
+        let salt = vec![42u8; aead::SALT_SIZE];
+        let key = aead::derive_kek(password.as_bytes(), &salt, &Kdf::AT_REST).unwrap();
+        let (nonce, ciphertext) = aead::seal(&key, b"", keypair.secret_key.as_slice()).unwrap();
+
+        let json = serde_json::to_string(&EncryptedKeyFile {
+            version: 1,
+            salt,
+            nonce,
+            ciphertext,
+        })
+        .unwrap();
+        fs::write(&path, json).await.unwrap();
+
+        let loaded = BlsKeyPair::load_encrypted(&path, password).await.unwrap();
+        assert_eq!(loaded.public_key_hex(), expected_pk);
     }
 
     #[tokio::test]

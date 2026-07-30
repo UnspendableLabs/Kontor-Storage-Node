@@ -38,6 +38,14 @@ pub struct Cli {
     #[arg(long, env = "STORAGE_DIR")]
     pub storage_dir: Option<PathBuf>,
 
+    /// Application data directory: the keystore, the admin credential and the
+    /// SQLite database live here (default: platform data dir, `/data` in Docker).
+    ///
+    /// This is the one directory that must survive a restart for the node to
+    /// come back unattended.
+    #[arg(long, env = "KONTOR_APP_DIR")]
+    pub app_dir: Option<PathBuf>,
+
     /// Interval in seconds between portal polling runs
     #[arg(long, env = "PORTAL_POLLING_INTERVAL", default_value_t = 30)]
     pub portal_polling_interval_secs: u64,

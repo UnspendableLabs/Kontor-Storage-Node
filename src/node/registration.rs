@@ -28,7 +28,7 @@ use crate::clients::kontor_op::{
 use crate::clients::portal::RegisterNodeRequest;
 use crate::clients::PortalClient;
 use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, FIRST_ACCOUNT, REGISTER_NEW_ACCOUNT_ENV};
-use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
+use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, PublicIdentity};
 use crate::node::known_identity::KnownIdentity;
 
 /// Prefix the Portal signs over to bind a BLS key to a Taproot identity.
@@ -158,35 +158,26 @@ pub fn build_registration_request(
     })
 }
 
-/// Build the registration for a mnemonic-derived identity.
+/// Build this node's own registration from its public identity.
 ///
-/// The wallet-driven path gets `xpubkey` and `schnorr_sig` from a browser; a
-/// node holding the seed phrase signs the Schnorr half itself, and everything
-/// downstream is the same code.
+/// The Schnorr signature is read off the record rather than produced, which is
+/// the whole point of writing it down at setup: it is a signature over a fixed
+/// digest, it carries no nonce, and the Portal accepts the same bytes forever.
+/// A node that threw its seed away registers exactly as well as one that kept
+/// it.
 ///
 /// # Errors
-/// If the Schnorr signature cannot be produced, or the request cannot be built.
-pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNodeRequest> {
-    // The Portal recovers the x-only key from the xpub and verifies both halves
-    // of the proof of possession against it, while the node signs with the key
-    // it derived directly. They are the same key by construction — this catches
-    // the construction being wrong, here rather than as an opaque 400.
-    let from_xpub = x_only_from_xpub(&identity.xpubkey)?;
-    if from_xpub != identity.x_only {
-        return Err(anyhow!(
-            "the derived Taproot key does not match its own extended public key \
-             (xpub carries {}, signing with {})",
-            hex::encode(from_xpub),
-            hex::encode(identity.x_only),
-        ));
-    }
-
-    let schnorr_sig = identity.schnorr_binding_sig()?;
+/// If the recorded fields are malformed, or if `keypair` is not the key the
+/// identity names.
+pub fn build_registration_from_public(
+    keypair: &BlsKeyPair,
+    public: &PublicIdentity,
+) -> Result<RegisterNodeRequest> {
     build_registration_request(
-        &identity.keypair,
-        &identity.xpubkey,
-        &identity.bls_pubkey(),
-        &schnorr_sig,
+        keypair,
+        &public.xpubkey,
+        &public.bls_pubkey,
+        &public.schnorr_binding_sig,
     )
 }
 
@@ -554,7 +545,8 @@ mod tests {
     #[test]
     fn a_self_registration_is_shaped_like_a_wallet_one() {
         let identity = derived(2);
-        let request = build_self_registration(&identity).unwrap();
+        let request =
+            build_registration_from_public(&identity.keypair, &identity.public().unwrap()).unwrap();
 
         assert_eq!(request.xpubkey, identity.xpubkey);
         assert_eq!(request.bls_pubkey, identity.bls_pubkey());
@@ -572,8 +564,9 @@ mod tests {
     #[test]
     fn a_self_registration_is_deterministic() {
         let identity = derived(3);
-        let first = build_self_registration(&identity).unwrap();
-        let second = build_self_registration(&identity).unwrap();
+        let public = identity.public().unwrap();
+        let first = build_registration_from_public(&identity.keypair, &public).unwrap();
+        let second = build_registration_from_public(&identity.keypair, &public).unwrap();
 
         assert_eq!(first.schnorr_sig, second.schnorr_sig);
         assert_eq!(first.bls_sig, second.bls_sig);

@@ -92,7 +92,7 @@ pub async fn register_node(
     // the RegisterBlsKey op, which is exactly the state onboarding already
     // knows how to wait out. Restarting hands the problem back to it rather
     // than growing a second poll loop here.
-    let restarting = restart_if_possible(identity, state);
+    let restarting = restart_if_possible(&identity, state);
 
     info!(node_id = %response.node_id, restarting, "Node registered with the Portal");
 
@@ -198,7 +198,7 @@ mod tests {
             db: setup_in_memory_db().await,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: None,
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(None, None),
             admin: AdminState::with_identity(identity, restart),
         };
         (state, keypair, dir)
@@ -424,7 +424,7 @@ mod tests {
             db: setup_in_memory_db().await,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: None,
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(None, None),
             admin: AdminState::disabled(),
         };
 

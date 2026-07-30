@@ -16,7 +16,6 @@ use axum::http::{header, StatusCode};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 
 use crate::server::admin::{error_codes, AdminState, ApiError};
@@ -144,7 +143,8 @@ pub(crate) fn reset_throttle_for_tests(client: Option<IpAddr>) {
 /// Verifies the password and issues a session token.
 ///
 /// # Errors
-/// - `503 ADMIN_UI_DISABLED` when `ADMIN_PASSWORD` is unset.
+/// - `503 ADMIN_UI_DISABLED` when the UI is turned off outright.
+/// - `409 ADMIN_NOT_CLAIMED` when nobody has set a password yet.
 /// - `429 TOO_MANY_ATTEMPTS` once the per-client failure budget is exhausted.
 /// - `401 INVALID_PASSWORD` on mismatch.
 /// - `500` when the token cannot be signed.
@@ -153,11 +153,23 @@ pub async fn login(
     client: Option<IpAddr>,
     admin: &AdminState,
 ) -> Result<Value, ApiError> {
+    // Unclaimed and disabled are different answers on purpose. The page has to
+    // tell "nobody has set this node up yet, here is the token field" from "the
+    // operator turned the UI off", and a single 503 for both would send someone
+    // hunting for a variable they never set.
+    if admin.is_unclaimed() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            error_codes::ADMIN_NOT_CLAIMED,
+            "This node has not been claimed yet. Enter its setup token to choose an admin \
+             password.",
+        ));
+    }
     if !admin.is_enabled() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             error_codes::ADMIN_UI_DISABLED,
-            "The admin UI is disabled. Set ADMIN_PASSWORD to enable it.",
+            "The admin UI is disabled on this node.",
         ));
     }
 
@@ -173,19 +185,7 @@ pub async fn login(
         ));
     }
 
-    let expected = admin.password().expose();
-
-    // Constant-time compare so response latency doesn't leak a prefix match.
-    // `ct_eq` is only defined for equal-length inputs, so a length mismatch is
-    // its own (unavoidable, and non-secret) rejection.
-    let matches = expected.len() == request.password.len()
-        && expected
-            .as_bytes()
-            .ct_eq(request.password.as_bytes())
-            .unwrap_u8()
-            == 1;
-
-    if !matches {
+    if !admin.verify_password(&request.password) {
         record_failure(client);
         tokio::time::sleep(FAILED_ATTEMPT_DELAY).await;
         warn!(?client, "Rejected admin login attempt");
@@ -196,6 +196,98 @@ pub async fn login(
         ));
     }
 
+    clear_failures(client);
+    issue_session(client, admin)
+}
+
+/// Request body for `POST /api/admin/claim`.
+#[derive(Debug, Deserialize)]
+pub struct AdminClaimRequest {
+    pub token: String,
+    pub password: String,
+}
+
+/// Trade a setup token for an admin password, and hand back a session.
+///
+/// Behind the same throttle as [`login`], for the same reason: it is the other
+/// endpoint on this node where guessing a secret gets you in, and an unclaimed
+/// node is the one with no password to fall back on.
+///
+/// Signing the operator straight in is deliberate. They have just proved they
+/// hold the token and chosen the password; making them type it again buys
+/// nothing and is one more chance to get locked out of a node they have
+/// configured but not yet finished setting up.
+///
+/// # Errors
+/// - `503 ADMIN_UI_DISABLED` when the UI is turned off outright.
+/// - `409 ALREADY_CLAIMED` when a password is already set.
+/// - `429 TOO_MANY_ATTEMPTS` once the per-client failure budget is exhausted.
+/// - `400 WEAK_PASSWORD` when the chosen password is too short.
+/// - `401 INVALID_SETUP_TOKEN` when the token does not match.
+pub async fn claim(
+    request: &AdminClaimRequest,
+    client: Option<IpAddr>,
+    admin: &AdminState,
+) -> Result<Value, ApiError> {
+    if matches!(admin.bootstrap(), (false, _)) && !admin.is_enabled() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::ADMIN_UI_DISABLED,
+            "The admin UI is disabled on this node.",
+        ));
+    }
+    if !admin.is_unclaimed() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            error_codes::ALREADY_CLAIMED,
+            "This node already has an admin password. Sign in with it, or set \
+             ADMIN_PASSWORD to override it.",
+        ));
+    }
+
+    if is_throttled(client) {
+        warn!(
+            ?client,
+            "Admin claim throttled after {MAX_ATTEMPTS} failed attempts"
+        );
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            error_codes::TOO_MANY_ATTEMPTS,
+            "Too many failed attempts. Try again later.",
+        ));
+    }
+
+    // The password floor is checked before the token so an operator who typed a
+    // short password is told that, rather than being sent away to re-check a
+    // token that was fine. It leaks nothing: the length rule is documented.
+    if request.password.chars().count() < crate::app::config::MIN_ADMIN_PASSWORD_LEN {
+        return Err(ApiError::bad_request(
+            error_codes::WEAK_PASSWORD,
+            format!(
+                "The admin password must be at least {} characters.",
+                crate::app::config::MIN_ADMIN_PASSWORD_LEN
+            ),
+        ));
+    }
+
+    if let Err(e) = admin.claim(&request.token, &request.password) {
+        record_failure(client);
+        tokio::time::sleep(FAILED_ATTEMPT_DELAY).await;
+        warn!(?client, error = %format!("{e:#}"), "Rejected admin claim");
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            error_codes::INVALID_SETUP_TOKEN,
+            "That setup token is not this node's.",
+        ));
+    }
+
+    clear_failures(client);
+    info!(?client, "Node claimed; admin password set");
+    issue_session(client, admin)
+}
+
+/// Mint a session token for a caller that has just authenticated.
+fn issue_session(client: Option<IpAddr>, admin: &AdminState) -> Result<Value, ApiError> {
     let expires_at = chrono::Utc::now().timestamp() + ADMIN_SESSION_EXPIRY_SECS;
     let claims = SessionClaims {
         sub: "admin".to_string(),
@@ -209,7 +301,6 @@ pub async fn login(
     )
     .map_err(|err| ApiError::server_error(format!("failed to issue admin session: {err}")))?;
 
-    clear_failures(client);
     info!(?client, "Admin session issued");
 
     Ok(json!({
