@@ -230,6 +230,54 @@ mod tests {
         }
     }
 
+    /// Every lifecycle card ships `hidden` and is revealed by the phase alone.
+    /// A card with no `renderPhase` branch is a card an operator can never
+    /// reach — and on a fresh node the setup wizard is the only way in, so that
+    /// failure is a node nobody can configure.
+    #[test]
+    fn admin_html_reveals_each_lifecycle_card_from_the_phase() {
+        assert!(ADMIN_HTML.contains("function renderPhase"));
+        assert!(
+            ADMIN_HTML.contains("renderPhase(data)"),
+            "the status poll must drive the phase, or the cards never move"
+        );
+
+        for branch in [
+            r#"$("setup").hidden = phase !== "uninitialized""#,
+            r#"$("unseal").hidden = phase !== "sealed""#,
+        ] {
+            assert!(
+                ADMIN_HTML.contains(branch),
+                "the page must still use {branch}"
+            );
+        }
+        // The seal card is the exception: it is loaded rather than toggled,
+        // because its contents come from an endpoint.
+        assert!(ADMIN_HTML.contains("loadSeal()"));
+        assert!(ADMIN_HTML.contains("phase-notice"));
+    }
+
+    /// The passphrase slot is the only recovery from a lost seal key, and it
+    /// can only be added while the node still holds what opened its keystore.
+    /// A page that did not offer it would leave the unseal card — which it does
+    /// have — permanently unreachable in practice.
+    #[test]
+    fn admin_html_offers_the_passphrase_slot_the_seal_api_describes() {
+        for key in [
+            "/api/admin/seal/passphrase",
+            "seal.can_add_passphrase_slot",
+            "seal.has_passphrase_slot",
+            "seal.min_passphrase_len",
+            "seal-passphrase-submit",
+            "function addPassphraseSlot",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+
+        // Sealed on the way up like the seed phrase, and cleared once sent.
+        assert!(ADMIN_HTML.contains(r#"field.value = "";"#));
+    }
+
     /// The ledger block is the only place a stopped prover shows up: the row
     /// counts look healthy either way. A rename on the server side must not
     /// leave the page quietly reading `undefined`.

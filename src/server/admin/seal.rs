@@ -85,6 +85,14 @@ pub fn status(state: &DownloadServerState) -> Value {
         "fingerprint": seal.fingerprint,
         "can_add_env_slot": !seal.slots.contains(&SlotKind::Env),
         "can_drop_file_slot": seal.can_drop_file_slot(),
+        // Whether there is an open keystore to add a passphrase slot to. Adding
+        // one needs the data key, so it is only possible while the node holds
+        // the key that opened it — which is exactly `opened_with` being set. A
+        // sealed node is the one that most wants a passphrase and is the one
+        // place it cannot be added, which is why the page has to say so.
+        "can_add_passphrase_slot": seal.opened_with.is_some(),
+        "has_passphrase_slot": seal.slots.contains(&SlotKind::Passphrase),
+        "min_passphrase_len": MIN_PASSPHRASE_LEN,
         "env_var": keystore::SEAL_KEY_ENV,
     })
 }
@@ -839,7 +847,35 @@ mod tests {
             "fingerprint": seal.fingerprint,
             "can_add_env_slot": !seal.slots.contains(&SlotKind::Env),
             "can_drop_file_slot": seal.can_drop_file_slot(),
+            "can_add_passphrase_slot": seal.opened_with.is_some(),
+            "has_passphrase_slot": seal.slots.contains(&SlotKind::Passphrase),
+            "min_passphrase_len": MIN_PASSPHRASE_LEN,
             "env_var": keystore::SEAL_KEY_ENV,
         })
+    }
+
+    /// A passphrase slot needs the data key, so it can only be added while the
+    /// node holds what opened the keystore. The page has to be told, because a
+    /// sealed node is both the one that most wants a passphrase and the one
+    /// place it cannot be added — the moment to do it is before the seal key
+    /// goes missing.
+    #[test]
+    fn status_offers_a_passphrase_slot_only_on_an_open_node() {
+        let open = render(&seal_status(vec![SlotKind::File], Some(SlotKind::File)));
+        assert_eq!(open["can_add_passphrase_slot"], true);
+        assert_eq!(open["has_passphrase_slot"], false);
+        assert_eq!(open["min_passphrase_len"], MIN_PASSPHRASE_LEN);
+
+        let sealed = render(&seal_status(vec![SlotKind::File], None));
+        assert_eq!(sealed["can_add_passphrase_slot"], false);
+
+        let with_one = render(&seal_status(
+            vec![SlotKind::File, SlotKind::Passphrase],
+            Some(SlotKind::File),
+        ));
+        assert_eq!(with_one["has_passphrase_slot"], true);
+        // Still offered: `add_slot` replaces a slot of the same kind, so this
+        // is also how a passphrase gets changed.
+        assert_eq!(with_one["can_add_passphrase_slot"], true);
     }
 }
