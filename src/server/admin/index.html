@@ -42,16 +42,24 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; font-weight: 600; }
   button.danger { background: var(--red); border-color: var(--red); color: #2a0a0a; font-weight: 600; }
-  input[type="password"], input[type="text"] {
+  /* Every control on the page, not only the two the login screen uses. The
+     setup card is the first thing an operator ever sees, and its seed phrase
+     box, account number and network picker were left at the user agent's
+     defaults — three light widgets on a dark page. */
+  input[type="password"], input[type="text"], input[type="number"], textarea, select {
     font: inherit;
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 8px 12px;
-    width: 100%;
   }
-  input:focus { outline: none; border-color: var(--accent); }
+  input[type="password"], input[type="text"], textarea { width: 100%; }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+  /* Inside a `.row`, which is `space-between`: full width would push the label
+     off the line. */
+  .row input[type="number"] { width: 7em; text-align: right; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
   a { color: var(--blue); }
 
   /* `hidden` has to win.
@@ -95,11 +103,19 @@
   .trunc { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 
   /* ---- misc ---- */
-  .msg { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; border: 1px solid; }
+  /* `pre-wrap`, because `show()` writes `textContent` and the messages that
+     matter most are written with blank lines in them. Without it the one-time
+     KONTOR_SEAL_KEY reveal collapses into a single run-on line with the key
+     wedged between two sentences — and that key is shown exactly once, is not
+     recoverable, and is copied by hand. */
+  .msg { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; border: 1px solid; white-space: pre-wrap; }
   .msg.err { background: rgba(248,113,113,.1); border-color: var(--red); color: var(--red); }
   .msg.ok { background: rgba(52,211,153,.1); border-color: var(--green); color: var(--green); }
   .msg.warn { background: rgba(251,191,36,.1); border-color: var(--amber); color: var(--amber); }
   .msg:empty { display: none; }
+  /* The one message that carries a 44-character base64 blob. `anywhere` rather
+     than `break-all` so ordinary prose still breaks at spaces. */
+  #seal-key-reveal { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
   .muted { color: var(--muted); }
   .danger-zone { border-color: var(--red); margin-top: 20px; }
   .danger-zone h2 { color: var(--red); }
@@ -1316,8 +1332,12 @@
     show($("seal-success"), "");
 
     api("/api/admin/seal/drop-file-slot", { method: "POST", body: { confirm: "DROP" } })
-      .then(function () {
+      .then(function (result) {
         show($("seal-success"), "The seal key file is gone. This node now opens only from its environment.", true);
+        // The slot went; the file may not have. Said out loud rather than
+        // folded into the success message, because it is the one part of this
+        // the operator still has to do something about.
+        if (result && result.warning) { show($("seal-error"), result.warning, true); }
         return loadSeal();
       })
       .catch(report.bind(null, $("seal-error")))

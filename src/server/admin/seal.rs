@@ -268,8 +268,26 @@ pub async fn drop_file_slot(
     keystore
         .remove_slot(SlotKind::File)
         .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
-    keystore::remove_seal_key_file(state.admin.app_dir())
-        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+
+    // The slot is what decides, and it is already gone, so this is not allowed
+    // to fail the request. A `.seal-key` left behind by a read-only mount opens
+    // nothing — there is no file slot for it to unwrap — and answering 500 for
+    // it would tell an operator the change did not happen when it did, sending
+    // them to retry an endpoint that now refuses because the slot it removes is
+    // no longer there.
+    let warning = keystore::remove_seal_key_file(state.admin.app_dir())
+        .err()
+        .map(|e| {
+            let detail = format!("{e:#}");
+            tracing::warn!(
+                error = %detail,
+                "Removed the file seal slot but could not delete the seal key file itself"
+            );
+            format!(
+                "The file slot is gone, but the key file could not be deleted ({detail}). It \
+                 opens nothing now — no slot matches it — and should be removed by hand."
+            )
+        });
 
     state.runtime.set_slots(keystore.slots());
 
@@ -279,6 +297,7 @@ pub async fn drop_file_slot(
 
     Ok(json!({
         "slots": keystore.slots().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "warning": warning,
     }))
 }
 
@@ -337,6 +356,14 @@ pub async fn unseal(
     request: &SealedRequest,
     state: &DownloadServerState,
 ) -> Result<Value, ApiError> {
+    // Taken before the phase is read, and held to the end, for the reason
+    // `setup::provision` holds it: the phase *is* the check below, so a second
+    // tab that reads it before the first has entered `Activating` would pay
+    // another 64 MiB of Argon2id against a node already on its way up. Waiting
+    // here costs that tab the first one's derivation and then answers 409 —
+    // without spending an envelope, which is opened further down.
+    let _guard = state.admin.lock_keystore().await;
+
     if state.runtime.phase() != Phase::Sealed {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -489,9 +516,16 @@ async fn open_keystore(state: &DownloadServerState) -> Result<(Keystore, SealKey
 
     let key = match state.runtime.seal_key() {
         Some(key) => key,
+        // Whichever candidate actually opens this keystore, rather than the
+        // preferred one: an operator who pasted `KONTOR_SEAL_KEY` before asking
+        // for the slot it belongs to has an environment key that names a slot
+        // which does not exist yet, and the file beside the keystore is the one
+        // that works.
         None => {
-            keystore::resolve_seal_key(app_dir, false)
-                .map_err(|e| ApiError::server_error(format!("{e:#}")))?
+            keystore::candidate_seal_keys(app_dir)
+                .keys
+                .into_iter()
+                .find(|(candidate, _)| keystore.unseal(candidate).is_ok())
                 .ok_or_else(unavailable)?
                 .0
         }
@@ -725,6 +759,78 @@ mod tests {
         // The key file goes with the slot; leaving it would be a key on the
         // volume that opens nothing, which is only ever confusing.
         assert!(!dir.path().join(keystore::SEAL_KEY_FILENAME).exists());
+    }
+
+    fn confirmed() -> SealRequest {
+        SealRequest {
+            confirm: CONFIRMATION_PHRASE.to_string(),
+        }
+    }
+
+    /// Put a node in the state step 3 of the hardening flow finds it in: booted
+    /// through the env slot, with the file slot and its key file still there.
+    async fn with_a_file_slot(
+        state: &DownloadServerState,
+        dir: &std::path::Path,
+        env_key: &SealKey,
+    ) -> std::path::PathBuf {
+        let mut keystore = Keystore::load(dir).await.unwrap().unwrap();
+        let file_key = SealKey::generate(SlotKind::File);
+        keystore.add_slot(env_key, &file_key).unwrap();
+        state.runtime.set_slots(keystore.slots());
+
+        let path = dir.join(keystore::SEAL_KEY_FILENAME);
+        std::fs::write(&path, file_key.encode().unwrap().as_bytes()).unwrap();
+        path
+    }
+
+    /// The end of the hardening flow, which had no test at all: the slot goes,
+    /// the key file goes with it, and the node reports what it is left with.
+    #[tokio::test]
+    async fn dropping_the_file_slot_removes_both_the_slot_and_the_key_file() {
+        let env_key = SealKey::generate(SlotKind::Env);
+        let (state, dir) = node_sealed_with(&env_key, SealKeySource::Env).await;
+        let path = with_a_file_slot(&state, dir.path(), &env_key).await;
+
+        let body = drop_file_slot(&confirmed(), &state).await.unwrap();
+
+        assert_eq!(body["slots"], json!(["env"]));
+        assert!(body["warning"].is_null(), "nothing was left behind: {body}");
+        assert!(
+            !path.exists(),
+            "the key file goes with the slot it stood for"
+        );
+        assert_eq!(state.runtime.seal().slots, vec![SlotKind::Env]);
+    }
+
+    /// The slot is what decides, and by the time the file is touched it is
+    /// already gone. Reporting a failed unlink as a 500 would tell an operator
+    /// the change did not happen when it did — and send them to retry an
+    /// endpoint that now refuses, because the slot it removes is no longer there.
+    #[tokio::test]
+    async fn a_key_file_that_will_not_delete_is_reported_rather_than_failing_the_change() {
+        let env_key = SealKey::generate(SlotKind::Env);
+        let (state, dir) = node_sealed_with(&env_key, SealKeySource::Env).await;
+        let path = with_a_file_slot(&state, dir.path(), &env_key).await;
+
+        // An undeletable name, in the one form a test can arrange portably.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let body = drop_file_slot(&confirmed(), &state)
+            .await
+            .expect("the slot was removed, so the request succeeded");
+
+        assert_eq!(body["slots"], json!(["env"]));
+        assert!(
+            body["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("could not be deleted")),
+            "the operator has to be told what is left to do by hand: {body}"
+        );
+
+        let reloaded = Keystore::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(reloaded.slots(), vec![SlotKind::Env]);
     }
 
     /// Destructive, so it needs the phrase — and without it nothing must change.

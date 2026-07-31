@@ -612,18 +612,69 @@ impl SealKeySource {
     }
 }
 
-/// Find the seal key this boot should use.
+/// Every seal key this boot could try, in the order it should try them.
 ///
-/// `KONTOR_SEAL_KEY` wins over `.seal-key` so that hardening is a pure
-/// environment change: the operator pastes the key into the platform, redeploys,
-/// and the node reports that it unsealed through the env slot — which is the
-/// evidence `/admin` requires before it will offer to delete the file.
+/// Plural, and that is the whole point of the type. `KONTOR_SEAL_KEY` is tried
+/// first so that hardening is a pure environment change — the operator pastes
+/// the key into the platform, redeploys, and the node reports that it opened
+/// through the env slot, which is the evidence `/admin` requires before it will
+/// offer to delete the file. But *preferring* the environment is not the same as
+/// *depending* on it: the file this node generated for itself is still sitting
+/// there, by design, precisely because the paste might have been wrong.
+#[derive(Debug)]
+pub struct SealKeyCandidates {
+    /// Usable keys, environment first.
+    pub keys: Vec<(SealKey, SealKeySource)>,
+    /// Sources that were present and could not be turned into a key at all.
+    /// Reported rather than raised: one bad source must not hide a good one.
+    pub problems: Vec<String>,
+}
+
+/// Collect every seal key on this machine, and every reason one is missing.
+#[must_use]
+pub fn candidate_seal_keys(app_dir: &Path) -> SealKeyCandidates {
+    let mut keys = Vec::new();
+    let mut problems = Vec::new();
+
+    if let Ok(encoded) = std::env::var(SEAL_KEY_ENV) {
+        if !encoded.trim().is_empty() {
+            match SealKey::decode(SlotKind::Env, &encoded) {
+                Ok(key) => keys.push((key, SealKeySource::Env)),
+                Err(e) => problems.push(format!(
+                    "{SEAL_KEY_ENV} is set but unusable ({e:#}). It must be 32 random bytes, \
+                     base64."
+                )),
+            }
+        }
+    }
+
+    let path = app_dir.join(SEAL_KEY_FILENAME);
+    match std::fs::read_to_string(&path) {
+        Ok(encoded) => match SealKey::decode(SlotKind::File, &encoded) {
+            Ok(key) => keys.push((key, SealKeySource::File)),
+            Err(e) => problems.push(format!("{} is unusable ({e:#})", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => problems.push(format!("reading {} failed: {e}", path.display())),
+    }
+
+    SealKeyCandidates { keys, problems }
+}
+
+/// Find the seal key a *new* keystore should be sealed under.
 ///
-/// With `generate` set and neither source present, a key is created and written.
-/// That is what makes a node with no configuration at all able to seal something
-/// on its very first boot; it is only ever done while provisioning, never on the
-/// way up to an existing keystore, where a generated key would simply fail to
-/// open it.
+/// The counterpart to [`candidate_seal_keys`], and the difference is the whole
+/// reason there are two: that one is for opening a keystore, where a broken
+/// source is something to step over, and this one is for creating one, where it
+/// is something to stop at. Sealing a fresh key under a generated file key while
+/// the operator believes their `KONTOR_SEAL_KEY` is the one in use would produce
+/// a node nobody can open from the environment they configured.
+///
+/// With `generate` set and no source present, a key is created and written. That
+/// is what makes a node with no configuration at all able to seal something on
+/// its very first boot; it is only ever done while provisioning, never on the way
+/// up to an existing keystore, where a generated key would simply fail to open
+/// it.
 ///
 /// # Errors
 /// If a present source is malformed, or a generated key cannot be written.
@@ -631,28 +682,14 @@ pub fn resolve_seal_key(
     app_dir: &Path,
     generate: bool,
 ) -> Result<Option<(SealKey, SealKeySource)>> {
-    if let Ok(encoded) = std::env::var(SEAL_KEY_ENV) {
-        if !encoded.trim().is_empty() {
-            let key = SealKey::decode(SlotKind::Env, &encoded).with_context(|| {
-                format!("{SEAL_KEY_ENV} is set but unusable. It must be 32 random bytes, base64.")
-            })?;
-            return Ok(Some((key, SealKeySource::Env)));
-        }
-    }
+    let candidates = candidate_seal_keys(app_dir);
 
-    let path = app_dir.join(SEAL_KEY_FILENAME);
-    match std::fs::read_to_string(&path) {
-        Ok(encoded) => {
-            let key = SealKey::decode(SlotKind::File, &encoded)
-                .with_context(|| format!("{} is unusable", path.display()))?;
-            return Ok(Some((key, SealKeySource::File)));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
-        }
+    if let Some(problem) = candidates.problems.first() {
+        return Err(anyhow!("{problem}"));
     }
-
+    if let Some(first) = candidates.keys.into_iter().next() {
+        return Ok(Some(first));
+    }
     if !generate {
         return Ok(None);
     }
@@ -661,7 +698,7 @@ pub fn resolve_seal_key(
     let encoded = key
         .encode()
         .ok_or_else(|| anyhow!("a generated seal key must be a raw key"))?;
-    aead::write_secret_file(&path, encoded.as_bytes())?;
+    aead::write_secret_file(&app_dir.join(SEAL_KEY_FILENAME), encoded.as_bytes())?;
     Ok(Some((key, SealKeySource::Generated)))
 }
 

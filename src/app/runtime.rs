@@ -160,6 +160,17 @@ const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const UNREGISTERED_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long a failed activation waits before trying itself again.
+#[cfg(not(test))]
+const ACTIVATION_RETRY_MIN: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const ACTIVATION_RETRY_MIN: Duration = Duration::from_millis(50);
+
+/// The ceiling that retry doubles up to. The same cap the portal daemon's own
+/// backoff uses, for the same reason: past a few minutes, retrying faster only
+/// costs the Portal requests it is already refusing.
+const ACTIVATION_RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Run the application with a custom shutdown signal.
 ///
 /// # Errors
@@ -319,6 +330,7 @@ async fn serve(
             daemon: None,
             watcher: None,
             keystore: None,
+            retry_in: None,
         }
         .run(opened),
     );
@@ -376,6 +388,9 @@ struct Supervisor {
     /// anything: unsealing a raw slot is one AEAD open, so re-deriving the keys
     /// is cheaper than keeping a `NodeKeys` alive across every await.
     keystore: Option<(Box<Keystore>, SealKey, SealKeySource)>,
+    /// How long to wait before trying a failed activation again, doubling with
+    /// each failure. `None` once one succeeds — see [`Supervisor::fail`].
+    retry_in: Option<Duration>,
 }
 
 type Opened = (Box<Keystore>, Box<NodeKeys>, SealKey, SealKeySource);
@@ -388,13 +403,27 @@ impl Supervisor {
         }
 
         loop {
-            match self.runtime.next().await {
-                Activation::Open {
+            // A clone, so nothing borrows `self` across the wait and the
+            // activation that follows it.
+            let runtime = self.runtime.clone();
+            let next = match self.retry_in {
+                None => Some(runtime.next().await),
+                // A failed activation is retried on a timer, and an operator
+                // can still cut the wait short by asking for something: both
+                // arms lead to the same work.
+                Some(delay) => tokio::select! {
+                    activation = runtime.next() => Some(activation),
+                    () = tokio::time::sleep(delay) => None,
+                },
+            };
+
+            match next {
+                Some(Activation::Open {
                     keystore,
                     keypair,
                     seal_key,
                     source,
-                } => {
+                }) => {
                     let keys = NodeKeys::Sealed(Box::new(node::SealedKeys {
                         keypair: *keypair,
                         public: keystore.public().cloned(),
@@ -408,7 +437,10 @@ impl Supervisor {
                     self.keystore = Some((keystore, seal_key, source));
                     self.activate(keys).await;
                 }
-                Activation::Reonboard => match self.reopen().await {
+                // Asked for by an operator, or by the retry timer. Both mean
+                // the same thing: open the keystore this node already holds and
+                // onboard again.
+                Some(Activation::Reonboard) | None => match self.reopen().await {
                     Ok(keys) => self.activate(keys).await,
                     Err(e) => self.fail("could not reopen the keystore", &e),
                 },
@@ -457,12 +489,16 @@ impl Supervisor {
         .await;
 
         match outcome {
-            Ok(node::OnboardingOutcome::Ready(result)) => {
-                if let Err(e) = self.start_running(*result).await {
-                    self.fail("the node onboarded but could not start serving", &e);
-                }
+            Ok(node::OnboardingOutcome::Ready(result)) => match self.start_running(*result).await {
+                Ok(()) => self.retry_in = None,
+                Err(e) => self.fail("the node onboarded but could not start serving", &e),
+            },
+            // Not a failure: the node is up, waiting on a whitelist entry, and
+            // the watcher below is already the retry for that one.
+            Ok(node::OnboardingOutcome::Unregistered(node)) => {
+                self.retry_in = None;
+                self.wait_for_registration(*node);
             }
-            Ok(node::OnboardingOutcome::Unregistered(node)) => self.wait_for_registration(*node),
             Err(e) => self.fail("onboarding failed", &e),
         }
     }
@@ -625,16 +661,48 @@ impl Supervisor {
         }));
     }
 
-    /// Land in [`Phase::Failed`] with the reason on record.
+    /// Land in [`Phase::Failed`] with the reason on record, and arrange to try
+    /// again.
     ///
     /// Never fatal to the process. The server is the only way an operator can
     /// see the reason or do anything about it, so taking it down with the
     /// activation would remove the fix along with the problem.
-    fn fail(&self, what: &str, error: &anyhow::Error) {
+    ///
+    /// # Why it retries rather than waiting to be asked
+    ///
+    /// The commonest way to land here is not a misconfiguration at all: it is a
+    /// Portal that was not reachable in the second this node happened to start,
+    /// which is what a `docker compose up` looks like from the node's side. That
+    /// used to exit the process, and the platform's restart policy was the retry.
+    /// Serving `/admin` instead of exiting removed the exit — and with it the
+    /// only thing that ever tried again, leaving a node that serves files,
+    /// proves nothing, and looks healthy from outside for the life of the
+    /// process. So the retry has to live here now, on a backoff, with the wait
+    /// stated in the notice the page shows.
+    fn fail(&mut self, what: &str, error: &anyhow::Error) {
         let detail = format!("{error:#}");
-        tracing::error!(error = %detail, "{what}");
-        let _ = writeln!(self.writer.clone(), "\n{what}: {detail}\n");
-        self.runtime.set_notice(Some(format!("{what}: {detail}")));
+
+        // Only when there is something to retry *with*. A node with no keystore
+        // has nothing to reopen, so a timer would do no more than run the same
+        // failure again on a schedule.
+        let retry = self.keystore.is_some().then(|| {
+            self.retry_in.map_or(ACTIVATION_RETRY_MIN, |previous| {
+                (previous * 2).min(ACTIVATION_RETRY_MAX)
+            })
+        });
+        self.retry_in = retry;
+
+        let notice = match retry {
+            Some(delay) => format!(
+                "{what}: {detail}. Trying again on its own in {}s.",
+                delay.as_secs().max(1)
+            ),
+            None => format!("{what}: {detail}"),
+        };
+
+        tracing::error!(error = %detail, retry_in = ?retry, "{what}");
+        let _ = writeln!(self.writer.clone(), "\n{notice}\n");
+        self.runtime.set_notice(Some(notice));
         self.runtime.enter(Phase::Failed);
     }
 
@@ -1834,6 +1902,96 @@ mod tests {
         assert!(
             !output.contains("✓ Announced"),
             "should not show announced message when announce fails: {output}"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The failure this branch traded an exit code for.
+    ///
+    /// A Portal that is not up in the second this node happens to start is not a
+    /// misconfiguration — it is what `docker compose up` looks like from the
+    /// node's side, and it used to be answered by exiting non-zero and letting
+    /// the platform's restart policy try again. Serving `/admin` instead of
+    /// exiting removed the exit, and with it the only thing that ever retried:
+    /// the node would sit in `failed` for the life of the process, serving files
+    /// and proving nothing while looking perfectly healthy from outside.
+    ///
+    /// So the supervisor retries itself. The Portal answers 500 once here, and
+    /// the node has to reach a running daemon with nobody touching it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_transient_portal_failure_is_retried_until_the_node_is_running() {
+        let _guard = TempAppDirGuard::new("activation_retry");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("activation_retry");
+        let node_id = "NODE-retry";
+
+        // First mounted wins, so the first lookup gets the 500 and every later
+        // one gets the answer the fixtures below mount.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("portal is starting"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        let bls_key_path =
+            setup_onboarding_fixtures_no_announce(&mock_server, node_id, &storage_dir).await;
+
+        Mock::given(method("PUT"))
+            .and(path("/api/nodes/announce"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "agreements": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let cli = unregistered_cli(mock_server.uri(), storage_dir.clone(), bls_key_path);
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Stopped by the assertion rather than by a timer: what is being tested
+        // is that the node gets there at all, without an exit and without a
+        // human.
+        let shutdown = async {
+            let recovered = captured
+                .wait_for("Node onboarding complete", Duration::from_secs(30))
+                .await;
+            assert!(
+                recovered,
+                "the supervisor must retry a failed activation on its own:\n{}",
+                captured.text()
+            );
+            Ok(())
+        };
+
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        cleanup_onboarding_env();
+        let output = captured.text();
+
+        assert_eq!(
+            outcome,
+            Outcome::Shutdown,
+            "recovery happens in this process, not by exiting to be restarted"
+        );
+        assert!(
+            output.contains("onboarding failed"),
+            "the failure is still reported: {output}"
+        );
+        assert!(
+            output.contains("Trying again on its own"),
+            "and the wait is stated rather than left for the operator to guess: {output}"
         );
 
         std::fs::remove_dir_all(&storage_dir).ok();

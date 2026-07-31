@@ -238,12 +238,29 @@ door that only opens one way.
 A mistyped paste, a variable set on the wrong service, or a deploy that did not
 pick it up therefore costs a retry rather than the key.
 
-And it costs a retry rather than an outage. A `KONTOR_SEAL_KEY` that is
-malformed, or simply not this keystore's, does **not** stop the node: it comes
-up in the `sealed` phase, serving `/admin`, with the reason on the page. Only
-a keystore that cannot be *parsed* is fatal — that one is an identity out of
-reach, and carrying on there would offer the setup wizard a chance to provision
-a second one over the top of it.
+And it costs a retry rather than an outage, which is the point of leaving the
+file slot in place for step 2. A `KONTOR_SEAL_KEY` that is malformed, or simply
+not this keystore's, does not stop the node and does not even seal it: the node
+falls back to the slot that does open, comes up normally, and says which source
+failed —
+
+```
+! the env seal key did not open this keystore (…)
+  The node opened through the file slot instead and is running normally.
+    Correct the above before removing anything.
+✓ Keystore opened (file slot, fingerprint 2bd8450f)
+```
+
+Falling back does not count as hardening. `/admin` asks *which slot this boot
+came in through*, so a node that fell back still reports `file` and is still
+refused step 3 — the fallback keeps the node up without ever letting a bad
+variable be followed by deleting the key that still works.
+
+Only when **nothing** on the machine opens the keystore does the node come up in
+the `sealed` phase, serving `/admin` with the reason on the page. And only a
+keystore that cannot be *parsed* is fatal — that one is an identity out of reach,
+and carrying on there would offer the setup wizard a chance to provision a second
+one over the top of it.
 
 #### If the seal key is lost
 
@@ -267,11 +284,18 @@ reachable in every state. `GET /api/admin/status` reports which one:
 | `activating` | Keys in hand, talking to the Portal. |
 | `unregistered` | The Portal has never heard of this key; the node keeps re-offering its registration. |
 | `running` | Onboarded, daemon running. |
-| `failed` | Activation failed. The server stays up so the reason can be read. |
+| `failed` | Activation failed. The server stays up so the reason can be read, and the node keeps retrying. |
 
 Every transition happens **in the running process**. Completing setup, unsealing,
 registering, or having an address whitelisted all move the node forward without
 an exit and without a container restart.
+
+`failed` is not a resting state. The commonest way to reach it is a Portal that
+was not up in the second this node happened to start, which used to be answered
+by exiting non-zero and letting the platform's restart policy try again — so the
+supervisor now does that itself, retrying on a backoff from 30 s to 5 minutes and
+naming the wait in `notice`. A node that reaches `running` on the third attempt
+never needed anybody.
 
 ### Monitoring
 
@@ -291,13 +315,21 @@ separate question, answered by the same endpoint without authentication:
 
 Alert on `serving` being false, or on `phase` staying anything but `running`.
 `unregistered` and `uninitialized` are states a node can sit in indefinitely and
-correctly — they need a person, not a restart.
+correctly — they need a person, not a restart. `failed` retries itself, so alert
+on it *persisting* rather than on it appearing.
 
 ### Migrating an existing node
 
 A node that already runs on `KONTOR_STORAGE_MNEMONIC`, or on a `bls_key.enc` plus
 `BLS_PASSWORD`, migrates itself on the next start. It seals the key it already
 has into a keystore, keeps the same identity and node id, and says so:
+
+> **The one place the server does not start first.** Migration happens before the
+> HTTP listener opens, because it is what decides which node this is. A
+> `bls_key.enc` whose `BLS_PASSWORD` is wrong or unset therefore still stops the
+> node with no `/admin` to explain it — the key file needs that password and a
+> container has no terminal to prompt at. Check the variable before deploying
+> this release. Once the migration has run, the password is never needed again.
 
 ```
 No keystore yet, but this node has key material from an older release. Migrating it into one.
@@ -336,10 +368,13 @@ now that the UI is how a node is configured, so such a node comes back
 beside the keystore, and prints it on every start until somebody claims it.
 
 Whoever can read those logs or that volume can therefore claim the admin UI, and
-from there reset the database or re-register the node. That is the same trust
-boundary as the file seal slot, so it moves no line that was not already there —
-but it is a line worth knowing about. Three ways to decide it deliberately rather
-than inherit it:
+from there reset the database, re-register the node, or be handed a seal key. The
+*volume* half of that is the same trust boundary as the file seal slot, so it
+moves no line that was not already there. The *log* half is worth a second look
+before this release is deployed: a log aggregator is usually readable by more
+people than a volume is, and until this release nothing an operator could do from
+`/admin` was reachable on such a node at all. Three ways to decide it deliberately
+rather than inherit it:
 
 - Set `ADMIN_PASSWORD` (at least 16 characters). It overrides anything stored and
   no token is minted.

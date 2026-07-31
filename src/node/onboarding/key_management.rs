@@ -431,44 +431,72 @@ pub async fn open_or_migrate(
     if let Some(keystore) = Keystore::load(app_dir).await? {
         warn_about_a_stale_mnemonic(&keystore, mnemonic);
 
-        let sealed = |reason: Option<String>| KeySource::Sealed {
-            keystore: Box::new(keystore.clone()),
-            reason,
-        };
+        // Every key on the machine, not just the preferred one. A key that will
+        // not parse is a typo in the environment or a truncated file, and one
+        // that parses but opens nothing is the same mistake one step later —
+        // the commonest one there is here, since the hardening flow asks an
+        // operator to paste 32 base64 bytes into a platform by hand. Neither is
+        // a reason to take the node down while another slot would open it.
+        let candidates = keystore::candidate_seal_keys(app_dir);
+        let mut problems = candidates.problems;
 
-        // A key that will not parse is a typo in the environment or a truncated
-        // file, not a reason to take the node's only repair channel away.
-        let resolved = match keystore::resolve_seal_key(app_dir, false) {
-            Ok(resolved) => resolved,
-            Err(e) => return Ok(sealed(Some(format!("{e:#}")))),
-        };
+        for (seal_key, seal_source) in candidates.keys {
+            let keypair = match keystore.unseal(&seal_key) {
+                Ok(keypair) => keypair,
+                Err(e) => {
+                    problems.push(format!(
+                        "the {} seal key did not open this keystore ({e:#})",
+                        seal_source.kind()
+                    ));
+                    continue;
+                }
+            };
 
-        let Some((seal_key, seal_source)) = resolved else {
-            return Ok(sealed(None));
-        };
+            // Reached only when something the operator set up did *not* work.
+            // The node stays up on the slot that did — during step 2 of the
+            // hardening flow the file is still there by design, which is the
+            // whole reason that step is safe — and says loudly which source to
+            // correct. It cannot be dropped either way: `can_drop_file_slot`
+            // asks which slot this boot came in through, and this one did not
+            // come in through the environment.
+            if !problems.is_empty() {
+                tracing::error!(
+                    opened_with = %seal_source.kind(),
+                    problems = %problems.join("; "),
+                    "This node opened its keystore through a fallback slot. Until the source \
+                     that failed is corrected, hardening cannot be completed and the file slot \
+                     cannot be dropped."
+                );
+                writeln!(
+                    writer,
+                    "\n! {}\n  The node opened through the {} slot instead and is running \
+                     normally. Correct the above before removing anything.",
+                    problems.join("\n! "),
+                    seal_source.kind()
+                )?;
+            }
 
-        // And a key that parses but opens nothing is the same mistake one step
-        // later — the commonest one there is here, since the hardening flow
-        // asks an operator to paste 32 base64 bytes into a platform by hand.
-        let keypair = match keystore.unseal(&seal_key) {
-            Ok(keypair) => keypair,
-            Err(e) => return Ok(sealed(Some(format!("{e:#}")))),
-        };
-        let public = keystore.public().cloned();
+            let public = keystore.public().cloned();
 
-        // A passphrase has no fingerprint to print, and never reaches this
-        // path anyway: nothing on the machine can supply one at boot.
-        writeln!(
-            writer,
-            "✓ Keystore opened ({} slot, fingerprint {})",
-            seal_source.kind(),
-            seal_key.fingerprint().as_deref().unwrap_or("none")
-        )?;
-        return Ok(KeySource::Open {
+            // A passphrase has no fingerprint to print, and never reaches this
+            // path anyway: nothing on the machine can supply one at boot.
+            writeln!(
+                writer,
+                "✓ Keystore opened ({} slot, fingerprint {})",
+                seal_source.kind(),
+                seal_key.fingerprint().as_deref().unwrap_or("none")
+            )?;
+            return Ok(KeySource::Open {
+                keystore: Box::new(keystore),
+                keys: Box::new(NodeKeys::Sealed(Box::new(SealedKeys { keypair, public }))),
+                seal_key,
+                seal_source,
+            });
+        }
+
+        return Ok(KeySource::Sealed {
             keystore: Box::new(keystore),
-            keys: Box::new(NodeKeys::Sealed(Box::new(SealedKeys { keypair, public }))),
-            seal_key,
-            seal_source,
+            reason: (!problems.is_empty()).then(|| problems.join("; ")),
         });
     }
 
@@ -1061,6 +1089,115 @@ mod tests {
         };
         let reason = reason.expect("something was tried, so it has to be explained");
         assert!(reason.contains("did not open"), "{reason}");
+    }
+
+    /// The same mistake at the moment it actually happens, which is the case
+    /// the two tests either side of this one both step around by deleting
+    /// `.seal-key` first.
+    ///
+    /// Step 2 of the hardening flow is "set the variable and redeploy", and the
+    /// file slot is deliberately still there — that is what makes the step
+    /// reversible and is the whole argument for splitting it in two. So a
+    /// mistyped paste has to cost a retry, as the module documentation promises,
+    /// rather than an outage that only an environment change and another
+    /// redeploy can end.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_wrong_env_key_falls_back_to_the_file_the_node_still_has() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        let KeySource::Open {
+            mut keystore,
+            seal_key,
+            ..
+        } = source
+        else {
+            panic!("the migration must open the keystore it just wrote");
+        };
+        let node_id = keystore.public().unwrap().node_id.clone();
+
+        // The env slot is added and the file slot left alone, exactly as
+        // `POST /api/admin/seal/env-slot` leaves them.
+        keystore
+            .add_slot(&seal_key, &SealKey::generate(crate::crypto::SlotKind::Env))
+            .unwrap();
+
+        let mistyped = SealKey::generate(crate::crypto::SlotKind::Env);
+        std::env::set_var(keystore::SEAL_KEY_ENV, mistyped.encode().unwrap().as_str());
+        let source = migrate(dir.path(), &key_path, None).await;
+        std::env::remove_var(keystore::SEAL_KEY_ENV);
+
+        let KeySource::Open {
+            keystore,
+            seal_source,
+            ..
+        } = source.expect("a wrong key must not be fatal")
+        else {
+            panic!("the file slot is still there and still opens this keystore");
+        };
+        assert_eq!(
+            seal_source,
+            SealKeySource::File,
+            "the node has to come up on the slot that worked"
+        );
+        assert_eq!(
+            keystore.public().unwrap().node_id,
+            node_id,
+            "and as the same node"
+        );
+    }
+
+    /// And it must not thereby look like a node that finished hardening. The
+    /// evidence `drop-file-slot` requires is *which slot this boot came in
+    /// through*, so a fallback has to leave that answer at `file` — otherwise
+    /// the mistyped variable would be followed by deleting the only key that
+    /// still works.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn falling_back_to_the_file_does_not_unlock_dropping_it() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        let KeySource::Open {
+            mut keystore,
+            seal_key,
+            ..
+        } = migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap()
+        else {
+            panic!("the migration must open");
+        };
+        keystore
+            .add_slot(&seal_key, &SealKey::generate(crate::crypto::SlotKind::Env))
+            .unwrap();
+
+        std::env::set_var(keystore::SEAL_KEY_ENV, "obviously not base64 ****");
+        let source = migrate(dir.path(), &key_path, None).await;
+        std::env::remove_var(keystore::SEAL_KEY_ENV);
+
+        let KeySource::Open {
+            keystore,
+            seal_key,
+            seal_source,
+            ..
+        } = source.expect("a typo must not be fatal")
+        else {
+            panic!("the file slot still opens this keystore");
+        };
+
+        let status = crate::app::lifecycle::SealStatus::opened(&keystore, &seal_key, seal_source);
+        assert!(status.is_open());
+        assert!(
+            !status.can_drop_file_slot(),
+            "this node has never come up through its env slot"
+        );
     }
 
     /// The same rule one step earlier: a `KONTOR_SEAL_KEY` that is not even

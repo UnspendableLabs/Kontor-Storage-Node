@@ -624,10 +624,13 @@ Removes the `file` slot and deletes `.seal-key`, leaving the node openable only 
 
 + Response 200 (application/json)
 
+    `warning` is `null` on the ordinary path. It is a string when the slot was removed but `.seal-key` itself could not be deleted — a read-only mount, permissions. The change still happened: the leftover file matches no slot and opens nothing, and it is named here rather than reported as a failure, because telling the operator the removal failed would send them to retry an endpoint that now refuses.
+
     + Body
 
             {
-                "slots": ["env"]
+                "slots": ["env"],
+                "warning": null
             }
 
 + Response 400 (application/json)
