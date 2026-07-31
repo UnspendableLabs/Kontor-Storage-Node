@@ -238,6 +238,13 @@ door that only opens one way.
 A mistyped paste, a variable set on the wrong service, or a deploy that did not
 pick it up therefore costs a retry rather than the key.
 
+And it costs a retry rather than an outage. A `KONTOR_SEAL_KEY` that is
+malformed, or simply not this keystore's, does **not** stop the node: it comes
+up in the `sealed` phase, serving `/admin`, with the reason on the page. Only
+a keystore that cannot be *parsed* is fatal — that one is an identity out of
+reach, and carrying on there would offer the setup wizard a chance to provision
+a second one over the top of it.
+
 #### If the seal key is lost
 
 Add a **seal passphrase** from `/admin` while the node is still open. It is an
@@ -256,7 +263,7 @@ reachable in every state. `GET /api/admin/status` reports which one:
 | Phase | Meaning |
 |---|---|
 | `uninitialized` | No keystore. The setup wizard has the work. |
-| `sealed` | A keystore exists and nothing here can open it. |
+| `sealed` | A keystore exists and nothing here opened it — no key at all, or one that did not fit. `notice` says which. |
 | `activating` | Keys in hand, talking to the Portal. |
 | `unregistered` | The Portal has never heard of this key; the node keeps re-offering its registration. |
 | `running` | Onboarded, daemon running. |

@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::app::lifecycle::{Activation, Phase};
 use crate::crypto::keystore::{self, Keystore};
-use crate::crypto::{BitcoinNetwork, MnemonicIdentity, MnemonicSettings};
+use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, MnemonicSettings};
 use crate::server::admin::envelope::{self, SealedRequest};
 use crate::server::admin::{error_codes, ApiError};
 use crate::server::state::DownloadServerState;
@@ -87,6 +87,14 @@ pub async fn provision(
     let keystore = Keystore::provision(app_dir, &secret, Some(public.clone()), &seal_key)
         .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
 
+    // Rebuilt from the secret that was just sealed rather than left for the
+    // supervisor to unwrap: it is the same key either way, and handing it over
+    // is what keeps the supervisor off the unsealing path entirely. Cheap here
+    // — this is a curve operation, not a key derivation.
+    let keypair = BlsKeyPair::from_secret_key_hex(&secret)
+        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+    drop(secret);
+
     tracing::info!(
         node_id = %public.node_id,
         seal_slot = %source.kind(),
@@ -110,6 +118,7 @@ pub async fn provision(
     state.runtime.enter(Phase::Activating);
     state.runtime.request(Activation::Open {
         keystore: Box::new(keystore),
+        keypair: Box::new(keypair),
         seal_key,
         source,
     });

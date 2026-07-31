@@ -157,6 +157,46 @@ async function startNode() {
   throw new Error(`the node never served /api/info:\n${log}`);
 }
 
+/* ---------------- the page's own reveal logic ---------------- */
+
+/// `show`, sliced out of the page and driven against a stand-in element.
+///
+/// It earns its place here for the same reason the envelope functions do: it
+/// was wrong, and neither suite could see it. Several message boxes ship the
+/// `hidden` attribute, nothing else ever clears it, and a `show` that wrote
+/// only `textContent` left them invisible — including the one-time
+/// `KONTOR_SEAL_KEY` reveal, which the node hands back once and never again.
+/// The endpoint tests above all passed while the operator saw nothing at all.
+async function checkTheReveal() {
+  const page = await readFile(PAGE, "utf8");
+
+  // eslint-disable-next-line no-new-func
+  const show = new Function(
+    "window",
+    `${extractFunction(page, "show")}\nreturn show;`,
+  )({ setTimeout: () => 0, clearTimeout: () => {} });
+
+  const box = { textContent: "", hidden: true, msgTimer: null };
+
+  show(box, "KONTOR_SEAL_KEY=…", true);
+  check(box.textContent === "KONTOR_SEAL_KEY=…", "show writes the message");
+  check(box.hidden === false, "and reveals a box that ships hidden");
+
+  show(box, "");
+  check(box.hidden === true, "clearing a message hides its box again");
+
+  // The rule the CSS has to hold up its end of, since `[hidden]` only exists in
+  // the user agent stylesheet and any author `display` rule outranks it.
+  check(
+    page.includes("[hidden] { display: none !important; }"),
+    "the stylesheet makes the hidden attribute authoritative",
+  );
+  check(
+    !/#(login|claim|app)\b[^{]*\{[^}]*display:\s*none/.test(page),
+    "and no screen is hidden by a display rule the attribute cannot override",
+  );
+}
+
 /* ---------------- the checks ---------------- */
 
 function check(condition, what) {
@@ -289,6 +329,10 @@ async function main() {
     check(!bodies.includes("abandon abandon"), "no request body carried the phrase");
     check(!bodies.includes(SEAL_PASSPHRASE), "no request body carried the passphrase");
     check(!bodies.includes(opened.key), "no request body carried the seal key");
+
+    // 5. And the key the node just handed back is one the page would show.
+    console.log("");
+    await checkTheReveal();
   } catch (error) {
     failure = error;
   } finally {

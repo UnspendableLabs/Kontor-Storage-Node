@@ -54,15 +54,28 @@
   input:focus { outline: none; border-color: var(--accent); }
   a { color: var(--blue); }
 
-  /* ---- login ---- */
-  #login { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-  #login .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
-  #login h1 { margin: 0 0 4px; font-size: 20px; }
-  #login p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
-  #login button { width: 100%; margin-top: 14px; }
+  /* `hidden` has to win.
+     The attribute is only `[hidden] { display: none }` in the user agent's own
+     stylesheet, and *any* author rule setting `display` beats it — origin
+     outranks specificity. So `#login { display: grid }` quietly made
+     `$("login").hidden = true` do nothing, and an unclaimed node rendered a
+     full-viewport sign-in screen with the claim form, its only way in, pushed
+     below the fold. One `!important` makes the attribute mean what every
+     reader of this file already assumes it means, for the three screens and
+     for every card inside them alike. */
+  [hidden] { display: none !important; }
+
+  /* ---- the two pre-session screens ----
+     Identical furniture, and exactly one of the three screens is ever shown;
+     `showScreen` is the only thing that decides which. */
+  #login, #claim { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  #login .card, #claim .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
+  #login h1, #claim h1 { margin: 0 0 4px; font-size: 20px; }
+  #login p.sub, #claim p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  #login button, #claim button { width: 100%; margin-top: 14px; }
 
   /* ---- shell ---- */
-  #app { display: none; max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
+  #app { max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
   header.bar { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
   header.bar h1 { font-size: 18px; margin: 0; }
   header.bar .spacer { flex: 1; }
@@ -132,7 +145,7 @@
   </form>
 </div>
 
-<div id="app">
+<div id="app" hidden>
   <header class="bar">
     <h1>Storage Node · Admin</h1>
     <span class="spacer"></span>
@@ -333,6 +346,9 @@
 
   var token = sessionStorage.getItem(TOKEN_KEY);
   var statusTimer = null;
+  // The phase the seal card was last loaded for, so the status poll does not
+  // re-fetch it every 30 s. `null` means "not loaded"; see `renderPhase`.
+  var sealLoadedFor = null;
   var walletProvider = null;
   // Whether the detection poll below has already run. It only ever runs once:
   // the extension injects its provider early or not at all, and the note it
@@ -355,12 +371,21 @@
   // The pending timeout is tracked on the element itself: without that, a
   // second message shown within the 6 s window inherits the first one's
   // countdown and disappears almost immediately.
+  //
+  // `hidden` is set alongside the text, and that is not decoration. Several of
+  // these boxes ship `hidden` in the markup, and nothing else ever clears it —
+  // so a `show()` that only wrote `textContent` left the message invisible.
+  // That is how the one-time `KONTOR_SEAL_KEY` reveal came to display nothing
+  // at all: the node hands the key back once, the page never showed it, and the
+  // env slot it had just committed became a slot nobody could open.
   function show(el, text, keep) {
     if (el.msgTimer) { window.clearTimeout(el.msgTimer); el.msgTimer = null; }
     el.textContent = text || "";
+    el.hidden = !text;
     if (text && !keep) {
       el.msgTimer = window.setTimeout(function () {
         el.textContent = "";
+        el.hidden = true;
         el.msgTimer = null;
       }, 6000);
     }
@@ -393,6 +418,15 @@
     return response.text().then(function (text) {
       try { return text ? JSON.parse(text) : null; } catch (e) { return null; }
     });
+  }
+
+  // Every `api()` caller ends the same way: show the failure, unless it was the
+  // session dying — `api` has already dropped the page back to the sign-in
+  // screen for that, and a second message next to a login form would only
+  // describe a request nobody is waiting for any more.
+  function report(box, error) {
+    if (error.status === 401 || error.status === 403) { return; }
+    show(box, error.message, true);
   }
 
   function apiErrorFrom(response, payload) {
@@ -470,18 +504,29 @@
     if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
   }
 
+  // Exactly one of the three top-level screens, every time. Written as one
+  // function rather than as pairs of assignments scattered across `signOut`,
+  // `openApp` and `chooseScreen`, because the state that mattered was the one
+  // nobody wrote down: "login hidden *and* claim shown".
+  function showScreen(which) {
+    $("login").hidden = which !== "login";
+    $("claim").hidden = which !== "claim";
+    $("app").hidden = which !== "app";
+  }
+
   function signOut() {
     token = null;
     sessionStorage.removeItem(TOKEN_KEY);
     stopPolling();
-    $("app").style.display = "none";
-    $("login").style.display = "grid";
+    // The next session starts from nothing, including the seal card: the node
+    // may have been resealed, or replaced entirely, since this one began.
+    sealLoadedFor = null;
+    showScreen("login");
     $("password").focus();
   }
 
   function openApp() {
-    $("login").style.display = "none";
-    $("app").style.display = "block";
+    showScreen("app");
     loadStatus();
     if (!statusTimer) { statusTimer = window.setInterval(loadStatus, STATUS_POLL_MS); }
   }
@@ -557,11 +602,18 @@
     // reseal with, and `loadSeal` would offer changes that cannot succeed.
     if (phase === "uninitialized" || phase === "sealed") {
       $("seal").hidden = true;
-    } else {
+      sealLoadedFor = null;
+    } else if (sealLoadedFor !== phase) {
+      // Once per phase, not once per poll. Nothing on the seal card changes on
+      // its own — every slot change comes from a button on this page, and each
+      // of those reloads it — so re-fetching every 30 s would be a request that
+      // can only ever return what is already on screen.
+      //
       // Swallowed: `api` has already dropped an expired session back to the
       // login screen, and a seal card that failed to load is not worth a second
-      // error box next to the one the status call would have raised.
-      loadSeal().catch(function () {});
+      // error box next to the one the status call would have raised. The phase
+      // is only recorded on success, so a failure is retried on the next poll.
+      loadSeal().then(function () { sealLoadedFor = phase; }).catch(function () {});
     }
 
     // The one thing an operator cannot infer from the counters: why the node
@@ -601,11 +653,12 @@
 
   function loadStatus() {
     api("/api/admin/status").then(function (data) {
-      $("status-error").textContent = "";
+      // Cleared through `show` like every other message box, so the `hidden`
+      // it manages and the text it manages never disagree.
+      show($("status-error"), "");
       renderStatus(data);
     }).catch(function (error) {
-      if (error.status === 401 || error.status === 403) { return; }
-      show($("status-error"), error.message, true);
+      report($("status-error"), error);
     });
   }
 
@@ -814,9 +867,7 @@
       button.textContent = label;
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("register-error"), error.message, true);
-      }
+      report($("register-error"), error);
       button.disabled = false;
       button.textContent = label;
     });
@@ -882,7 +933,7 @@
       }
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) { show($("reset-error"), error.message, true); }
+      report($("reset-error"), error);
     }).then(function () {
       button.disabled = $("reset-confirm").value !== CONFIRMATION_PHRASE;
     });
@@ -1006,6 +1057,27 @@
     });
   }
 
+  // Fetch an envelope, seal `payload` into it, and post it — the whole of what
+  // the four sealed endpoints have in common.
+  //
+  // Resolves to `{ result, channel }`: the channel is kept because a reply may
+  // come back sealed too, and only the browser that derived these keys can open
+  // it. Callers that send nothing up still go through here — a browser that
+  // cannot produce a ciphertext this process opens cannot read the answer
+  // either, and finding that out after the node has committed a slot is the
+  // wrong order.
+  function sealedPost(path, payload) {
+    var channel;
+    return openEnvelope().then(function (opened) {
+      channel = opened;
+      return sealRequest(channel, payload);
+    }).then(function (body) {
+      return api(path, { method: "POST", body: body });
+    }).then(function (result) {
+      return { result: result, channel: channel };
+    });
+  }
+
   // Shown wherever a secret would otherwise have to travel in the clear. The
   // honest answer is to refuse rather than to fall back.
   var NO_CRYPTO = "This browser will not encrypt here; see the note above.";
@@ -1041,24 +1113,20 @@
     button.disabled = true;
     button.textContent = "Encrypting…";
 
-    openEnvelope().then(function (channel) {
+    sealedPost("/api/admin/setup/provision", {
+      mnemonic: phrase,
+      account: account,
+      network: $("setup-network").value
+    }).then(function (sealed) {
       $("setup-envelope").textContent =
-        "Envelope fingerprint " + channel.envelope.fingerprint +
+        "Envelope fingerprint " + sealed.channel.envelope.fingerprint +
         " — it appears in the node's own logs; compare them if you want to be sure " +
         "this page is talking to the node itself.";
 
-      return sealRequest(channel, {
-        mnemonic: phrase,
-        account: account,
-        network: $("setup-network").value
-      });
-    }).then(function (body) {
-      button.textContent = "Setting up…";
-      return api("/api/admin/setup/provision", { method: "POST", body: body });
-    }).then(function (result) {
       // Cleared as soon as it has been sent: there is no reason for it to stay
       // in a field on a page that may be left open.
       $("setup-mnemonic").value = "";
+      var result = sealed.result;
       show($("setup-success"),
         "Set up as " + result.node_id + " (account " + result.account + ", " +
         result.network + "). Whitelist " + result.taproot_address +
@@ -1066,9 +1134,7 @@
         true);
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("setup-error"), error.message, true);
-      }
+      report($("setup-error"), error);
     }).then(function () {
       button.disabled = false;
       button.textContent = "Encrypt and set up";
@@ -1163,11 +1229,7 @@
 
     // Sealed on the way up, like the seed phrase: it opens the keystore, so it
     // must not sit in a request body an edge is free to log.
-    openEnvelope().then(function (channel) {
-      return sealRequest(channel, { passphrase: passphrase });
-    }).then(function (body) {
-      return api("/api/admin/seal/passphrase", { method: "POST", body: body });
-    }).then(function () {
+    sealedPost("/api/admin/seal/passphrase", { passphrase: passphrase }).then(function () {
       // Cleared as soon as it has been sent, for the same reason the seed
       // phrase field is: the page may be left open.
       field.value = "";
@@ -1176,9 +1238,7 @@
         "it is what opens this key if the seal key is ever lost.", true);
       return loadSeal();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("seal-error"), error.message, true);
-      }
+      report($("seal-error"), error);
     }).then(function () {
       passphraseInFlight = false;
       button.disabled = false;
@@ -1200,15 +1260,13 @@
     // The key comes back sealed, so the exchange has to be set up before it is
     // asked for. Nothing secret goes up: the empty payload is there so the node
     // can check this browser derived the same keys before committing a slot.
-    var channel;
-    openEnvelope().then(function (opened) {
-      channel = opened;
-      return sealRequest(channel, {});
-    }).then(function (body) {
-      return api("/api/admin/seal/env-slot", { method: "POST", body: body });
-    }).then(function (result) {
-      return openResponse(channel, result.sealed).then(function (reply) {
+    sealedPost("/api/admin/seal/env-slot", {}).then(function (sealed) {
+      var result = sealed.result;
+      return openResponse(sealed.channel, result.sealed).then(function (reply) {
         // Shown once and never retrievable again: the node does not keep it.
+        // `show` is what makes it visible at all — this box ships `hidden`, and
+        // a reveal that stayed hidden would mean a slot the node committed and
+        // nobody can ever open.
         show($("seal-key-reveal"),
           "Copy this now — it is not shown again and the node did not keep it.\n\n" +
           reply.env_var + "=" + reply.key + "\n\n" + result.next,
@@ -1216,9 +1274,7 @@
         return loadSeal();
       });
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("seal-error"), error.message, true);
-      }
+      report($("seal-error"), error);
     }).then(function () { button.disabled = false; });
   }
 
@@ -1233,11 +1289,7 @@
         show($("seal-success"), "The seal key file is gone. This node now opens only from its environment.", true);
         return loadSeal();
       })
-      .catch(function (error) {
-        if (error.status !== 401 && error.status !== 403) {
-          show($("seal-error"), error.message, true);
-        }
-      })
+      .catch(report.bind(null, $("seal-error")))
       .then(function () { button.disabled = false; });
   }
 
@@ -1255,17 +1307,11 @@
     // Sealed for the same reason the seed phrase is: a passphrase that opens
     // the keystore must not sit in a request body an edge is free to log.
     var passphrase = $("unseal-passphrase").value;
-    openEnvelope().then(function (channel) {
-      return sealRequest(channel, { passphrase: passphrase });
-    }).then(function (body) {
-      return api("/api/admin/unseal", { method: "POST", body: body });
-    }).then(function () {
+    sealedPost("/api/admin/unseal", { passphrase: passphrase }).then(function () {
       $("unseal-passphrase").value = "";
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("unseal-error"), error.message, true);
-      }
+      report($("unseal-error"), error);
     }).then(function () { button.disabled = false; });
   }
 
@@ -1297,7 +1343,6 @@
       sessionStorage.setItem(TOKEN_KEY, token);
       $("claim-token").value = "";
       $("claim-password").value = "";
-      $("claim").hidden = true;
       openApp();
     }).catch(function (error) {
       errorBox.textContent = error.message;
@@ -1315,15 +1360,14 @@
       .then(readBody)
       .then(function (info) {
         if (info && info.claimed === false) {
-          $("login").hidden = true;
-          $("app").hidden = true;
-          $("claim").hidden = false;
+          showScreen("claim");
           if (info.setup_token_fingerprint) {
             var note = $("claim-fingerprint");
             note.textContent = "Token fingerprint " + info.setup_token_fingerprint +
               " — the node logs the same one, so you can check you have the right token.";
             note.hidden = false;
           }
+          $("claim-token").focus();
           return;
         }
         if (token) { openApp(); } else { signOut(); }

@@ -45,7 +45,6 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -272,36 +271,73 @@ impl AdminCredential {
     }
 }
 
+/// Why a claim did not go through.
+///
+/// Typed rather than one `anyhow::Error`, because the four outcomes are four
+/// different answers and only one of them is the caller's fault. Flattening
+/// them told an operator whose volume was full or read-only that their setup
+/// token was wrong — and charged them a throttle penalty for it — while the
+/// real failure was on the node. [`crate::server::admin::session::claim`] is
+/// what turns each of these into its own status code.
+#[derive(Debug)]
+pub enum ClaimError {
+    /// A password is already set. A second claim is a race, or a stale tab.
+    AlreadyClaimed,
+    /// The token does not match. The only variant a guesser can produce, and
+    /// so the only one that costs anything.
+    InvalidToken,
+    /// The chosen password is below [`MIN_ADMIN_PASSWORD_LEN`].
+    WeakPassword,
+    /// The credential could not be hashed or written: a full disk, a read-only
+    /// mount, permissions. Nothing the person claiming can do about it.
+    Storage(anyhow::Error),
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyClaimed => f.write_str("this node has already been claimed"),
+            Self::InvalidToken => f.write_str("that setup token is not this node's"),
+            Self::WeakPassword => write!(
+                f,
+                "the admin password must be at least {MIN_ADMIN_PASSWORD_LEN} characters"
+            ),
+            Self::Storage(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
 /// Trade a setup token for a password.
 ///
 /// # Errors
-/// If the node is already claimed, if the token does not match, if the password
-/// is too short, or if the credential cannot be written.
+/// See [`ClaimError`]: already claimed, wrong token, password too short, or the
+/// credential could not be written.
 pub fn claim(
     app_dir: &Path,
     current: &AdminCredential,
     token: &str,
     password: &str,
-) -> Result<AdminCredential> {
+) -> Result<AdminCredential, ClaimError> {
     if !current.is_unclaimed() {
-        return Err(anyhow!("this node has already been claimed"));
+        return Err(ClaimError::AlreadyClaimed);
     }
     if !current.verify_token(token) {
-        return Err(anyhow!("that setup token is not this node's"));
+        return Err(ClaimError::InvalidToken);
     }
     if password.chars().count() < MIN_ADMIN_PASSWORD_LEN {
-        return Err(anyhow!(
-            "the admin password must be at least {MIN_ADMIN_PASSWORD_LEN} characters"
-        ));
+        return Err(ClaimError::WeakPassword);
     }
 
-    let phc = hash_password(password)?;
+    let phc = hash_password(password).map_err(ClaimError::Storage)?;
     let encoded = serde_json::to_vec_pretty(&StoredCredential {
         version: VERSION,
         phc: phc.clone(),
     })
-    .context("encoding the admin credential")?;
-    aead::write_secret_file(&app_dir.join(ADMIN_FILE), &encoded)?;
+    .context("encoding the admin credential")
+    .map_err(ClaimError::Storage)?;
+    aead::write_secret_file(&app_dir.join(ADMIN_FILE), &encoded).map_err(ClaimError::Storage)?;
 
     // Consumed, so it cannot be used again. Best-effort: the credential above is
     // what actually decides, and a token file that outlives its usefulness is
@@ -360,13 +396,7 @@ async fn read_stored(app_dir: &Path) -> Result<Option<String>> {
     // which is a way to lose a node to a truncated write.
     let stored: StoredCredential =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    if stored.version != VERSION {
-        return Err(anyhow!(
-            "{} has version {}, which this node does not understand",
-            path.display(),
-            stored.version
-        ));
-    }
+    aead::check_version(&path, stored.version, VERSION)?;
     Ok(Some(stored.phc))
 }
 
@@ -410,11 +440,13 @@ fn token_path(app_dir: &Path) -> PathBuf {
 }
 
 /// A short, non-reversible identifier for a token.
+///
+/// Safe to publish here in a way it would not be for a passphrase: a token is
+/// 32 random bytes, or — supplied — at least 32 characters, so there is no list
+/// of candidates four bytes of a hash could narrow. See
+/// [`crate::crypto::aead::fingerprint`].
 fn fingerprint(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(FINGERPRINT_DOMAIN);
-    hasher.update(token.as_bytes());
-    hex::encode(&hasher.finalize()[..4])
+    aead::fingerprint(FINGERPRINT_DOMAIN, token.as_bytes())
 }
 
 #[cfg(test)]
@@ -590,6 +622,35 @@ mod tests {
         assert!(err.to_string().contains("not this node's"), "{err}");
         assert!(!dir.path().join(ADMIN_FILE).exists());
         assert!(dir.path().join(SETUP_TOKEN_FILE).exists());
+    }
+
+    /// A node that cannot write its own credential must not blame the person
+    /// claiming it. The two failures need different answers — one is a guess,
+    /// the other is a full or read-only volume — and telling them apart is the
+    /// whole reason [`ClaimError`] is a type.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_volume_that_cannot_be_written_is_not_a_wrong_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvGuard::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let unclaimed = AdminCredential::load_or_bootstrap(dir.path(), &no_env_password())
+            .await
+            .unwrap();
+        let token = std::fs::read_to_string(dir.path().join(SETUP_TOKEN_FILE)).unwrap();
+
+        // Relies on the test process not being root, as the reset's own
+        // read-only-directory test does.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = claim(dir.path(), &unclaimed, token.trim(), PASSWORD).unwrap_err();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(err, ClaimError::Storage(_)),
+            "a failed write must not read as a wrong token: {err}"
+        );
     }
 
     #[tokio::test]

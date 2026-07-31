@@ -46,7 +46,6 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -189,11 +188,17 @@ impl SealKey {
     }
 
     /// The base64 form, for showing once in `/admin` or writing to `.seal-key`.
+    ///
+    /// `None` for a passphrase, for the same reason [`Self::fingerprint`] is:
+    /// the two callers are "write this to `.seal-key`" and "hand this back to
+    /// the browser", and neither is ever a thing to do with a secret an
+    /// operator typed and holds elsewhere. Returning the passphrase here would
+    /// make writing it to the volume a one-character mistake.
     #[must_use]
-    pub fn encode(&self) -> Zeroizing<String> {
+    pub fn encode(&self) -> Option<Zeroizing<String>> {
         match self {
-            Self::Raw { key, .. } => Zeroizing::new(BASE64.encode(key.as_slice())),
-            Self::Passphrase(value) => Zeroizing::new(value.to_string()),
+            Self::Raw { key, .. } => Some(Zeroizing::new(BASE64.encode(key.as_slice()))),
+            Self::Passphrase(_) => None,
         }
     }
 
@@ -223,10 +228,7 @@ impl SealKey {
             return None;
         };
 
-        let mut hasher = Sha256::new();
-        hasher.update(FINGERPRINT_DOMAIN);
-        hasher.update(key.as_slice());
-        Some(hex::encode(&hasher.finalize()[..4]))
+        Some(aead::fingerprint(FINGERPRINT_DOMAIN, key.as_slice()))
     }
 
     /// The key-encryption key for a slot, deriving it when the slot needs a salt.
@@ -337,14 +339,7 @@ impl Keystore {
         let file: KeystoreFile = serde_json::from_slice(&raw)
             .with_context(|| format!("parsing the keystore at {}", path.display()))?;
 
-        if file.version != VERSION {
-            return Err(anyhow!(
-                "the keystore at {} has version {}, which this node does not understand \
-                 (it writes version {VERSION}). It was probably written by a newer build.",
-                path.display(),
-                file.version
-            ));
-        }
+        aead::check_version(&path, file.version, VERSION)?;
 
         if file.slots.is_empty() {
             return Err(anyhow!(
@@ -663,7 +658,10 @@ pub fn resolve_seal_key(
     }
 
     let key = SealKey::generate(SlotKind::File);
-    aead::write_secret_file(&path, key.encode().as_bytes())?;
+    let encoded = key
+        .encode()
+        .ok_or_else(|| anyhow!("a generated seal key must be a raw key"))?;
+    aead::write_secret_file(&path, encoded.as_bytes())?;
     Ok(Some((key, SealKeySource::Generated)))
 }
 
@@ -994,7 +992,7 @@ mod tests {
             key.fingerprint(),
             SealKey::generate(SlotKind::File).fingerprint()
         );
-        assert!(!key.encode().contains(&fingerprint));
+        assert!(!key.encode().unwrap().contains(&fingerprint));
     }
 
     /// A passphrase has no fingerprint, and must not grow one. The value is
@@ -1010,18 +1008,33 @@ mod tests {
         assert!(SealKey::generate(SlotKind::File).fingerprint().is_some());
     }
 
+    /// And no encoding either. The two callers of `encode` write the result to
+    /// `.seal-key` or hand it back to a browser, and doing either with a
+    /// passphrase would put an operator's own secret somewhere they never chose
+    /// to put it.
+    #[test]
+    fn a_passphrase_has_no_encoding_to_hand_out() {
+        let phrase = SealKey::passphrase("correct horse battery staple");
+
+        assert!(phrase.encode().is_none());
+        assert!(SealKey::generate(SlotKind::File).encode().is_some());
+    }
+
     #[test]
     fn a_seal_key_never_prints_itself() {
         let key = SealKey::generate(SlotKind::Env);
         let rendered = format!("{key:?}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(!rendered.contains(key.encode().as_str()), "{rendered}");
+        assert!(
+            !rendered.contains(key.encode().unwrap().as_str()),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn seal_keys_round_trip_through_base64() {
         let key = SealKey::generate(SlotKind::Env);
-        let decoded = SealKey::decode(SlotKind::Env, &key.encode()).unwrap();
+        let decoded = SealKey::decode(SlotKind::Env, &key.encode().unwrap()).unwrap();
         assert_eq!(decoded.fingerprint(), key.fingerprint());
 
         assert!(SealKey::decode(SlotKind::Env, "not base64!!").is_err());
@@ -1057,7 +1070,7 @@ mod tests {
         let (file_key, _) = resolve_seal_key(dir.path(), true).unwrap().unwrap();
 
         let env_key = SealKey::generate(SlotKind::Env);
-        std::env::set_var(SEAL_KEY_ENV, env_key.encode().as_str());
+        std::env::set_var(SEAL_KEY_ENV, env_key.encode().unwrap().as_str());
 
         let (resolved, source) = resolve_seal_key(dir.path(), true).unwrap().unwrap();
         assert_eq!(source, SealKeySource::Env);
@@ -1149,7 +1162,7 @@ mod tests {
         let raw = std::fs::read_to_string(Keystore::path_in(dir.path())).unwrap();
         assert!(raw.contains("\"network\": \"signet\""), "{raw}");
         assert!(raw.contains(&store.public().unwrap().node_id), "{raw}");
-        assert!(!raw.contains(key.encode().as_str()), "{raw}");
+        assert!(!raw.contains(key.encode().unwrap().as_str()), "{raw}");
     }
 
     #[test]

@@ -171,15 +171,23 @@ pub async fn add_env_slot(
     let (mut keystore, unlock) = open_keystore(state).await?;
 
     let new = SealKey::generate(SlotKind::Env);
+
+    // Both `Option`s are `Some` for a generated raw key, and both are `None`
+    // only for a passphrase — which this endpoint never makes. Encoded before
+    // the slot is written: a key that cannot be handed back is a slot nobody
+    // could ever open, so the impossible case still must not commit one.
+    let (Some(encoded), Some(fingerprint)) = (new.encode(), new.fingerprint()) else {
+        return Err(ApiError::server_error(
+            "a generated env seal key must be a raw key",
+        ));
+    };
+
     keystore
         .add_slot(&unlock, &new)
         .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
 
     state.runtime.set_slots(keystore.slots());
 
-    // A generated raw key always has one; the type is `Option` for the sake of
-    // passphrases, which must never be fingerprinted.
-    let fingerprint = new.fingerprint();
     tracing::info!(
         fingerprint = ?fingerprint,
         "Added an env seal slot from /admin; the key was sealed to the browser once and not retained"
@@ -195,7 +203,7 @@ pub async fn add_env_slot(
             &request.client_pubkey,
             &EnvSlotReply {
                 env_var: keystore::SEAL_KEY_ENV,
-                key: new.encode(),
+                key: encoded,
             },
         )?,
         "next": format!(
@@ -347,7 +355,10 @@ pub async fn unseal(
             .await
             .map_err(|e| ApiError::server_error(format!("unsealing task failed: {e}")))?
     };
-    attempt.map_err(|e| {
+    // Kept, not discarded. This derivation cost 64 MiB of Argon2id on a
+    // blocking thread; handing the result to the supervisor is what stops it
+    // from being paid a second time, on the executor.
+    let keypair = attempt.map_err(|e| {
         ApiError::new(
             StatusCode::UNAUTHORIZED,
             error_codes::INVALID_PASSWORD,
@@ -360,6 +371,7 @@ pub async fn unseal(
 
     state.runtime.request(Activation::Open {
         keystore: Box::new(keystore),
+        keypair: Box::new(keypair),
         seal_key: key,
         // Not `Env` or `File`: nothing on this machine supplied it, so the node
         // must not go on to report that it could restart unattended.
@@ -609,7 +621,7 @@ mod tests {
         let (client, request) = sealed(&state, &json!({}));
 
         let stray = SealKey::generate(SlotKind::Env);
-        std::env::set_var(keystore::SEAL_KEY_ENV, stray.encode().as_str());
+        std::env::set_var(keystore::SEAL_KEY_ENV, stray.encode().unwrap().as_str());
         let body = add_env_slot(&request, &state).await;
         std::env::remove_var(keystore::SEAL_KEY_ENV);
 
@@ -831,7 +843,9 @@ mod tests {
         assert_eq!(value["fingerprint"], json!(file_key.fingerprint()));
         assert_eq!(value["env_var"], keystore::SEAL_KEY_ENV);
         assert!(
-            !value.to_string().contains(file_key.encode().as_str()),
+            !value
+                .to_string()
+                .contains(file_key.encode().unwrap().as_str()),
             "the seal key must not be in a status response"
         );
     }

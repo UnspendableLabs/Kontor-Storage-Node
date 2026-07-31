@@ -196,14 +196,18 @@ async fn serve(
 ) -> Result<Outcome> {
     let parts = build_server_parts(&config).await?;
 
-    // Reading the keys can fail — a corrupt keystore, a seal key that does not
-    // open it — and that failure is fatal by design: it means there *is* an
-    // identity here and we cannot reach it, which is the one situation where
+    // Reading the keys can fail, and only one way: the keystore itself is
+    // unreadable. That is fatal by design — it means there *is* an identity
+    // here and we cannot even parse it, which is the one situation where
     // carrying on and offering the setup wizard would provision a second one
     // over the top of the first.
+    //
+    // A seal key that is malformed or simply wrong is not that. It comes back
+    // as `Sealed` with a reason, the server starts, and `/admin` offers the
+    // passphrase that gets the node open again.
     let source = resolve_keys(&config, &mut writer).await?;
 
-    let (phase, seal, opened) = match source {
+    let (phase, seal, opened, notice) = match source {
         KeySource::Open {
             keystore,
             keys,
@@ -216,34 +220,54 @@ async fn serve(
             // shown one without the other.
             SealStatus::default(),
             Some((keystore, keys, seal_key, seal_source)),
+            None,
         ),
-        KeySource::Sealed { keystore } => {
-            writeln!(
-                writer,
-                "\nThis node has a keystore but nothing here can open it.\n  \
-                   slots: {}\n  \
-                 Set {} to the key for one of them, restore the seal key file, or unlock \
-                 it from /admin.",
-                keystore
-                    .slots()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                crate::crypto::keystore::SEAL_KEY_ENV,
-            )?;
-            (Phase::Sealed, SealStatus::locked(&keystore), None)
+        KeySource::Sealed { keystore, reason } => {
+            let slots = keystore
+                .slots()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // The reason leads, because it is the actionable half: "the env
+            // seal key did not open this keystore" sends an operator to the
+            // variable they just pasted, and its absence means there was
+            // nothing to try in the first place.
+            let notice = match &reason {
+                Some(reason) => format!(
+                    "This node has a keystore and could not open it: {reason}. Its slots are \
+                     {slots}. Correct {}, restore the seal key file, or unseal it here with a \
+                     passphrase.",
+                    crate::crypto::keystore::SEAL_KEY_ENV
+                ),
+                None => format!(
+                    "This node has a keystore but nothing here can open it. Its slots are \
+                     {slots}. Set {} to the key for one of them, restore the seal key file, \
+                     or unseal it here with a passphrase.",
+                    crate::crypto::keystore::SEAL_KEY_ENV
+                ),
+            };
+
+            writeln!(writer, "\n{notice}")?;
+            (
+                Phase::Sealed,
+                SealStatus::locked(&keystore),
+                None,
+                Some(notice),
+            )
         }
         KeySource::Uninitialized => {
             writeln!(
                 writer,
                 "\nThis node has no keys yet. Open /admin to set it up."
             )?;
-            (Phase::Uninitialized, SealStatus::default(), None)
+            (Phase::Uninitialized, SealStatus::default(), None, None)
         }
     };
 
     let runtime = NodeRuntime::new(phase, seal);
+    runtime.set_notice(notice);
 
     // The key this boot opened the keystore with, published before the server
     // is: `/admin` reseals with it, and a request can arrive before the
@@ -367,28 +391,24 @@ impl Supervisor {
             match self.runtime.next().await {
                 Activation::Open {
                     keystore,
+                    keypair,
                     seal_key,
                     source,
                 } => {
-                    match keystore.unseal(&seal_key) {
-                        Ok(keypair) => {
-                            let keys = NodeKeys::Sealed(Box::new(node::SealedKeys {
-                                keypair,
-                                public: keystore.public().cloned(),
-                            }));
-                            // Announced only once it has worked. A key that did
-                            // not open the keystore is not the key `/admin`
-                            // should go on to reseal with, and a status saying
-                            // otherwise would offer an operator a slot change
-                            // that cannot succeed.
-                            self.runtime.opened(&keystore, &seal_key, source);
-                            self.keystore = Some((keystore, seal_key, source));
-                            self.activate(keys).await;
-                        }
-                        Err(e) => self.fail("could not open the keystore", &e),
-                    }
+                    let keys = NodeKeys::Sealed(Box::new(node::SealedKeys {
+                        keypair: *keypair,
+                        public: keystore.public().cloned(),
+                    }));
+                    // The key arrived already opened, by whoever proved it
+                    // opens — so there is nothing here that can fail, and no
+                    // second Argon2 derivation on this task. Announced before
+                    // activating, because `/admin` reseals with it and a
+                    // request can land at any point after this.
+                    self.runtime.opened(&keystore, &seal_key, source);
+                    self.keystore = Some((keystore, seal_key, source));
+                    self.activate(keys).await;
                 }
-                Activation::Reonboard => match self.reopen() {
+                Activation::Reonboard => match self.reopen().await {
                     Ok(keys) => self.activate(keys).await,
                     Err(e) => self.fail("could not reopen the keystore", &e),
                 },
@@ -397,15 +417,27 @@ impl Supervisor {
     }
 
     /// Derive the keys again from the keystore this node was opened with.
-    fn reopen(&self) -> Result<NodeKeys> {
+    ///
+    /// Off the executor, for the same reason every other unseal on this branch
+    /// is: on a node held open by a passphrase this is 64 MiB of Argon2id, and
+    /// a registration finishing is exactly when it runs.
+    async fn reopen(&self) -> Result<NodeKeys> {
         let (keystore, seal_key, _) = self
             .keystore
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("this node has no keystore to reopen"))?;
 
+        let public = keystore.public().cloned();
+        let keystore = keystore.clone();
+        let seal_key = seal_key.clone();
+
+        let keypair = tokio::task::spawn_blocking(move || keystore.unseal(&seal_key))
+            .await
+            .map_err(|e| anyhow::anyhow!("the unsealing task failed: {e}"))??;
+
         Ok(NodeKeys::Sealed(Box::new(node::SealedKeys {
-            keypair: keystore.unseal(seal_key)?,
-            public: keystore.public().cloned(),
+            keypair,
+            public,
         })))
     }
 
@@ -1160,10 +1192,13 @@ mod tests {
             "expected onboarding complete message: {output}"
         );
 
-        let lock_path = storage_dir.join(".portal-daemon.lock");
+        // The lock file outlives every holder on purpose — see
+        // `app::daemon::LockFileGuard` — so what has to be true after a
+        // shutdown is that nothing still *holds* it, not that it is gone.
+        #[cfg(unix)]
         assert!(
-            !lock_path.exists(),
-            "lock file should be cleaned up after shutdown"
+            !crate::app::daemon::lock_is_held(&storage_dir.join(".portal-daemon.lock")),
+            "the daemon lock should be released after shutdown"
         );
 
         let requests = mock_server.received_requests().await.unwrap();

@@ -161,10 +161,19 @@ impl SealStatus {
 
 /// Something an operator asked for that the supervisor has to carry out.
 pub enum Activation {
-    /// A keystore is ready to be opened — freshly provisioned by the wizard, or
-    /// unlocked by a passphrase.
+    /// A keystore that has **already been opened** — freshly provisioned by the
+    /// wizard, or unlocked by a passphrase.
+    ///
+    /// The opened key travels with it rather than being derived again on the
+    /// other side. That is not a micro-optimisation: a passphrase slot costs
+    /// 64 MiB of Argon2id across four lanes, the endpoints run it on
+    /// `spawn_blocking` precisely because it must not sit on the executor, and
+    /// the supervisor is a plain `tokio` task. Re-deriving here would pay the
+    /// whole cost a second time, on the one thread that has no business
+    /// blocking.
     Open {
         keystore: Box<Keystore>,
+        keypair: Box<crate::crypto::BlsKeyPair>,
         seal_key: SealKey,
         source: SealKeySource,
     },
@@ -654,8 +663,10 @@ mod tests {
 
         let runtime = NodeRuntime::new(Phase::Uninitialized, SealStatus::default());
         runtime.request(Activation::Reonboard);
+        let keypair = keystore.unseal(&key).unwrap();
         runtime.request(Activation::Open {
             keystore: Box::new(keystore),
+            keypair: Box::new(keypair),
             seal_key: key,
             source: SealKeySource::File,
         });
@@ -684,16 +695,21 @@ mod tests {
         let keystore =
             Keystore::provision(dir.path(), &keypair.secret_key_hex(), None, &key).unwrap();
 
+        let keypair = keystore.unseal(&key).unwrap();
         let rendered = format!(
             "{:?}",
             Activation::Open {
                 keystore: Box::new(keystore),
+                keypair: Box::new(keypair),
                 seal_key: key.clone(),
                 source: SealKeySource::Env,
             }
         );
         assert!(rendered.contains("Env"), "{rendered}");
-        assert!(!rendered.contains(key.encode().as_str()), "{rendered}");
+        assert!(
+            !rendered.contains(key.encode().unwrap().as_str()),
+            "{rendered}"
+        );
         assert_eq!(format!("{:?}", Activation::Reonboard), "Reonboard");
     }
 }

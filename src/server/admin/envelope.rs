@@ -70,7 +70,7 @@ use p256::{EncodedPoint, PublicKey};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::crypto::aead::{self, KEY_SIZE};
@@ -146,10 +146,10 @@ impl EnvelopeSession {
     /// compare the browser against the node's own logs.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(FINGERPRINT_DOMAIN);
-        hasher.update(EncodedPoint::from(self.secret.public_key()).as_bytes());
-        hex::encode(&hasher.finalize()[..4])
+        aead::fingerprint(
+            FINGERPRINT_DOMAIN,
+            EncodedPoint::from(self.secret.public_key()).as_bytes(),
+        )
     }
 
     #[must_use]
@@ -286,8 +286,7 @@ pub fn open(
 
     let session = state
         .admin
-        .take_envelope()
-        .filter(|session| session.id_hex() == request.session_id && !session.is_expired())
+        .take_envelope(&request.session_id)
         .ok_or_else(unknown)?;
 
     let plaintext = session

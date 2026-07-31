@@ -14,7 +14,7 @@ use std::process;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum backoff duration (5 minutes).
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -217,12 +217,6 @@ async fn downloaded_files_count(database: &DatabaseConnection) -> Result<u64> {
     Ok(count)
 }
 
-/// How many times [`LockFileGuard::take`] re-reads the path when it is replaced
-/// underneath the handle it just locked. Each retry is one lost race against a
-/// daemon shutting down, which happens at most once per acquisition.
-#[cfg(unix)]
-const LOCK_ATTEMPTS: usize = 3;
-
 /// Filesystem lock preventing two daemons from running against one storage
 /// directory.
 ///
@@ -247,6 +241,23 @@ const LOCK_ATTEMPTS: usize = 3;
 ///
 /// The pid is still written, because it is worth reading in a log; nothing
 /// decides anything from it any more.
+///
+/// # Why the file is never deleted
+///
+/// Because the file is not the lock — the lock is on the inode, and the kernel
+/// holds it whether or not any name still points there. Unlinking on the way
+/// out is therefore not cleanup; it is a way to lose the lock. A daemon that
+/// removes the name a successor has already created and locked leaves that
+/// successor holding an anonymous inode, and a third daemon can then create a
+/// fresh file, lock *that*, and run alongside it. Two daemons on one key
+/// desynchronise the nonce, which is the failure this whole guard exists to
+/// prevent.
+///
+/// So the file simply stays. It costs one inode, it carries the last holder's
+/// pid for whoever is reading logs, and its presence means nothing at all —
+/// which is exactly the property that made `SIGKILL` survivable in the first
+/// place. Off Unix there is no `flock`, so there the file's existence *is* the
+/// lock and it has to be removed; see [`LockFileGuard::take`].
 #[derive(Debug)]
 struct LockFileGuard {
     path: PathBuf,
@@ -277,50 +288,32 @@ impl LockFileGuard {
     }
 
     /// Take the lock, or report that a live daemon holds it.
+    ///
+    /// One open, one `flock`, no retry and no inode comparison: nothing ever
+    /// unlinks this path, so the name and the inode behind it cannot come
+    /// apart. That is the simplification the "never deleted" rule on
+    /// [`LockFileGuard`] buys, and the reason it is worth having.
     #[cfg(unix)]
     fn take(path: &Path) -> Result<std::fs::File> {
-        use std::os::unix::fs::MetadataExt;
+        // `create`, not `create_new`: the file left by a killed daemon is not
+        // the lock, so finding one is not a refusal. `flock` below is what
+        // decides.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("unable to open the daemon lock at {}", path.display()))?;
 
-        for _ in 0..LOCK_ATTEMPTS {
-            // `create`, not `create_new`: the file left by a killed daemon is
-            // not the lock, so finding one is not a refusal. `flock` below is
-            // what decides.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)
-                .with_context(|| format!("unable to open the daemon lock at {}", path.display()))?;
-
-            if !flock_exclusive(&file)? {
-                return Err(anyhow!(
-                    "another daemon is already running (lock at {})",
-                    path.display()
-                ));
-            }
-
-            // The lock lives on the inode, not on the name. A daemon shutting
-            // down unlinks the name it locked, so a handle opened a moment
-            // earlier can end up holding an uncontested lock on a file nothing
-            // points at — while the next daemon creates a fresh one and locks
-            // that. Comparing what was locked against what the name resolves to
-            // now is what closes that window.
-            let locked = file.metadata().context("inspecting the daemon lock")?;
-            match fs::metadata(path) {
-                Ok(named) if named.dev() == locked.dev() && named.ino() == locked.ino() => {
-                    return Ok(file)
-                }
-                // Unlinked or replaced under us. Dropping the handle releases
-                // its lock; go around again against whatever the name means now.
-                _ => drop(file),
-            }
+        if !flock_exclusive(&file)? {
+            return Err(anyhow!(
+                "another daemon is already running (lock at {})",
+                path.display()
+            ));
         }
 
-        Err(anyhow!(
-            "the daemon lock at {} was replaced {LOCK_ATTEMPTS} times while being taken",
-            path.display()
-        ))
+        Ok(file)
     }
 
     /// Off Unix there is no `flock`, so the file's existence has to be the lock
@@ -422,8 +415,30 @@ fn flock_exclusive(file: &std::fs::File) -> Result<bool> {
 
 impl Drop for LockFileGuard {
     fn drop(&mut self) {
+        // Off Unix the file's existence *is* the lock, so there it has to go.
+        // On Unix it deliberately stays: closing the handle is the whole
+        // release, and unlinking a name a successor may already have created
+        // and locked is how two daemons end up running. See [`LockFileGuard`].
+        #[cfg(not(unix))]
         let _ = fs::remove_file(&self.path);
+
+        debug!(lock = %self.path.display(), "released the daemon lock");
     }
+}
+
+/// Whether something currently holds the daemon lock at `path`.
+///
+/// Test-only, and it exists because the file no longer answers that question:
+/// it outlives every holder, so "is the lock free" has to be asked of the
+/// kernel. Probing takes the lock and immediately drops it, which is safe
+/// precisely because nothing unlinks the name.
+#[cfg(all(test, unix))]
+pub(crate) fn lock_is_held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        // No file at all means nothing ever locked it here.
+        return false;
+    };
+    !flock_exclusive(&file).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -452,7 +467,12 @@ mod tests {
             "the new holder must be recorded, with none of the old pid left behind"
         );
         drop(guard);
-        assert!(!path.exists());
+
+        // The name stays; the lock does not. That asymmetry is the design: the
+        // file is a place to read a pid, and the kernel is the authority on
+        // whether anything holds it.
+        assert!(path.exists(), "the lock file is never unlinked");
+        assert!(!lock_is_held(&path), "dropping the guard releases the lock");
     }
 
     /// The container case, which is the whole reason a recorded pid cannot be
@@ -488,11 +508,38 @@ mod tests {
             "a held lock must not be handed out twice"
         );
         drop(guard);
-        assert!(!path.exists());
 
         // And it can be taken again afterwards, which is what a restart does.
         let again = LockFileGuard::acquire(path.clone()).unwrap();
         drop(again);
+    }
+
+    /// The reason the file is never unlinked, as a test rather than a comment.
+    /// A guard that removed its own path on the way out would take a
+    /// successor's file with it — leaving that successor holding an anonymous
+    /// inode while a third daemon creates a fresh name, locks it, and runs
+    /// alongside. Two daemons on one key desynchronise the nonce.
+    #[cfg(unix)]
+    #[test]
+    fn releasing_a_lock_never_removes_a_successor_s_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+
+        let outgoing = LockFileGuard::acquire(path.clone()).unwrap();
+        drop(outgoing);
+
+        let incoming = LockFileGuard::acquire(path.clone()).unwrap();
+        // A second release of the outgoing guard cannot happen, but the shape
+        // it would have — an unlink of this path — must not be something the
+        // successor's lock depends on surviving. It does not: the name is still
+        // the inode the successor holds, and the lock is still held.
+        assert!(path.exists());
+        assert!(lock_is_held(&path), "the successor still holds it");
+        assert!(
+            LockFileGuard::acquire(path.clone()).is_err(),
+            "and nobody else can take it"
+        );
+        drop(incoming);
     }
 
     /// `flock` is what the whole design rests on, so its two answers are pinned
@@ -530,8 +577,9 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[cfg(unix)]
     #[test]
-    fn lock_file_guard_creates_and_cleans_lock_file() {
+    fn lock_file_guard_records_its_holder_and_releases_on_drop() {
         let lock_path = unique_test_path("lock_basic");
         let _ = fs::remove_file(&lock_path);
 
@@ -543,13 +591,15 @@ mod tests {
                 contents.contains("pid="),
                 "lock file should record the process id"
             );
+            assert!(lock_is_held(&lock_path));
             drop(guard);
         }
 
         assert!(
-            !lock_path.exists(),
-            "lock file should be removed when guard is dropped"
+            !lock_is_held(&lock_path),
+            "the lock should be free once the guard is dropped"
         );
+        let _ = fs::remove_file(&lock_path);
     }
 
     #[test]
@@ -565,10 +615,9 @@ mod tests {
         );
         drop(guard);
 
-        assert!(
-            !lock_path.exists(),
-            "lock file should be cleaned after the original guard is dropped"
-        );
+        LockFileGuard::acquire(lock_path.clone())
+            .expect("the lock should be free after the original guard is dropped");
+        let _ = fs::remove_file(&lock_path);
     }
 
     #[tokio::test]
@@ -603,8 +652,8 @@ mod tests {
             "initial sync errors should be surfaced"
         );
         assert!(
-            !lock_path.exists(),
-            "lock file should be removed even when an error occurs"
+            !lock_is_held(&lock_path),
+            "the lock should be released even when an error occurs"
         );
     }
 
@@ -669,8 +718,8 @@ mod tests {
             "daemon should not call portal when max files limit is reached"
         );
         assert!(
-            !lock_path.exists(),
-            "lock file should be cleaned up when daemon task is dropped"
+            !lock_is_held(&lock_path),
+            "the lock should be released when the daemon task is dropped"
         );
     }
 
@@ -710,8 +759,8 @@ mod tests {
             "daemon task should exit after logging the error"
         );
         assert!(
-            !lock_path.exists(),
-            "lock file should be cleaned up after daemon exits"
+            !lock_is_held(&lock_path),
+            "the lock should be released after the daemon exits"
         );
     }
 
@@ -944,8 +993,8 @@ mod tests {
         assert_eq!(contents, "file-body");
 
         assert!(
-            !lock_path.exists(),
-            "lock file should be cleaned up when daemon task is dropped"
+            !lock_is_held(&lock_path),
+            "the lock should be released when the daemon task is dropped"
         );
     }
 

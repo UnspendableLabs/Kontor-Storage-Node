@@ -25,6 +25,7 @@ use aes_gcm::{
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -158,6 +159,48 @@ pub fn open(
         .map_err(|_| anyhow!("decryption failed: wrong key or corrupted data"))?;
 
     Ok(Zeroizing::new(plaintext))
+}
+
+/// A short, non-reversible identifier for a secret, so two people can check
+/// they hold the same one without either of them saying it.
+///
+/// One implementation, four callers — the seal key, the setup token, the
+/// envelope's public key, and the keystore's own tests. Each passes its own
+/// `domain`, which is what stops a fingerprint of one from ever matching a
+/// fingerprint of another over the same bytes.
+///
+/// Four bytes, and that bound is load-bearing rather than arbitrary: this value
+/// is published in bodies that are not themselves sealed, so it has to be short
+/// enough to narrow nothing. It is only ever safe over material an attacker has
+/// no list to try — see [`crate::crypto::keystore::SealKey::fingerprint`] for
+/// the one place that rule forced a `None`.
+#[must_use]
+pub fn fingerprint(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hex::encode(&hasher.finalize()[..4])
+}
+
+/// Refuse a file written by a build that knew something this one does not.
+///
+/// Shared by every versioned file this node keeps — the keystore and the admin
+/// credential — because the two failures are the same failure and the wording
+/// is the part worth getting right once: a node that silently read a future
+/// format would act on fields it could not see.
+///
+/// # Errors
+/// If `found` is not `expected`.
+pub fn check_version(path: &Path, found: u32, expected: u32) -> Result<()> {
+    if found == expected {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "{} has version {found}, which this node does not understand (it writes \
+         version {expected}). It was probably written by a newer build.",
+        path.display()
+    ))
 }
 
 /// A fresh 32-byte random key.
@@ -417,6 +460,47 @@ mod tests {
             p_cost: 0,
         };
         assert!(derive_kek(b"password", &random_salt(), &kdf).is_err());
+    }
+
+    /// Four bytes, stable, and different for different inputs — the three
+    /// properties every caller of it relies on.
+    #[test]
+    fn a_fingerprint_is_short_stable_and_specific() {
+        const DOMAIN: &[u8] = b"KONTOR_TEST_FP";
+
+        assert_eq!(fingerprint(DOMAIN, b"secret").len(), 8);
+        assert_eq!(
+            fingerprint(DOMAIN, b"secret"),
+            fingerprint(DOMAIN, b"secret")
+        );
+        assert_ne!(
+            fingerprint(DOMAIN, b"secret"),
+            fingerprint(DOMAIN, b"other")
+        );
+        assert!(!fingerprint(DOMAIN, b"secret").contains("secret"));
+    }
+
+    /// The reason every caller passes a domain: the same bytes must fingerprint
+    /// differently depending on what they are, so a seal key's identifier can
+    /// never be mistaken for a setup token's.
+    #[test]
+    fn the_domain_separates_fingerprints_of_the_same_bytes() {
+        assert_ne!(
+            fingerprint(b"KONTOR_A", b"the same bytes"),
+            fingerprint(b"KONTOR_B", b"the same bytes")
+        );
+    }
+
+    #[test]
+    fn check_version_accepts_its_own_and_names_anything_else() {
+        let path = Path::new("/data/keystore.json");
+
+        assert!(check_version(path, 1, 1).is_ok());
+
+        let err = check_version(path, 99, 1).unwrap_err();
+        assert!(err.to_string().contains("version 99"), "{err}");
+        assert!(err.to_string().contains("keystore.json"), "{err}");
+        assert!(err.to_string().contains("newer build"), "{err}");
     }
 
     #[test]

@@ -233,6 +233,69 @@ mod tests {
         }
     }
 
+    /// The two rules that make `hidden` mean anything on this page, and both of
+    /// them were learned the hard way.
+    ///
+    /// `[hidden]` only exists in the user agent's stylesheet, so any author rule
+    /// setting `display` silently outranks it — `#login { display: grid }` did
+    /// exactly that, and an unclaimed node rendered a full-viewport sign-in
+    /// screen over the claim form that was its only way in. And a box that
+    /// ships `hidden` stays hidden unless something clears it: `show` writing
+    /// only `textContent` is why the one-time `KONTOR_SEAL_KEY` reveal
+    /// displayed nothing at all, on the one screen where the value is never
+    /// shown twice.
+    #[test]
+    fn admin_html_makes_the_hidden_attribute_authoritative() {
+        assert!(
+            ADMIN_HTML.contains("[hidden] { display: none !important; }"),
+            "an author `display` rule would otherwise beat the attribute"
+        );
+        assert!(
+            ADMIN_HTML.contains("el.hidden = !text;"),
+            "`show` must reveal the box it writes into, or a message box that \
+             ships `hidden` can never be read"
+        );
+    }
+
+    /// One function decides which of the three screens is up. The state that
+    /// broke was the one nobody wrote down — login hidden *and* claim shown —
+    /// so the page must not go back to setting them one at a time.
+    #[test]
+    fn admin_html_switches_screens_in_one_place() {
+        assert!(ADMIN_HTML.contains("function showScreen"));
+        for screen in [
+            "showScreen(\"login\")",
+            "showScreen(\"claim\")",
+            "showScreen(\"app\")",
+        ] {
+            assert!(
+                ADMIN_HTML.contains(screen),
+                "the page must still use {screen}"
+            );
+        }
+        assert!(
+            !ADMIN_HTML.contains("$(\"login\").style.display")
+                && !ADMIN_HTML.contains("$(\"app\").style.display"),
+            "the screens are switched by `showScreen`, not by inline styles"
+        );
+    }
+
+    /// Every sealed exchange goes through one helper. Four copies of
+    /// envelope-then-seal-then-post is four chances for one of them to drop the
+    /// envelope and post a secret in the clear.
+    #[test]
+    fn admin_html_seals_every_request_through_one_helper() {
+        assert!(ADMIN_HTML.contains("function sealedPost"));
+        for path in [
+            "sealedPost(\"/api/admin/setup/provision\"",
+            "sealedPost(\"/api/admin/seal/passphrase\"",
+            "sealedPost(\"/api/admin/seal/env-slot\"",
+            "sealedPost(\"/api/admin/unseal\"",
+        ] {
+            assert!(ADMIN_HTML.contains(path), "the page must still use {path}");
+        }
+    }
+
     /// Every lifecycle card ships `hidden` and is revealed by the phase alone.
     /// A card with no `renderPhase` branch is a card an operator can never
     /// reach — and on a fresh node the setup wizard is the only way in, so that

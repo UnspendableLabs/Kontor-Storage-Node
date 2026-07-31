@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::server::admin::credentials::ClaimError;
 use crate::server::admin::{error_codes, AdminState, ApiError};
 use crate::server::state::DownloadServerState;
 
@@ -312,6 +313,7 @@ pub struct AdminClaimRequest {
 /// - `409 ALREADY_CLAIMED` when a password is already set.
 /// - `400 WEAK_PASSWORD` when the chosen password is too short.
 /// - `401 INVALID_SETUP_TOKEN` when the token does not match.
+/// - `500` when the node could not write the credential it just hashed.
 pub async fn claim(
     request: &AdminClaimRequest,
     client: Option<IpAddr>,
@@ -324,38 +326,33 @@ pub async fn claim(
             "The admin UI is disabled on this node.",
         ));
     }
-    if !admin.is_unclaimed() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            error_codes::ALREADY_CLAIMED,
-            "This node already has an admin password. Sign in with it, or set \
-             ADMIN_PASSWORD to override it.",
-        ));
-    }
 
+    // Both of these are checked again inside `credentials::claim`, under the
+    // write guard, where they are the real decision. Checking them here first
+    // is what keeps an ordinary mistake off the Argon2 path — and the wording
+    // comes from one place either way, so the two answers cannot drift.
+    if !admin.is_unclaimed() {
+        return Err(claim_error(ClaimError::AlreadyClaimed));
+    }
     // The password floor is checked before the token so an operator who typed a
     // short password is told that, rather than being sent away to re-check a
     // token that was fine. It leaks nothing: the length rule is documented.
     if request.password.chars().count() < crate::app::config::MIN_ADMIN_PASSWORD_LEN {
-        return Err(ApiError::bad_request(
-            error_codes::WEAK_PASSWORD,
-            format!(
-                "The admin password must be at least {} characters.",
-                crate::app::config::MIN_ADMIN_PASSWORD_LEN
-            ),
-        ));
+        return Err(claim_error(ClaimError::WeakPassword));
     }
 
-    if let Err(e) = claim_blocking(admin, &request.token, &request.password).await {
-        let failures = failures(Gate::Claim, client);
-        record_failure(Gate::Claim, client);
-        tokio::time::sleep(penalty(failures)).await;
-        warn!(?client, error = %format!("{e:#}"), "Rejected admin claim");
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            error_codes::INVALID_SETUP_TOKEN,
-            "That setup token is not this node's.",
-        ));
+    if let Err(rejection) = claim_blocking(admin, &request.token, &request.password).await {
+        // Only a wrong token is a guess, so only a wrong token pays. Charging
+        // the delay for a claim the node itself could not carry out would slow
+        // an operator down for a fault that is not theirs — and, worse, tell
+        // them their token was wrong while a read-only volume was the reason.
+        if matches!(rejection, ClaimError::InvalidToken) {
+            let failures = failures(Gate::Claim, client);
+            record_failure(Gate::Claim, client);
+            tokio::time::sleep(penalty(failures)).await;
+        }
+        warn!(?client, error = %rejection.to_string(), "Rejected admin claim");
+        return Err(claim_error(rejection));
     }
 
     clear_failures(Gate::Claim, client);
@@ -363,22 +360,62 @@ pub async fn claim(
     issue_session(client, admin)
 }
 
+/// Turn a rejected claim into the answer it actually deserves.
+///
+/// Four outcomes, four status codes, and the distinction is the point: a `401`
+/// tells the operator to re-check their token, and telling them that when the
+/// node's own volume is read-only sends them looking in the wrong place for as
+/// long as it takes them to give up.
+fn claim_error(rejection: ClaimError) -> ApiError {
+    match rejection {
+        ClaimError::AlreadyClaimed => ApiError::new(
+            StatusCode::CONFLICT,
+            error_codes::ALREADY_CLAIMED,
+            "This node already has an admin password. Sign in with it, or set \
+             ADMIN_PASSWORD to override it.",
+        ),
+        ClaimError::InvalidToken => ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            error_codes::INVALID_SETUP_TOKEN,
+            "That setup token is not this node's.",
+        ),
+        ClaimError::WeakPassword => ApiError::bad_request(
+            error_codes::WEAK_PASSWORD,
+            format!(
+                "The admin password must be at least {} characters.",
+                crate::app::config::MIN_ADMIN_PASSWORD_LEN
+            ),
+        ),
+        // The one the operator cannot act on by retrying, and the one worth
+        // naming out loud: the node could not write its own credential.
+        ClaimError::Storage(e) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "This node could not save its admin password. Check that its data \
+             directory is writable, then try again.",
+        )
+        .with_detail(format!("{e:#}")),
+    }
+}
+
 /// Trade the token for a password off the executor.
 ///
 /// Hashing the new password is the same Argon2id cost [`verify_password`]
 /// avoids running inline, and this one also writes `admin.json` and fsyncs it.
-async fn claim_blocking(
-    admin: &AdminState,
-    token: &str,
-    password: &str,
-) -> Result<(), anyhow::Error> {
+///
+/// A join failure is reported as [`ClaimError::Storage`]: the task panicked or
+/// was cancelled, which is a node-side fault and never the caller's token.
+async fn claim_blocking(admin: &AdminState, token: &str, password: &str) -> Result<(), ClaimError> {
     let admin = admin.clone();
     let token = token.to_string();
     let password = password.to_string();
 
-    tokio::task::spawn_blocking(move || admin.claim(&token, &password))
-        .await
-        .map_err(|e| anyhow::anyhow!("the claim task failed: {e}"))?
+    match tokio::task::spawn_blocking(move || admin.claim(&token, &password)).await {
+        Ok(result) => result,
+        Err(e) => Err(ClaimError::Storage(anyhow::anyhow!(
+            "the claim task failed: {e}"
+        ))),
+    }
 }
 
 /// Mint a session token for a caller that has just authenticated.

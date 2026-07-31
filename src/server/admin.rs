@@ -313,9 +313,10 @@ impl AdminState {
     /// wait out one password hash, once in a node's life.
     ///
     /// # Errors
-    /// If the node is already claimed, the token is wrong, the password is too
-    /// short, or the credential cannot be written.
-    pub fn claim(&self, token: &str, password: &str) -> Result<(), anyhow::Error> {
+    /// See [`credentials::ClaimError`]. The variants are kept apart all the way
+    /// out to the status code: a node whose volume will not take a write must
+    /// not tell the operator their token was wrong.
+    pub fn claim(&self, token: &str, password: &str) -> Result<(), credentials::ClaimError> {
         let mut current = self.credential_mut();
         *current = credentials::claim(&self.inner.app_dir, &current, token, password)?;
         Ok(())
@@ -368,14 +369,29 @@ impl AdminState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
     }
 
-    /// Consume the live envelope. An envelope is good for one attempt, whether
-    /// or not that attempt succeeds.
-    pub(crate) fn take_envelope(&self) -> Option<envelope::EnvelopeSession> {
-        self.inner
+    /// Consume the live envelope, but only if it is the one being asked for.
+    ///
+    /// An envelope is good for one attempt, whether or not that attempt
+    /// succeeds — so a request that names it takes it. A request that names
+    /// *something else* leaves it alone: a stale tab replaying an old body
+    /// must not be able to invalidate the envelope the operator is in the
+    /// middle of using. An expired one is dropped either way; nothing is
+    /// gained by keeping a key nobody may spend.
+    pub(crate) fn take_envelope(&self, session_id: &str) -> Option<envelope::EnvelopeSession> {
+        let mut held = self
+            .inner
             .envelope
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match held.as_ref() {
+            Some(session) if session.is_expired() => {
+                *held = None;
+                None
+            }
+            Some(session) if session.id_hex() == session_id => held.take(),
+            _ => None,
+        }
     }
 
     /// Take the right to rewrite `keystore.json`. See [`Inner::keystore`].

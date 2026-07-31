@@ -354,8 +354,17 @@ pub enum KeySource {
         seal_key: SealKey,
         seal_source: SealKeySource,
     },
-    /// A keystore exists, but nothing on this machine can open it.
-    Sealed { keystore: Box<Keystore> },
+    /// A keystore exists, but nothing on this machine opened it.
+    ///
+    /// `reason` is present when something was *tried* and did not work — a
+    /// malformed `KONTOR_SEAL_KEY`, a truncated `.seal-key`, a key that simply
+    /// is not this keystore's — and absent when there was nothing to try. The
+    /// distinction is the whole message: the first is a mistake with a fix, and
+    /// the operator reads it on the page that offers the fix.
+    Sealed {
+        keystore: Box<Keystore>,
+        reason: Option<String>,
+    },
     /// No keystore and nothing to migrate. The setup wizard has the work.
     Uninitialized,
 }
@@ -370,9 +379,10 @@ impl std::fmt::Debug for KeySource {
                 .field("keys", keys)
                 .field("seal_source", seal_source)
                 .finish_non_exhaustive(),
-            Self::Sealed { keystore } => f
+            Self::Sealed { keystore, reason } => f
                 .debug_struct("Sealed")
                 .field("slots", &keystore.slots())
+                .field("reason", reason)
                 .finish_non_exhaustive(),
             Self::Uninitialized => f.write_str("Uninitialized"),
         }
@@ -391,6 +401,15 @@ impl std::fmt::Debug for KeySource {
 ///    disagreement is reported loudly and the keystore still wins — refusing to
 ///    start would strand a working node over a variable somebody forgot to
 ///    delete.
+///
+///    If no seal key opens it, that is [`KeySource::Sealed`] and **not** an
+///    error. Only the keystore itself being unreadable is fatal, and the two
+///    are not the same failure: provisioning over a keystore that merely cannot
+///    be parsed would replace an identity, whereas a key that does not open one
+///    is a mistake with an obvious fix — the wrong `KONTOR_SEAL_KEY`, most
+///    likely, pasted during the two-step hardening flow. Exiting there would
+///    take `/admin` down with the node and remove the only channel that could
+///    correct it, on the one path this release exists to make recoverable.
 /// 2. **No keystore, but something to migrate** — a mnemonic in the
 ///    environment, or a `bls_key.enc` this process can open. The key is sealed
 ///    into a keystore on the spot and the node comes up on the new path. The
@@ -399,8 +418,9 @@ impl std::fmt::Debug for KeySource {
 /// 3. **Neither.** [`KeySource::Uninitialized`], and `/admin` does the rest.
 ///
 /// # Errors
-/// If the keystore is unreadable, if a present seal key does not open it, or if
-/// legacy material is present but cannot be read.
+/// If the keystore is unreadable, or if legacy material is present but cannot
+/// be read. A seal key that is malformed or simply wrong is *not* an error —
+/// see the note on case 1.
 pub async fn open_or_migrate(
     app_dir: &Path,
     key_path: &Path,
@@ -411,13 +431,29 @@ pub async fn open_or_migrate(
     if let Some(keystore) = Keystore::load(app_dir).await? {
         warn_about_a_stale_mnemonic(&keystore, mnemonic);
 
-        let Some((seal_key, seal_source)) = keystore::resolve_seal_key(app_dir, false)? else {
-            return Ok(KeySource::Sealed {
-                keystore: Box::new(keystore),
-            });
+        let sealed = |reason: Option<String>| KeySource::Sealed {
+            keystore: Box::new(keystore.clone()),
+            reason,
         };
 
-        let keypair = keystore.unseal(&seal_key)?;
+        // A key that will not parse is a typo in the environment or a truncated
+        // file, not a reason to take the node's only repair channel away.
+        let resolved = match keystore::resolve_seal_key(app_dir, false) {
+            Ok(resolved) => resolved,
+            Err(e) => return Ok(sealed(Some(format!("{e:#}")))),
+        };
+
+        let Some((seal_key, seal_source)) = resolved else {
+            return Ok(sealed(None));
+        };
+
+        // And a key that parses but opens nothing is the same mistake one step
+        // later — the commonest one there is here, since the hardening flow
+        // asks an operator to paste 32 base64 bytes into a platform by hand.
+        let keypair = match keystore.unseal(&seal_key) {
+            Ok(keypair) => keypair,
+            Err(e) => return Ok(sealed(Some(format!("{e:#}")))),
+        };
         let public = keystore.public().cloned();
 
         // A passphrase has no fingerprint to print, and never reaches this
@@ -974,10 +1010,82 @@ mod tests {
 
         let source = migrate(dir.path(), &key_path, None).await.unwrap();
 
-        let KeySource::Sealed { keystore } = source else {
+        let KeySource::Sealed { keystore, reason } = source else {
             panic!("a keystore nothing can open must report itself sealed");
         };
         assert_eq!(keystore.slots(), vec![crate::crypto::SlotKind::File]);
+        assert!(
+            reason.is_none(),
+            "nothing was tried, so there is nothing to explain: {reason:?}"
+        );
+    }
+
+    /// The mistake the two-step hardening flow invites: paste `KONTOR_SEAL_KEY`
+    /// wrong, redeploy. The node must come up **sealed and serving**, not exit.
+    /// Exiting would take `/admin` down — the only place the passphrase slot
+    /// can be used, and the only place the mistake can be seen.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_seal_key_that_does_not_open_the_keystore_seals_the_node_rather_than_stopping_it() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        let KeySource::Open {
+            mut keystore,
+            seal_key,
+            ..
+        } = source
+        else {
+            panic!("the migration must open the keystore it just wrote");
+        };
+
+        // Exactly the two-step flow, played out: the operator adds an env slot,
+        // sets the variable, redeploys — and pastes the wrong 32 bytes.
+        keystore
+            .add_slot(&seal_key, &SealKey::generate(crate::crypto::SlotKind::Env))
+            .unwrap();
+        std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
+
+        let mistyped = SealKey::generate(crate::crypto::SlotKind::Env);
+        std::env::set_var(keystore::SEAL_KEY_ENV, mistyped.encode().unwrap().as_str());
+        let source = migrate(dir.path(), &key_path, None).await;
+        std::env::remove_var(keystore::SEAL_KEY_ENV);
+
+        let KeySource::Sealed { reason, .. } = source.expect("a wrong key must not be fatal")
+        else {
+            panic!("a key that opens nothing must leave the node sealed");
+        };
+        let reason = reason.expect("something was tried, so it has to be explained");
+        assert!(reason.contains("did not open"), "{reason}");
+    }
+
+    /// The same rule one step earlier: a `KONTOR_SEAL_KEY` that is not even
+    /// base64 is a typo, and a typo must not be a node that will not boot.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_malformed_seal_key_seals_the_node_rather_than_stopping_it() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bls_key.enc");
+
+        migrate(dir.path(), &key_path, Some(&settings(2)))
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
+
+        std::env::set_var(keystore::SEAL_KEY_ENV, "obviously not base64 ****");
+        let source = migrate(dir.path(), &key_path, None).await;
+        std::env::remove_var(keystore::SEAL_KEY_ENV);
+
+        let KeySource::Sealed { reason, .. } = source.expect("a typo must not be fatal") else {
+            panic!("an unusable key must leave the node sealed");
+        };
+        let reason = reason.expect("something was tried, so it has to be explained");
+        assert!(reason.contains(keystore::SEAL_KEY_ENV), "{reason}");
     }
 
     /// Hardening, end to end: the env slot opens the same keystore the file slot
@@ -1003,7 +1111,7 @@ mod tests {
 
         let env_key = SealKey::generate(crate::crypto::SlotKind::Env);
         keystore.add_slot(&seal_key, &env_key).unwrap();
-        std::env::set_var(keystore::SEAL_KEY_ENV, env_key.encode().as_str());
+        std::env::set_var(keystore::SEAL_KEY_ENV, env_key.encode().unwrap().as_str());
         std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
 
         let source = migrate(dir.path(), &key_path, None).await.unwrap();

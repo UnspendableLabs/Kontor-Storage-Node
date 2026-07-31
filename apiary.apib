@@ -229,11 +229,15 @@ The session comes back with it: the caller has just proved they hold the token a
 
 + Response 401 (application/json)
 
-    The token does not match (`INVALID_SETUP_TOKEN`). Repeated failures cost an escalating delay, capped at two seconds; this gate never locks, because a node nobody can claim is a node nobody can configure.
+    The token does not match (`INVALID_SETUP_TOKEN`). Repeated failures cost an escalating delay, capped at two seconds; this gate never locks, because a node nobody can claim is a node nobody can configure. Only this answer costs the delay — a claim the node itself could not carry out is not a guess.
 
 + Response 409 (application/json)
 
     This node already has an admin password (`ALREADY_CLAIMED`). Sign in with it, or set `ADMIN_PASSWORD` to override it.
+
++ Response 500 (application/json)
+
+    The password was accepted and the node could not write it down (`INTERNAL_ERROR`): a full disk, a read-only mount, permissions on the application directory. Distinct from `401` on purpose — a node that answered "wrong token" here would send the operator to re-check something that was never the problem.
 
 + Response 503 (application/json)
 
