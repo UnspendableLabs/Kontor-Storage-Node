@@ -101,7 +101,14 @@ fn render(seal: &SealStatus) -> Value {
         "slots": seal.slots.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "opened_with": seal.opened_with.map(|kind| kind.to_string()),
         "fingerprint": seal.fingerprint,
-        "can_add_env_slot": open && !seal.slots.contains(&SlotKind::Env),
+        // Not gated on the absence of an env slot, and that is deliberate.
+        // `add_env_slot` replaces one rather than refusing, because the mistake
+        // it exists to undo is losing the key between the reveal and the paste
+        // — and a page that hid the button once a slot existed left that
+        // operator with a slot nothing can open and no way back, on the one
+        // node where the whole point was that hardening is reversible.
+        "can_add_env_slot": open,
+        "has_env_slot": seal.slots.contains(&SlotKind::Env),
         "can_drop_file_slot": open && seal.can_drop_file_slot(),
         // A sealed node is the one that most wants a passphrase and is the one
         // place it cannot be added, which is why the page has to say so.
@@ -182,9 +189,18 @@ pub async fn add_env_slot(
         ));
     };
 
-    keystore
-        .add_slot(&unlock, &new)
-        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+    // Off the executor, for the same reason the passphrase slot below is. The
+    // key being *added* is raw, but the key doing the unwrapping need not be: a
+    // node reopened through `POST /api/admin/unseal` holds a passphrase, and
+    // unwrapping the data key with one is 64 MiB of Argon2id across four lanes.
+    // That is the recovery path — lose the seal key, unseal by passphrase,
+    // re-establish an env slot — so it is not a corner worth blocking a worker
+    // for.
+    let keystore =
+        tokio::task::spawn_blocking(move || keystore.add_slot(&unlock, &new).map(|()| keystore))
+            .await
+            .map_err(|e| ApiError::server_error(format!("sealing task failed: {e}")))?
+            .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
 
     state.runtime.set_slots(keystore.slots());
 
@@ -368,6 +384,17 @@ pub async fn unseal(
     })?;
 
     tracing::info!("Node unsealed from /admin with a passphrase");
+
+    // Both published before the supervisor gets a chance to, and for the reason
+    // `setup::provision` does the same: the phase is what the check at the top
+    // of this function reads, so entering it here is what stops a second tab —
+    // or an impatient operator — from paying another 64 MiB of Argon2id against
+    // a node that is already on its way up. The seal status goes with it so the
+    // page never sees an open node reported as one that cannot reseal itself.
+    state
+        .runtime
+        .opened(&keystore, &key, SealKeySource::Passphrase);
+    state.runtime.enter(Phase::Activating);
 
     state.runtime.request(Activation::Open {
         keystore: Box::new(keystore),
@@ -781,6 +808,24 @@ mod tests {
         let (_, right) = sealed_passphrase_request(&state, PASSPHRASE);
         let body = unseal(&right, &state).await.unwrap();
         assert_eq!(body["unsealing"], true);
+
+        // Left for the supervisor, this phase would still read `sealed` when the
+        // page polls a moment later — and a second tab would be free to pay
+        // another 64 MiB of Argon2id against a node already on its way up. The
+        // status goes with it: the key that just opened the keystore is the key
+        // every reseal needs, so an operator must never be shown an open node
+        // reported as one that has nothing to reseal with.
+        assert_eq!(state.runtime.phase(), Phase::Activating);
+        assert_eq!(state.runtime.seal().opened_with, Some(SlotKind::Passphrase));
+        assert!(
+            !state.runtime.can_restart(),
+            "nothing on this machine supplied that passphrase, so a restart is still an outage"
+        );
+
+        let (_, again) = sealed_passphrase_request(&state, PASSPHRASE);
+        let err = unseal(&again, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::SEAL_UNAVAILABLE);
     }
 
     /// Unsealing a node that is not sealed is a mistake worth naming rather
@@ -851,14 +896,34 @@ mod tests {
     }
 
     #[test]
-    fn status_offers_the_env_slot_only_while_there_is_none() {
+    fn status_offers_the_env_slot_on_a_node_that_has_none() {
         let seal = seal_status(vec![SlotKind::File], Some(SlotKind::File));
         let value = render(&seal);
 
         assert_eq!(value["can_add_env_slot"], true);
+        assert_eq!(value["has_env_slot"], false);
         assert_eq!(value["can_drop_file_slot"], false);
         assert_eq!(value["opened_with"], "file");
         assert_eq!(value["slots"], json!(["file"]));
+    }
+
+    /// The offer survives the slot existing, and it has to. `add_env_slot`
+    /// replaces rather than refuses, because the mistake it undoes is losing the
+    /// revealed key before pasting it in — and a node whose env slot cannot be
+    /// regenerated is one whose hardening flow only runs forwards.
+    ///
+    /// `has_env_slot` is what the page words the button from, so "add" and
+    /// "replace" stay distinguishable without the two sides deciding separately
+    /// what the slots mean.
+    #[test]
+    fn a_lost_env_key_can_still_be_replaced() {
+        let value = render(&seal_status(
+            vec![SlotKind::File, SlotKind::Env],
+            Some(SlotKind::File),
+        ));
+
+        assert_eq!(value["can_add_env_slot"], true);
+        assert_eq!(value["has_env_slot"], true);
     }
 
     #[test]
@@ -867,7 +932,6 @@ mod tests {
             vec![SlotKind::File, SlotKind::Env],
             Some(SlotKind::File),
         ));
-        assert_eq!(via_file["can_add_env_slot"], false);
         assert_eq!(via_file["can_drop_file_slot"], false);
 
         let via_env = render(&seal_status(
@@ -891,6 +955,9 @@ mod tests {
         assert_eq!(value["can_add_env_slot"], false);
         assert_eq!(value["can_drop_file_slot"], false);
         assert_eq!(value["can_add_passphrase_slot"], false);
+        // Still reported, because it is a fact about the file rather than an
+        // offer: the page words its note from it even where it offers nothing.
+        assert_eq!(value["has_env_slot"], true);
 
         // And the same node with nothing recorded at all — a keystore that has
         // not been read yet — is equally inert.

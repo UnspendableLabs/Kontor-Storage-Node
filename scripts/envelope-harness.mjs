@@ -195,6 +195,23 @@ async function checkTheReveal() {
     !/#(login|claim|app)\b[^{]*\{[^}]*display:\s*none/.test(page),
     "and no screen is hidden by a display rule the attribute cannot override",
   );
+
+  // The same failure one card over. `renderPhase` hides `#setup` the moment the
+  // node leaves `uninitialized`, and provisioning does that *before* it answers
+  // — so a confirmation nested inside that card is one the operator never reads,
+  // along with the Taproot address it names, which at that moment is the entire
+  // remaining task. Both boxes have to sit outside it.
+  const card = page.indexOf('id="setup" hidden');
+  const success = page.indexOf('id="setup-success"');
+  const envelope = page.indexOf('id="setup-envelope"');
+  check(
+    card !== -1 && /\$\("setup"\)\.hidden = phase !== "uninitialized"/.test(page),
+    "renderPhase hides the setup card as soon as the node has a key",
+  );
+  check(
+    success !== -1 && envelope !== -1 && success < card && envelope < card,
+    "so the confirmation and the fingerprint live outside it",
+  );
 }
 
 /* ---------------- the checks ---------------- */
@@ -272,15 +289,17 @@ async function main() {
     );
     check(provisioned.seal_slot === "file", "the key is sealed under the generated file slot");
 
-    // The supervisor opens the keystore a moment later; the seal card is what
-    // waits on that, exactly as the page does.
-    let seal = null;
-    for (let i = 0; i < 100; i += 1) {
-      seal = await api("/api/admin/seal");
-      if (seal.can_add_env_slot) break;
-      await sleep(50);
-    }
+    // On the first fetch, not whenever the supervisor happens to be scheduled.
+    // The endpoint that sealed the keystore publishes the seal status before it
+    // answers, because the page caches this card per phase: an answer of "this
+    // node cannot open its own keystore" would otherwise stick for the whole of
+    // activation, on a node provisioned a moment earlier.
+    const seal = await api("/api/admin/seal");
     check(seal.opened_with === "file", "the node reports which slot it opened through");
+    check(
+      seal.can_add_env_slot === true && seal.has_env_slot === false,
+      "and offers the env slot without waiting for the supervisor",
+    );
 
     // 2. The seal key, down.
     const envChannel = await page.openEnvelope();

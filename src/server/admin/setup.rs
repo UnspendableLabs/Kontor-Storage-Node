@@ -111,6 +111,16 @@ pub async fn provision(
         "seal_fingerprint": seal_key.fingerprint(),
     });
 
+    // Published here rather than left to the supervisor, which announces the
+    // same thing when it picks the activation up. This endpoint has just sealed
+    // the keystore with this key, so it knows the answer, and the supervisor may
+    // be a scheduling quantum away: in between, `GET /api/admin/seal` would tell
+    // an operator their node cannot open its own keystore and `restart_available`
+    // would say no — about a node that was provisioned a moment ago. The page
+    // caches the seal card per phase, so that answer would then stick for as long
+    // as activation takes.
+    state.runtime.opened(&keystore, &seal_key, source);
+
     // Entered here rather than left to the supervisor. The phase *is* the lock
     // this endpoint checks, so publishing it before the guard is dropped is what
     // makes the check above mean anything: a second request that arrives while
@@ -225,6 +235,23 @@ mod tests {
 
         // And the phase moved before the supervisor had a chance to run.
         assert_eq!(state.runtime.phase(), Phase::Activating);
+
+        // So did the seal status. The supervisor announces the same thing when
+        // it picks the activation up, but it may be a scheduling quantum away —
+        // and in between `GET /api/admin/seal` would tell an operator that the
+        // node they just provisioned cannot open its own keystore, and
+        // `restart_available` would say no. The page caches the seal card per
+        // phase, so that answer would then stand for the whole of activation.
+        let seal = state.runtime.seal();
+        assert!(seal.is_open());
+        assert_eq!(
+            seal.opened_with,
+            Some(crate::crypto::keystore::SlotKind::File)
+        );
+        assert!(
+            state.runtime.can_restart(),
+            "a node that has just sealed a file slot can plainly come back on it"
+        );
     }
 
     /// The window the phase change closes. A second tab posting its own

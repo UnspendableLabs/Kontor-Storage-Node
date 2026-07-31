@@ -328,6 +328,27 @@ different one the node logs an error naming both and keeps its own. The legacy
 `bls_key.enc` is left exactly where it is; deleting an operator's key file is not
 the node's call to make.
 
+**One thing changes for a node that was running without `ADMIN_PASSWORD`.** Until
+now that meant `/admin` rendered and nothing behind it could be unlocked, which
+was a coherent default while the UI was an optional convenience. It is not one
+now that the UI is how a node is configured, so such a node comes back
+*unclaimed*: it mints a setup token, writes it to `.setup-token` (mode `0600`)
+beside the keystore, and prints it on every start until somebody claims it.
+
+Whoever can read those logs or that volume can therefore claim the admin UI, and
+from there reset the database or re-register the node. That is the same trust
+boundary as the file seal slot, so it moves no line that was not already there —
+but it is a line worth knowing about. Three ways to decide it deliberately rather
+than inherit it:
+
+- Set `ADMIN_PASSWORD` (at least 16 characters). It overrides anything stored and
+  no token is minted.
+- Set `KONTOR_SETUP_TOKEN` to a secret of your own, at least 32 characters. Only
+  its fingerprint is ever logged. This trades a secret in the log stream for one
+  in the environment; it is a choice of which exposure, not an escape from both.
+- Set `ADMIN_UI_DISABLED=1` if this node is not meant to be administered from a
+  browser at all. Nothing behind `/admin` then opens, including the setup wizard.
+
 ### Deriving from a seed phrase
 
 Derivation matches Horizon Wallet exactly — BIP-39 with an empty passphrase, then

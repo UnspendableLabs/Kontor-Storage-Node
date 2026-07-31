@@ -158,13 +158,21 @@
   <div class="msg err" id="status-error"></div>
   <div class="msg warn" id="phase-notice"></div>
 
+  <!-- Outside the card it reports on, and that is the whole reason it is here.
+       Provisioning enters `Phase::Activating` before it answers, so the very
+       next status poll hides `#setup` — and a message inside it would be gone
+       in the time one request takes. This one names the node id and the Taproot
+       address a Portal admin has to whitelist, which is the entire remaining
+       task at that moment. It outlives the form that produced it. -->
+  <div class="msg ok" id="setup-success"></div>
+  <p class="muted" id="setup-envelope" hidden></p>
+
   <!-- Shown on a node with no key at all. The seed phrase is encrypted in the
        browser before it leaves it; see `server::admin::setup` for what that
        does and does not defend against. -->
   <div class="card" id="setup" hidden>
     <h2>Set up this node's identity</h2>
     <div class="msg err" id="setup-error"></div>
-    <div class="msg ok" id="setup-success"></div>
     <div class="msg err" id="setup-insecure" hidden>
       This page is not running in a secure context, so the browser will not
       provide the cryptography needed to encrypt your seed phrase before sending
@@ -190,7 +198,6 @@
         <option value="regtest">regtest</option>
       </select>
     </div>
-    <p class="muted" id="setup-envelope"></p>
     <button class="primary" id="setup-submit">Encrypt and set up</button>
   </div>
 
@@ -521,6 +528,7 @@
     // The next session starts from nothing, including the seal card: the node
     // may have been resealed, or replaced entirely, since this one began.
     sealLoadedFor = null;
+    lastSeal = null;
     showScreen("login");
     $("password").focus();
   }
@@ -1088,6 +1096,7 @@
 
     show($("setup-error"), "");
     show($("setup-success"), "");
+    show($("setup-envelope"), "");
 
     if (!cryptoAvailable()) {
       show($("setup-error"), NO_CRYPTO, true);
@@ -1118,10 +1127,13 @@
       account: account,
       network: $("setup-network").value
     }).then(function (sealed) {
-      $("setup-envelope").textContent =
+      // Kept, like the success box below it and for the same reason: both live
+      // outside `#setup`, which the next status poll hides.
+      show($("setup-envelope"),
         "Envelope fingerprint " + sealed.channel.envelope.fingerprint +
         " — it appears in the node's own logs; compare them if you want to be sure " +
-        "this page is talking to the node itself.";
+        "this page is talking to the node itself.",
+        true);
 
       // Cleared as soon as it has been sent: there is no reason for it to stay
       // in a field on a page that may be left open.
@@ -1143,12 +1155,25 @@
 
   /* ---------------- sealing ---------------- */
 
+  // The last seal status this page was given. Kept because a request that
+  // finishes has to put the card back the way the *server* says it should be,
+  // rather than re-enabling whatever it disabled on the way in — see
+  // `addPassphraseSlot`.
+  var lastSeal = null;
+
   function loadSeal() {
     return api("/api/admin/seal").then(function (seal) {
+      lastSeal = seal;
       $("seal-slots").textContent = (seal.slots || []).join(", ") || "—";
       $("seal-opened").textContent = seal.opened_with || "—";
       $("seal-fingerprint").textContent = seal.fingerprint || "—";
       $("seal-add-env").hidden = !seal.can_add_env_slot;
+      // Replacing rather than adding, once one exists. Said on the button
+      // because it is the difference between "harden this node" and "I lost the
+      // key I was shown", and only the operator knows which one they are doing.
+      $("seal-add-env").textContent = seal.has_env_slot
+        ? "Generate a replacement key for " + seal.env_var
+        : "Generate a key for " + seal.env_var;
       $("seal-drop-file").hidden = !seal.can_drop_file_slot;
       renderPassphraseSlot(seal);
 
@@ -1157,14 +1182,16 @@
         note = "This node started through the environment slot, so the seal key file " +
                "is no longer needed. Removing it means the key can only be opened with " +
                seal.env_var + ".";
-      } else if (seal.can_add_env_slot) {
+      } else if (!seal.has_env_slot) {
         note = "The key is sealed under a file next to it, which protects against the " +
                "environment leaking but not against the volume leaking. Generating a key " +
                "for " + seal.env_var + " adds the other half; the file stays until the " +
                "node has actually started through it.";
       } else {
         note = "An environment slot exists. Set " + seal.env_var + " and restart, and " +
-               "the file slot can then be removed.";
+               "the file slot can then be removed. If the key was lost before it was " +
+               "pasted in, generating a replacement simply overwrites that slot — the " +
+               "file slot is untouched either way, so the node keeps starting as it does now.";
       }
       $("seal-note").textContent = note;
       $("seal").hidden = false;
@@ -1241,7 +1268,11 @@
       report($("seal-error"), error);
     }).then(function () {
       passphraseInFlight = false;
-      button.disabled = false;
+      // Restored from the status, not re-enabled outright: on a node that
+      // cannot open its own keystore the server says so, and a blanket
+      // `disabled = false` here would hand back a button whose only possible
+      // answer is an error.
+      if (lastSeal) { renderPassphraseSlot(lastSeal); } else { button.disabled = false; }
     });
   }
 

@@ -532,7 +532,7 @@ How this node's key is sealed right now. Nothing here is secret.
 
 `opened_with` is recorded rather than inferred, and the distinction is load-bearing: "there is an env slot" is not the same claim as "this boot came up on it", and only the second makes dropping the file slot safe.
 
-Every `can_` flag is false on a node that cannot currently open its own keystore, whatever slots it has: changing a slot needs the data key, which needs the key this boot came in with. `fingerprint` is `null` on such a node, and also on one opened with a passphrase — this response is not sealed, and four bytes of a hash of a human-chosen secret would let anyone who saw the body confirm guesses offline at one `SHA-256` each, against the 64 MiB of Argon2id per guess that trying the keystore itself costs. A random 32-byte seal key has no such weakness, and is fingerprinted so an operator can compare it against the node's own logs.
+Every `can_` flag is false on a node that cannot currently open its own keystore, whatever slots it has: changing a slot needs the data key, which needs the key this boot came in with. The `has_` flags are facts about the file rather than offers, so they stay true on such a node — `can_add_env_slot` remains true once an env slot exists, because adding one replaces it, and a page that stopped offering it would strand an operator who lost the key between the reveal and the paste. `fingerprint` is `null` on such a node, and also on one opened with a passphrase — this response is not sealed, and four bytes of a hash of a human-chosen secret would let anyone who saw the body confirm guesses offline at one `SHA-256` each, against the 64 MiB of Argon2id per guess that trying the keystore itself costs. A random 32-byte seal key has no such weakness, and is fingerprinted so an operator can compare it against the node's own logs.
 
 + Request
 
@@ -548,7 +548,8 @@ Every `can_` flag is false on a node that cannot currently open its own keystore
                 "slots": ["file", "env"],
                 "opened_with": "file",
                 "fingerprint": "2bd8450f",
-                "can_add_env_slot": false,
+                "can_add_env_slot": true,
+                "has_env_slot": true,
                 "can_drop_file_slot": false,
                 "can_add_passphrase_slot": true,
                 "has_passphrase_slot": false,
