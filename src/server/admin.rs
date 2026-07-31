@@ -23,16 +23,22 @@
 //!   so sessions do not survive a restart and there is no long-lived secret on
 //!   disk to leak. It is held in `sessionStorage` and sent as a bearer — no
 //!   cookie, so no CSRF surface.
-//! - Failed attempts are counted per peer IP (10 per 15 minutes) and every
-//!   rejection costs a fixed 250 ms. `X-Forwarded-For` is deliberately not
-//!   trusted: behind a proxy all clients collapse into one bucket, which fails
-//!   closed, whereas a spoofable header would hand an attacker unlimited
-//!   buckets.
+//! - Failed attempts are counted per peer IP and every rejection costs a delay.
+//!   `X-Forwarded-For` is deliberately not trusted: behind a proxy all clients
+//!   collapse into one bucket, whereas a spoofable header would hand an attacker
+//!   unlimited buckets. Login and claim are counted separately and fail in
+//!   opposite directions — see [`session::claim`] for why the claim gate must
+//!   never close.
 //! - The admin routes are merged *after* the permissive `CorsLayer`, so they
 //!   carry no `Access-Control-Allow-Origin` and a browser refuses to let
 //!   another origin read their responses.
+//! - Every secret that crosses these routes — the seed phrase at setup, a seal
+//!   passphrase, the seal key handed back — is sealed end to end by
+//!   [`envelope`], in whichever direction it travels. TLS covers the wire; it
+//!   does not cover an edge that logs bodies.
 
 pub mod credentials;
+pub mod envelope;
 pub mod register;
 pub mod reset;
 pub mod seal;
@@ -150,12 +156,25 @@ struct Inner {
     credential: RwLock<AdminCredential>,
     /// Where `admin.json`, `.setup-token` and the keystore live.
     app_dir: PathBuf,
-    /// The live setup envelope, if one has been issued.
+    /// The live sealed-channel envelope, if one has been issued.
     ///
-    /// One slot, not a map. A node is set up by one operator in one browser; a
-    /// second `GET` invalidating the first is the correct behaviour, and it is
-    /// also what keeps a stale key from lingering after an abandoned attempt.
-    envelope: Mutex<Option<setup::EnvelopeSession>>,
+    /// One slot, not a map. A node is administered by one operator in one
+    /// browser; a second `GET` invalidating the first is the correct behaviour,
+    /// and it is also what keeps a stale key from lingering after an abandoned
+    /// attempt.
+    envelope: Mutex<Option<envelope::EnvelopeSession>>,
+    /// Serialises every read-modify-write of `keystore.json`.
+    ///
+    /// The seal endpoints each load the file, change one slot and write it back.
+    /// [`crate::crypto::aead::write_secret_file`] makes that write atomic, which
+    /// rules out a torn file and nothing else: two requests that both read
+    /// before either wrote would still end with one slot silently missing.
+    /// Provisioning takes it too, so the phase check that guards it cannot be
+    /// raced either.
+    ///
+    /// `tokio`'s mutex rather than `std`'s because the guard is held across the
+    /// `await` on reading the file back.
+    keystore: tokio::sync::Mutex<()>,
     /// HMAC key for session tokens. Generated per process and never written
     /// anywhere: a node runs as a single process, so there is nothing to share
     /// a persisted secret with, and an ephemeral key means a leaked token dies
@@ -190,6 +209,7 @@ impl AdminState {
                 credential: RwLock::new(credential),
                 app_dir,
                 envelope: Mutex::new(None),
+                keystore: tokio::sync::Mutex::new(()),
                 session_key,
                 restart,
                 runtime,
@@ -262,6 +282,13 @@ impl AdminState {
         self.credential().is_unclaimed()
     }
 
+    /// True when the operator turned the UI off outright, as opposed to a node
+    /// that simply has no password yet.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.credential().is_disabled()
+    }
+
     /// What a `/admin` page needs to know before it has a session: which pane to
     /// render, and — on an unclaimed node — which token is live.
     #[must_use]
@@ -322,8 +349,8 @@ impl AdminState {
         &self.inner.app_dir
     }
 
-    /// Hold a freshly issued setup envelope, replacing any previous one.
-    pub(crate) fn store_envelope(&self, session: setup::EnvelopeSession) {
+    /// Hold a freshly issued envelope, replacing any previous one.
+    pub(crate) fn store_envelope(&self, session: envelope::EnvelopeSession) {
         *self
             .inner
             .envelope
@@ -333,12 +360,17 @@ impl AdminState {
 
     /// Consume the live envelope. An envelope is good for one attempt, whether
     /// or not that attempt succeeds.
-    pub(crate) fn take_envelope(&self) -> Option<setup::EnvelopeSession> {
+    pub(crate) fn take_envelope(&self) -> Option<envelope::EnvelopeSession> {
         self.inner
             .envelope
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    /// Take the right to rewrite `keystore.json`. See [`Inner::keystore`].
+    pub(crate) async fn lock_keystore(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.keystore.lock().await
     }
 
     fn session_key(&self) -> &[u8; 32] {
@@ -504,7 +536,7 @@ pub fn router() -> Router<DownloadServerState> {
         .route("/api/admin/status", get(status_handler))
         .route("/api/admin/reset-database", post(reset_handler))
         .route("/api/admin/register-node", post(register_handler))
-        .route("/api/admin/setup/envelope", get(envelope_handler))
+        .route("/api/admin/envelope", get(envelope_handler))
         .route("/api/admin/setup/provision", post(provision_handler))
         .route("/api/admin/seal", get(seal_handler))
         .route("/api/admin/seal/env-slot", post(add_env_slot_handler))
@@ -567,21 +599,21 @@ async fn claim_handler(
         .map(Json)
 }
 
-/// `GET /api/admin/setup/envelope`
+/// `GET /api/admin/envelope`
 async fn envelope_handler(
     _session: AdminSession,
     State(state): State<DownloadServerState>,
-) -> Result<Json<Value>, ApiError> {
-    setup::issue_envelope(&state).map(Json)
+) -> Json<Value> {
+    Json(envelope::issue(&state))
 }
 
 /// `POST /api/admin/setup/provision`
 async fn provision_handler(
     _session: AdminSession,
     State(state): State<DownloadServerState>,
-    Json(request): Json<setup::ProvisionRequest>,
+    Json(request): Json<envelope::SealedRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    setup::provision(&request, &state).map(Json)
+    setup::provision(&request, &state).await.map(Json)
 }
 
 /// `GET /api/admin/seal`
@@ -593,11 +625,17 @@ async fn seal_handler(
 }
 
 /// `POST /api/admin/seal/env-slot`
+///
+/// Carries an envelope even though it sends nothing secret *up*: the key it
+/// hands back is sealed to the browser, and opening the request first is what
+/// proves the browser derived the same keys before the node commits a slot to
+/// them.
 async fn add_env_slot_handler(
     _session: AdminSession,
     State(state): State<DownloadServerState>,
+    Json(request): Json<envelope::SealedRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    seal::add_env_slot(&state).await.map(Json)
+    seal::add_env_slot(&request, &state).await.map(Json)
 }
 
 /// `POST /api/admin/seal/drop-file-slot`
@@ -613,7 +651,7 @@ async fn drop_file_slot_handler(
 async fn add_passphrase_slot_handler(
     _session: AdminSession,
     State(state): State<DownloadServerState>,
-    Json(request): Json<seal::PassphraseRequest>,
+    Json(request): Json<envelope::SealedRequest>,
 ) -> Result<Json<Value>, ApiError> {
     seal::add_passphrase_slot(&request, &state).await.map(Json)
 }
@@ -622,7 +660,7 @@ async fn add_passphrase_slot_handler(
 async fn unseal_handler(
     _session: AdminSession,
     State(state): State<DownloadServerState>,
-    Json(request): Json<seal::PassphraseRequest>,
+    Json(request): Json<envelope::SealedRequest>,
 ) -> Result<Json<Value>, ApiError> {
     seal::unseal(&request, &state).await.map(Json)
 }
@@ -880,6 +918,14 @@ mod tests {
 
         /// State for a node nobody has claimed, over a real application
         /// directory so the claim actually writes a credential.
+        ///
+        /// Every test built on this is `#[serial]`, and has to be:
+        /// [`credentials::AdminCredential::load_or_bootstrap`] consults
+        /// `KONTOR_SETUP_TOKEN`, which is process-global, and the tests in
+        /// [`credentials`] set and clear it. A node bootstrapped while one of
+        /// those holds the variable takes the token from the environment and
+        /// writes no file — leaving this helper reading one that was never
+        /// created, on a schedule nothing here controls.
         async fn unclaimed_state() -> (DownloadServerState, tempfile::TempDir, String) {
             let (mut state, _dir) = state_with_password(None).await;
             let app_dir = tempfile::tempdir().unwrap();
@@ -907,6 +953,7 @@ mod tests {
         /// The bootstrap endpoint is what a browser with no session asks first,
         /// so it has to answer without one.
         #[tokio::test]
+        #[serial_test::serial]
         async fn bootstrap_is_public_and_says_whether_the_node_is_claimed() {
             let (state, _app_dir, _token) = unclaimed_state().await;
 
@@ -929,6 +976,7 @@ mod tests {
         /// Unclaimed and disabled are different answers, and the page renders a
         /// different screen for each.
         #[tokio::test]
+        #[serial_test::serial]
         async fn login_on_an_unclaimed_node_says_so_rather_than_unavailable() {
             let (state, _app_dir, _token) = unclaimed_state().await;
             session::reset_throttle_for_tests(None);
@@ -946,6 +994,7 @@ mod tests {
         /// The whole zero-configuration entry point: a token off the logs
         /// becomes a password and a session, in one request.
         #[tokio::test]
+        #[serial_test::serial]
         async fn claiming_sets_a_password_and_signs_the_operator_in() {
             let (state, app_dir, token) = unclaimed_state().await;
             session::reset_throttle_for_tests(None);
@@ -975,6 +1024,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_claim_with_the_wrong_token_is_rejected_and_changes_nothing() {
             let (state, app_dir, _token) = unclaimed_state().await;
             session::reset_throttle_for_tests(None);
@@ -997,6 +1047,7 @@ mod tests {
         /// a short password is told that rather than sent to re-check a token
         /// that was fine.
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_claim_with_a_short_password_says_which_rule_it_broke() {
             let (state, _app_dir, token) = unclaimed_state().await;
             session::reset_throttle_for_tests(None);
@@ -1015,6 +1066,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial]
         async fn a_claimed_node_refuses_a_second_claim() {
             let (state, _app_dir, token) = unclaimed_state().await;
             session::reset_throttle_for_tests(None);
@@ -1057,11 +1109,19 @@ mod tests {
             ] {
                 state.runtime.enter(phase);
 
+                // The phase is read before the envelope is opened, so a body
+                // that would never decrypt still gets the answer that matters.
                 let (status, payload) = call(
                     &state,
-                    authorized(Request::builder().uri("/api/admin/setup/envelope"), &token)
-                        .body(Body::empty())
-                        .unwrap(),
+                    authorized(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/admin/setup/provision")
+                            .header(header::CONTENT_TYPE, "application/json"),
+                        &token,
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
                 )
                 .await;
 
@@ -1082,7 +1142,7 @@ mod tests {
 
             let (status, envelope) = call(
                 &state,
-                authorized(Request::builder().uri("/api/admin/setup/envelope"), &token)
+                authorized(Request::builder().uri("/api/admin/envelope"), &token)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1138,7 +1198,7 @@ mod tests {
             let (state, _dir) = state_with_password(Some(PASSWORD)).await;
 
             for (method, uri) in [
-                ("GET", "/api/admin/setup/envelope"),
+                ("GET", "/api/admin/envelope"),
                 ("POST", "/api/admin/setup/provision"),
                 ("GET", "/api/admin/seal"),
                 ("POST", "/api/admin/seal/env-slot"),

@@ -133,23 +133,33 @@ first is what running a second node is for; the second is not needed, because th
 account is now chosen once, in a form that shows you the derived address and node
 id before you commit them.
 
-### How the seed phrase travels
+### How secrets travel between `/admin` and the node
 
 TLS already covers the wire. It does not cover what happens at the ends of it: a
 platform edge that logs request bodies, a proxy that buffers them, an APM agent
-that samples them, an error reporter that serializes the whole request when
+that samples them, an error reporter that serializes the whole exchange when
 something downstream fails. None of that is an attack, and all of it ends with a
 seed phrase in somebody's log store — permanently, since a seed phrase cannot be
 rotated.
 
-So the browser encrypts it before sending:
+Three things move through `/admin` that must not appear in such a log, and they
+move in both directions:
+
+| Secret | Direction |
+|---|---|
+| the seed phrase, at setup | browser → node |
+| a seal passphrase, when adding a slot or unlocking a sealed node | browser → node |
+| the key for `KONTOR_SEAL_KEY`, when adding an env slot | node → browser |
+
+All three go through one sealed envelope:
 
 - the node mints an **ephemeral** P-256 keypair, in memory, for one use;
 - the browser mints its own, does ECDH, and runs the shared secret through
-  HKDF-SHA256 salted with the session id;
-- it seals the payload with AES-256-GCM, using that same session id as
-  additional authenticated data, which binds the ciphertext to the one envelope
-  it was made for.
+  HKDF-SHA256 salted with the session id, expanded to **64 bytes**;
+- those are two AES-256-GCM keys, one per direction, so a reply can never be
+  replayed as a request;
+- every seal uses the session id as additional authenticated data, which binds
+  the ciphertext to the one envelope it was made for.
 
 Everything is native WebCrypto — the page loads no scripts at all, and its
 content-security policy forbids it from trying.
@@ -193,9 +203,9 @@ every account, on every network, forever.
 Two steps, with a redeploy in between, because the obvious one-step version is a
 door that only opens one way.
 
-1. In `/admin`, **generate a key for `KONTOR_SEAL_KEY`**. It is shown once and
-   the node does not keep it. The file slot is untouched, so the node still
-   starts exactly as before.
+1. In `/admin`, **generate a key for `KONTOR_SEAL_KEY`**. It comes back sealed to
+   your browser, is shown once, and the node does not keep it. The file slot is
+   untouched, so the node still starts exactly as before.
 2. Set `KONTOR_SEAL_KEY` on the deployment and restart. The node records which
    slot it actually opened through.
 3. Only once that record says `env` does `/admin` offer to **remove the seal key
@@ -233,6 +243,26 @@ Every transition happens **in the running process**. Completing setup, unsealing
 registering, or having an address whitelisted all move the node forward without
 an exit and without a container restart.
 
+### Monitoring
+
+That design has a consequence worth stating out loud: **the server answering is
+no longer evidence that the node works.** A node waiting for its setup wizard, or
+for a Portal admin to whitelist its address, or one whose activation failed,
+serves `/api/info` and `/admin` exactly like a healthy one — deliberately, since
+taking the server down would remove the only page explaining what is wrong.
+
+So the container health check (`GET /api/info`, in the Dockerfile) is a
+*liveness* check and nothing more. Whether the node is doing its job is a
+separate question, answered by the same endpoint without authentication:
+
+```json
+{ "node_id": "node-…", "phase": "running", "serving": true }
+```
+
+Alert on `serving` being false, or on `phase` staying anything but `running`.
+`unregistered` and `uninitialized` are states a node can sit in indefinitely and
+correctly — they need a person, not a restart.
+
 ### Migrating an existing node
 
 A node that already runs on `KONTOR_STORAGE_MNEMONIC`, or on a `bls_key.enc` plus
@@ -245,8 +275,22 @@ No keystore yet, but this node has key material from an older release. Migrating
   KONTOR_STORAGE_MNEMONIC is no longer needed and should be removed from this deployment.
 ```
 
-Then remove the variable. Nothing else changes: same key, same node id, same
-agreements.
+Nothing else changes: same key, same node id, same agreements.
+
+**Then confirm the keystore is on durable storage before removing the variable,
+in that order.** The keystore is written to `KONTOR_APP_DIR` — `/data` in Docker
+— which is the directory a deployment is supposed to mount a volume over. If it
+turns out not to be one, the keystore is gone at the next deploy, and by then the
+mnemonic that could have rebuilt it has been deleted too. One restart tells you:
+
+1. Deploy this release and look for the `✓ Sealed into …` line above.
+2. Restart once with `KONTOR_STORAGE_MNEMONIC` still set. The node must now print
+   `✓ Keystore opened (file slot, fingerprint …)` — the same fingerprint, and no
+   second migration.
+3. Only then remove the variable.
+
+Step 2 costs a restart and is the whole of the safety net: a node that reports
+opening the keystore it wrote has proved the file survives a deploy.
 
 The keystore wins from that point on, unconditionally. A `KONTOR_STORAGE_MNEMONIC`
 left behind cannot move a running node to another identity — if it derives a
@@ -378,7 +422,7 @@ Endpoints:
 | Path | Description |
 |------|-------------|
 | `GET /` | HTML dashboard listing stored files |
-| `GET /api/info` | JSON: `{ "node_id": "..." }` |
+| `GET /api/info` | JSON: `{ "node_id": ..., "phase": ..., "serving": ... }` — see [Monitoring](#monitoring) |
 | `GET /files?offset=&limit=` | JSON: paginated list of stored files |
 | `GET /files/:file_id` | Download (local backend) or 307 redirect to a GCS signed URL |
 | `GET /static/*` | Static assets (logo, dashboard CSS/JS) |
@@ -387,6 +431,12 @@ Endpoints:
 | `GET /api/admin/status` | JSON: row counts, storage summary and registration state (session required) |
 | `POST /api/admin/reset-database` | Wipe the node's database, optionally restarting the node (session required) |
 | `POST /api/admin/register-node` | Register the node's BLS key on the Portal (session required) |
+| `GET /api/admin/envelope` | Mint a one-shot sealed channel for the secrets below (session required) |
+| `POST /api/admin/setup/provision` | Give an unconfigured node its identity, from a sealed seed phrase (session required) |
+| `POST /api/admin/seal/env-slot` | Add a `KONTOR_SEAL_KEY` slot; the key comes back sealed (session required) |
+| `POST /api/admin/seal/drop-file-slot` | Remove `.seal-key`, once the node has booted on the env slot (session required) |
+| `POST /api/admin/seal/passphrase` | Add a slot only a human can open, from a sealed passphrase (session required) |
+| `POST /api/admin/unseal` | Open a sealed node with a sealed passphrase (session required) |
 
 CORS is permissive (`Access-Control-Allow-Origin: *`) on the serving routes, which are all public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. The `/admin` routes are deliberately outside that CORS layer and carry their own password gate. See [`apiary.apib`](apiary.apib) for the full API specification.
 
@@ -397,12 +447,14 @@ to configure one — see [First-run setup](#first-run-setup). It is protected as
 follows:
 
 - the password is exchanged at `POST /api/admin/login` for a session token that expires after 8 hours and is held in `sessionStorage`, never a cookie;
-- an unclaimed node answers `409 ADMIN_NOT_CLAIMED` instead, and `POST /api/admin/claim` trades the setup token for a password — behind the same throttle, since it is the other endpoint where guessing a secret gets you in;
+- an unclaimed node answers `409 ADMIN_NOT_CLAIMED` instead, and `POST /api/admin/claim` trades the setup token for a password;
 - the chosen password is stored as an Argon2id hash (OWASP's interactive profile, not the 64 MiB at-rest one: this hash is checked online behind a throttle, and 64 MiB per attempt would be a memory-exhaustion lever rather than a defence);
 - `ADMIN_PASSWORD` overrides the stored password and is the recovery path if it is forgotten; `ADMIN_UI_DISABLED=1` turns the UI off entirely;
 - the token is signed with a key generated at startup and never persisted, so restarting the node ends every session;
 - failed logins are throttled per peer IP (10 per 15 minutes) with a fixed 250 ms delay on each rejection, and the password is compared in constant time;
-- `X-Forwarded-For` is not trusted, so behind a reverse proxy every client shares one throttle bucket (which fails closed, not open).
+- failed *claims* are counted separately and never lock the door: they cost an escalating delay capped at 2 s instead. A setup token is 32 bytes of entropy, so grinding it is not a threat worth a lockout — whereas on an unclaimed node a lockout would let anyone who can reach the node decide it never gets configured at all;
+- `X-Forwarded-For` is not trusted, so behind a reverse proxy every client shares one throttle bucket (which fails closed, not open);
+- Argon2 verification runs off the async executor, so a burst of login attempts cannot park the threads serving everything else.
 
 Beyond first-run setup, the UI shows what the node holds and offers: **register
 the node on the Portal**, **reset the database**, and the [key sealing](#key-sealing)

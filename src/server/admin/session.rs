@@ -35,12 +35,37 @@ const THROTTLE_WINDOW: Duration = Duration::from_secs(900);
 /// rate without being noticeable to a human typing their password correctly.
 const FAILED_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
+/// Ceiling on the escalating delay [`claim`] uses in place of a lockout. High
+/// enough to make grinding pointless, low enough that a few of them cannot pin
+/// connections open indefinitely.
+const MAX_CLAIM_DELAY: Duration = Duration::from_secs(2);
+
 /// Upper bound on tracked client buckets, so an attacker rotating source
 /// addresses cannot grow the map without limit.
 const THROTTLE_MAX_ENTRIES: usize = 4096;
 
+/// Which door a failed attempt was against.
+///
+/// The two are counted separately, and that is not tidiness. They fail in
+/// opposite directions: exhausting the login budget must lock the door, because
+/// a password can be weak; exhausting the claim budget must **not**, because on
+/// an unclaimed node `/admin` is the only way to configure the node at all and a
+/// lockout there is an attacker deciding the node never comes up. Sharing one
+/// counter would let failures against either close both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Gate {
+    Login,
+    Claim,
+}
+
 /// Failed-attempt count and the instant the current window opened.
 type Attempts = (u32, Instant);
+
+/// One counter per gate per client. `None` is every client behind a proxy.
+type Bucket = (Gate, Option<IpAddr>);
+
+/// The whole throttle.
+type Counters = Mutex<HashMap<Bucket, Attempts>>;
 
 /// Request body for `POST /api/admin/login`.
 #[derive(Debug, Deserialize)]
@@ -63,45 +88,45 @@ pub struct AdminSession {
     pub expires_at: i64,
 }
 
-/// Failed-attempt counters keyed by client IP.
+/// Failed-attempt counters keyed by gate and client IP.
 ///
 /// `None` (no `ConnectInfo`, which is the case under `oneshot()` in tests, and
 /// for any deployment that terminates connections in a proxy) collapses into a
 /// single shared bucket rather than bypassing the throttle.
-fn login_throttle() -> &'static Mutex<HashMap<Option<IpAddr>, Attempts>> {
-    static THROTTLE: OnceLock<Mutex<HashMap<Option<IpAddr>, Attempts>>> = OnceLock::new();
+fn attempt_counters() -> &'static Counters {
+    static THROTTLE: OnceLock<Counters> = OnceLock::new();
     THROTTLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Returns `true` when this client has burned through its attempt budget
-/// inside the current window. Expired windows reset the counter in place.
-fn is_throttled(client: Option<IpAddr>) -> bool {
-    let Ok(mut throttle) = login_throttle().lock() else {
+/// How many failures this client has against this gate inside the current
+/// window. Expired windows reset the counter in place.
+fn failures(gate: Gate, client: Option<IpAddr>) -> u32 {
+    let Ok(mut throttle) = attempt_counters().lock() else {
         // A poisoned mutex must not turn into an open door, but it also must
-        // not lock the operator out permanently: fail open here and rely on the
-        // constant-time comparison plus the delay below.
-        return false;
+        // not lock the operator out permanently: report no failures and rely on
+        // the constant-time comparison plus the delay below.
+        return 0;
     };
-    match throttle.get(&client) {
-        Some((attempts, first_seen)) if first_seen.elapsed() < THROTTLE_WINDOW => {
-            *attempts >= MAX_ATTEMPTS
-        }
+    match throttle.get(&(gate, client)) {
+        Some((attempts, first_seen)) if first_seen.elapsed() < THROTTLE_WINDOW => *attempts,
         Some(_) => {
-            throttle.remove(&client);
-            false
+            throttle.remove(&(gate, client));
+            0
         }
-        None => false,
+        None => 0,
     }
 }
 
-fn record_failure(client: Option<IpAddr>) {
-    let Ok(mut throttle) = login_throttle().lock() else {
+fn record_failure(gate: Gate, client: Option<IpAddr>) {
+    let Ok(mut throttle) = attempt_counters().lock() else {
         return;
     };
 
+    let key = (gate, client);
+
     // Evict the oldest quarter once the cap is reached.
-    if throttle.len() >= THROTTLE_MAX_ENTRIES && !throttle.contains_key(&client) {
-        let mut entries: Vec<(Option<IpAddr>, Instant)> = throttle
+    if throttle.len() >= THROTTLE_MAX_ENTRIES && !throttle.contains_key(&key) {
+        let mut entries: Vec<(Bucket, Instant)> = throttle
             .iter()
             .map(|(key, (_, first_seen))| (*key, *first_seen))
             .collect();
@@ -111,32 +136,46 @@ fn record_failure(client: Option<IpAddr>) {
         }
     }
 
-    let entry = throttle
-        .entry(client)
-        .or_insert_with(|| (0, Instant::now()));
+    let entry = throttle.entry(key).or_insert_with(|| (0, Instant::now()));
     if entry.1.elapsed() >= THROTTLE_WINDOW {
         *entry = (0, Instant::now());
     }
     entry.0 = entry.0.saturating_add(1);
 }
 
-fn clear_failures(client: Option<IpAddr>) {
-    if let Ok(mut throttle) = login_throttle().lock() {
-        throttle.remove(&client);
+fn clear_failures(gate: Gate, client: Option<IpAddr>) {
+    if let Ok(mut throttle) = attempt_counters().lock() {
+        throttle.remove(&(gate, client));
     }
 }
 
-/// Drops the failed-attempt counter for a single client. Test-only.
+/// The penalty a rejected claim pays, doubling with each failure up to
+/// [`MAX_CLAIM_DELAY`].
 ///
-/// Scoped to one key on purpose. The throttle is a process-global static and
+/// A delay rather than the lockout [`login`] uses, because the two gates protect
+/// different things. A setup token is 32 bytes of entropy, or — when supplied
+/// through `KONTOR_SETUP_TOKEN` — at least 32 characters, so grinding one is not
+/// a threat a lockout is needed for. What *is* a threat is anyone who can reach
+/// an unclaimed node spending ten guesses to keep its operator from ever
+/// claiming it, on the only endpoint that can configure the node.
+fn claim_penalty(failures: u32) -> Duration {
+    FAILED_ATTEMPT_DELAY
+        .saturating_mul(1u32 << failures.min(3))
+        .min(MAX_CLAIM_DELAY)
+}
+
+/// Drops the failed-attempt counters for a single client. Test-only.
+///
+/// Scoped to one client on purpose. The throttle is a process-global static and
 /// `cargo test` runs cases in parallel in one process, so clearing the whole
 /// map would be a race rather than isolation: it would wipe the counter another
 /// test is still accumulating. Tests isolate by using distinct client
 /// addresses; this only clears what a previous run of *this* case left behind.
 #[cfg(test)]
 pub(crate) fn reset_throttle_for_tests(client: Option<IpAddr>) {
-    if let Ok(mut throttle) = login_throttle().lock() {
-        throttle.remove(&client);
+    if let Ok(mut throttle) = attempt_counters().lock() {
+        throttle.remove(&(Gate::Login, client));
+        throttle.remove(&(Gate::Claim, client));
     }
 }
 
@@ -173,7 +212,7 @@ pub async fn login(
         ));
     }
 
-    if is_throttled(client) {
+    if failures(Gate::Login, client) >= MAX_ATTEMPTS {
         warn!(
             ?client,
             "Admin login throttled after {MAX_ATTEMPTS} failed attempts"
@@ -185,8 +224,8 @@ pub async fn login(
         ));
     }
 
-    if !admin.verify_password(&request.password) {
-        record_failure(client);
+    if !verify_password(admin, &request.password).await {
+        record_failure(Gate::Login, client);
         tokio::time::sleep(FAILED_ATTEMPT_DELAY).await;
         warn!(?client, "Rejected admin login attempt");
         return Err(ApiError::new(
@@ -196,8 +235,28 @@ pub async fn login(
         ));
     }
 
-    clear_failures(client);
+    clear_failures(Gate::Login, client);
     issue_session(client, admin)
+}
+
+/// Check a password without parking a `tokio` worker on Argon2.
+///
+/// A stored credential is verified with Argon2id at
+/// [`crate::crypto::aead::Kdf::LOGIN`] — 19 MiB and two passes, by design, since
+/// the whole value of the hash is that it is slow. Doing that inline blocks one
+/// executor thread for tens of milliseconds per attempt and, with a handful of
+/// clients each spending their budget, blocks all of them. It is CPU-bound work
+/// of exactly the shape `spawn_blocking` exists for.
+///
+/// A join failure answers "no", which is the direction a panicking hasher should
+/// fail in.
+async fn verify_password(admin: &AdminState, password: &str) -> bool {
+    let admin = admin.clone();
+    let password = password.to_string();
+
+    tokio::task::spawn_blocking(move || admin.verify_password(&password))
+        .await
+        .unwrap_or(false)
 }
 
 /// Request body for `POST /api/admin/claim`.
@@ -218,10 +277,12 @@ pub struct AdminClaimRequest {
 /// nothing and is one more chance to get locked out of a node they have
 /// configured but not yet finished setting up.
 ///
+/// Repeated failures cost an escalating delay rather than a lockout — see
+/// [`claim_penalty`] for why this gate must never close.
+///
 /// # Errors
 /// - `503 ADMIN_UI_DISABLED` when the UI is turned off outright.
 /// - `409 ALREADY_CLAIMED` when a password is already set.
-/// - `429 TOO_MANY_ATTEMPTS` once the per-client failure budget is exhausted.
 /// - `400 WEAK_PASSWORD` when the chosen password is too short.
 /// - `401 INVALID_SETUP_TOKEN` when the token does not match.
 pub async fn claim(
@@ -229,7 +290,7 @@ pub async fn claim(
     client: Option<IpAddr>,
     admin: &AdminState,
 ) -> Result<Value, ApiError> {
-    if matches!(admin.bootstrap(), (false, _)) && !admin.is_enabled() {
+    if admin.is_disabled() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             error_codes::ADMIN_UI_DISABLED,
@@ -242,18 +303,6 @@ pub async fn claim(
             error_codes::ALREADY_CLAIMED,
             "This node already has an admin password. Sign in with it, or set \
              ADMIN_PASSWORD to override it.",
-        ));
-    }
-
-    if is_throttled(client) {
-        warn!(
-            ?client,
-            "Admin claim throttled after {MAX_ATTEMPTS} failed attempts"
-        );
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            error_codes::TOO_MANY_ATTEMPTS,
-            "Too many failed attempts. Try again later.",
         ));
     }
 
@@ -270,9 +319,10 @@ pub async fn claim(
         ));
     }
 
-    if let Err(e) = admin.claim(&request.token, &request.password) {
-        record_failure(client);
-        tokio::time::sleep(FAILED_ATTEMPT_DELAY).await;
+    if let Err(e) = claim_blocking(admin, &request.token, &request.password).await {
+        let failures = failures(Gate::Claim, client);
+        record_failure(Gate::Claim, client);
+        tokio::time::sleep(claim_penalty(failures)).await;
         warn!(?client, error = %format!("{e:#}"), "Rejected admin claim");
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -281,9 +331,27 @@ pub async fn claim(
         ));
     }
 
-    clear_failures(client);
+    clear_failures(Gate::Claim, client);
     info!(?client, "Node claimed; admin password set");
     issue_session(client, admin)
+}
+
+/// Trade the token for a password off the executor.
+///
+/// Hashing the new password is the same Argon2id cost [`verify_password`]
+/// avoids running inline, and this one also writes `admin.json` and fsyncs it.
+async fn claim_blocking(
+    admin: &AdminState,
+    token: &str,
+    password: &str,
+) -> Result<(), anyhow::Error> {
+    let admin = admin.clone();
+    let token = token.to_string();
+    let password = password.to_string();
+
+    tokio::task::spawn_blocking(move || admin.claim(&token, &password))
+        .await
+        .map_err(|e| anyhow::anyhow!("the claim task failed: {e}"))?
 }
 
 /// Mint a session token for a caller that has just authenticated.
@@ -578,6 +646,121 @@ mod tests {
             let err = login(&request("typo"), operator, &state).await.unwrap_err();
             assert_eq!(err.code, error_codes::INVALID_PASSWORD);
         }
+    }
+
+    /// The two gates must not share a counter. An attacker who cannot reach a
+    /// node's password can still reach its claim form, and burning that budget
+    /// must not be a way to lock the operator out of logging in — nor the
+    /// reverse.
+    #[tokio::test]
+    async fn a_spent_claim_budget_does_not_close_the_login_door() {
+        reset_throttle_for_tests(client(20));
+        let state = enabled_state();
+        let attacker = client(20);
+
+        for _ in 0..(MAX_ATTEMPTS * 2) {
+            record_failure(Gate::Claim, attacker);
+        }
+
+        assert!(
+            failures(Gate::Login, attacker) < MAX_ATTEMPTS,
+            "claim failures must not count against login"
+        );
+        login(&request(PASSWORD), attacker, &state)
+            .await
+            .expect("the login gate is untouched by claim failures");
+
+        // And the reverse: a locked-out login leaves the claim gate open.
+        reset_throttle_for_tests(client(21));
+        for _ in 0..(MAX_ATTEMPTS * 2) {
+            record_failure(Gate::Login, client(21));
+        }
+        assert_eq!(failures(Gate::Claim, client(21)), 0);
+    }
+
+    /// The claim gate must never hand an attacker a way to stop a node being
+    /// configured at all. Guesses cost an escalating delay, capped, and the
+    /// answer stays "wrong token" rather than becoming "come back later".
+    #[test]
+    fn the_claim_penalty_escalates_but_never_locks_out() {
+        assert_eq!(claim_penalty(0), FAILED_ATTEMPT_DELAY);
+        assert!(claim_penalty(1) > claim_penalty(0));
+        assert!(claim_penalty(3) > claim_penalty(1));
+
+        // Bounded, so a handful of them cannot pin connections open.
+        assert_eq!(claim_penalty(3), MAX_CLAIM_DELAY);
+        assert_eq!(claim_penalty(u32::MAX), MAX_CLAIM_DELAY);
+    }
+
+    /// Failures beyond the login budget still answer 401 on the claim gate, not
+    /// 429: the operator with the right token must always get in.
+    ///
+    /// The counter is filled directly rather than by making the guesses. Each
+    /// rejection sleeps for its penalty by design, and paying fifteen of them
+    /// would buy this case nothing the arithmetic above does not already pin.
+    #[tokio::test]
+    async fn a_ground_down_claim_gate_still_accepts_the_right_token() {
+        use crate::server::admin::credentials::AdminCredential;
+        use crate::testutils::tempdir;
+
+        let dir = tempdir();
+        let attacker = client(22);
+        reset_throttle_for_tests(attacker);
+
+        let credential = AdminCredential::load_or_bootstrap(dir.path(), &AdminPassword::new(None))
+            .await
+            .unwrap();
+        let token = credential
+            .startup_notice()
+            .and_then(|notice| {
+                notice
+                    .split_whitespace()
+                    .find(|word| word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit()))
+                    .map(str::to_string)
+            })
+            .expect("a generated token is printed in full");
+
+        let state = AdminState::new(
+            credential,
+            dir.path().to_path_buf(),
+            crate::app::restart::RestartHandle::unavailable(),
+            crate::app::lifecycle::NodeRuntime::for_tests(None, None),
+        );
+
+        for _ in 0..(MAX_ATTEMPTS + 5) {
+            record_failure(Gate::Claim, attacker);
+        }
+        assert!(failures(Gate::Claim, attacker) > MAX_ATTEMPTS);
+
+        // Well past what would lock the login gate, and the answer is still
+        // "wrong token" rather than "come back later".
+        let err = claim(
+            &AdminClaimRequest {
+                token: "an entirely wrong token that is long enough".to_string(),
+                password: PASSWORD.to_string(),
+            },
+            attacker,
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code,
+            error_codes::INVALID_SETUP_TOKEN,
+            "the claim gate must never close"
+        );
+
+        let value = claim(
+            &AdminClaimRequest {
+                token,
+                password: PASSWORD.to_string(),
+            },
+            attacker,
+            &state,
+        )
+        .await
+        .expect("the right token still claims the node");
+        assert!(value["token"].as_str().is_some());
     }
 
     #[test]

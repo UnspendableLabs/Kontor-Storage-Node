@@ -186,26 +186,58 @@ pub fn random_salt() -> Vec<u8> {
 /// the blocking cost is noise next to getting the permissions wrong.
 ///
 /// The temporary file lives in the destination directory rather than `/tmp` so
-/// the rename stays within one filesystem, which is what makes it atomic.
+/// the rename stays within one filesystem, which is what makes it atomic. Its
+/// name is unique per write — see [`temp_path`] — and the directory entry the
+/// rename creates is flushed as well as the contents, so a crash lands on
+/// either the old file or the new one and never on neither.
 ///
 /// # Errors
 /// If the parent directory cannot be created, or the write or rename fails.
 pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
+    let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+    let tmp = temp_path(path);
+    let result = stage(&tmp, bytes).and_then(|()| {
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+    });
+
+    if result.is_err() {
+        // The rename never happened, so this is scratch nobody will read. Best
+        // effort: a leftover is untidy, not dangerous, and the original error is
+        // the one worth reporting.
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+
+    // The contents were flushed before the rename; this flushes the *name*. A
+    // failure here means the new file may not survive a power cut — it does not
+    // mean the write failed, and reporting it as one would have a caller undo
+    // work that is already visible to every reader.
+    if let Some(parent) = parent {
+        if let Err(e) = sync_dir(parent) {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                path = %path.display(),
+                "wrote a secret file but could not flush its directory entry"
+            );
         }
     }
 
-    let mut file_name = path.file_name().unwrap_or_default().to_os_string();
-    file_name.push(".tmp");
-    let tmp = path.with_file_name(file_name);
+    Ok(())
+}
+
+/// Write the payload to a fresh 0600 file and get it onto the disk.
+fn stage(tmp: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    // `create_new`, so a leftover from an interrupted write is never appended to
+    // or silently reused as somebody else's scratch space.
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -213,18 +245,54 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     let mut handle = options
-        .open(&tmp)
+        .open(tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
     handle
         .write_all(bytes)
         .with_context(|| format!("writing {}", tmp.display()))?;
     handle
         .sync_all()
-        .with_context(|| format!("flushing {}", tmp.display()))?;
-    drop(handle);
+        .with_context(|| format!("flushing {}", tmp.display()))
+}
 
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+/// A scratch name in the destination directory that no other write will pick.
+///
+/// One fixed `.tmp` is enough for a single writer, and there is more than one:
+/// `/admin` can add a seal slot while another request drops one, both rewriting
+/// the same keystore. Two writers sharing a scratch file interleave into
+/// something that renames perfectly well and is not either version.
+///
+/// Random rather than a pid and a counter, which is the obvious alternative and
+/// is wrong here. In a container the node is pid 1 and its counters start at
+/// zero, so a scratch file left by a crash is exactly the name the next boot
+/// would choose — and `create_new` would then refuse to write the keystore for
+/// the rest of the volume's life.
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
 
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", hex::encode(nonce)));
+    path.with_file_name(name)
+}
+
+/// Flush a directory, committing the entries renamed into it.
+///
+/// `sync_all` on a file commits its contents and says nothing about the name
+/// pointing at them. Without this, a crash can leave the directory still naming
+/// the old file while the new one exists only under a temporary name — which is
+/// exactly the outcome writing through a rename is meant to rule out.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("flushing {}", dir.display()))
+}
+
+/// Not portable, and not needed: opening a directory as a file is a Unix
+/// notion. Production is Linux.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -415,6 +483,55 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    /// Two writers on one path — `/admin` adding a seal slot while another
+    /// request drops one — must not share a scratch file. If they did, the
+    /// loser's bytes would interleave with the winner's into something that
+    /// renames perfectly well and is neither version.
+    #[test]
+    fn concurrent_writes_do_not_share_a_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.json");
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|n| vec![n; 4096]).collect();
+
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let path = path.clone();
+                scope.spawn(move || write_secret_file(&path, payload).unwrap());
+            }
+        });
+
+        // Whichever won, the file has to be one of them in full — never a mix.
+        let landed = std::fs::read(&path).unwrap();
+        assert!(payloads.contains(&landed), "a torn write landed on disk");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+
+    /// Scratch names must not repeat, across writes *or* across restarts. The
+    /// second half is why they are random: a container is always pid 1 with its
+    /// counters at zero, so a name derived from those would be the same one a
+    /// crashed write already left on the volume — and `create_new` would then
+    /// refuse to save the keystore for the rest of that volume's life.
+    #[test]
+    fn scratch_names_are_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.json");
+
+        let names: std::collections::HashSet<_> = (0..256).map(|_| temp_path(&path)).collect();
+        assert_eq!(names.len(), 256, "a scratch name was handed out twice");
+
+        // And debris under those names is stepped over rather than tripped on.
+        for name in &names {
+            std::fs::write(name, b"debris").unwrap();
+        }
+        write_secret_file(&path, b"payload").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
     }
 
     #[test]

@@ -186,6 +186,16 @@ impl AdminCredential {
         matches!(self, Self::Unclaimed { .. })
     }
 
+    /// True when the operator turned the UI off outright.
+    ///
+    /// Distinct from `!is_enabled()`, which is also true of an unclaimed node.
+    /// Every caller that means "the operator switched this off" wants this one;
+    /// the difference decides whether a request gets a 503 or the claim form.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
     /// Check a submitted password.
     ///
     /// Constant-time for the environment password, as before. The stored hash

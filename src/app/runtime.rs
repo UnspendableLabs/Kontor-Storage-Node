@@ -211,7 +211,10 @@ async fn serve(
             seal_source,
         } => (
             Phase::Activating,
-            SealStatus::opened(&keystore, &seal_key, seal_source),
+            // Filled in below rather than here: the status and the key that
+            // produced it are published in one call, so `/admin` can never be
+            // shown one without the other.
+            SealStatus::default(),
             Some((keystore, keys, seal_key, seal_source)),
         ),
         KeySource::Sealed { keystore } => {
@@ -241,6 +244,13 @@ async fn serve(
     };
 
     let runtime = NodeRuntime::new(phase, seal);
+
+    // The key this boot opened the keystore with, published before the server
+    // is: `/admin` reseals with it, and a request can arrive before the
+    // supervisor task has had a chance to run.
+    if let Some((keystore, _, seal_key, seal_source)) = opened.as_ref() {
+        runtime.opened(keystore, seal_key, *seal_source);
+    }
 
     // A restart is only ever offered where a restarted process could come back
     // on its own. That used to mean "a password is in the environment"; it now
@@ -363,14 +373,18 @@ impl Supervisor {
                     seal_key,
                     source,
                 } => {
-                    self.runtime
-                        .set_seal(SealStatus::opened(&keystore, &seal_key, source));
                     match keystore.unseal(&seal_key) {
                         Ok(keypair) => {
                             let keys = NodeKeys::Sealed(Box::new(node::SealedKeys {
                                 keypair,
                                 public: keystore.public().cloned(),
                             }));
+                            // Announced only once it has worked. A key that did
+                            // not open the keystore is not the key `/admin`
+                            // should go on to reseal with, and a status saying
+                            // otherwise would offer an operator a slot change
+                            // that cannot succeed.
+                            self.runtime.opened(&keystore, &seal_key, source);
                             self.keystore = Some((keystore, seal_key, source));
                             self.activate(keys).await;
                         }
@@ -598,9 +612,9 @@ impl Supervisor {
     /// Stop the daemon and **wait for it to be gone**.
     ///
     /// The await is the whole point. `abort()` only schedules cancellation, and
-    /// the daemon holds its lock file until its guard drops; re-spawning before
-    /// that lands means the new daemon finds the old one's lock, reports
-    /// "another daemon may already be running" into a log line, and quietly
+    /// the daemon holds its lock until its guard drops; re-spawning before that
+    /// lands means the new daemon finds the old one's lock genuinely held,
+    /// reports "another daemon is already running" into a log line, and quietly
     /// never runs. A node that serves files while proving nothing looks healthy
     /// from outside, which is the worst way to fail.
     async fn stop_daemon(&mut self) {

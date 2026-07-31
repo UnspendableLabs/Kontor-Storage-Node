@@ -137,7 +137,7 @@ mod tests {
         for key in [
             "/api/admin/bootstrap",
             "/api/admin/claim",
-            "/api/admin/setup/envelope",
+            "/api/admin/envelope",
             "/api/admin/setup/provision",
             "/api/admin/unseal",
             "/api/admin/seal",
@@ -149,6 +149,8 @@ mod tests {
             "envelope.node_pubkey",
             "client_pubkey",
             "ciphertext",
+            // The reply direction: the seal key arrives under `sealed`.
+            "result.sealed",
         ] {
             assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
         }
@@ -156,10 +158,11 @@ mod tests {
 
     /// The envelope is only as good as the primitives on both sides agreeing.
     /// These are the exact WebCrypto names that have to match
-    /// [`crate::server::admin::setup`]: P-256 ECDH, HKDF-SHA256 salted with the
-    /// session id, AES-GCM with that same id as additional authenticated data.
+    /// [`crate::server::admin::envelope`]: P-256 ECDH, HKDF-SHA256 salted with
+    /// the session id, AES-GCM with that same id as additional authenticated
+    /// data.
     #[test]
-    fn admin_html_seals_the_mnemonic_with_the_agreed_primitives() {
+    fn admin_html_seals_with_the_agreed_primitives() {
         for key in [
             "P-256",
             "ECDH",
@@ -168,25 +171,63 @@ mod tests {
             "AES-GCM",
             "deriveBits",
             "additionalData",
-            "KONTOR_ADMIN_SETUP_V1",
+            "KONTOR_ADMIN_ENVELOPE_V1",
         ] {
             assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
         }
     }
 
-    /// The one thing this page must never do. A field named for a seed phrase
-    /// must not be posted anywhere except through the sealed envelope, so the
-    /// only route out of the page carrying it is `setup/provision`.
+    /// Both directions, expanded from one HKDF call. 512 bits is the number
+    /// that has to match [`crate::server::admin::envelope`]: expand to 256 and
+    /// the page would derive one key where the node derives two, and every
+    /// sealed reply would fail to open with nothing saying why.
     #[test]
-    fn admin_html_never_posts_a_bare_mnemonic() {
-        // The phrase is read once, into the object that gets sealed.
-        assert!(ADMIN_HTML.contains("mnemonic: phrase"));
-        // And cleared as soon as it has been sent.
-        assert!(ADMIN_HTML.contains(r#"$("setup-mnemonic").value = "";"#));
+    fn admin_html_derives_a_key_for_each_direction() {
         assert!(
-            !ADMIN_HTML.contains("body: { mnemonic"),
-            "a seed phrase must never be posted outside the sealed envelope"
+            ADMIN_HTML.contains("ikm, 512"),
+            "the page must expand HKDF to two keys"
         );
+        for key in ["openEnvelope", "sealRequest", "openResponse"] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+        // One encrypt key and one decrypt key, not a single reversible one.
+        assert!(ADMIN_HTML.contains(r#"["encrypt"]"#));
+        assert!(ADMIN_HTML.contains(r#"["decrypt"]"#));
+    }
+
+    /// The account is the one field on this page a typo cannot be recovered
+    /// from: an off-by-one derives a different node entirely, registers it, and
+    /// leaves the original's agreements behind. `0` is refused by name rather
+    /// than read as the first account — see [`crate::crypto::mnemonic`] — and
+    /// that refusal only reaches the operator if the page sends what they typed
+    /// instead of coercing it.
+    #[test]
+    fn admin_html_sends_the_account_as_typed() {
+        assert!(
+            !ADMIN_HTML.contains("|| 1"),
+            "a falsy default would turn a typed 0 into account 1, silently"
+        );
+        assert!(ADMIN_HTML.contains("account: account"));
+    }
+
+    /// The one thing this page must never do. Neither of the two secrets it
+    /// sends may appear in a request body outside the sealed envelope: a seed
+    /// phrase cannot be rotated after a leak, and a seal passphrase opens the
+    /// keystore. Both are read into the object that gets sealed and nowhere
+    /// else.
+    #[test]
+    fn admin_html_never_posts_a_bare_secret() {
+        assert!(ADMIN_HTML.contains("mnemonic: phrase"));
+        assert!(ADMIN_HTML.contains("passphrase: passphrase"));
+        // And the phrase is cleared as soon as it has been sent.
+        assert!(ADMIN_HTML.contains(r#"$("setup-mnemonic").value = "";"#));
+
+        for bare in ["body: { mnemonic", "body: { passphrase"] {
+            assert!(
+                !ADMIN_HTML.contains(bare),
+                "{bare}: a secret must never be posted outside the sealed envelope"
+            );
+        }
     }
 
     /// The ledger block is the only place a stopped prover shows up: the row

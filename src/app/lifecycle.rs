@@ -164,6 +164,15 @@ struct State {
     node_id: Option<String>,
     identity: Option<Arc<NodeIdentity>>,
     seal: SealStatus,
+    /// The key this boot actually opened the keystore with.
+    ///
+    /// Kept rather than re-resolved. `/admin` changes how the node is sealed by
+    /// unwrapping the data key with whatever opened it, and the environment is
+    /// not a reliable answer to "what was that": a node unsealed by passphrase
+    /// has nothing on the machine to re-derive, and a `KONTOR_SEAL_KEY` pasted
+    /// in ahead of the slot it belongs to names a slot that does not exist yet.
+    /// Both cases are a working node being told it cannot reseal itself.
+    seal_key: Option<SealKey>,
     /// Why the node is where it is, when that needs saying — a failed
     /// activation, a Portal that will not register it, an environment variable
     /// that disagrees with the keystore.
@@ -192,6 +201,7 @@ impl NodeRuntime {
                     node_id: None,
                     identity: None,
                     seal,
+                    seal_key: None,
                     notice: None,
                     pending: None,
                 }),
@@ -238,6 +248,12 @@ impl NodeRuntime {
         self.read().seal.clone()
     }
 
+    /// The key this boot opened the keystore with, when it opened one.
+    #[must_use]
+    pub fn seal_key(&self) -> Option<SealKey> {
+        self.read().seal_key.clone()
+    }
+
     #[must_use]
     pub fn notice(&self) -> Option<String> {
         self.read().notice.clone()
@@ -266,8 +282,25 @@ impl NodeRuntime {
         self.write().notice = notice;
     }
 
-    pub fn set_seal(&self, seal: SealStatus) {
-        self.write().seal = seal;
+    /// Record that the keystore was opened, and with what.
+    ///
+    /// The status and the key are written together and only together. `/admin`
+    /// decides what it may offer from the status and then acts with the key, so
+    /// the two drifting apart is how an operator gets told a slot can be added
+    /// and then handed a 500 when they try.
+    pub fn opened(&self, keystore: &Keystore, key: &SealKey, source: SealKeySource) {
+        let mut state = self.write();
+        state.seal = SealStatus::opened(keystore, key, source);
+        state.seal_key = Some(key.clone());
+    }
+
+    /// Refresh which slots exist, after `/admin` has added or dropped one.
+    ///
+    /// Only the list changes: the key this boot came up on is still the key it
+    /// came up on, and `opened_with` still names the slot it came through — a
+    /// node that has just gained an env slot has not thereby started using it.
+    pub fn set_slots(&self, slots: Vec<SlotKind>) {
+        self.write().seal.slots = slots;
     }
 
     /// Publish the identity the rest of the process should work from.
@@ -408,6 +441,65 @@ mod tests {
             ..SealStatus::default()
         };
         assert!(!env_only.can_drop_file_slot());
+    }
+
+    /// The status and the key are published in one call because `/admin` reads
+    /// one and acts with the other: it decides a slot may be added from
+    /// `SealStatus`, then unwraps the data key with the key. A runtime that
+    /// carried one without the other would offer a change that cannot succeed.
+    #[test]
+    fn opening_publishes_the_status_and_the_key_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SealKey::generate(SlotKind::File);
+        let keypair = crate::crypto::BlsKeyPair::generate().unwrap();
+        let keystore =
+            Keystore::provision(dir.path(), &keypair.secret_key_hex(), None, &key).unwrap();
+
+        let runtime = NodeRuntime::new(Phase::Activating, SealStatus::default());
+        runtime.opened(&keystore, &key, SealKeySource::File);
+
+        assert_eq!(runtime.seal().opened_with, Some(SlotKind::File));
+        assert_eq!(runtime.seal().fingerprint, Some(key.fingerprint()));
+        assert_eq!(
+            runtime.seal_key().map(|held| held.fingerprint()),
+            Some(key.fingerprint()),
+            "the key that opened it must be the one /admin reseals with"
+        );
+    }
+
+    /// Nothing hands out a seal key until one has actually opened the keystore.
+    /// The supervisor only announces an opening after the unseal succeeds, so a
+    /// key that turned out to be wrong never becomes the one `/admin` acts with.
+    #[test]
+    fn a_runtime_that_never_opened_anything_holds_no_key() {
+        let runtime = NodeRuntime::new(Phase::Sealed, SealStatus::default());
+
+        assert!(runtime.seal_key().is_none());
+        assert!(runtime.seal().opened_with.is_none());
+    }
+
+    /// Gaining a slot is not the same as having booted through it, and only the
+    /// second permits dropping the file slot.
+    #[test]
+    fn refreshing_the_slots_leaves_the_boot_record_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SealKey::generate(SlotKind::File);
+        let keypair = crate::crypto::BlsKeyPair::generate().unwrap();
+        let keystore =
+            Keystore::provision(dir.path(), &keypair.secret_key_hex(), None, &key).unwrap();
+
+        let runtime = NodeRuntime::new(Phase::Running, SealStatus::default());
+        runtime.opened(&keystore, &key, SealKeySource::File);
+        runtime.set_slots(vec![SlotKind::File, SlotKind::Env]);
+
+        let seal = runtime.seal();
+        assert_eq!(seal.slots, vec![SlotKind::File, SlotKind::Env]);
+        assert_eq!(seal.opened_with, Some(SlotKind::File));
+        assert!(!seal.can_drop_file_slot());
+        assert!(
+            runtime.seal_key().is_some(),
+            "the boot key is still the key"
+        );
     }
 
     #[test]

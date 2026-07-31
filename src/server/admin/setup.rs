@@ -4,49 +4,11 @@
 //!
 //! Take a seed phrase in the clear.
 //!
-//! TLS already covers the wire, and on a well-behaved deployment that would be
-//! the end of it. Deployments are not well-behaved. The connection terminates at
-//! a platform edge that is free to log request bodies; a proxy in between may
-//! buffer them; an APM agent may sample them; an error reporter may serialize
-//! the whole request when something downstream panics. None of that is an
-//! attack, and all of it ends with a wallet's seed phrase in somebody's log
-//! store, forever. A mnemonic is not a password that can be rotated after such a
-//! leak — it is every key the operator will ever derive.
-//!
-//! So the browser encrypts it to a key that only this process holds, and what
-//! travels is ciphertext that the edge, the proxy and the reporter can all log
-//! to their heart's content.
-//!
-//! # What it is, precisely
-//!
-//! ECIES over P-256, the shape of an HPKE ciphersuite and using only what
-//! WebCrypto offers natively, because [`crate::server::admin::ui`] forbids the
-//! page from loading a single external script:
-//!
-//! 1. The node mints an **ephemeral** P-256 keypair, in memory, for one use.
-//! 2. The browser mints its own, does ECDH, and runs the shared secret's
-//!    x-coordinate through `HKDF-SHA256` — salted with the session id, with a
-//!    fixed `info` string.
-//! 3. It seals the payload with `AES-256-GCM`, **with the session id as
-//!    additional authenticated data**. That is what binds a ciphertext to the
-//!    one envelope it was made for; a captured body cannot be replayed against
-//!    the next one.
-//!
-//! P-256 rather than X25519 for one reason only: WebCrypto's `ECDH` supports it
-//! everywhere, and X25519 does not have the same browser floor.
-//!
-//! # What this does not defend against, stated plainly
-//!
-//! An attacker who controls the *response* path. The envelope's public key is
-//! only as trustworthy as the admin session that fetched it, and that session's
-//! bearer token crosses the same proxy in an `Authorization` header — so anyone
-//! able to rewrite responses can equally steal the session and hand out an
-//! envelope of their own. This is defence against **passive capture**, which is
-//! the failure that actually happens, not against an active man in the middle.
-//!
-//! The one out-of-band check is the fingerprint: the node logs it when the
-//! envelope is issued and the page shows it, so an operator who cares can
-//! compare the two. That is exactly why it is worth printing.
+//! It does not: the phrase arrives sealed to a one-shot key only this process
+//! holds, and what crosses the edge, the proxy and the error reporter is
+//! ciphertext. [`crate::server::admin::envelope`] is that channel, and the
+//! reasoning for it — along with what it deliberately does not defend against —
+//! lives there rather than here.
 //!
 //! # After decryption
 //!
@@ -55,149 +17,18 @@
 //! is the sealed BLS key and the public identity — see
 //! [`crate::crypto::identity`] for why that is enough forever.
 
-use std::time::{Duration, Instant};
-
-use aes_gcm::aead::rand_core::RngCore;
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use axum::http::StatusCode;
-use hkdf::Hkdf;
-use p256::ecdh::EphemeralSecret;
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::{EncodedPoint, PublicKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::app::lifecycle::{Activation, Phase};
-use crate::crypto::aead::{self, KEY_SIZE};
 use crate::crypto::keystore::{self, Keystore};
 use crate::crypto::{BitcoinNetwork, MnemonicIdentity, MnemonicSettings};
+use crate::server::admin::envelope::{self, SealedRequest};
 use crate::server::admin::{error_codes, ApiError};
 use crate::server::state::DownloadServerState;
-
-/// How long an unused envelope stays valid.
-///
-/// Long enough to type a seed phrase carefully, short enough that a page left
-/// open over lunch does not leave a live decryption key in the process.
-pub const ENVELOPE_TTL: Duration = Duration::from_secs(300);
-
-/// Bound to the derivation so a key from this exchange cannot be mistaken for
-/// one from any other.
-const HKDF_INFO: &[u8] = b"KONTOR_ADMIN_SETUP_V1";
-
-/// Domain separation for the envelope fingerprint.
-const FINGERPRINT_DOMAIN: &[u8] = b"KONTOR_ENVELOPE_FP_V1";
-
-const SESSION_ID_BYTES: usize = 16;
-
-/// A one-shot decryption key, alive in memory only.
-pub struct EnvelopeSession {
-    id: [u8; SESSION_ID_BYTES],
-    secret: EphemeralSecret,
-    issued: Instant,
-}
-
-impl std::fmt::Debug for EnvelopeSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EnvelopeSession")
-            .field("id", &hex::encode(self.id))
-            .field("secret", &"<redacted>")
-            .finish()
-    }
-}
-
-impl EnvelopeSession {
-    /// Mint a fresh envelope.
-    #[must_use]
-    pub fn issue() -> Self {
-        let mut id = [0u8; SESSION_ID_BYTES];
-        rand::thread_rng().fill_bytes(&mut id);
-        Self {
-            id,
-            secret: EphemeralSecret::random(&mut OsRng),
-            issued: Instant::now(),
-        }
-    }
-
-    #[must_use]
-    pub fn id_hex(&self) -> String {
-        hex::encode(self.id)
-    }
-
-    /// The public key the browser encrypts to, as uncompressed SEC1 — the
-    /// encoding WebCrypto's `"raw"` export produces, so neither side has to
-    /// convert.
-    #[must_use]
-    pub fn public_key_hex(&self) -> String {
-        hex::encode(EncodedPoint::from(self.secret.public_key()).as_bytes())
-    }
-
-    /// A short identifier for the key in this envelope, so an operator can
-    /// compare the browser against the node's own logs.
-    #[must_use]
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(FINGERPRINT_DOMAIN);
-        hasher.update(EncodedPoint::from(self.secret.public_key()).as_bytes());
-        hex::encode(&hasher.finalize()[..4])
-    }
-
-    #[must_use]
-    pub fn is_expired(&self) -> bool {
-        self.issued.elapsed() >= ENVELOPE_TTL
-    }
-
-    /// Seconds left before this envelope stops working.
-    #[must_use]
-    pub fn expires_in(&self) -> u64 {
-        ENVELOPE_TTL.saturating_sub(self.issued.elapsed()).as_secs()
-    }
-
-    /// Open what the browser sealed.
-    ///
-    /// # Errors
-    /// If the client key is malformed, or authentication fails — which covers a
-    /// wrong envelope, a tampered body and a replayed session id alike.
-    pub fn open(
-        &self,
-        client_pubkey_hex: &str,
-        nonce_hex: &str,
-        ciphertext_hex: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        let client_bytes =
-            hex::decode(client_pubkey_hex).context("the client public key is not hex")?;
-        let client = PublicKey::from_sec1_bytes(&client_bytes)
-            .map_err(|e| anyhow!("the client public key is not a P-256 point: {e}"))?;
-
-        let shared = self.secret.diffie_hellman(&client);
-
-        let mut key = Zeroizing::new([0u8; KEY_SIZE]);
-        Hkdf::<Sha256>::new(Some(&self.id), shared.raw_secret_bytes())
-            .expand(HKDF_INFO, key.as_mut())
-            .map_err(|e| anyhow!("deriving the envelope key: {e}"))?;
-
-        aead::open(
-            &key,
-            &self.id,
-            &hex::decode(nonce_hex).context("the nonce is not hex")?,
-            &hex::decode(ciphertext_hex).context("the ciphertext is not hex")?,
-        )
-    }
-}
-
-/// Request body for `POST /api/admin/setup/provision`.
-#[derive(Debug, Default, Deserialize)]
-pub struct ProvisionRequest {
-    #[serde(default)]
-    pub session_id: String,
-    #[serde(default)]
-    pub client_pubkey: String,
-    #[serde(default)]
-    pub nonce: String,
-    #[serde(default)]
-    pub ciphertext: String,
-}
 
 /// What the browser sealed. Never logged, never echoed.
 #[derive(Deserialize)]
@@ -213,33 +44,6 @@ fn default_account() -> u32 {
     crate::crypto::mnemonic::FIRST_ACCOUNT
 }
 
-/// `GET /api/admin/setup/envelope` — mint a key for the browser to seal to.
-///
-/// # Errors
-/// `409 SETUP_UNAVAILABLE` on a node that already has a keystore.
-pub fn issue_envelope(state: &DownloadServerState) -> Result<Value, ApiError> {
-    require_uninitialized(state)?;
-
-    let session = EnvelopeSession::issue();
-    let body = json!({
-        "session_id": session.id_hex(),
-        "node_pubkey": session.public_key_hex(),
-        "fingerprint": session.fingerprint(),
-        "expires_in": session.expires_in(),
-    });
-
-    // Logged so an operator who wants to check that the page is talking to this
-    // process, and not to something in front of it, has something to compare
-    // against. It is the only out-of-band check this design offers.
-    tracing::info!(
-        fingerprint = %session.fingerprint(),
-        "Issued a setup envelope; compare this fingerprint with the one shown in /admin"
-    );
-
-    state.admin.store_envelope(session);
-    Ok(body)
-}
-
 /// `POST /api/admin/setup/provision` — derive, seal, and activate.
 ///
 /// # Errors
@@ -248,43 +52,19 @@ pub fn issue_envelope(state: &DownloadServerState) -> Result<Value, ApiError> {
 ///   payload does not authenticate.
 /// - `400 INVALID_SETUP` when what it contained is not a usable seed phrase.
 /// - `500` when the keystore cannot be written.
-pub fn provision(
-    request: &ProvisionRequest,
+pub async fn provision(
+    request: &SealedRequest,
     state: &DownloadServerState,
 ) -> Result<Value, ApiError> {
+    // Held across the whole of provisioning, and the phase is read *inside* it.
+    // Two tabs would otherwise both see `Uninitialized`, both derive, and the
+    // second would write its keystore over the first — leaving a node whose
+    // identity is whichever request happened to finish last, and a `.seal-key`
+    // that opens only one of the two.
+    let _guard = state.admin.lock_keystore().await;
     require_uninitialized(state)?;
 
-    // Taken, not borrowed: an envelope is good for exactly one attempt, whether
-    // or not that attempt succeeds. A failed decryption that left the key alive
-    // would turn a one-shot exchange into an oracle.
-    let session = state
-        .admin
-        .take_envelope()
-        .filter(|session| session.id_hex() == request.session_id && !session.is_expired())
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                error_codes::INVALID_ENVELOPE,
-                "That setup envelope is unknown or has expired. Reload /admin and try again.",
-            )
-        })?;
-
-    let plaintext = session
-        .open(&request.client_pubkey, &request.nonce, &request.ciphertext)
-        .map_err(|e| {
-            ApiError::bad_request(
-                error_codes::INVALID_ENVELOPE,
-                "The setup payload did not decrypt. Reload /admin and try again.",
-            )
-            .with_detail(format!("{e:#}"))
-        })?;
-
-    let payload: ProvisionPayload = serde_json::from_slice(&plaintext).map_err(|e| {
-        ApiError::bad_request(
-            error_codes::INVALID_SETUP,
-            "The setup payload was not in the expected form.",
-        )
-        .with_detail(format!("{e:#}"))
-    })?;
+    let (_session, payload) = envelope::open_as::<ProvisionPayload>(request, state)?;
 
     // From here on the phrase lives in `Zeroizing` and nothing else. It is not
     // logged, not echoed in the response, and not written to disk in any form.
@@ -323,6 +103,11 @@ pub fn provision(
         "seal_fingerprint": seal_key.fingerprint(),
     });
 
+    // Entered here rather than left to the supervisor. The phase *is* the lock
+    // this endpoint checks, so publishing it before the guard is dropped is what
+    // makes the check above mean anything: a second request that arrives while
+    // the supervisor is still waking up now sees a node that already has a key.
+    state.runtime.enter(Phase::Activating);
     state.runtime.request(Activation::Open {
         keystore: Box::new(keystore),
         seal_key,
@@ -365,158 +150,161 @@ fn require_uninitialized(state: &DownloadServerState) -> Result<(), ApiError> {
 mod tests {
     use super::*;
 
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes256Gcm, Nonce};
+    use crate::app::lifecycle::{NodeRuntime, SealStatus};
+    use crate::app::restart::RestartHandle;
+    use crate::app::tasks::downloadagreements::StorageBackend;
+    use crate::server::admin::credentials::AdminCredential;
+    use crate::server::admin::envelope::testing::Client;
+    use crate::server::admin::AdminState;
+    use crate::testutils::{setup_in_memory_db, tempdir};
 
     const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                           abandon abandon abandon about";
 
-    /// The browser half of the exchange, in Rust.
-    ///
-    /// This is what makes the protocol testable at all: the page's WebCrypto
-    /// calls cannot run here, but the wire format they produce can be built
-    /// exactly, and a server that opens this will open theirs. What stays
-    /// unverified by the suite is the shape of the JavaScript calls, and
-    /// pretending otherwise would be worse than saying so.
-    fn seal_for(
-        node_pubkey_hex: &str,
-        session_id_hex: &str,
-        plaintext: &[u8],
-    ) -> (String, String, String) {
-        let node_public =
-            PublicKey::from_sec1_bytes(&hex::decode(node_pubkey_hex).unwrap()).unwrap();
-        let client_secret = EphemeralSecret::random(&mut OsRng);
-        let shared = client_secret.diffie_hellman(&node_public);
-        let session_id = hex::decode(session_id_hex).unwrap();
+    /// A node in the phase the wizard is for, with a real application directory
+    /// under it so a provision actually lands on disk.
+    async fn uninitialized_node() -> (DownloadServerState, tempfile::TempDir) {
+        let dir = tempdir();
+        let runtime = NodeRuntime::new(Phase::Uninitialized, SealStatus::default());
 
-        let mut key = [0u8; KEY_SIZE];
-        Hkdf::<Sha256>::new(Some(&session_id), shared.raw_secret_bytes())
-            .expand(HKDF_INFO, &mut key)
-            .unwrap();
+        let state = DownloadServerState {
+            db: setup_in_memory_db().await,
+            storage_dir: dir.path().to_path_buf(),
+            storage_backend: StorageBackend::local(),
+            runtime: runtime.clone(),
+            admin: AdminState::new(
+                AdminCredential::Disabled,
+                dir.path().to_path_buf(),
+                RestartHandle::unavailable(),
+                runtime,
+            ),
+        };
+        (state, dir)
+    }
 
-        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: plaintext,
-                    aad: &session_id,
-                },
-            )
-            .unwrap();
+    /// Fetch an envelope and seal a setup payload against it, as the page does.
+    fn sealed_setup(state: &DownloadServerState, account: u32) -> SealedRequest {
+        let envelope = envelope::issue(state);
+        let session_id = envelope["session_id"].as_str().unwrap();
+        let client = Client::greet(envelope["node_pubkey"].as_str().unwrap(), session_id);
 
-        (
-            hex::encode(EncodedPoint::from(client_secret.public_key()).as_bytes()),
-            hex::encode(nonce_bytes),
-            hex::encode(ciphertext),
+        client.seal(
+            session_id,
+            &serde_json::to_vec(&json!({
+                "mnemonic": PHRASE,
+                "account": account,
+                "network": "signet",
+            }))
+            .unwrap(),
         )
     }
 
-    fn payload() -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "mnemonic": PHRASE,
-            "account": 2,
-            "network": "signet",
-        }))
-        .unwrap()
+    #[tokio::test]
+    async fn a_sealed_phrase_provisions_the_node_it_names() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 2);
+
+        let body = provision(&request, &state).await.unwrap();
+
+        assert_eq!(body["account"], 2);
+        assert_eq!(body["network"], "signet");
+        assert_eq!(body["seal_slot"], "file");
+
+        // The keystore landed, and it holds the identity the response named.
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(keystore.public().unwrap().node_id, body["node_id"]);
+
+        // And the phase moved before the supervisor had a chance to run.
+        assert_eq!(state.runtime.phase(), Phase::Activating);
     }
 
-    #[test]
-    fn a_payload_sealed_by_the_client_opens_on_the_node() {
-        let session = EnvelopeSession::issue();
-        let (client_pubkey, nonce, ciphertext) =
-            seal_for(&session.public_key_hex(), &session.id_hex(), &payload());
+    /// The window the phase change closes. A second tab posting its own
+    /// envelope must not be able to write a second identity over the first.
+    #[tokio::test]
+    async fn a_second_provision_cannot_overwrite_the_first() {
+        let (state, dir) = uninitialized_node().await;
 
-        let opened = session.open(&client_pubkey, &nonce, &ciphertext).unwrap();
-        let parsed: ProvisionPayload = serde_json::from_slice(&opened).unwrap();
+        let first = sealed_setup(&state, 1);
+        provision(&first, &state).await.unwrap();
+        let node_id = Keystore::load(dir.path())
+            .await
+            .unwrap()
+            .unwrap()
+            .public()
+            .unwrap()
+            .node_id
+            .clone();
 
-        assert_eq!(parsed.mnemonic, PHRASE);
-        assert_eq!(parsed.account, 2);
+        let second = sealed_setup(&state, 3);
+        let err = provision(&second, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::SETUP_UNAVAILABLE);
+
+        // The identity on disk is still the first one.
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(keystore.public().unwrap().node_id, node_id);
     }
 
-    /// The property the AAD buys: a body captured off one envelope is useless
-    /// against the next.
-    #[test]
-    fn a_payload_sealed_for_another_envelope_does_not_open() {
-        let first = EnvelopeSession::issue();
-        let second = EnvelopeSession::issue();
-        let (client_pubkey, nonce, ciphertext) =
-            seal_for(&first.public_key_hex(), &first.id_hex(), &payload());
+    /// An envelope is good for one attempt, successful or not. Replaying a body
+    /// captured off the wire must not provision anything.
+    #[tokio::test]
+    async fn a_replayed_body_is_refused() {
+        let (state, _dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 1);
 
-        assert!(second.open(&client_pubkey, &nonce, &ciphertext).is_err());
-    }
-
-    /// The same node key, but the session id the ciphertext was bound to has
-    /// been swapped. Only the AAD catches this.
-    #[test]
-    fn a_payload_bound_to_another_session_id_does_not_open() {
-        let session = EnvelopeSession::issue();
-        let other_id = EnvelopeSession::issue().id_hex();
-        let (client_pubkey, nonce, ciphertext) =
-            seal_for(&session.public_key_hex(), &other_id, &payload());
-
-        assert!(session.open(&client_pubkey, &nonce, &ciphertext).is_err());
-    }
-
-    #[test]
-    fn a_tampered_ciphertext_does_not_open() {
-        let session = EnvelopeSession::issue();
-        let (client_pubkey, nonce, ciphertext) =
-            seal_for(&session.public_key_hex(), &session.id_hex(), &payload());
-
-        let flipped = format!(
-            "{}{}",
-            if ciphertext.starts_with('a') {
-                'b'
-            } else {
-                'a'
-            },
-            &ciphertext[1..]
+        // A wrong ciphertext consumes the envelope just as a right one does.
+        let spent = SealedRequest {
+            session_id: request.session_id.clone(),
+            client_pubkey: request.client_pubkey.clone(),
+            nonce: request.nonce.clone(),
+            ciphertext: format!("ff{}", &request.ciphertext[2..]),
+        };
+        assert_eq!(
+            provision(&spent, &state).await.unwrap_err().code,
+            error_codes::INVALID_ENVELOPE
         );
-        assert!(session.open(&client_pubkey, &nonce, &flipped).is_err());
+
+        // And the original body, valid as it is, has nothing left to open it.
+        assert_eq!(
+            provision(&request, &state).await.unwrap_err().code,
+            error_codes::INVALID_ENVELOPE
+        );
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
     }
 
-    #[test]
-    fn malformed_client_material_is_refused_rather_than_panicking() {
-        let session = EnvelopeSession::issue();
-        let (client_pubkey, nonce, ciphertext) =
-            seal_for(&session.public_key_hex(), &session.id_hex(), &payload());
+    /// A phrase that is not one has to come back as the operator's mistake, not
+    /// as a 500 — and must leave the node exactly as it was.
+    #[tokio::test]
+    async fn an_unusable_phrase_leaves_the_node_alone() {
+        let (state, dir) = uninitialized_node().await;
 
-        assert!(session.open("not hex", &nonce, &ciphertext).is_err());
-        assert!(session
-            .open(&hex::encode([1u8; 65]), &nonce, &ciphertext)
-            .is_err());
-        assert!(session.open(&client_pubkey, "zz", &ciphertext).is_err());
-        assert!(session.open(&client_pubkey, &nonce, "zz").is_err());
+        let envelope = envelope::issue(&state);
+        let session_id = envelope["session_id"].as_str().unwrap();
+        let client = Client::greet(envelope["node_pubkey"].as_str().unwrap(), session_id);
+        let request = client.seal(
+            session_id,
+            &serde_json::to_vec(&json!({ "mnemonic": "not a seed phrase", "account": 1 })).unwrap(),
+        );
+
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_SETUP);
+
+        assert!(Keystore::load(dir.path()).await.unwrap().is_none());
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
     }
 
-    #[test]
-    fn an_envelope_reports_its_own_shape() {
-        let session = EnvelopeSession::issue();
+    /// Setup is for a node with no key. One that is merely sealed must be
+    /// refused too: provisioning over a keystore nobody can open right now would
+    /// replace an identity that is only temporarily out of reach.
+    #[tokio::test]
+    async fn a_sealed_node_is_not_offered_the_wizard() {
+        let (state, _dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 1);
+        state.runtime.enter(Phase::Sealed);
 
-        assert_eq!(session.id_hex().len(), SESSION_ID_BYTES * 2);
-        // Uncompressed SEC1 for P-256: 0x04 plus two 32-byte coordinates.
-        assert_eq!(session.public_key_hex().len(), 65 * 2);
-        assert!(session.public_key_hex().starts_with("04"));
-        assert_eq!(session.fingerprint().len(), 8);
-        assert!(!session.is_expired());
-        assert!(session.expires_in() > 0);
-
-        let rendered = format!("{session:?}");
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-    }
-
-    /// Two envelopes must never share a key or an id.
-    #[test]
-    fn every_envelope_is_its_own() {
-        let first = EnvelopeSession::issue();
-        let second = EnvelopeSession::issue();
-
-        assert_ne!(first.id_hex(), second.id_hex());
-        assert_ne!(first.public_key_hex(), second.public_key_hex());
-        assert_ne!(first.fingerprint(), second.fingerprint());
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::SETUP_UNAVAILABLE);
     }
 
     #[test]
@@ -540,6 +328,27 @@ mod tests {
         assert!(derive(phrase, 1, Some("dogecoin")).is_err());
         assert!(derive("not a mnemonic", 1, None).is_err());
         assert!(derive("", 1, None).is_err());
-        assert!(derive(PHRASE, 0, None).is_err());
+    }
+
+    /// `0` is refused by name rather than read as the first account, and the
+    /// refusal has to say so: the page sends what the operator typed, so this
+    /// message is what they see. Quietly setting up account 1 instead would
+    /// leave them a node that is not the one they meant, discoverable only
+    /// after it registers.
+    #[test]
+    fn account_zero_is_refused_in_the_operator_s_own_terms() {
+        let refused = derive(PHRASE, 0, None).unwrap_err().to_string();
+        assert!(refused.contains("from 1"), "{refused}");
+        assert!(refused.contains("got 0"), "{refused}");
+    }
+
+    /// The default the payload carries when the page leaves the field blank. It
+    /// has to be the wallet's first account, not the derivation path's zero.
+    #[test]
+    fn a_payload_without_an_account_means_the_first_one() {
+        let parsed: ProvisionPayload =
+            serde_json::from_value(json!({ "mnemonic": PHRASE })).unwrap();
+        assert_eq!(parsed.account, crate::crypto::mnemonic::FIRST_ACCOUNT);
+        assert!(parsed.network.is_none());
     }
 }

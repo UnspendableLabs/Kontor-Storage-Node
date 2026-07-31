@@ -18,12 +18,16 @@ Retrieve information about the storage node.
 + Response 200 (application/json)
 
     + Attributes
-        + node_id: `abc123def456` (string, required) - Unique identifier of the storage node
+        + node_id: `abc123def456` (string, required) - Unique identifier of the storage node, `null` until the Portal has registered it
+        + phase: `running` (string, required) - Where the node is in its life: `uninitialized`, `sealed`, `activating`, `unregistered`, `running` or `failed`
+        + serving: `true` (boolean, required) - Whether the node is serving files and proving storage. Only `true` in the `running` phase; this is the field to alert on, since the server answers this request in every phase
 
     + Body
 
             {
-                "node_id": "abc123def456"
+                "node_id": "abc123def456",
+                "phase": "running",
+                "serving": true
             }
 
 ## Group Files
@@ -374,6 +378,272 @@ On success the node asks to restart, since onboarding is what turns a registrati
 + Response 502 (application/json)
 
     The Portal refused the registration or could not be reached (`PORTAL_ERROR`). Its own message is forwarded — most usefully `Bitcoin address … is not whitelisted for node registration`, which only a Portal admin can clear.
+
+### Sealed Envelope [GET /api/admin/envelope]
+
+Mints a one-shot channel between the operator's browser and this process, for the three secrets that must never appear in a body a proxy might log: the seed phrase at setup, a seal passphrase, and the seal key handed back when an env slot is added.
+
+The browser mints its own ephemeral P-256 keypair, does ECDH against `node_pubkey`, and runs the shared secret through HKDF-SHA256 — salted with `session_id`, `info` = `KONTOR_ADMIN_ENVELOPE_V1` — expanded to **64 bytes**. Those are two AES-256-GCM keys: the first seals browser to node, the second node to browser, so a reply can never be replayed as a request. Every seal carries `session_id` as additional authenticated data, which binds a ciphertext to the one envelope it was made for.
+
+The envelope is spent by the first request that presents it, successful or not, and a second `GET` replaces any envelope still outstanding.
+
+This defends against **passive capture** — an edge that logs bodies, an APM agent that samples them — and not against an attacker who controls the response path, who could hand out an envelope of their own. The out-of-band check is `fingerprint`: the node logs it when the envelope is issued and `/admin` shows it, so the two can be compared.
+
++ Request
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
++ Response 200 (application/json)
+
+    + Attributes
+        + session_id: `9f86d081884c7d659a2feaa0c55ad015` (string, required) - 16 random bytes, hex. HKDF salt and AEAD additional authenticated data
+        + node_pubkey: `04a1b2...` (string, required) - The node's ephemeral P-256 public key, uncompressed SEC1, hex — the encoding WebCrypto's `"raw"` export produces
+        + fingerprint: `1fac2362` (string, required) - Short identifier for that key, also logged by the node
+        + expires_in: 300 (number, required) - Seconds until the envelope stops working
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
+### Provision Node [POST /api/admin/setup/provision]
+
+Gives a node with no key its identity. Available only in the `uninitialized` phase — a node that is merely `sealed` is refused too, because provisioning over a keystore nobody can currently open would replace an identity that is only temporarily out of reach.
+
+The sealed payload is `{"mnemonic": ..., "account": ..., "network": ...}`. `account` is numbered as Horizon Wallet numbers it, from 1; `0` is refused by name rather than read as the first account. The phrase lives in the process only as long as it takes to derive a key and is never written anywhere: what persists is the sealed BLS key and the public identity.
+
+On success the node enters the `activating` phase before answering, so a second request cannot provision a different identity over the first.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + session_id: `9f86d081884c7d659a2feaa0c55ad015` (string, required) - The envelope this body was sealed to
+        + client_pubkey: `04c3d4...` (string, required) - The browser's ephemeral P-256 public key, uncompressed SEC1, hex
+        + nonce: `1a2b3c4d5e6f70819a2b3c4d` (string, required) - 12-byte AES-GCM nonce, hex
+        + ciphertext: `8f2c...` (string, required) - The sealed payload, hex
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "node_id": "node-deac9e85...",
+                "account": 2,
+                "network": "signet",
+                "taproot_address": "tb1p...",
+                "bls_pubkey": "a1b2...",
+                "seal_slot": "file",
+                "seal_fingerprint": "2bd8450f"
+            }
+
+    `taproot_address` is what a Portal admin has to whitelist before the node can register.
+
++ Response 400 (application/json)
+
+    The envelope is unknown, expired or its payload did not authenticate (`INVALID_ENVELOPE`), or what it contained is not a usable seed phrase (`INVALID_SETUP`). Nothing is written in either case.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    This node already has a key (`SETUP_UNAVAILABLE`).
+
+### Seal Status [GET /api/admin/seal]
+
+How this node's key is sealed right now. Nothing here is secret.
+
+`opened_with` is recorded rather than inferred, and the distinction is load-bearing: "there is an env slot" is not the same claim as "this boot came up on it", and only the second makes dropping the file slot safe.
+
++ Request
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "slots": ["file", "env"],
+                "opened_with": "file",
+                "fingerprint": "2bd8450f",
+                "can_add_env_slot": false,
+                "can_drop_file_slot": false,
+                "env_var": "KONTOR_SEAL_KEY"
+            }
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
+### Add Env Slot [POST /api/admin/seal/env-slot]
+
+Generates a key for `KONTOR_SEAL_KEY` and adds a slot for it. The file slot is untouched, so the node still starts exactly as before; this is step one of a two-step hardening flow with a redeploy in between.
+
+The key is returned **once**, sealed to the browser that asked, and the node keeps no copy it can read back. Together with the volume it *is* this node's BLS key, which is why it does not travel in the clear. If it is lost before being pasted in, call this again: the previous env slot is replaced.
+
+The request carries an envelope even though it sends nothing secret up. Opening it first is what proves the browser derived the same keys before the node commits a slot to them.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + session_id: `9f86d081884c7d659a2feaa0c55ad015` (string, required) - The envelope this reply is sealed to
+        + client_pubkey: `04c3d4...` (string, required) - The browser's ephemeral P-256 public key, hex
+        + nonce: `1a2b3c4d5e6f70819a2b3c4d` (string, required) - 12-byte AES-GCM nonce, hex
+        + ciphertext: `8f2c...` (string, required) - A sealed empty object, hex
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "env_var": "KONTOR_SEAL_KEY",
+                "fingerprint": "7c1e9a04",
+                "sealed": {
+                    "nonce": "9b8a7c6d5e4f30211a2b3c4d",
+                    "ciphertext": "d41f..."
+                },
+                "next": "Set KONTOR_SEAL_KEY=<key> on this deployment and restart. ..."
+            }
+
+    `sealed` opens under the node-to-browser key to `{"env_var": ..., "key": ...}`, where `key` is 32 random bytes, base64. `fingerprint` is outside the envelope on purpose: it reveals nothing and is what the operator compares against the node's logs after the redeploy.
+
++ Response 400 (application/json)
+
+    The envelope is unknown, expired or its payload did not authenticate (`INVALID_ENVELOPE`). No slot is written.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    There is no open keystore to add a slot to (`SEAL_UNAVAILABLE`).
+
+### Drop File Slot [POST /api/admin/seal/drop-file-slot]
+
+Removes the `file` slot and deletes `.seal-key`, leaving the node openable only from its environment. Step three of the hardening flow, and refused until the node has actually started through the env slot — check `can_drop_file_slot` on `GET /api/admin/seal` first.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + confirm: `DROP` (string, required) - Must be exactly `DROP`
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "slots": ["env"]
+            }
+
++ Response 400 (application/json)
+
+    `confirm` was not `DROP` (`CONFIRMATION_REQUIRED`). Nothing is removed.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    This boot did not come up through the env slot, so removing the file slot could leave the node unopenable (`SEAL_UNAVAILABLE`).
+
+### Add Passphrase Slot [POST /api/admin/seal/passphrase]
+
+Adds a slot only a human can open, from a sealed `{"passphrase": ...}` payload. Added *alongside* the machine-supplied slots, never instead of them, so unattended restarts keep working — the node refuses to be left with nothing a machine can supply.
+
+This is the answer to a lost seal key. Without such a slot, a node that loses both its `.seal-key` and its `KONTOR_SEAL_KEY` starts in the `sealed` phase and stays there.
+
+The floor is 20 characters, higher than the admin password's and for a different reason: this one is not behind a login throttle, so anyone holding the keystore file can try it offline as fast as their hardware allows.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + session_id: `9f86d081884c7d659a2feaa0c55ad015` (string, required) - The envelope this body was sealed to
+        + client_pubkey: `04c3d4...` (string, required) - The browser's ephemeral P-256 public key, hex
+        + nonce: `1a2b3c4d5e6f70819a2b3c4d` (string, required) - 12-byte AES-GCM nonce, hex
+        + ciphertext: `8f2c...` (string, required) - The sealed payload, hex
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "slots": ["file", "passphrase"]
+            }
+
++ Response 400 (application/json)
+
+    The envelope did not authenticate (`INVALID_ENVELOPE`), or the passphrase is shorter than 20 characters (`WEAK_PASSWORD`). The floor is checked on the decrypted payload, so a short one is named rather than sealed away into a slot.
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    There is no open keystore (`SEAL_UNAVAILABLE`).
+
+### Unseal Node [POST /api/admin/unseal]
+
+Opens a node in the `sealed` phase with a sealed `{"passphrase": ...}` payload. Without this, that phase is a dead end: the key is on the volume and nothing on the machine can open it.
+
+The passphrase is checked before the supervisor is asked to do anything, so a wrong one is an error the operator sees rather than a phase change that fails somewhere they are not looking. The node does not go on to report that it could restart unattended — nothing on this machine supplied the key.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + session_id: `9f86d081884c7d659a2feaa0c55ad015` (string, required) - The envelope this body was sealed to
+        + client_pubkey: `04c3d4...` (string, required) - The browser's ephemeral P-256 public key, hex
+        + nonce: `1a2b3c4d5e6f70819a2b3c4d` (string, required) - 12-byte AES-GCM nonce, hex
+        + ciphertext: `8f2c...` (string, required) - The sealed payload, hex
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "unsealing": true
+            }
+
+    The node moves out of `sealed` on the supervisor's next tick; poll `GET /api/info` for the phase.
+
++ Response 400 (application/json)
+
+    The envelope did not authenticate (`INVALID_ENVELOPE`).
+
++ Response 401 (application/json)
+
+    That passphrase does not open this node's keystore (`INVALID_PASSWORD`).
+
++ Response 409 (application/json)
+
+    This node is not sealed, or has no keystore to unseal (`SEAL_UNAVAILABLE`).
 
 ## Data Structures
 

@@ -639,6 +639,48 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["node_id"], "NODE-info-test");
+        // The server answers this request in every phase, so the phase has to
+        // be in the answer: without it, a node waiting for its setup wizard and
+        // a node proving storage are indistinguishable to a health check.
+        assert_eq!(json["phase"], "running");
+        assert_eq!(json["serving"], true);
+    }
+
+    /// The case the two new fields exist for: the server is up, and the node is
+    /// not doing its job.
+    #[tokio::test]
+    async fn node_info_reports_a_node_that_is_up_but_not_serving() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            runtime: crate::app::lifecycle::NodeRuntime::new(
+                crate::app::lifecycle::Phase::Uninitialized,
+                crate::app::lifecycle::SealStatus::default(),
+            ),
+            admin: AdminState::disabled(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "liveness is unaffected");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["phase"], "uninitialized");
+        assert_eq!(json["serving"], false);
+        assert!(json["node_id"].is_null());
     }
 
     #[tokio::test]
