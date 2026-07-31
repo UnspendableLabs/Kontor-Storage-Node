@@ -420,11 +420,13 @@ pub async fn open_or_migrate(
         let keypair = keystore.unseal(&seal_key)?;
         let public = keystore.public().cloned();
 
+        // A passphrase has no fingerprint to print, and never reaches this
+        // path anyway: nothing on the machine can supply one at boot.
         writeln!(
             writer,
             "✓ Keystore opened ({} slot, fingerprint {})",
             seal_source.kind(),
-            seal_key.fingerprint()
+            seal_key.fingerprint().as_deref().unwrap_or("none")
         )?;
         return Ok(KeySource::Open {
             keystore: Box::new(keystore),
@@ -464,7 +466,7 @@ pub async fn open_or_migrate(
         "✓ Sealed into {} ({} slot, fingerprint {})",
         Keystore::path_in(app_dir).display(),
         seal_source.kind(),
-        seal_key.fingerprint()
+        seal_key.fingerprint().as_deref().unwrap_or("none")
     )?;
     if mnemonic.is_some() {
         writeln!(

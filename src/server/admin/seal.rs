@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::app::lifecycle::{Activation, Phase};
+use crate::app::lifecycle::{Activation, Phase, SealStatus};
 use crate::crypto::keystore::{self, Keystore, SealKey, SealKeySource, SlotKind};
 use crate::server::admin::envelope::{self, EnvelopeSession, SealedRequest};
 use crate::server::admin::{error_codes, ApiError};
@@ -72,25 +72,40 @@ use crate::server::state::DownloadServerState;
 pub const MIN_PASSPHRASE_LEN: usize = 20;
 
 /// `GET /api/admin/seal` — how this node is sealed right now.
-///
-/// Nothing here is secret: which slots exist and which one this boot came up on
-/// are facts an operator needs before deciding anything, and the fingerprint is
-/// by construction not reversible.
 #[must_use]
 pub fn status(state: &DownloadServerState) -> Value {
-    let seal = state.runtime.seal();
+    render(&state.runtime.seal())
+}
+
+/// The body of [`status`], over the seal status alone.
+///
+/// Split out so the tests below drive the real thing. A test that rebuilt this
+/// object to assert on it would pass for as long as the copy agreed with
+/// itself, which is exactly as long as nobody changed either.
+///
+/// Nothing here is secret. Which slots exist and which one this boot came up on
+/// are facts an operator needs before deciding anything, and `fingerprint` is
+/// absent for the one kind of key that could be narrowed by publishing four
+/// bytes of a hash of it — see [`SealKey::fingerprint`].
+#[must_use]
+fn render(seal: &SealStatus) -> Value {
+    // Every offer below is gated on the node holding the key that opened its
+    // keystore, because every one of them has to unwrap the data key with it.
+    // `slots` alone is not enough: a node in `Phase::Failed`, or one caught
+    // between provisioning and its first activation, reports slots it cannot
+    // currently open — and offering a change there is offering a button whose
+    // only possible answer is an error.
+    let open = seal.is_open();
+
     json!({
         "slots": seal.slots.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "opened_with": seal.opened_with.map(|kind| kind.to_string()),
         "fingerprint": seal.fingerprint,
-        "can_add_env_slot": !seal.slots.contains(&SlotKind::Env),
-        "can_drop_file_slot": seal.can_drop_file_slot(),
-        // Whether there is an open keystore to add a passphrase slot to. Adding
-        // one needs the data key, so it is only possible while the node holds
-        // the key that opened it — which is exactly `opened_with` being set. A
-        // sealed node is the one that most wants a passphrase and is the one
+        "can_add_env_slot": open && !seal.slots.contains(&SlotKind::Env),
+        "can_drop_file_slot": open && seal.can_drop_file_slot(),
+        // A sealed node is the one that most wants a passphrase and is the one
         // place it cannot be added, which is why the page has to say so.
-        "can_add_passphrase_slot": seal.opened_with.is_some(),
+        "can_add_passphrase_slot": open,
         "has_passphrase_slot": seal.slots.contains(&SlotKind::Passphrase),
         "min_passphrase_len": MIN_PASSPHRASE_LEN,
         "env_var": keystore::SEAL_KEY_ENV,
@@ -115,10 +130,16 @@ struct PassphrasePayload {
 }
 
 /// What the node seals back when it hands out a key.
+///
+/// The key is `Zeroizing` rather than a bare `String`, and the difference is
+/// not decorative: `SealKey::encode` hands back a zeroizing buffer, and copying
+/// it into a plain field to be serialized would leave the base64 of this node's
+/// seal key in a heap allocation nothing ever wipes — in the one struct on this
+/// path whose whole purpose is to carry it.
 #[derive(Serialize)]
 struct EnvSlotReply {
     env_var: &'static str,
-    key: String,
+    key: Zeroizing<String>,
 }
 
 /// The phrase a destructive seal change has to carry, mirroring the reset.
@@ -156,8 +177,11 @@ pub async fn add_env_slot(
 
     state.runtime.set_slots(keystore.slots());
 
+    // A generated raw key always has one; the type is `Option` for the sake of
+    // passphrases, which must never be fingerprinted.
+    let fingerprint = new.fingerprint();
     tracing::info!(
-        fingerprint = %new.fingerprint(),
+        fingerprint = ?fingerprint,
         "Added an env seal slot from /admin; the key was sealed to the browser once and not retained"
     );
 
@@ -165,13 +189,13 @@ pub async fn add_env_slot(
         "env_var": keystore::SEAL_KEY_ENV,
         // Not the key: the operator compares this against the node's logs after
         // the redeploy, and it reveals nothing on its own.
-        "fingerprint": new.fingerprint(),
+        "fingerprint": fingerprint,
         "sealed": seal_reply(
             &session,
             &request.client_pubkey,
             &EnvSlotReply {
                 env_var: keystore::SEAL_KEY_ENV,
-                key: new.encode().to_string(),
+                key: new.encode(),
             },
         )?,
         "next": format!(
@@ -474,7 +498,7 @@ mod tests {
             admin: AdminState::new(
                 AdminCredential::Disabled,
                 dir.path().to_path_buf(),
-                RestartHandle::unavailable(),
+                RestartHandle::new(),
                 runtime,
             ),
         };
@@ -521,7 +545,7 @@ mod tests {
         // And it is the key that actually opens the new slot.
         let reloaded = Keystore::load(dir.path()).await.unwrap().unwrap();
         let handed_out = SealKey::decode(SlotKind::Env, key).expect("valid base64");
-        assert_eq!(body["fingerprint"], handed_out.fingerprint());
+        assert_eq!(body["fingerprint"], json!(handed_out.fingerprint()));
         reloaded.unseal(&handed_out).expect("the env slot opens it");
     }
 
@@ -693,7 +717,7 @@ mod tests {
             .unseal(&SealKey::passphrase(PASSPHRASE))
             .expect("the passphrase opens it");
         // And the node can still come back from a restart on its own.
-        assert!(reloaded.can_boot_unattended());
+        assert!(keystore::slots_can_boot_unattended(&reloaded.slots()));
     }
 
     /// The floor is checked on the plaintext, after the envelope — so a short
@@ -804,7 +828,7 @@ mod tests {
         let value = status(&state);
         assert_eq!(value["slots"], json!(["file"]));
         assert_eq!(value["opened_with"], "file");
-        assert_eq!(value["fingerprint"], file_key.fingerprint());
+        assert_eq!(value["fingerprint"], json!(file_key.fingerprint()));
         assert_eq!(value["env_var"], keystore::SEAL_KEY_ENV);
         assert!(
             !value.to_string().contains(file_key.encode().as_str()),
@@ -839,19 +863,44 @@ mod tests {
         assert_eq!(via_env["can_drop_file_slot"], true);
     }
 
-    /// The rendering half of [`status`], without needing a whole server state.
-    fn render(seal: &SealStatus) -> Value {
-        json!({
-            "slots": seal.slots.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "opened_with": seal.opened_with.map(|kind| kind.to_string()),
-            "fingerprint": seal.fingerprint,
-            "can_add_env_slot": !seal.slots.contains(&SlotKind::Env),
-            "can_drop_file_slot": seal.can_drop_file_slot(),
-            "can_add_passphrase_slot": seal.opened_with.is_some(),
-            "has_passphrase_slot": seal.slots.contains(&SlotKind::Passphrase),
-            "min_passphrase_len": MIN_PASSPHRASE_LEN,
-            "env_var": keystore::SEAL_KEY_ENV,
-        })
+    /// Every offer needs the data key, so a node that cannot open its own
+    /// keystore must be offered none of them. The page reveals the seal card in
+    /// every phase but `uninitialized` and `sealed` — which includes `failed`,
+    /// and the moment between a wizard provisioning a keystore and the
+    /// supervisor opening it — so "there is a slot" must not read as "a slot
+    /// can be changed".
+    #[test]
+    fn a_node_that_cannot_open_its_keystore_is_offered_nothing() {
+        let value = render(&seal_status(vec![SlotKind::File, SlotKind::Env], None));
+
+        assert_eq!(value["slots"], json!(["file", "env"]));
+        assert_eq!(value["can_add_env_slot"], false);
+        assert_eq!(value["can_drop_file_slot"], false);
+        assert_eq!(value["can_add_passphrase_slot"], false);
+
+        // And the same node with nothing recorded at all — a keystore that has
+        // not been read yet — is equally inert.
+        let nothing = render(&SealStatus::default());
+        assert_eq!(nothing["can_add_env_slot"], false);
+        assert_eq!(nothing["can_add_passphrase_slot"], false);
+    }
+
+    /// The one key kind with no fingerprint to publish. `GET /api/admin/seal`
+    /// is not sealed, so four bytes of a hash of an operator's passphrase would
+    /// be an offline confirmation oracle for anyone who saw the body.
+    #[tokio::test]
+    async fn a_node_opened_by_passphrase_publishes_no_fingerprint() {
+        let passphrase = SealKey::passphrase(PASSPHRASE);
+        let (state, _dir) = node_sealed_with(&passphrase, SealKeySource::Passphrase).await;
+
+        let value = status(&state);
+
+        assert_eq!(value["opened_with"], "passphrase");
+        assert_eq!(value["fingerprint"], Value::Null);
+        assert!(
+            !value.to_string().contains(PASSPHRASE),
+            "the passphrase must not be in a status response in any form"
+        );
     }
 
     /// A passphrase slot needs the data key, so it can only be added while the

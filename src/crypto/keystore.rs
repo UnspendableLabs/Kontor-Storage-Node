@@ -206,17 +206,27 @@ impl SealKey {
         }
     }
 
-    /// A short, non-reversible identifier an operator can compare between a log
-    /// line and a browser without either of them showing the key.
+    /// A short identifier an operator can compare between a log line and a
+    /// browser without either of them showing the key.
+    ///
+    /// `None` for a passphrase, and that is the whole point of the return type.
+    /// A raw key is 32 uniform random bytes, so four bytes of a hash of it
+    /// narrows nothing: there is no list to try. A passphrase is chosen by a
+    /// human, and this value is published — [`crate::server::admin::seal`]
+    /// returns it in a body the sealed channel deliberately does not cover. A
+    /// fingerprint of it would let anyone who saw that body confirm guesses
+    /// offline at one `SHA-256` each, against the 64 MiB of Argon2id per guess
+    /// that opening the keystore itself costs. The identifier is not worth that.
     #[must_use]
-    pub fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> Option<String> {
+        let Self::Raw { key, .. } = self else {
+            return None;
+        };
+
         let mut hasher = Sha256::new();
         hasher.update(FINGERPRINT_DOMAIN);
-        match self {
-            Self::Raw { key, .. } => hasher.update(key.as_slice()),
-            Self::Passphrase(value) => hasher.update(value.as_bytes()),
-        }
-        hex::encode(&hasher.finalize()[..4])
+        hasher.update(key.as_slice());
+        Some(hex::encode(&hasher.finalize()[..4]))
     }
 
     /// The key-encryption key for a slot, deriving it when the slot needs a salt.
@@ -411,12 +421,6 @@ impl Keystore {
         self.file.slots.iter().map(|slot| slot.kind).collect()
     }
 
-    /// Whether some slot could be supplied by the machine itself at boot.
-    #[must_use]
-    pub fn can_boot_unattended(&self) -> bool {
-        self.file.slots.iter().any(|slot| slot.kind.is_unattended())
-    }
-
     /// Open the BLS key.
     ///
     /// # Errors
@@ -500,7 +504,7 @@ impl Keystore {
                  seal the key away for good. Add another slot first."
             ));
         }
-        if !remaining.iter().any(|slot| slot.is_unattended()) {
+        if !slots_can_boot_unattended(&remaining) {
             return Err(anyhow!(
                 "removing the {kind} slot would leave only slots a human has to type, so \
                  the node could not come back from a restart on its own. Add an env or \
@@ -551,6 +555,19 @@ impl Keystore {
         let encoded = serde_json::to_vec_pretty(&self.file).context("encoding the keystore")?;
         aead::write_secret_file(&self.path, &encoded)
     }
+}
+
+/// Whether a node holding these slots could come back from a restart without a
+/// human at a terminal.
+///
+/// One implementation, two callers: [`Keystore::remove_slot`], which enforces
+/// that it stays true, and [`crate::app::lifecycle::SealStatus`], which answers
+/// the same question about the copy `/admin` can see and is what decides
+/// whether a restart is a recovery or an outage. A predicate this load-bearing
+/// must not be spelled out twice and drift.
+#[must_use]
+pub fn slots_can_boot_unattended(slots: &[SlotKind]) -> bool {
+    slots.iter().any(|slot| slot.is_unattended())
 }
 
 fn wrap_dek(dek: &Zeroizing<[u8; KEY_SIZE]>, key: &SealKey) -> Result<Slot> {
@@ -696,7 +713,7 @@ mod tests {
         let loaded = Keystore::load(dir.path()).await.unwrap().unwrap();
         assert_eq!(loaded.unseal(&key).unwrap().public_key_hex(), pubkey);
         assert_eq!(loaded.slots(), vec![SlotKind::File]);
-        assert!(loaded.can_boot_unattended());
+        assert!(slots_can_boot_unattended(&loaded.slots()));
     }
 
     #[tokio::test]
@@ -969,12 +986,28 @@ mod tests {
     #[test]
     fn a_fingerprint_identifies_a_key_without_revealing_it() {
         let key = SealKey::generate(SlotKind::File);
-        let fingerprint = key.fingerprint();
+        let fingerprint = key.fingerprint().unwrap();
 
         assert_eq!(fingerprint.len(), 8);
-        assert_eq!(fingerprint, key.fingerprint());
-        assert_ne!(fingerprint, SealKey::generate(SlotKind::File).fingerprint());
+        assert_eq!(key.fingerprint(), Some(fingerprint.clone()));
+        assert_ne!(
+            key.fingerprint(),
+            SealKey::generate(SlotKind::File).fingerprint()
+        );
         assert!(!key.encode().contains(&fingerprint));
+    }
+
+    /// A passphrase has no fingerprint, and must not grow one. The value is
+    /// published in a body the sealed channel does not cover, so four bytes of a
+    /// hash of a human-chosen secret would be an offline confirmation oracle at
+    /// one `SHA-256` per guess — against the 64 MiB of Argon2id that trying the
+    /// same guess against the keystore costs.
+    #[test]
+    fn a_passphrase_has_no_fingerprint_to_publish() {
+        let phrase = SealKey::passphrase("correct horse battery staple");
+
+        assert_eq!(phrase.fingerprint(), None);
+        assert!(SealKey::generate(SlotKind::File).fingerprint().is_some());
     }
 
     #[test]

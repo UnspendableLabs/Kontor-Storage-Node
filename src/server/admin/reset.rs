@@ -144,13 +144,13 @@ pub async fn reset_database(
         ));
     }
 
-    if request.restart && !state.admin.restart().is_available() {
+    if request.restart && !state.runtime.can_restart() {
         return Err(ApiError::bad_request(
             error_codes::RESTART_UNAVAILABLE,
-            "This node cannot restart itself: BLS_PASSWORD is unset, so a restarted \
-             process would stop at the key password prompt with no terminal to answer \
-             it. Set the variable, or reset without the restart and restart the node \
-             yourself.",
+            "This node cannot restart itself: nothing on this machine could open its \
+             keystore again, so it would come back up sealed and wait for someone to \
+             type a passphrase. Add a file or env seal slot from the Sealing card, or \
+             reset without the restart and restart the node yourself.",
         ));
     }
 
@@ -352,6 +352,7 @@ mod tests {
     use crate::app::restart::RestartHandle;
     use crate::app::tasks::downloadagreements::StorageBackend;
     use crate::clients::GcsClient;
+    use crate::crypto::keystore::SlotKind;
     use crate::entities::challenges;
     use crate::server::admin::AdminState;
     use crate::testutils::{
@@ -566,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn reset_alone_never_asks_for_a_restart() {
         let (mut state, _dir) = seeded_state().await;
-        let restart = RestartHandle::available();
+        let restart = RestartHandle::new();
         state.admin = AdminState::with_restart(restart.clone());
 
         let value = reset_database(&confirmed(true), &state).await.unwrap();
@@ -578,8 +579,11 @@ mod tests {
     #[tokio::test]
     async fn reset_asks_for_a_restart_when_it_can_deliver_one() {
         let (mut state, _dir) = seeded_state().await;
-        let restart = RestartHandle::available();
+        let restart = RestartHandle::new();
         state.admin = AdminState::with_restart(restart.clone());
+        // A slot this machine can supply on its own: that is what makes a
+        // restart a recovery rather than an outage.
+        state.runtime.set_slots(vec![SlotKind::File]);
 
         let value = reset_database(&confirmed_with_restart(), &state)
             .await
@@ -590,14 +594,16 @@ mod tests {
         assert!(restart.is_requested());
     }
 
-    /// Without `BLS_PASSWORD` a restarted process stops at the password prompt,
-    /// so the request is refused whole rather than wiping the node and then
-    /// leaving it up with the stale identity the operator wanted gone.
+    /// A node whose only way in is a passphrase would come back up sealed,
+    /// waiting for a human. The request is refused whole rather than wiping the
+    /// node and then leaving it up with the stale identity the operator wanted
+    /// gone.
     #[tokio::test]
     async fn reset_refuses_a_restart_it_cannot_deliver_and_wipes_nothing() {
         let (mut state, _dir) = seeded_state().await;
-        let restart = RestartHandle::unavailable();
+        let restart = RestartHandle::new();
         state.admin = AdminState::with_restart(restart.clone());
+        state.runtime.set_slots(vec![SlotKind::Passphrase]);
 
         let err = reset_database(&confirmed_with_restart(), &state)
             .await
@@ -605,7 +611,7 @@ mod tests {
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.code, error_codes::RESTART_UNAVAILABLE);
-        assert!(err.message.contains("BLS_PASSWORD"), "{}", err.message);
+        assert!(err.message.contains("seal slot"), "{}", err.message);
         assert_eq!(count_rows(&state).await, (3, 2), "nothing was touched");
         assert!(!restart.is_requested());
     }
@@ -614,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_that_cannot_restart_can_still_be_wiped() {
         let (mut state, _dir) = seeded_state().await;
-        state.admin = AdminState::with_restart(RestartHandle::unavailable());
+        state.admin = AdminState::with_restart(RestartHandle::new());
 
         let value = reset_database(&confirmed(false), &state).await.unwrap();
 
@@ -627,8 +633,9 @@ mod tests {
     #[tokio::test]
     async fn an_unconfirmed_restart_fails_on_the_phrase_not_the_switch() {
         let (mut state, _dir) = seeded_state().await;
-        let restart = RestartHandle::available();
+        let restart = RestartHandle::new();
         state.admin = AdminState::with_restart(restart.clone());
+        state.runtime.set_slots(vec![SlotKind::File]);
 
         let err = reset_database(
             &ResetDatabaseRequest {

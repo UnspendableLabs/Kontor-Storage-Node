@@ -166,7 +166,11 @@ For local storage, the file content is streamed directly. For GCS storage, a tem
 
 The operator UI at `/admin` and the endpoints behind it.
 
-These are disabled unless `ADMIN_PASSWORD` is configured; without it, login answers `503 ADMIN_UI_DISABLED`. The password is exchanged for a session token that expires after 8 hours and is signed with a key generated at startup, so restarting the node invalidates every session. Errors are returned as `{"error": {"code": ..., "message": ...}}`, where `message` is safe to display — internal causes are logged by the node, never returned.
+A node that has never been configured has no password: it mints a setup token on first boot, and `POST /api/admin/claim` trades that token for one. Until it does, `POST /api/admin/login` answers `409 ADMIN_NOT_CLAIMED` and `GET /api/admin/bootstrap` — the one endpoint here that needs no session — says which screen to render. `ADMIN_PASSWORD` overrides whatever password is stored and is the recovery path for a forgotten one; `ADMIN_UI_DISABLED` turns the UI off outright, and is the only state that answers `503 ADMIN_UI_DISABLED`.
+
+The password is exchanged for a session token that expires after 8 hours and is signed with a key generated at startup, so restarting the node invalidates every session. Errors are returned as `{"error": {"code": ..., "message": ...}}`, where `message` is safe to display — internal causes are logged by the node, never returned.
+
+Failed attempts are counted per peer address, per gate. An identified client that exhausts its login budget is locked out for the window; a claim, and a login from a deployment that terminates connections in a proxy — where every client shares one counter — pays an escalating delay capped at two seconds instead. A lockout on a shared counter would be any stranger deciding the operator never gets into the only page that can administer the node.
 
 Unlike the file endpoints, these carry no CORS headers: they are only ever called same-origin by the embedded page.
 
@@ -176,14 +180,73 @@ The single-page operator UI. Public — it is the login screen — and contains 
 
 + Response 200 (text/html; charset=utf-8)
 
-### Sign In [POST /api/admin/login]
+### Bootstrap [GET /api/admin/bootstrap]
 
-Exchange the configured password for a session token.
+Which screen a browser with no session should render. The only unauthenticated endpoint behind `/admin`, and it has to be: the question it answers is what to show someone who cannot yet log in.
+
+It gives away nothing `POST /api/admin/login` does not already give away through its status code — whether the node is claimed, and what phase it is in. The setup token itself is **not** included, only its fingerprint: an operator holding the token can confirm they have the right one, and an operator who does not learns nothing.
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "phase": "uninitialized",
+                "claimed": false,
+                "enabled": false,
+                "setup_token_fingerprint": "4f2a91c7"
+            }
+
+    `phase` is one of `uninitialized`, `sealed`, `activating`, `unregistered`, `running`, `failed` — see `GET /api/info`. `claimed` is whether an admin password exists; `enabled` is whether one can be checked, which is false on both an unclaimed node and one with `ADMIN_UI_DISABLED`. `setup_token_fingerprint` is `null` once the node is claimed.
+
+### Claim [POST /api/admin/claim]
+
+Trade the setup token for an admin password, and get a session back.
+
+A node that starts with no configuration prints a token on every boot until it is claimed and writes it to `.setup-token` on the volume; `KONTOR_SETUP_TOKEN` supplies one instead, in which case only its fingerprint is ever logged. The token opens an unconfigured node — one with no key and nothing to steal — and stops working the moment a password is set.
+
+The session comes back with it: the caller has just proved they hold the token and chosen the password, so asking them to type it again buys nothing.
 
 + Request (application/json)
 
     + Attributes
-        + password: `correct horse battery staple` (string, required) - Value of `ADMIN_PASSWORD`
+        + token: `9f86d081884c7d65...` (string, required) - The node's setup token
+        + password: `correct horse battery staple` (string, required) - At least 16 characters
+
++ Response 200 (application/json)
+
+    + Body
+
+            {
+                "token": "eyJhbGciOiJIUzI1NiJ9...",
+                "expires_at": 1798761600,
+                "expires_in": 28800
+            }
+
++ Response 400 (application/json)
+
+    The chosen password is shorter than 16 characters (`WEAK_PASSWORD`). Checked before the token, so someone who mistyped a password is told that rather than sent to re-check a token that was fine.
+
++ Response 401 (application/json)
+
+    The token does not match (`INVALID_SETUP_TOKEN`). Repeated failures cost an escalating delay, capped at two seconds; this gate never locks, because a node nobody can claim is a node nobody can configure.
+
++ Response 409 (application/json)
+
+    This node already has an admin password (`ALREADY_CLAIMED`). Sign in with it, or set `ADMIN_PASSWORD` to override it.
+
++ Response 503 (application/json)
+
+    `ADMIN_UI_DISABLED` is set, so the UI is off (`ADMIN_UI_DISABLED`).
+
+### Sign In [POST /api/admin/login]
+
+Exchange this node's admin password for a session token. That is the password chosen at claim time, or `ADMIN_PASSWORD` when it is set, which overrides it.
+
++ Request (application/json)
+
+    + Attributes
+        + password: `correct horse battery staple` (string, required) - The node's admin password
 
 + Response 200 (application/json)
 
@@ -199,13 +262,17 @@ Exchange the configured password for a session token.
 
     Wrong password (`INVALID_PASSWORD`). Every rejection costs a fixed 250 ms.
 
++ Response 409 (application/json)
+
+    Nobody has claimed this node yet, so there is no password to check (`ADMIN_NOT_CLAIMED`). Claim it first.
+
 + Response 429 (application/json)
 
-    More than 10 failed attempts from this client in 15 minutes (`TOO_MANY_ATTEMPTS`). The correct password is refused too until the window expires.
+    More than 10 failed attempts from this client in 15 minutes (`TOO_MANY_ATTEMPTS`). The correct password is refused too until the window expires. Only ever returned to a client the node can tell apart from the others: behind a proxy the attempts share one counter, and that counter delays rather than locks.
 
 + Response 503 (application/json)
 
-    `ADMIN_PASSWORD` is not configured (`ADMIN_UI_DISABLED`).
+    `ADMIN_UI_DISABLED` is set, so the UI is off (`ADMIN_UI_DISABLED`).
 
 ### Node Status [GET /api/admin/status]
 
@@ -258,11 +325,11 @@ Counts of everything a reset would erase, plus where it is stored.
                 "session_expires_at": 1798761600
             }
 
-    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when neither `BLS_PASSWORD` nor `KONTOR_STORAGE_MNEMONIC` is set, because a restarted process would stop at the key password prompt.
+    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when its keystore has no slot this machine can supply on its own, because it would come back up sealed and wait for someone to type a passphrase. It is read from the live seal status on every poll, so a node that gains its first machine slot part way through a session reports `true` without a reload.
 
     `registration` says whether the Portal knows this node's BLS key. `registered: false` means onboarding stopped at the lookup and no daemon is running — the node serves this page and nothing else until the key is registered. `node_id` and `signer_id` are then `null`, and `signer_id` is also `null` on a node whose `RegisterBlsKey` transaction has not confirmed yet. `supported: false` means no BLS key was loaded at all, so there is nothing to register.
 
-    `registration.derived` is present only on a node running from `KONTOR_STORAGE_MNEMONIC`, and is `null` otherwise. Such a node registers itself during onboarding and has no use for the wallet flow, so what the page shows instead is the account it derived and the Taproot address a Portal admin has to whitelist. `derived.account` is the wallet's own account number — the value of `KONTOR_STORAGE_ACCOUNT_INDEX`, counting from 1, not the child index in the derivation path. `derived.network` is one of `mainnet`, `testnet`, `signet`, `regtest`, and decides the address prefix as well as the coin type. Its `node_id` is the identifier derived from the xpub, which equals the outer `node_id` once the Portal has the row. While `registered` is `false` such a node re-offers its registration every 30 seconds, so `derived.taproot_address` being whitelisted is the only action left — this endpoint starts reporting `registered: true` on its own once it is. The exception is a registration the Portal read and rejected outright (`400`, `401`, `409`, `422`): replaying identical bytes cannot change that answer, so the node logs it and stops, and `registered` then only turns `true` if somebody registers the key elsewhere.
+    `registration.derived` is present on a node that knows its own Taproot account — one set up from a seed phrase, through the wizard or an older release — and is `null` on a node whose BLS key was imported without one. Such a node registers itself during onboarding and has no use for the wallet flow, so what the page shows instead is the account it derived and the Taproot address a Portal admin has to whitelist. `derived.account` is the wallet's own account number, counting from 1, not the child index in the derivation path. `derived.network` is one of `mainnet`, `testnet`, `signet`, `regtest`, and decides the address prefix as well as the coin type. Its `node_id` is the identifier derived from the xpub, which equals the outer `node_id` once the Portal has the row. While `registered` is `false` such a node re-offers its registration every 30 seconds, so `derived.taproot_address` being whitelisted is the only action left — this endpoint starts reporting `registered: true` on its own once it is. The exception is a registration the Portal read and rejected outright (`400`, `401`, `409`, `422`): replaying identical bytes cannot change that answer, so the node logs it and stops, and `registered` then only turns `true` if somebody registers the key elsewhere.
 
     `ledger` reports whether the node can still prove. `placed` is how many stored files carry a contract-assigned slot and would enter the rebuilt ledger; `awaiting_ledger_index` is how many are stored and served but not yet provable, because the Portal has not reconciled their creating transaction. `rebuild_blocked` is `true` once `highest_slot + 1` exceeds `placed` by more than kontor-crypto's sparsity gap (1024), at which point the ledger cannot be rebuilt and every proof is skipped — see the README.
 
@@ -322,7 +389,7 @@ With `restart`, the node answers this request and then exits with code `75` so i
 
 + Response 400 (application/json)
 
-    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`), or `restart` was asked for on a node with no `BLS_PASSWORD` in its environment (`RESTART_UNAVAILABLE`). Nothing is deleted in either case.
+    `confirm` was not `RESET` (`CONFIRMATION_REQUIRED`), or `restart` was asked for on a node whose keystore has no slot this machine could supply again (`RESTART_UNAVAILABLE`). Nothing is deleted in either case.
 
 + Response 401 (application/json)
 
@@ -340,7 +407,7 @@ The body carries only what the node cannot produce for itself: the extended publ
 
 `bls_pubkey` must be this node's own key. Registering any other would write a Portal row the node cannot sign for, leaving the same failed lookup one restart later, so a mismatch is refused before the Portal is called at all.
 
-On success the node asks to restart, since onboarding is what turns a registration into a running node — including waiting for the `RegisterBlsKey` transaction to confirm on-chain. A node with no `BLS_PASSWORD` cannot restart unattended, so it answers `restarting: false` and stays up; restart it yourself once the Portal has confirmed the key.
+On success the node onboards again **in the running process**, since onboarding is what turns a registration into a running node — including waiting for the `RegisterBlsKey` transaction to confirm on-chain. It answers `reonboarding: true` and stays up: the session survives, and the phase reported by `GET /api/admin/status` moves on its own. Nothing has to restart, which matters most on the one node that could not — a node held open by a passphrase.
 
 + Request (application/json)
 
@@ -360,7 +427,7 @@ On success the node asks to restart, since onboarding is what turns a registrati
             {
                 "node_id": "abc123def456",
                 "bls_pubkey": "92538f03...",
-                "restarting": true
+                "reonboarding": true
             }
 
 + Response 400 (application/json)
@@ -461,6 +528,8 @@ How this node's key is sealed right now. Nothing here is secret.
 
 `opened_with` is recorded rather than inferred, and the distinction is load-bearing: "there is an env slot" is not the same claim as "this boot came up on it", and only the second makes dropping the file slot safe.
 
+Every `can_` flag is false on a node that cannot currently open its own keystore, whatever slots it has: changing a slot needs the data key, which needs the key this boot came in with. `fingerprint` is `null` on such a node, and also on one opened with a passphrase — this response is not sealed, and four bytes of a hash of a human-chosen secret would let anyone who saw the body confirm guesses offline at one `SHA-256` each, against the 64 MiB of Argon2id per guess that trying the keystore itself costs. A random 32-byte seal key has no such weakness, and is fingerprinted so an operator can compare it against the node's own logs.
+
 + Request
 
     + Headers
@@ -477,6 +546,9 @@ How this node's key is sealed right now. Nothing here is secret.
                 "fingerprint": "2bd8450f",
                 "can_add_env_slot": false,
                 "can_drop_file_slot": false,
+                "can_add_passphrase_slot": true,
+                "has_passphrase_slot": false,
+                "min_passphrase_len": 20,
                 "env_var": "KONTOR_SEAL_KEY"
             }
 

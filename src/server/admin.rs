@@ -16,9 +16,12 @@
 //! These routes are not, so they carry their own guard rather than relying on a
 //! reverse proxy:
 //!
-//! - `ADMIN_PASSWORD` is exchanged at `POST /api/admin/login` for a session
-//!   token that expires after 8 hours. Leaving the variable unset disables the
-//!   UI entirely (login answers 503), which is the default.
+//! - A password is exchanged at `POST /api/admin/login` for a session token
+//!   that expires after 8 hours. On a node nobody has claimed there is no
+//!   password yet: `POST /api/admin/claim` trades the setup token for one, and
+//!   until it does, login answers 409. `ADMIN_PASSWORD` overrides whatever is
+//!   stored and is the recovery path; `ADMIN_UI_DISABLED` turns the UI off
+//!   outright, which is the only state that answers 503. See [`credentials`].
 //! - The token is signed with a key generated at startup and never persisted,
 //!   so sessions do not survive a restart and there is no long-lived secret on
 //!   disk to leak. It is held in `sessionStorage` and sent as a bearer — no
@@ -26,9 +29,10 @@
 //! - Failed attempts are counted per peer IP and every rejection costs a delay.
 //!   `X-Forwarded-For` is deliberately not trusted: behind a proxy all clients
 //!   collapse into one bucket, whereas a spoofable header would hand an attacker
-//!   unlimited buckets. Login and claim are counted separately and fail in
-//!   opposite directions — see [`session::claim`] for why the claim gate must
-//!   never close.
+//!   unlimited buckets. Login and claim are counted separately, and a lockout is
+//!   only ever applied to a bucket that belongs to one client — see
+//!   [`session::penalty`] for the two gates that must never close, and what a
+//!   shared bucket pays instead.
 //! - The admin routes are merged *after* the permissive `CorsLayer`, so they
 //!   carry no `Access-Control-Allow-Origin` and a browser refuses to let
 //!   another origin read their responses.
@@ -226,7 +230,7 @@ impl AdminState {
         Self::new(
             AdminCredential::Disabled,
             PathBuf::new(),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
             NodeRuntime::for_tests(None, None),
         )
     }
@@ -252,7 +256,7 @@ impl AdminState {
         Self::new(
             AdminCredential::Env(password),
             PathBuf::new(),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
             NodeRuntime::for_tests(None, None),
         )
     }
@@ -299,15 +303,21 @@ impl AdminState {
 
     /// Trade a setup token for a password, replacing the live credential.
     ///
+    /// The write guard is held across the whole exchange, including the Argon2
+    /// hash and the write to `admin.json`. Taking a read guard, releasing it and
+    /// then taking a write guard would leave a window two claims could both pass
+    /// — `RwLock` cannot promote one into the other — and both would answer with
+    /// a session while only the later password survived on disk. It is the same
+    /// window [`crate::server::admin::setup::provision`] closes by entering its
+    /// phase before dropping its guard. The cost is that other admin requests
+    /// wait out one password hash, once in a node's life.
+    ///
     /// # Errors
     /// If the node is already claimed, the token is wrong, the password is too
     /// short, or the credential cannot be written.
     pub fn claim(&self, token: &str, password: &str) -> Result<(), anyhow::Error> {
-        let claimed = {
-            let current = self.credential();
-            credentials::claim(&self.inner.app_dir, &current, token, password)?
-        };
-        *self.credential_mut() = claimed;
+        let mut current = self.credential_mut();
+        *current = credentials::claim(&self.inner.app_dir, &current, token, password)?;
         Ok(())
     }
 
@@ -742,7 +752,7 @@ mod tests {
         );
         let rendered = format!(
             "{:?}",
-            AdminState::with_identity(identity, RestartHandle::unavailable())
+            AdminState::with_identity(identity, RestartHandle::new())
         );
 
         assert!(rendered.contains("node-debug"), "{rendered}");
@@ -944,7 +954,7 @@ mod tests {
             state.admin = AdminState::new(
                 credential,
                 app_dir.path().to_path_buf(),
-                RestartHandle::unavailable(),
+                RestartHandle::new(),
                 crate::app::lifecycle::NodeRuntime::for_tests(None, None),
             );
             (state, app_dir, token)

@@ -35,10 +35,10 @@ const THROTTLE_WINDOW: Duration = Duration::from_secs(900);
 /// rate without being noticeable to a human typing their password correctly.
 const FAILED_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
-/// Ceiling on the escalating delay [`claim`] uses in place of a lockout. High
-/// enough to make grinding pointless, low enough that a few of them cannot pin
+/// Ceiling on the escalating delay used in place of a lockout. High enough to
+/// make grinding pointless, low enough that a few of them cannot pin
 /// connections open indefinitely.
-const MAX_CLAIM_DELAY: Duration = Duration::from_secs(2);
+const MAX_PENALTY: Duration = Duration::from_secs(2);
 
 /// Upper bound on tracked client buckets, so an attacker rotating source
 /// addresses cannot grow the map without limit.
@@ -47,9 +47,9 @@ const THROTTLE_MAX_ENTRIES: usize = 4096;
 /// Which door a failed attempt was against.
 ///
 /// The two are counted separately, and that is not tidiness. They fail in
-/// opposite directions: exhausting the login budget must lock the door, because
-/// a password can be weak; exhausting the claim budget must **not**, because on
-/// an unclaimed node `/admin` is the only way to configure the node at all and a
+/// opposite directions: an identified client's login budget must lock the door,
+/// because a password can be weak; the claim budget must **not**, because on an
+/// unclaimed node `/admin` is the only way to configure the node at all and a
 /// lockout there is an attacker deciding the node never comes up. Sharing one
 /// counter would let failures against either close both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,19 +149,22 @@ fn clear_failures(gate: Gate, client: Option<IpAddr>) {
     }
 }
 
-/// The penalty a rejected claim pays, doubling with each failure up to
-/// [`MAX_CLAIM_DELAY`].
+/// The delay a rejected attempt pays, doubling with each failure up to
+/// [`MAX_PENALTY`].
 ///
-/// A delay rather than the lockout [`login`] uses, because the two gates protect
-/// different things. A setup token is 32 bytes of entropy, or — when supplied
-/// through `KONTOR_SETUP_TOKEN` — at least 32 characters, so grinding one is not
-/// a threat a lockout is needed for. What *is* a threat is anyone who can reach
-/// an unclaimed node spending ten guesses to keep its operator from ever
-/// claiming it, on the only endpoint that can configure the node.
-fn claim_penalty(failures: u32) -> Duration {
+/// Used wherever a lockout would punish the wrong person:
+///
+/// - **Every claim.** A setup token is 32 bytes of entropy, or — supplied
+///   through `KONTOR_SETUP_TOKEN` — at least 32 characters, so grinding one is
+///   not a threat a lockout is needed for. What *is* a threat is anyone who can
+///   reach an unclaimed node spending ten guesses to keep its operator from ever
+///   claiming it, on the only endpoint that can configure the node.
+/// - **A login with no client address**, which behind a proxy is *every* login.
+///   See [`login`].
+fn penalty(failures: u32) -> Duration {
     FAILED_ATTEMPT_DELAY
         .saturating_mul(1u32 << failures.min(3))
-        .min(MAX_CLAIM_DELAY)
+        .min(MAX_PENALTY)
 }
 
 /// Drops the failed-attempt counters for a single client. Test-only.
@@ -184,7 +187,9 @@ pub(crate) fn reset_throttle_for_tests(client: Option<IpAddr>) {
 /// # Errors
 /// - `503 ADMIN_UI_DISABLED` when the UI is turned off outright.
 /// - `409 ADMIN_NOT_CLAIMED` when nobody has set a password yet.
-/// - `429 TOO_MANY_ATTEMPTS` once the per-client failure budget is exhausted.
+/// - `429 TOO_MANY_ATTEMPTS` once an *identified* client exhausts its failure
+///   budget. Never for the shared bucket a proxied deployment uses, which pays
+///   an escalating delay instead — see the note in the body.
 /// - `401 INVALID_PASSWORD` on mismatch.
 /// - `500` when the token cannot be signed.
 pub async fn login(
@@ -212,7 +217,23 @@ pub async fn login(
         ));
     }
 
-    if failures(Gate::Login, client) >= MAX_ATTEMPTS {
+    // A lockout is only ever applied to a bucket that belongs to one client.
+    //
+    // `None` is every client behind a proxy, sharing one counter, and locking
+    // that shared counter hands anyone who can reach the node a way to keep its
+    // operator out — of the page that is now the *only* way to administer a
+    // node, including the seal and the setup wizard. That is the same failure
+    // the claim gate is built to avoid, and it is worse here, because there is
+    // no second channel to recover through. So a proxied deployment pays an
+    // escalating delay instead: the budget stops being a door that closes and
+    // becomes a rate, capped at one guess every two seconds.
+    //
+    // What that costs is stated rather than hidden: on such a deployment an
+    // attacker can go on guessing at that rate indefinitely. The password has a
+    // 16-character floor for exactly this reason, and an operator who wants the
+    // lockout back gets it by giving the node real client addresses.
+    let identified = client.is_some();
+    if identified && failures(Gate::Login, client) >= MAX_ATTEMPTS {
         warn!(
             ?client,
             "Admin login throttled after {MAX_ATTEMPTS} failed attempts"
@@ -225,8 +246,14 @@ pub async fn login(
     }
 
     if !verify_password(admin, &request.password).await {
+        let failures = failures(Gate::Login, client);
         record_failure(Gate::Login, client);
-        tokio::time::sleep(FAILED_ATTEMPT_DELAY).await;
+        tokio::time::sleep(if identified {
+            FAILED_ATTEMPT_DELAY
+        } else {
+            penalty(failures)
+        })
+        .await;
         warn!(?client, "Rejected admin login attempt");
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -278,7 +305,7 @@ pub struct AdminClaimRequest {
 /// configured but not yet finished setting up.
 ///
 /// Repeated failures cost an escalating delay rather than a lockout — see
-/// [`claim_penalty`] for why this gate must never close.
+/// [`penalty`] for why this gate must never close.
 ///
 /// # Errors
 /// - `503 ADMIN_UI_DISABLED` when the UI is turned off outright.
@@ -322,7 +349,7 @@ pub async fn claim(
     if let Err(e) = claim_blocking(admin, &request.token, &request.password).await {
         let failures = failures(Gate::Claim, client);
         record_failure(Gate::Claim, client);
-        tokio::time::sleep(claim_penalty(failures)).await;
+        tokio::time::sleep(penalty(failures)).await;
         warn!(?client, error = %format!("{e:#}"), "Rejected admin claim");
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -430,14 +457,24 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let admin = DownloadServerState::from_ref(state).admin;
 
-        // A disabled UI has no valid sessions at all. Saying so plainly beats a
-        // 401 that sends the operator hunting for a password that was never
-        // configured.
+        // Unclaimed and disabled both mean "no session can be valid", and they
+        // are still different answers — the same distinction [`login`] makes,
+        // and for the same reason. A node nobody has claimed is not one whose
+        // operator switched the UI off, and telling them to set ADMIN_PASSWORD
+        // sends them hunting for a variable that was never the way in.
+        if admin.is_unclaimed() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                error_codes::ADMIN_NOT_CLAIMED,
+                "This node has not been claimed yet. Enter its setup token at /admin to \
+                 choose an admin password.",
+            ));
+        }
         if !admin.is_enabled() {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 error_codes::ADMIN_UI_DISABLED,
-                "The admin UI is disabled. Set ADMIN_PASSWORD to enable it.",
+                "The admin UI is disabled on this node.",
             ));
         }
 
@@ -682,14 +719,43 @@ mod tests {
     /// configured at all. Guesses cost an escalating delay, capped, and the
     /// answer stays "wrong token" rather than becoming "come back later".
     #[test]
-    fn the_claim_penalty_escalates_but_never_locks_out() {
-        assert_eq!(claim_penalty(0), FAILED_ATTEMPT_DELAY);
-        assert!(claim_penalty(1) > claim_penalty(0));
-        assert!(claim_penalty(3) > claim_penalty(1));
+    fn the_penalty_escalates_but_never_locks_out() {
+        assert_eq!(penalty(0), FAILED_ATTEMPT_DELAY);
+        assert!(penalty(1) > penalty(0));
+        assert!(penalty(3) > penalty(1));
 
         // Bounded, so a handful of them cannot pin connections open.
-        assert_eq!(claim_penalty(3), MAX_CLAIM_DELAY);
-        assert_eq!(claim_penalty(u32::MAX), MAX_CLAIM_DELAY);
+        assert_eq!(penalty(3), MAX_PENALTY);
+        assert_eq!(penalty(u32::MAX), MAX_PENALTY);
+    }
+
+    /// Behind a proxy every client shares one bucket, so a lockout there is any
+    /// stranger deciding the operator never gets back into the only page that
+    /// can administer this node. The budget becomes a rate instead: guesses are
+    /// still refused and still slowed, and the right password still works.
+    #[tokio::test]
+    async fn a_shared_bucket_slows_guesses_down_rather_than_locking_the_door() {
+        reset_throttle_for_tests(None);
+        let state = enabled_state();
+
+        // Well past what closes an identified client's door. Recorded directly:
+        // each rejection sleeps for its penalty by design, and paying twenty of
+        // them would buy this case nothing.
+        for _ in 0..(MAX_ATTEMPTS * 2) {
+            record_failure(Gate::Login, None);
+        }
+        assert!(failures(Gate::Login, None) > MAX_ATTEMPTS);
+
+        let err = login(&request("nope"), None, &state).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            error_codes::INVALID_PASSWORD,
+            "a shared bucket must never answer 429: that is the operator being locked out"
+        );
+
+        login(&request(PASSWORD), None, &state)
+            .await
+            .expect("the operator's own password must still work");
     }
 
     /// Failures beyond the login budget still answer 401 on the claim gate, not
@@ -723,7 +789,7 @@ mod tests {
         let state = AdminState::new(
             credential,
             dir.path().to_path_buf(),
-            crate::app::restart::RestartHandle::unavailable(),
+            crate::app::restart::RestartHandle::new(),
             crate::app::lifecycle::NodeRuntime::for_tests(None, None),
         );
 

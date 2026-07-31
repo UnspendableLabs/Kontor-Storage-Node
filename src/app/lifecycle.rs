@@ -37,7 +37,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::Notify;
 
-use crate::crypto::keystore::{Keystore, SealKey, SealKeySource, SlotKind};
+use crate::crypto::keystore::{self, Keystore, SealKey, SealKeySource, SlotKind};
 use crate::server::admin::NodeIdentity;
 
 /// Where the node is in its life.
@@ -101,13 +101,16 @@ pub struct SealStatus {
 
 impl SealStatus {
     /// The status of a node whose keystore was opened this boot.
+    ///
+    /// The fingerprint is whatever the key is willing to publish, which is
+    /// nothing at all for a passphrase — see [`SealKey::fingerprint`].
     #[must_use]
     pub fn opened(keystore: &Keystore, key: &SealKey, source: SealKeySource) -> Self {
         Self {
             slots: keystore.slots(),
             opened_with: Some(source.kind()),
             source: Some(source),
-            fingerprint: Some(key.fingerprint()),
+            fingerprint: key.fingerprint(),
         }
     }
 
@@ -118,6 +121,30 @@ impl SealStatus {
             slots: keystore.slots(),
             ..Self::default()
         }
+    }
+
+    /// Whether some slot could be supplied by the machine itself at boot.
+    ///
+    /// The same question [`Keystore::can_boot_unattended`] answers, asked of the
+    /// copy `/admin` can see. It is what decides whether a restart is a recovery
+    /// or an outage that waits for a human, and it lives here rather than being
+    /// captured once at startup because the slots change while the node runs:
+    /// a node provisioned through the wizard gains its first machine slot after
+    /// the server is already answering requests.
+    #[must_use]
+    pub fn can_boot_unattended(&self) -> bool {
+        keystore::slots_can_boot_unattended(&self.slots)
+    }
+
+    /// Whether `/admin` may offer to reseal this node at all.
+    ///
+    /// Adding or dropping a slot needs the data key, which needs the key this
+    /// boot opened the keystore with. A node that never opened one — sealed, or
+    /// stopped in [`Phase::Failed`] before it got there — has slots to show and
+    /// nothing to change them with.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.opened_with.is_some()
     }
 
     /// Whether `/admin` may offer to drop the file slot.
@@ -246,6 +273,19 @@ impl NodeRuntime {
     #[must_use]
     pub fn seal(&self) -> SealStatus {
         self.read().seal.clone()
+    }
+
+    /// Whether a restarted process could reach a running node again without a
+    /// human at a terminal.
+    ///
+    /// Answered from the slots rather than remembered from startup, because the
+    /// answer changes during a process's life: a node that came up with no
+    /// keystore at all says no, and says yes the moment the wizard seals one.
+    /// A handle carrying a `bool` fixed at boot would go on refusing the reset's
+    /// restart to exactly the nodes this release exists to create.
+    #[must_use]
+    pub fn can_restart(&self) -> bool {
+        self.read().seal.can_boot_unattended()
     }
 
     /// The key this boot opened the keystore with, when it opened one.
@@ -459,12 +499,52 @@ mod tests {
         runtime.opened(&keystore, &key, SealKeySource::File);
 
         assert_eq!(runtime.seal().opened_with, Some(SlotKind::File));
-        assert_eq!(runtime.seal().fingerprint, Some(key.fingerprint()));
+        assert_eq!(runtime.seal().fingerprint, key.fingerprint());
         assert_eq!(
-            runtime.seal_key().map(|held| held.fingerprint()),
-            Some(key.fingerprint()),
+            runtime.seal_key().and_then(|held| held.fingerprint()),
+            key.fingerprint(),
             "the key that opened it must be the one /admin reseals with"
         );
+    }
+
+    /// A node opened by hand publishes no fingerprint, because the only thing
+    /// there is to fingerprint is the operator's passphrase. Everything else
+    /// about the seal is still reported.
+    #[test]
+    fn opening_with_a_passphrase_publishes_no_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SealKey::passphrase("a passphrase long enough to be accepted");
+        let keypair = crate::crypto::BlsKeyPair::generate().unwrap();
+        let keystore =
+            Keystore::provision(dir.path(), &keypair.secret_key_hex(), None, &key).unwrap();
+
+        let runtime = NodeRuntime::new(Phase::Sealed, SealStatus::default());
+        runtime.opened(&keystore, &key, SealKeySource::Passphrase);
+
+        let seal = runtime.seal();
+        assert_eq!(seal.opened_with, Some(SlotKind::Passphrase));
+        assert!(seal.is_open());
+        assert_eq!(seal.fingerprint, None);
+        // And a node held open only by a human cannot be restarted into one.
+        assert!(!runtime.can_restart());
+    }
+
+    /// The restart offer follows the slots, and has to keep following them: a
+    /// node with no keystore says no, and says yes as soon as the wizard seals
+    /// one — in the same process, without anybody restarting anything.
+    #[test]
+    fn the_restart_offer_appears_with_the_first_machine_slot() {
+        let runtime = NodeRuntime::new(Phase::Uninitialized, SealStatus::default());
+        assert!(!runtime.can_restart());
+
+        runtime.set_slots(vec![SlotKind::Passphrase]);
+        assert!(
+            !runtime.can_restart(),
+            "a slot only a human can supply is not a way back from a restart"
+        );
+
+        runtime.set_slots(vec![SlotKind::File, SlotKind::Passphrase]);
+        assert!(runtime.can_restart());
     }
 
     /// Nothing hands out a seal key until one has actually opened the keystore.
@@ -514,10 +594,15 @@ mod tests {
         assert_eq!(locked.slots, vec![SlotKind::File]);
         assert!(locked.opened_with.is_none());
         assert!(locked.fingerprint.is_none());
+        assert!(!locked.is_open(), "a locked keystore cannot be resealed");
+        // It could still come back from a restart on its own — the slot is
+        // there, this boot simply had no key for it.
+        assert!(locked.can_boot_unattended());
 
         let opened = SealStatus::opened(&keystore, &key, SealKeySource::Generated);
         assert_eq!(opened.opened_with, Some(SlotKind::File));
-        assert_eq!(opened.fingerprint, Some(key.fingerprint()));
+        assert_eq!(opened.fingerprint, key.fingerprint());
+        assert!(opened.is_open());
     }
 
     #[tokio::test]

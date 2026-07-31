@@ -175,6 +175,21 @@ compare them.
 The page needs a secure context for `crypto.subtle` to exist at all — TLS, or
 localhost. It says so rather than failing at the moment you press the button.
 
+Both halves are tested. The node's half has its own tests, which play the client
+in Rust; the browser's half is exercised by a harness that slices
+`openEnvelope`, `sealRequest` and `openResponse` **verbatim** out of
+`index.html` and drives them against a live binary under Node's WebCrypto:
+
+```sh
+cargo build && node scripts/envelope-harness.mjs
+```
+
+It starts a node with no configuration, claims it, sets it up through the sealed
+channel, takes a seal key back out of it and adds a passphrase slot, then checks
+that none of the three secrets appears in any body that crossed. What it cannot
+cover is the page itself — no DOM, no CSP, no extension — so one manual pass over
+a secure origin is still worth doing before a deployment is trusted.
+
 ### Key sealing
 
 The BLS private key is sealed on disk with AES-256-GCM under a random data key.
@@ -192,6 +207,14 @@ There is no ranking here, only different exposures. A node with nothing
 configured uses the `file` slot, which is what makes zero configuration possible.
 On a platform that holds both your environment and your volume, neither slot
 defends against the platform itself.
+
+The Sealing card reports a short fingerprint of the key the node opened with, so
+you can compare it against the node's own logs. A **passphrase has none, by
+design**: that response is not sealed, and four bytes of a hash of a secret a
+human chose would let anyone who saw the body confirm guesses offline at one
+`SHA-256` each — against the 64 MiB of Argon2id per guess that trying the
+keystore itself costs. A random 32-byte key has no such weakness, which is why it
+is fingerprinted and a passphrase is not.
 
 What both do defend against is the thing being replaced. A stolen seal key plus a
 stolen keystore yields **one node's signing key** — revocable, re-registerable,
@@ -427,10 +450,12 @@ Endpoints:
 | `GET /files/:file_id` | Download (local backend) or 307 redirect to a GCS signed URL |
 | `GET /static/*` | Static assets (logo, dashboard CSS/JS) |
 | `GET /admin` | Operator UI (password-gated, see below) |
-| `POST /api/admin/login` | Exchange `ADMIN_PASSWORD` for an 8-hour session token |
+| `GET /api/admin/bootstrap` | Which screen to render: claimed, enabled, phase, setup-token fingerprint (no session) |
+| `POST /api/admin/claim` | Trade the setup token for an admin password, and get a session (no session) |
+| `POST /api/admin/login` | Exchange the admin password for an 8-hour session token |
 | `GET /api/admin/status` | JSON: row counts, storage summary and registration state (session required) |
 | `POST /api/admin/reset-database` | Wipe the node's database, optionally restarting the node (session required) |
-| `POST /api/admin/register-node` | Register the node's BLS key on the Portal (session required) |
+| `POST /api/admin/register-node` | Register the node's BLS key on the Portal and onboard again in place (session required) |
 | `GET /api/admin/envelope` | Mint a one-shot sealed channel for the secrets below (session required) |
 | `POST /api/admin/setup/provision` | Give an unconfigured node its identity, from a sealed seed phrase (session required) |
 | `POST /api/admin/seal/env-slot` | Add a `KONTOR_SEAL_KEY` slot; the key comes back sealed (session required) |
@@ -451,9 +476,9 @@ follows:
 - the chosen password is stored as an Argon2id hash (OWASP's interactive profile, not the 64 MiB at-rest one: this hash is checked online behind a throttle, and 64 MiB per attempt would be a memory-exhaustion lever rather than a defence);
 - `ADMIN_PASSWORD` overrides the stored password and is the recovery path if it is forgotten; `ADMIN_UI_DISABLED=1` turns the UI off entirely;
 - the token is signed with a key generated at startup and never persisted, so restarting the node ends every session;
-- failed logins are throttled per peer IP (10 per 15 minutes) with a fixed 250 ms delay on each rejection, and the password is compared in constant time;
+- failed logins from a client the node can tell apart are throttled per peer IP (10 per 15 minutes) with a fixed 250 ms delay on each rejection, and the password is compared in constant time;
 - failed *claims* are counted separately and never lock the door: they cost an escalating delay capped at 2 s instead. A setup token is 32 bytes of entropy, so grinding it is not a threat worth a lockout — whereas on an unclaimed node a lockout would let anyone who can reach the node decide it never gets configured at all;
-- `X-Forwarded-For` is not trusted, so behind a reverse proxy every client shares one throttle bucket (which fails closed, not open);
+- `X-Forwarded-For` is not trusted — a spoofable header would hand an attacker unlimited buckets — so behind a reverse proxy every client shares one throttle bucket. **A lockout is only ever applied to a bucket that belongs to one client.** Locking a shared one would let any stranger keep the operator out of the only page that can administer the node, which is the same failure the claim gate avoids and worse, since there is no second channel to recover through. A proxied deployment pays the escalating delay instead: the budget stops being a door that closes and becomes a rate, capped at one guess every two seconds. What that costs is that such a deployment can be ground at that rate indefinitely, which is why the password floor is 16 characters and why giving the node real client addresses is worth doing;
 - Argon2 verification runs off the async executor, so a burst of login attempts cannot park the threads serving everything else.
 
 Beyond first-run setup, the UI shows what the node holds and offers: **register
@@ -494,7 +519,7 @@ The wipe does not re-register the node, and cannot: the `signer_id`, the JWT and
 
 1. reset the database with **restart the node after the wipe** ticked;
 2. the node exits with code `75` and the supervisor starts it again, which re-runs onboarding, re-announces the URL and reconciles against the new chain;
-3. if the Portal no longer knows the node's BLS key, onboarding lands in the `unregistered` phase instead of exiting — register from the card above, and the node onboards without a further restart.
+3. if the Portal no longer knows the node's BLS key, onboarding lands in the `unregistered` phase instead of exiting — register from the card above, and the node onboards again in the same process, with no further restart and no second sign-in.
 
 Registering never issues `RegisterBlsKey` on-chain itself: the Portal's daemon batches that transaction, and onboarding waits for the resulting `signer_id` to appear.
 

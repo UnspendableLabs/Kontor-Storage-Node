@@ -97,6 +97,10 @@ mod tests {
     /// block it keys off, the route it posts to, and the three wallet fields it
     /// forwards. A rename on either side leaves an operator with a button that
     /// does nothing on the one node that needs it.
+    ///
+    /// No `result.restarting` here any more, and its absence is the point: a
+    /// registration is carried out in the running process, so the page has no
+    /// exit to announce and nothing to sign back into.
     #[test]
     fn admin_html_speaks_the_same_registration_api_as_the_server() {
         for key in [
@@ -104,7 +108,6 @@ mod tests {
             "registration.registered",
             "registration.bls_pubkey",
             "/api/admin/register-node",
-            "result.restarting",
             "pop.xpubkey",
             "pop.blsPubkey",
             "pop.schnorrSig",

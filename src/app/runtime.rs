@@ -252,16 +252,13 @@ async fn serve(
         runtime.opened(keystore, seal_key, *seal_source);
     }
 
-    // A restart is only ever offered where a restarted process could come back
-    // on its own. That used to mean "a password is in the environment"; it now
-    // means the keystore has a slot the machine can supply. A node whose only
-    // slot is a passphrase would come back up sealed and wait for a human, so
-    // restarting it is not a recovery, it is an outage.
-    let restart = RestartHandle::new(
-        opened
-            .as_ref()
-            .is_some_and(|(keystore, ..)| keystore.can_boot_unattended()),
-    );
+    // Whether a restart may be *offered* is not decided here. It is a question
+    // about the keystore's slots — a node whose only slot is a passphrase comes
+    // back up sealed, waiting for a human, so restarting it is an outage rather
+    // than a recovery — and the slots change while the node runs, which is the
+    // whole of zero configuration. `NodeRuntime::can_restart` answers it from
+    // the slots at the moment it is asked; this is only the switch.
+    let restart = RestartHandle::new();
     let credential =
         AdminCredential::load_or_bootstrap(&config.app_dir, &config.admin_password).await?;
     let setup_notice = credential.startup_notice();
@@ -1816,7 +1813,7 @@ mod tests {
         let err = serve_until_shutdown(
             "127.0.0.1:1".parse().unwrap(),
             state,
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
             future::pending::<io::Result<()>>(),
         )
         .await
@@ -1838,11 +1835,16 @@ mod tests {
         std::fs::create_dir_all(&storage_dir).unwrap();
         let db = DBClient::new("sqlite::memory:").await.unwrap();
 
+        let runtime = crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None);
+        // A slot this machine can supply on its own, which is what makes a
+        // restart something `/admin` is allowed to ask for.
+        runtime.set_slots(vec![crate::crypto::keystore::SlotKind::File]);
+
         let state = server::DownloadServerState {
             db: db.connection().clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
+            runtime,
             admin,
         };
         (state, storage_dir)
@@ -1853,7 +1855,7 @@ mod tests {
     /// supervisor acts on, so a plain `Shutdown` here would leave the node down.
     #[tokio::test]
     async fn serving_reports_a_restart_the_admin_ui_asked_for() {
-        let restart = RestartHandle::available();
+        let restart = RestartHandle::new();
         let (state, storage_dir) =
             idle_state("admin_restart", AdminState::with_restart(restart.clone())).await;
 
@@ -1897,7 +1899,7 @@ mod tests {
         ));
 
         let addr = free_local_addr();
-        let restart = RestartHandle::available();
+        let restart = RestartHandle::new();
         let (state, storage_dir) = idle_state(
             "restart_over_http",
             AdminState::new(
@@ -1976,7 +1978,7 @@ mod tests {
             serve_until_shutdown(
                 "127.0.0.1:0".parse().unwrap(),
                 state,
-                RestartHandle::unavailable(),
+                RestartHandle::new(),
                 future::ready(Ok(())),
             ),
         )

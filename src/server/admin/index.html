@@ -493,16 +493,18 @@
       '</div><div class="label">' + esc(label) + "</div></div>";
   }
 
-  // A node with no BLS password in its environment would stop at the key
-  // prompt on the way back up, so the API refuses to restart it. Saying so
-  // here beats letting the operator find out after typing RESET.
+  // A node whose keystore has no slot this machine can supply would come back
+  // up sealed, waiting for someone to type a passphrase, so the API refuses to
+  // restart it. Saying so here beats letting the operator find out after typing
+  // RESET. Re-read on every poll: a node set up through the wizard gains its
+  // first machine slot while this page is open.
   function setRestartAvailable(available) {
     var box = $("reset-restart");
     box.disabled = !available;
     if (!available) { box.checked = false; }
     $("reset-restart-note").textContent = available
       ? "Re-runs onboarding, so the node picks up its signer id, token and announced URL from the Portal again."
-      : "Unavailable: BLS_PASSWORD is not set, so a restarted node would stop at the key password prompt. Restart it yourself after the wipe.";
+      : "Unavailable: nothing on this machine could open this node's keystore again, so it would come back up sealed. Add a file or env seal slot below, or restart it yourself after the wipe.";
   }
 
   function renderStatus(data) {
@@ -651,8 +653,9 @@
     detectWallet();
   }
 
-  // Mnemonic mode: the node derived its own keys, so what matters is which
-  // account it derived and which address a Portal admin has to whitelist.
+  // The node knows its own Taproot account — it was set up from a seed phrase,
+  // here or in an older release — so what matters is which account that is and
+  // which address a Portal admin has to whitelist.
   function renderDerived(derived, registered) {
     var accountRow = $("register-derived-account-row");
     var addressRow = $("register-derived-address-row");
@@ -678,14 +681,14 @@
     addressRow.hidden = false;
 
     note.textContent = registered
-      ? "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself " +
-        "and needs no wallet. Change KONTOR_STORAGE_ACCOUNT_INDEX and restart to bind " +
-        "a different account."
-      : "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself — " +
-        "no wallet needed. It is still unregistered, which almost always means the " +
-        "Taproot address above is not on the Portal's whitelist yet. Ask a Portal admin " +
-        "to add it: the node keeps offering the same registration every 30 seconds, so " +
-        "it comes up on its own shortly after they do. No restart needed.";
+      ? "This node holds its own Taproot account, so it registers itself and needs no " +
+        "wallet. The account was chosen when the node was set up and is now part of its " +
+        "sealed identity; binding a different one means setting up a second node."
+      : "This node holds its own Taproot account, so it registers itself — no wallet " +
+        "needed. It is still unregistered, which almost always means the Taproot address " +
+        "above is not on the Portal's whitelist yet. Ask a Portal admin to add it: the " +
+        "node keeps offering the same registration every 30 seconds, so it comes up on " +
+        "its own shortly after they do. No restart needed.";
     note.hidden = false;
 
     // Nothing here for a browser to sign.
@@ -800,23 +803,12 @@
     }).then(function (result) {
       show($("register-success"), "Registered as " + result.node_id, true);
 
-      // Same reasoning as the reset: the process is going away, and its session
-      // key goes with it.
-      if (result.restarting) {
-        stopPolling();
-        show($("register-restarting"),
-          "The node is restarting to onboard. The Portal still has to confirm the " +
-          "RegisterBlsKey transaction on-chain, which the node waits for on the way up. " +
-          "Sign in again once it is back.",
-          true);
-        button.disabled = true;
-        button.textContent = label;
-        return;
-      }
-
+      // The node onboards again in this process, so the session survives and
+      // the phase below moves on its own. Nothing to sign back into.
       show($("register-restarting"),
-        "Registered, but this node cannot restart itself: BLS_PASSWORD is not set. " +
-        "Restart it yourself once the Portal has confirmed the key on-chain.",
+        "The node is onboarding again. The Portal still has to confirm the RegisterBlsKey " +
+        "transaction on-chain, which the node waits for — watch the phase above; it needs " +
+        "no restart and no second sign-in.",
         true);
       button.disabled = false;
       button.textContent = label;

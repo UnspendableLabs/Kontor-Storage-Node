@@ -23,7 +23,10 @@ use crate::server::state::DownloadServerState;
 /// will be signed out instead of finding out mid-reset. `restart_available`
 /// answers the same question ahead of time for the restart checkbox: the page
 /// disables it rather than letting the operator meet a `RESTART_UNAVAILABLE`
-/// only once they have typed the confirmation phrase.
+/// only once they have typed the confirmation phrase. It is read from the live
+/// seal status on every poll, so a node that gains its first machine slot part
+/// way through a session — which is what the setup wizard does — sees the
+/// checkbox come alive without a reload.
 ///
 /// # Errors
 /// `500 DATABASE_ERROR` if any of the counts cannot be read.
@@ -78,7 +81,7 @@ pub async fn node_status(
             "total": challenges_total,
         },
         "ledger": ledger,
-        "restart_available": state.admin.restart().is_available(),
+        "restart_available": state.runtime.can_restart(),
         "session_expires_at": session_expires_at,
     }))
 }
@@ -296,7 +299,7 @@ mod tests {
                 None,
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -328,7 +331,7 @@ mod tests {
                 }),
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -366,7 +369,7 @@ mod tests {
                     schnorr_binding_sig: "bb".repeat(64),
                 }),
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -399,7 +402,7 @@ mod tests {
                 None,
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -422,18 +425,32 @@ mod tests {
 
     /// The page needs this before the operator commits to anything, so the
     /// restart checkbox can be disabled with a reason rather than rejected.
+    ///
+    /// It follows the slots, and has to: a node set up through the wizard has
+    /// no keystore when its `/admin` first answers and a machine slot moments
+    /// later, in the same process and the same session.
     #[tokio::test]
     async fn status_reports_whether_a_restart_is_available() {
-        let (mut state, _dir) = state_with(&[]).await;
+        use crate::crypto::keystore::SlotKind;
+
+        let (state, _dir) = state_with(&[]).await;
 
         assert_eq!(
             node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
             false,
-            "AdminState::disabled carries a handle that refuses restarts"
+            "a node with no keystore has nothing to come back up on"
         );
 
-        state.admin = AdminState::with_restart(crate::app::restart::RestartHandle::available());
+        state.runtime.set_slots(vec![SlotKind::Passphrase]);
+        assert_eq!(
+            node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
+            false,
+            "a slot only a human can supply is not a way back from a restart"
+        );
 
+        state
+            .runtime
+            .set_slots(vec![SlotKind::File, SlotKind::Passphrase]);
         assert_eq!(
             node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
             true

@@ -175,7 +175,7 @@ mod tests {
             admin: AdminState::new(
                 AdminCredential::Disabled,
                 dir.path().to_path_buf(),
-                RestartHandle::unavailable(),
+                RestartHandle::new(),
                 runtime,
             ),
         };
