@@ -218,7 +218,7 @@ async fn serve(
     // passphrase that gets the node open again.
     let source = resolve_keys(&config, &mut writer).await?;
 
-    let (phase, seal, opened, notice) = match source {
+    let (phase, seal, start, notice) = match source {
         KeySource::Open {
             keystore,
             keys,
@@ -230,7 +230,31 @@ async fn serve(
             // produced it are published in one call, so `/admin` can never be
             // shown one without the other.
             SealStatus::default(),
-            Some((keystore, keys, seal_key, seal_source)),
+            Some(Start::Open {
+                keystore,
+                keys,
+                seal_key,
+                seal_source,
+            }),
+            None,
+        ),
+        // No seal status at all, and that is the honest answer for the window
+        // this covers: there is no keystore yet. `/admin` reports a node that
+        // cannot restart unattended, which is true — what would bring it back
+        // is the environment variable it is in the middle of retiring — and
+        // stops being reported the moment the supervisor seals it.
+        KeySource::Migrating {
+            keys,
+            seal_key,
+            seal_source,
+        } => (
+            Phase::Activating,
+            SealStatus::default(),
+            Some(Start::Migrating {
+                keys,
+                seal_key,
+                seal_source,
+            }),
             None,
         ),
         KeySource::Sealed { keystore, reason } => {
@@ -282,8 +306,16 @@ async fn serve(
 
     // The key this boot opened the keystore with, published before the server
     // is: `/admin` reseals with it, and a request can arrive before the
-    // supervisor task has had a chance to run.
-    if let Some((keystore, _, seal_key, seal_source)) = opened.as_ref() {
+    // supervisor task has had a chance to run. A migration has nothing to
+    // announce yet — it has not written a keystore, and will not until
+    // onboarding has agreed to the identity.
+    if let Some(Start::Open {
+        keystore,
+        seal_key,
+        seal_source,
+        ..
+    }) = start.as_ref()
+    {
         runtime.opened(keystore, seal_key, *seal_source);
     }
 
@@ -330,9 +362,10 @@ async fn serve(
             daemon: None,
             watcher: None,
             keystore: None,
+            migrating: None,
             retry_in: None,
         }
-        .run(opened),
+        .run(start),
     );
 
     let outcome = serve_until_shutdown(
@@ -358,7 +391,10 @@ async fn serve(
 /// Open the keystore, migrating a legacy node into one if that is what this
 /// volume turns out to be.
 async fn resolve_keys(config: &Config, writer: &mut SharedWriter) -> Result<KeySource> {
-    let key_path = node::onboarding::key_management::get_key_path(config.bls_key_path.as_deref())?;
+    let key_path = node::onboarding::key_management::get_key_path(
+        &config.app_dir,
+        config.bls_key_path.as_deref(),
+    );
     let password_reader = node::onboarding::get_password_reader();
 
     node::open_or_migrate(
@@ -388,18 +424,61 @@ struct Supervisor {
     /// anything: unsealing a raw slot is one AEAD open, so re-deriving the keys
     /// is cheaper than keeping a `NodeKeys` alive across every await.
     keystore: Option<(Box<Keystore>, SealKey, SealKeySource)>,
+    /// The seal a migration is carrying but has not written yet, and whether the
+    /// material came from a mnemonic.
+    ///
+    /// `Some` only between the first activation of a legacy node and the first
+    /// onboarding that does not refuse it — see [`KeySource::Migrating`]. While
+    /// it is set there is no keystore, which is what puts the account guard back
+    /// on every retry instead of once.
+    migrating: Option<(SealKey, SealKeySource, bool)>,
     /// How long to wait before trying a failed activation again, doubling with
     /// each failure. `None` once one succeeds — see [`Supervisor::fail`].
     retry_in: Option<Duration>,
 }
 
-type Opened = (Box<Keystore>, Box<NodeKeys>, SealKey, SealKeySource);
+/// What the volume gave the supervisor to start from.
+enum Start {
+    /// A keystore that opened.
+    Open {
+        keystore: Box<Keystore>,
+        keys: Box<NodeKeys>,
+        seal_key: SealKey,
+        seal_source: SealKeySource,
+    },
+    /// Legacy material to onboard first and seal afterwards.
+    Migrating {
+        keys: Box<NodeKeys>,
+        seal_key: SealKey,
+        seal_source: SealKeySource,
+    },
+}
 
 impl Supervisor {
-    async fn run(mut self, opened: Option<Opened>) {
-        if let Some((keystore, keys, seal_key, seal_source)) = opened {
-            self.keystore = Some((keystore, seal_key, seal_source));
-            self.activate(*keys).await;
+    async fn run(mut self, start: Option<Start>) {
+        match start {
+            Some(Start::Open {
+                keystore,
+                keys,
+                seal_key,
+                seal_source,
+            }) => {
+                self.keystore = Some((keystore, seal_key, seal_source));
+                self.activate(*keys).await;
+            }
+            Some(Start::Migrating {
+                keys,
+                seal_key,
+                seal_source,
+            }) => {
+                // Whether to tell the operator the mnemonic can go, decided here
+                // because it is the last point that still holds the keys: only a
+                // seed produces `Derived`, and only a `bls_key.enc` produces
+                // `Imported`.
+                self.migrating = Some((seal_key, seal_source, keys.seed().is_some()));
+                self.activate(*keys).await;
+            }
+            None => {}
         }
 
         loop {
@@ -448,16 +527,15 @@ impl Supervisor {
         }
     }
 
-    /// Derive the keys again from the keystore this node was opened with.
+    /// Get the keys back for another attempt.
     ///
     /// Off the executor, for the same reason every other unseal on this branch
     /// is: on a node held open by a passphrase this is 64 MiB of Argon2id, and
     /// a registration finishing is exactly when it runs.
-    async fn reopen(&self) -> Result<NodeKeys> {
-        let (keystore, seal_key, _) = self
-            .keystore
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this node has no keystore to reopen"))?;
+    async fn reopen(&mut self) -> Result<NodeKeys> {
+        let Some((keystore, seal_key, _)) = self.keystore.as_ref() else {
+            return self.rederive().await;
+        };
 
         let public = keystore.public().cloned();
         let keystore = keystore.clone();
@@ -471,6 +549,86 @@ impl Supervisor {
             keypair,
             public,
         })))
+    }
+
+    /// Derive a migration's keys again, for a node that has nothing sealed yet.
+    ///
+    /// Re-derivation rather than anything held: it is what keeps the seed on the
+    /// retry path, and the seed is what the account guard needs. A supervisor
+    /// that cached `NodeKeys::Sealed` here — the obvious shortcut, since it
+    /// already has the secret — would hand the second attempt a node with no
+    /// seed, no sibling scan, and nothing left to refuse the account the first
+    /// attempt refused. The cost is one BIP-39 stretch per retry, on a path that
+    /// runs every thirty seconds at worst.
+    ///
+    /// The seal is re-resolved with it, because the two are read from the same
+    /// volume and a `.seal-key` that has changed underneath us is not one to
+    /// seal against.
+    async fn rederive(&mut self) -> Result<NodeKeys> {
+        if self.migrating.is_none() {
+            return Err(anyhow::anyhow!("this node has no keystore to reopen"));
+        }
+
+        match resolve_keys(&self.config, &mut self.writer).await? {
+            KeySource::Migrating {
+                keys,
+                seal_key,
+                seal_source,
+            } => {
+                self.migrating = Some((seal_key, seal_source, keys.seed().is_some()));
+                Ok(*keys)
+            }
+            // Something else wrote a keystore while this node was between
+            // attempts, which is not a state to guess at: `/admin` cannot
+            // provision over an activating node, so the only way here is a hand
+            // on the volume.
+            other => Err(anyhow::anyhow!(
+                "the key material this node was migrating is no longer what is on the \
+                 volume ({other:?}); restart it to pick up whatever is there now"
+            )),
+        }
+    }
+
+    /// Write the keystore a migration has been carrying, now that onboarding has
+    /// not refused the identity in it.
+    ///
+    /// Nothing to do on every other path, which is what makes this safe to call
+    /// from both outcomes of [`Self::activate`].
+    ///
+    /// # Errors
+    /// If the keystore cannot be written. The pending seal is put back, so the
+    /// retry seals as well as onboards — a node that onboarded and could not
+    /// record what it is would otherwise come back as nothing at all.
+    fn seal_migration(
+        &mut self,
+        keypair: &crate::crypto::BlsKeyPair,
+        public: Option<crate::crypto::PublicIdentity>,
+    ) -> Result<()> {
+        let Some((seal_key, seal_source, from_mnemonic)) = self.migrating.take() else {
+            return Ok(());
+        };
+
+        let sealed = node::onboarding::key_management::seal_migrated_keys(
+            &self.config.app_dir,
+            keypair,
+            public,
+            &seal_key,
+            seal_source,
+            &mut self.writer,
+            from_mnemonic,
+        );
+
+        match sealed {
+            Ok(keystore) => {
+                self.runtime.opened(&keystore, &seal_key, seal_source);
+                self.keystore = Some((Box::new(keystore), seal_key, seal_source));
+                Ok(())
+            }
+            Err(e) => {
+                self.migrating = Some((seal_key, seal_source, from_mnemonic));
+                Err(e)
+            }
+        }
     }
 
     /// Onboard, then start serving — or land in a phase that says why not.
@@ -488,14 +646,31 @@ impl Supervisor {
         )
         .await;
 
+        // Sealed on both outcomes and neither error, which is the whole of the
+        // rule: onboarding is where a migrated account is checked against the
+        // Portal, so an identity it *refused* must not reach the volume. A node
+        // waiting on a whitelist entry has not been refused — the guard passed
+        // and the Portal simply does not know the key yet — so it seals too,
+        // and does not spend that wait one power cut away from having to
+        // migrate again.
         match outcome {
-            Ok(node::OnboardingOutcome::Ready(result)) => match self.start_running(*result).await {
-                Ok(()) => self.retry_in = None,
-                Err(e) => self.fail("the node onboarded but could not start serving", &e),
-            },
+            Ok(node::OnboardingOutcome::Ready(result)) => {
+                if let Err(e) = self.seal_migration(&result.keypair, result.public.clone()) {
+                    self.fail("the node onboarded but its key could not be sealed", &e);
+                    return;
+                }
+                match self.start_running(*result).await {
+                    Ok(()) => self.retry_in = None,
+                    Err(e) => self.fail("the node onboarded but could not start serving", &e),
+                }
+            }
             // Not a failure: the node is up, waiting on a whitelist entry, and
             // the watcher below is already the retry for that one.
             Ok(node::OnboardingOutcome::Unregistered(node)) => {
+                if let Err(e) = self.seal_migration(&node.keypair, node.public.clone()) {
+                    self.fail("the node onboarded but its key could not be sealed", &e);
+                    return;
+                }
                 self.retry_in = None;
                 self.wait_for_registration(*node);
             }
@@ -682,10 +857,19 @@ impl Supervisor {
     fn fail(&mut self, what: &str, error: &anyhow::Error) {
         let detail = format!("{error:#}");
 
-        // Only when there is something to retry *with*. A node with no keystore
-        // has nothing to reopen, so a timer would do no more than run the same
-        // failure again on a schedule.
-        let retry = self.keystore.is_some().then(|| {
+        // Only when there is something to retry *with*, and only when trying
+        // again could answer differently.
+        //
+        // A node with neither a keystore nor a migration in flight has nothing
+        // to reopen, so a timer would do no more than run the same failure on a
+        // schedule. And the account guard's refusal is a misconfiguration the
+        // node cannot resolve on its own: the sibling scan reaches the same
+        // verdict every time, so retrying it would bury the one message that
+        // says what to change under a copy of itself every thirty seconds. Both
+        // want the same thing said out loud — this is where it stops.
+        let retryable = (self.keystore.is_some() || self.migrating.is_some())
+            && !node::registration::refusal_is_the_account_guard(error);
+        let retry = retryable.then(|| {
             self.retry_in.map_or(ACTIVATION_RETRY_MIN, |previous| {
                 (previous * 2).min(ACTIVATION_RETRY_MAX)
             })
@@ -1438,7 +1622,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_refused_mnemonic_node_retries_until_the_portal_relents() {
-        let _guard = TempAppDirGuard::new("whitelist_retry");
+        let guard = TempAppDirGuard::new("whitelist_retry");
         cleanup_onboarding_env();
         let mock_server = MockServer::start().await;
         let storage_dir = unique_storage_dir("whitelist_retry");
@@ -1561,6 +1745,135 @@ mod tests {
         assert!(
             output.contains("retrying the registration in the background"),
             "the node has to say what it will do, since nobody else can do it: {output}"
+        );
+
+        // The positive half of the migration rule, and the reason a node in
+        // this state is not one power cut away from having to derive again:
+        // onboarding did not refuse the identity, so it is on the volume even
+        // though the Portal has not finished with it.
+        assert!(
+            Keystore::path_in(&guard.dir).exists(),
+            "an accepted identity has to be sealed, whitelist or no whitelist: {output}"
+        );
+
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    /// The guard that a retry, or a restart, must not be able to walk around.
+    ///
+    /// A migrating node whose `KONTOR_STORAGE_ACCOUNT_INDEX` names an account
+    /// the mnemonic did not register is the one failure here that is *worth*
+    /// being fatal: registering the derived key anyway creates a second node and
+    /// strands the real one's agreements behind it. Two things have to hold, and
+    /// each one alone is not enough.
+    ///
+    /// **Nothing is sealed.** The scan runs during onboarding, so a keystore
+    /// written before it would already outrank the variable the operator is
+    /// about to correct — and the next start would open it, find no seed, skip
+    /// the scan entirely, and register the refused account.
+    ///
+    /// **Nothing is retried.** The supervisor's backoff re-derives, which does
+    /// put the scan back on the path, so the answer would be the same — but it
+    /// would be the same every thirty seconds, burying the one message that says
+    /// which variable to change under copies of itself.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_migration_onto_the_wrong_account_is_refused_and_left_unsealed() {
+        let guard = TempAppDirGuard::new("wrong_account");
+        cleanup_onboarding_env();
+        let mock_server = MockServer::start().await;
+        let storage_dir = unique_storage_dir("wrong_account");
+        fs::create_dir_all(&storage_dir).unwrap();
+
+        let settings =
+            |account| MnemonicSettings::new(TEST_PHRASE, BitcoinNetwork::Signet, account);
+        // What the environment says, and what the wallet actually registered.
+        let configured = MnemonicIdentity::derive(&settings(3)).unwrap();
+        let sibling = MnemonicIdentity::derive(&settings(1)).unwrap();
+
+        // The sibling scan's one hit. Mounted first so it wins over the
+        // catch-all below, which is what every other account falls through to.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .and(query_param("bls_pubkey", sibling.bls_pubkey().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": sibling.node_id,
+                "signer_id": 1,
+                "bls_public_key": sibling.bls_pubkey()
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/nodes/{}/check", configured.node_id)))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "code": "NODE_NOT_FOUND", "message": "no node" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // The assertion that matters most, and the only one that has to be made
+        // about something that did *not* happen.
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": configured.node_id,
+                "x_only_pubkey": hex::encode(configured.x_only),
+                "bls_public_key": configured.bls_pubkey()
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        env::set_var(MNEMONIC_ENV, TEST_PHRASE);
+        env::set_var(ACCOUNT_INDEX_ENV, "3");
+        env::set_var(NETWORK_ENV, "signet");
+
+        let cli = unregistered_cli(
+            mock_server.uri(),
+            storage_dir.clone(),
+            storage_dir.join("unused_bls_key.enc"),
+        );
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Long enough that a retry, if one were scheduled, would have fired: the
+        // backoff's floor is 50ms under `cfg(test)`.
+        let shutdown = {
+            let captured = captured.clone();
+            async move {
+                let refused = captured
+                    .wait_for("No node is registered for", Duration::from_secs(30))
+                    .await;
+                assert!(refused, "the guard has to refuse: {}", captured.text());
+                sleep(Duration::from_millis(500)).await;
+                Ok(())
+            }
+        };
+
+        let outcome = run_with_shutdown(cli, writer, shutdown).await.unwrap();
+        let output = captured.text();
+
+        cleanup_onboarding_env();
+
+        assert_eq!(outcome, Outcome::Shutdown);
+        assert!(
+            output.contains(&sibling.node_id),
+            "the refusal has to name the account that *is* registered: {output}"
+        );
+        assert!(
+            !output.contains("Trying again on its own"),
+            "a misconfiguration this node cannot resolve must not promise a retry: {output}"
+        );
+        assert!(
+            !Keystore::path_in(&guard.dir).exists(),
+            "the refused identity must not be on the volume, or correcting the \
+             variable would change nothing"
         );
 
         std::fs::remove_dir_all(&storage_dir).ok();

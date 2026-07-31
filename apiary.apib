@@ -186,6 +186,8 @@ Which screen a browser with no session should render. The only unauthenticated e
 
 It gives away nothing `POST /api/admin/login` does not already give away through its status code — whether the node is claimed, and what phase it is in. The setup token itself is **not** included, only its fingerprint: an operator holding the token can confirm they have the right one, and an operator who does not learns nothing.
 
+That last claim only holds for a *generated* token, which is 32 random bytes and so has no list of candidates four bytes of a hash could narrow. A token supplied through `KONTOR_SETUP_TOKEN` is only required to be 32 characters — a length rule, not an entropy one — so its fingerprint is omitted here rather than handing anyone who can reach an unclaimed node a way to confirm guesses offline at one hash each. The node still logs it at startup, for the operator who set it.
+
 + Response 200 (application/json)
 
     + Body
@@ -197,7 +199,7 @@ It gives away nothing `POST /api/admin/login` does not already give away through
                 "setup_token_fingerprint": "4f2a91c7"
             }
 
-    `phase` is one of `uninitialized`, `sealed`, `activating`, `unregistered`, `running`, `failed` — see `GET /api/info`. `claimed` is whether an admin password exists; `enabled` is whether one can be checked, which is false on both an unclaimed node and one with `ADMIN_UI_DISABLED`. `setup_token_fingerprint` is `null` once the node is claimed.
+    `phase` is one of `uninitialized`, `sealed`, `activating`, `unregistered`, `running`, `failed` — see `GET /api/info`. `claimed` is whether an admin password exists; `enabled` is whether one can be checked, which is false on both an unclaimed node and one with `ADMIN_UI_DISABLED`. `setup_token_fingerprint` is `null` once the node is claimed, and also whenever the token came from `KONTOR_SETUP_TOKEN`.
 
 ### Claim [POST /api/admin/claim]
 
@@ -329,7 +331,7 @@ Counts of everything a reset would erase, plus where it is stored.
                 "session_expires_at": 1798761600
             }
 
-    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when its keystore has no slot this machine can supply on its own, because it would come back up sealed and wait for someone to type a passphrase. It is read from the live seal status on every poll, so a node that gains its first machine slot part way through a session reports `true` without a reload.
+    `storage.directory` is `null` when the backend is GCS. `restart_available` is whether the node can be asked to restart itself after a reset — false when nothing on this machine could open its keystore again, because it would come back up sealed and wait for someone to type a passphrase. It follows the slot this boot actually came in through wherever there is one, rather than the list of slots: a node rescued with `POST /api/admin/unseal` still records a `file` slot whose key has gone missing, and it is the boot, not the list, that knows the difference. It is read from the live seal status on every poll, so a node that gains its first machine slot part way through a session reports `true` without a reload.
 
     `registration` says whether the Portal knows this node's BLS key. `registered: false` means onboarding stopped at the lookup and no daemon is running — the node serves this page and nothing else until the key is registered. `node_id` and `signer_id` are then `null`, and `signer_id` is also `null` on a node whose `RegisterBlsKey` transaction has not confirmed yet. `supported: false` means no BLS key was loaded at all, so there is nothing to register.
 

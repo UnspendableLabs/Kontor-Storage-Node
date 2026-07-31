@@ -302,14 +302,49 @@ pub async fn find_registered_siblings(
     found
 }
 
+/// The account guard's refusal, as a type the caller can recognise.
+///
+/// A distinct error rather than a bare `anyhow!` for one reason:
+/// [`crate::app::runtime`] retries a failed activation on a backoff, and this is
+/// the one failure that must not be retried. The guard only runs on a node that
+/// still holds its seed — it derives neighbouring accounts to reach its verdict
+/// — and the supervisor's retry re-opens the keystore, which by design has no
+/// seed in it. So a second attempt would not reach the guard at all: it would
+/// quietly do the thing the guard has just refused, thirty seconds later, and
+/// register the second identity this error exists to prevent.
+///
+/// Retrying it is not trying again. It is going around it.
+#[derive(Debug)]
+pub struct WrongAccount(String);
+
+impl std::fmt::Display for WrongAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WrongAccount {}
+
+/// Whether a failure is [`WrongAccount`], anywhere in its chain.
+///
+/// Asked of the whole chain rather than the head, so wrapping the error in
+/// context on the way up — which every layer between the guard and the
+/// supervisor is free to do — cannot quietly turn a refusal back into something
+/// retryable.
+#[must_use]
+pub fn refusal_is_the_account_guard(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<WrongAccount>())
+}
+
 /// The error an operator sees when the configured account may not be the
 /// registered one.
 ///
-/// Fatal by default, because the two things it can mean are not equally
-/// recoverable: a mistyped [`ACCOUNT_INDEX_ENV`] strands a running node's
-/// agreements behind a second identity, while a genuine second node is one
-/// environment variable away from starting. So the message names both readings
-/// and the variable that picks between them.
+/// Fatal, and permanently so: see [`WrongAccount`] for why it must not be
+/// retried. The two things it can mean are not equally recoverable — a mistyped
+/// [`ACCOUNT_INDEX_ENV`] strands a running node's agreements behind a second
+/// identity, while a genuine second node is one environment variable away from
+/// starting. So the message names both readings and the variable that picks
+/// between them.
 ///
 /// `known` is the identity this node last onboarded under, when there is one.
 /// Reaching this error with a record that does not match means the account
@@ -317,14 +352,29 @@ pub async fn find_registered_siblings(
 /// is the most actionable thing that can be said here — so it is said first,
 /// and it stands on its own: that branch never reads `siblings`, which is what
 /// lets the caller raise this on a record alone when the scan came back empty.
+///
+/// The advice it gives — correct the variable and start again — is only true
+/// because nothing has been sealed yet when this is raised. See
+/// [`crate::node::onboarding::key_management::KeySource::Migrating`], which is
+/// what keeps the keystore out of the way until the identity has been accepted.
 #[must_use]
 pub fn wrong_account_error(
     identity: &MnemonicIdentity,
     siblings: &[RegisteredSibling],
     known: Option<&KnownIdentity>,
 ) -> anyhow::Error {
+    anyhow::Error::new(WrongAccount(wrong_account_message(
+        identity, siblings, known,
+    )))
+}
+
+fn wrong_account_message(
+    identity: &MnemonicIdentity,
+    siblings: &[RegisteredSibling],
+    known: Option<&KnownIdentity>,
+) -> String {
     if let Some(record) = known {
-        return anyhow!(
+        return format!(
             "This node has already run as {} (account {}, {}), and {} = {} derives a \
              different identity.\n  \
                derived BLS key: {}\n  \
@@ -354,7 +404,7 @@ pub fn wrong_account_error(
         .collect::<Vec<_>>()
         .join("\n");
 
-    anyhow!(
+    format!(
         "No node is registered for {} = {} ({}).\n  \
            derived BLS key: {}\n  \
            derived address: {}\n\n  \
@@ -597,6 +647,32 @@ mod tests {
         assert!(rendered.contains(&real.taproot_address), "{rendered}");
         assert!(rendered.contains(&identity.taproot_address), "{rendered}");
         assert!(rendered.contains("second node"), "{rendered}");
+    }
+
+    /// What [`crate::app::runtime`] reads to decide not to retry.
+    ///
+    /// Through a wrapper, because the supervisor sees this error after
+    /// onboarding has had every chance to add context to it, and a check that
+    /// only looked at the head of the chain would silently turn a refusal back
+    /// into something worth trying again in thirty seconds.
+    #[test]
+    fn the_account_guards_refusal_is_recognisable_through_context() {
+        let refusal = wrong_account_error(&derived(1), &[sibling_of(&derived(3))], None);
+        assert!(refusal_is_the_account_guard(&refusal));
+
+        let wrapped = refusal.context("onboarding failed").context("activating");
+        assert!(
+            refusal_is_the_account_guard(&wrapped),
+            "the whole chain is asked, not just what is on top"
+        );
+        // And the operator still reads the message rather than the wrapper's
+        // idea of it.
+        assert!(format!("{wrapped:#}").contains(ACCOUNT_INDEX_ENV));
+
+        assert!(
+            !refusal_is_the_account_guard(&anyhow!("the Portal was not reachable")),
+            "everything else is a failure worth retrying"
+        );
     }
 
     /// The same message has to serve the operator whose account index is right

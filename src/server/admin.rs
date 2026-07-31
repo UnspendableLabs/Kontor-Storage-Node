@@ -31,7 +31,7 @@
 //!   collapse into one bucket, whereas a spoofable header would hand an attacker
 //!   unlimited buckets. Login and claim are counted separately, and a lockout is
 //!   only ever applied to a bucket that belongs to one client — see
-//!   [`session::penalty`] for the two gates that must never close, and what a
+//!   `session::penalty` for the two gates that must never close, and what a
 //!   shared bucket pays instead.
 //! - The admin routes are merged *after* the permissive `CorsLayer`, so they
 //!   carry no `Access-Control-Allow-Origin` and a browser refuses to let

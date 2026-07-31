@@ -99,7 +99,8 @@ through the rest:
    The token is also written to `.setup-token` in the application directory, and
    reprinted on every start until it is used — missing the first line does not
    lock you out. Set `KONTOR_SETUP_TOKEN` instead if you would rather it never
-   appeared in your logs; the node then prints only a fingerprint.
+   appeared in your logs; the node then prints only a fingerprint, and `/admin`
+   shows none.
 
 2. **Claim the node.** Paste the token into `/admin` and choose an admin
    password (16 characters or more). It is stored as an Argon2id hash next to the
@@ -272,6 +273,12 @@ the `sealed` phase and stays there: the key is there and nothing can open it.
 With one, `/admin` on a sealed node offers to unlock it, and the node onboards
 from there without restarting.
 
+A node rescued that way is running, but it is not one that can be restarted: the
+slot it came up through is the passphrase, and nothing on the machine can supply
+that at boot. `/admin` says so — the reset's restart checkbox stays disabled —
+until a seal key is put back or a fresh one generated. Restore the key, or add an
+env slot and redeploy, before treating the node as unattended again.
+
 ### Node phases
 
 The server starts before the node knows anything about itself, so `/admin` is
@@ -333,11 +340,27 @@ has into a keystore, keeps the same identity and node id, and says so:
 
 ```
 No keystore yet, but this node has key material from an older release. Migrating it into one.
+  It will be sealed into /data/keystore.json (file slot, fingerprint 2bd8450f) once the Portal has accepted this identity.
+Onboarding as node-2bd8… (account 2, signet)
 ✓ Sealed into /data/keystore.json (file slot, fingerprint 2bd8450f)
   KONTOR_STORAGE_MNEMONIC is no longer needed and should be removed from this deployment.
 ```
 
 Nothing else changes: same key, same node id, same agreements.
+
+**The keystore is written after onboarding, not before**, and the order is
+deliberate. The one thing that catches a mistyped `KONTOR_STORAGE_ACCOUNT_INDEX`
+is the check against the accounts this mnemonic already has registered, and that
+check needs the Portal — so it runs during onboarding, after the derivation. A
+node that sealed first would have committed the wrong account to a file that
+outranks the variable from then on: correcting the variable would change nothing,
+and the next start would open the keystore, find no seed phrase to scan with, and
+register the very identity the check had refused. So a refused account is never
+written down, and the fix really is to correct the variable and start again.
+
+Sealing happens on both outcomes onboarding can reach — a node that is running,
+and one waiting for a Portal admin to whitelist its address. Only an outright
+refusal leaves the volume untouched.
 
 **Then confirm the keystore is on durable storage before removing the variable,
 in that order.** The keystore is written to `KONTOR_APP_DIR` — `/data` in Docker
@@ -381,6 +404,9 @@ rather than inherit it:
 - Set `KONTOR_SETUP_TOKEN` to a secret of your own, at least 32 characters. Only
   its fingerprint is ever logged. This trades a secret in the log stream for one
   in the environment; it is a choice of which exposure, not an escape from both.
+  Note that 32 characters is a length rule and not an entropy one — use something
+  a generator produced, not a sentence. `/admin` does not publish the fingerprint
+  of a supplied token for that reason, so the claim screen shows none.
 - Set `ADMIN_UI_DISABLED=1` if this node is not meant to be administered from a
   browser at all. Nothing behind `/admin` then opens, including the setup wizard.
 

@@ -22,7 +22,7 @@ pub fn migrate_legacy_env_vars() {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
 pub struct Cli {
-    /// Portal API base URL (e.g. https://portal.example.com/api)
+    /// Portal API base URL (e.g. <https://portal.example.com/api>)
     #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
     pub portal_url: String,
 
@@ -78,7 +78,7 @@ pub struct Cli {
     #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
     pub server_address: String,
 
-    /// Public URL where this node is reachable for file downloads (e.g. https://node1.example.com)
+    /// Public URL where this node is reachable for file downloads (e.g. <https://node1.example.com>)
     #[arg(long, env = "PUBLIC_URL", default_value = "http://localhost:8081")]
     pub public_url: String,
 

@@ -27,6 +27,27 @@ const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const REGISTRATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long to wait for a `RegisterBlsKey` transaction to confirm before
+/// handing the process back.
+///
+/// The wait itself is legitimate — the Portal batches the op and it lands a few
+/// blocks later — but it has to be bounded, and the reason is not this function.
+/// It is that [`crate::app::runtime`]'s supervisor carries out one activation at
+/// a time: while this loop runs, an operator unsealing the node or registering
+/// it from `/admin` sits unread in the pending slot. An unbounded wait here is a
+/// `/admin` whose buttons do nothing, on a node whose page is working perfectly.
+///
+/// Giving up is not giving in. The supervisor's own backoff runs onboarding
+/// again from the top, so the polling continues — in a loop an operator can
+/// interrupt, with the reason on the page while it waits.
+#[cfg(not(test))]
+const REGISTRATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Long enough for the handful of polls the tests mount — dozens, at the
+/// interval above — and short enough that the case which asserts on the timeout
+/// does not slow the suite down.
+#[cfg(test)]
+const REGISTRATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Whether a Portal error is its "no such thing" answer rather than a failure.
 ///
 /// The Portal says 404 both for "no node holds this BLS key" and for "no node
@@ -398,7 +419,9 @@ async fn onboard(
 
     // Step 2: Look up node by BLS public key
     writeln!(writer, "Looking up node identity...")?;
-    let mut waiting = false;
+    // `Some(instant)` once the progress line has been opened, carrying when the
+    // wait began: the dots and the timeout are two readings of the same fact.
+    let mut waiting: Option<std::time::Instant> = None;
     // A mnemonic node registers itself, but only once per start: after the call
     // succeeds the row exists and the loop below waits for it to confirm. Trying
     // again here on a second 404 would be an infinite loop over a Portal that is
@@ -412,7 +435,7 @@ async fn onboard(
             Ok(l) => l,
             Err(e) => {
                 if is_not_found(&e) {
-                    if waiting {
+                    if waiting.is_some() {
                         writeln!(writer)?;
                     }
 
@@ -468,7 +491,7 @@ async fn onboard(
             }
         };
         if let Some(sid) = lookup.signer_id {
-            if waiting {
+            if waiting.is_some() {
                 writeln!(writer)?;
             }
             writeln!(
@@ -478,18 +501,38 @@ async fn onboard(
             )?;
             break (lookup.node_id, sid);
         }
-        if !waiting {
-            writeln!(
-                writer,
-                "Node {} found but RegisterBlsKey transaction not yet confirmed.",
-                lookup.node_id
-            )?;
-            write!(writer, "Waiting for on-chain confirmation")?;
-            waiting = true;
-        } else {
-            write!(writer, ".")?;
-        }
+        let since = match waiting {
+            Some(since) => {
+                write!(writer, ".")?;
+                since
+            }
+            None => {
+                writeln!(
+                    writer,
+                    "Node {} found but RegisterBlsKey transaction not yet confirmed.",
+                    lookup.node_id
+                )?;
+                write!(writer, "Waiting for on-chain confirmation")?;
+                let since = std::time::Instant::now();
+                waiting = Some(since);
+                since
+            }
+        };
         writer.flush()?;
+
+        // Reported as a failure rather than waited out, so the caller's retry
+        // takes over — see [`REGISTRATION_CONFIRMATION_TIMEOUT`]. The progress
+        // line is closed off first, or the error runs onto the end of the dots.
+        if since.elapsed() >= REGISTRATION_CONFIRMATION_TIMEOUT {
+            writeln!(writer)?;
+            return Err(anyhow!(
+                "the Portal has known {} for {}s and its RegisterBlsKey transaction is still \
+                 unconfirmed. Nothing here can hurry it; onboarding will be tried again.",
+                lookup.node_id,
+                REGISTRATION_CONFIRMATION_TIMEOUT.as_secs()
+            ));
+        }
+
         tokio::time::sleep(REGISTRATION_POLL_INTERVAL).await;
     };
 
@@ -1841,6 +1884,67 @@ mod tests {
         assert!(
             output.contains("Node node-pending found (signer_id: 42)"),
             "expected success line after poll, got: {output}"
+        );
+    }
+
+    /// A confirmation that never arrives has to give the caller its process
+    /// back.
+    ///
+    /// The supervisor runs one activation at a time, so a loop that waits here
+    /// for ever is an `/admin` whose unseal and register buttons queue up
+    /// behind it and are never read — on a node whose page looks perfectly
+    /// healthy. Failing hands control back to the supervisor's own backoff,
+    /// which polls the same thing somewhere an operator can interrupt.
+    #[tokio::test]
+    async fn onboarding_gives_up_waiting_for_a_confirmation_that_never_comes() {
+        let mock_server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("test_bls.enc");
+        let storage_dir = dir.path().join("storage");
+
+        let password = "testpassword123";
+        let keypair = BlsKeyPair::generate().unwrap();
+        let public_key = keypair.public_key_hex();
+        keypair.save_encrypted(&key_path, password).await.unwrap();
+
+        // Known to the Portal, and pending for ever.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "node-forever-pending",
+                "signer_id": null,
+                "bls_public_key": public_key
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::clients::PortalClient::new(mock_server.uri(), storage_dir);
+        let loaded = BlsKeyPair::load_encrypted(&key_path, password)
+            .await
+            .unwrap();
+        let keys = NodeKeys::Imported(Box::new(loaded));
+        let mut buffer = Vec::new();
+
+        // The bound is the assertion: without one this never returns at all, and
+        // the timeout is what turns that into a failing test rather than a
+        // hanging suite.
+        let err = tokio::time::timeout(
+            REGISTRATION_CONFIRMATION_TIMEOUT * 4,
+            perform_onboarding(&client, keys, None, &mut buffer),
+        )
+        .await
+        .expect("onboarding must not wait for a confirmation indefinitely")
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("still unconfirmed"),
+            "the reason has to name what it gave up on: {err:#}"
+        );
+
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(
+            output.ends_with('\n'),
+            "the progress line must be closed before the error: {output:?}"
         );
     }
 

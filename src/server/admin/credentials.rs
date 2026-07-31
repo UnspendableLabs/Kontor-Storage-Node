@@ -262,10 +262,29 @@ impl AdminCredential {
 
     /// The token's fingerprint, for a status response that must not carry the
     /// token itself.
+    ///
+    /// `None` for a supplied token, and the asymmetry is the same one
+    /// [`crate::crypto::keystore::SealKey::fingerprint`] makes for a passphrase.
+    /// A generated token is 32 random bytes, so four bytes of a hash of it
+    /// narrows nothing — there is no list to try. A supplied one only has to be
+    /// [`MIN_SETUP_TOKEN_LEN`] *characters*, which is a length rule and not an
+    /// entropy one: an operator may well have typed a sentence. This value is
+    /// published by `GET /api/admin/bootstrap` without a session, because the
+    /// login screen has to render before anybody can have one — so a fingerprint
+    /// there would let anyone who can reach an unclaimed node confirm guesses
+    /// offline at one `SHA-256` each, against the only secret guarding it.
+    ///
+    /// The operator who set the variable is not left without one: it is still
+    /// printed by [`Self::startup_notice`], in the node's own logs, where the
+    /// audience is the person who chose it rather than anyone who can reach the
+    /// port.
     #[must_use]
     pub fn token_fingerprint(&self) -> Option<String> {
         match self {
-            Self::Unclaimed { token, .. } => Some(fingerprint(token)),
+            Self::Unclaimed {
+                token,
+                source: TokenSource::Generated,
+            } => Some(fingerprint(token)),
             _ => None,
         }
     }
@@ -543,10 +562,13 @@ mod tests {
 
         let notice = credential.startup_notice().unwrap();
         assert!(!notice.contains(&token), "{notice}");
-        assert!(
-            notice.contains(&credential.token_fingerprint().unwrap()),
-            "{notice}"
-        );
+        // The logs get the fingerprint, because the person reading them is the
+        // one who chose the token.
+        assert!(notice.contains(&fingerprint(&token)), "{notice}");
+        // The unauthenticated bootstrap body does not, because anyone who can
+        // reach the port can read that one and a supplied token is only
+        // guaranteed to be long, not unguessable.
+        assert_eq!(credential.token_fingerprint(), None);
         assert!(credential.verify_token(&token));
 
         // Nothing is written either: the operator's secret store is the record.

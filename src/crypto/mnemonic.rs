@@ -235,7 +235,7 @@ impl std::fmt::Debug for MnemonicSettings {
 impl MnemonicSettings {
     /// Build settings from a phrase already in hand.
     ///
-    /// Test-only, as [`crate::crypto::BlsKeyPair::generate`] is: production
+    /// Test-only, as `BlsKeyPair::generate` is: production
     /// reads the phrase from the environment and nowhere else, and the tests
     /// that need one would otherwise have to set a process-wide variable and
     /// serialize against every other test that reads it.
@@ -245,7 +245,7 @@ impl MnemonicSettings {
     /// operator can configure — see [`Self::from_env`].
     /// Settings from an operator filling in the setup wizard.
     ///
-    /// Fallible where [`Self::new`] asserts: the account index arrives from a
+    /// Fallible where the test-only `Self::new` asserts: the account index arrives from a
     /// form rather than from a constant, so one below [`FIRST_ACCOUNT`] is
     /// something to report back to the person who typed it.
     ///

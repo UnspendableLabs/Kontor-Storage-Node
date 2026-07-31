@@ -7,7 +7,6 @@ use crate::crypto::mnemonic::MNEMONIC_ENV;
 use crate::crypto::{
     BlsKeyPair, Keystore, MnemonicIdentity, MnemonicSettings, PublicIdentity, BLS_KEY_FILENAME,
 };
-use crate::database::default_app_dir;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,7 +20,13 @@ pub const BLS_BLOB_ENV: &str = "BLS_ENCRYPTED_BLOB";
 
 /// Trait for reading passwords and interactive input from the user.
 /// This abstraction enables testing without interactive input.
-pub trait PasswordReader {
+///
+/// `Send + Sync` because resolving a node's keys is no longer something that
+/// happens once on the way up: [`crate::app::runtime`] does it again from its
+/// supervisor task whenever a migration has to be retried, and a task is spawned
+/// onto a thread pool. Every implementation here is a unit struct or a pair of
+/// `String`s, so the bound costs nothing and states what the callers already do.
+pub trait PasswordReader: Send + Sync {
     /// Read a password (for existing key).
     fn read_password(&self) -> Result<String>;
 
@@ -186,16 +191,15 @@ pub fn get_password_reader() -> Box<dyn PasswordReader> {
 
 /// Where the legacy `bls_key.enc` lives.
 ///
-/// # Errors
-/// If no override is given and no application data directory can be determined.
-pub fn get_key_path(configured: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = configured {
-        return Ok(path.to_path_buf());
-    }
-    let app_dir = default_app_dir().ok_or_else(|| {
-        anyhow!("unable to determine application data directory for storing BLS keys")
-    })?;
-    Ok(app_dir.join(BLS_KEY_FILENAME))
+/// Resolved against the directory this process actually settled on rather than
+/// against [`crate::database::default_app_dir`], which only ever reads
+/// `KONTOR_APP_DIR`. The two agree whenever the directory comes from the
+/// environment — every container does — and come apart when it comes from
+/// `--app-dir`, where the old spelling sent the migration hunting for a key file
+/// in a directory this node keeps nothing else in.
+#[must_use]
+pub fn get_key_path(app_dir: &Path, configured: Option<&Path>) -> PathBuf {
+    configured.map_or_else(|| app_dir.join(BLS_KEY_FILENAME), Path::to_path_buf)
 }
 
 /// A BLS key opened from [`crate::crypto::keystore`], with whatever public
@@ -365,6 +369,40 @@ pub enum KeySource {
         keystore: Box<Keystore>,
         reason: Option<String>,
     },
+    /// Legacy material, derived and **not yet sealed**.
+    ///
+    /// # Why the keystore is not written here
+    ///
+    /// Everything else about a sealed node rests on one claim: its account was
+    /// chosen deliberately, by an operator who was shown the address and the
+    /// node id before committing. That is what lets
+    /// [`crate::node::onboarding`] skip the sibling scan on a sealed node, and
+    /// the claim is true of the setup wizard.
+    ///
+    /// It is not true of a migration. The account comes from
+    /// `KONTOR_STORAGE_ACCOUNT_INDEX`, which can be mistyped, and the only thing
+    /// that catches a mistyped one is the sibling scan — which runs during
+    /// onboarding, against the Portal, long after this function has returned.
+    /// Sealing first would leave the scan refusing an identity that is already
+    /// on the volume and already outranks the variable the operator would go on
+    /// to correct: the next start would open the keystore, find no seed, skip
+    /// the scan entirely, and register the very account the guard refused,
+    /// stranding the real node's agreements behind it.
+    ///
+    /// So the material is carried out unsealed and
+    /// [`crate::app::runtime`] writes the keystore once onboarding has *not*
+    /// refused it. The cost is one variable that has to stay set across an
+    /// unusually long first start; the alternative is a guard a restart walks
+    /// around.
+    Migrating {
+        keys: Box<NodeKeys>,
+        /// Resolved here rather than at sealing time, so a missing or malformed
+        /// seal key is reported while the operator is still reading the startup
+        /// output — not minutes later, when the node has onboarded and cannot
+        /// write down what it just became.
+        seal_key: SealKey,
+        seal_source: SealKeySource,
+    },
     /// No keystore and nothing to migrate. The setup wizard has the work.
     Uninitialized,
 }
@@ -376,6 +414,13 @@ impl std::fmt::Debug for KeySource {
                 keys, seal_source, ..
             } => f
                 .debug_struct("Open")
+                .field("keys", keys)
+                .field("seal_source", seal_source)
+                .finish_non_exhaustive(),
+            Self::Migrating {
+                keys, seal_source, ..
+            } => f
+                .debug_struct("Migrating")
                 .field("keys", keys)
                 .field("seal_source", seal_source)
                 .finish_non_exhaustive(),
@@ -411,16 +456,19 @@ impl std::fmt::Debug for KeySource {
 ///    take `/admin` down with the node and remove the only channel that could
 ///    correct it, on the one path this release exists to make recoverable.
 /// 2. **No keystore, but something to migrate** — a mnemonic in the
-///    environment, or a `bls_key.enc` this process can open. The key is sealed
-///    into a keystore on the spot and the node comes up on the new path. The
-///    legacy material is left exactly where it is; deleting an operator's key
-///    file is not this function's call to make.
+///    environment, or a `bls_key.enc` this process can open. The key is derived
+///    and handed back as [`KeySource::Migrating`], which the caller seals once
+///    onboarding has accepted the identity and **not before** — see that
+///    variant for why the order is load-bearing rather than tidy. The legacy
+///    material is left exactly where it is; deleting an operator's key file is
+///    not this function's call to make.
 /// 3. **Neither.** [`KeySource::Uninitialized`], and `/admin` does the rest.
 ///
 /// # Errors
-/// If the keystore is unreadable, or if legacy material is present but cannot
-/// be read. A seal key that is malformed or simply wrong is *not* an error —
-/// see the note on case 1.
+/// If the keystore is unreadable, if legacy material is present but cannot be
+/// read, or if there is legacy material and no seal key can be resolved or
+/// generated to hold it. A seal key that is malformed or simply wrong is *not*
+/// an error on the keystore path — see the note on case 1.
 pub async fn open_or_migrate(
     app_dir: &Path,
     key_path: &Path,
@@ -515,15 +563,50 @@ pub async fn open_or_migrate(
     )?;
 
     let keys = ensure_node_keys(key_path, mnemonic, writer, password_reader).await?;
-    let public = keys.public()?;
-    let secret = keys.keypair().secret_key_hex();
 
-    // Generated here and only here: a node that already has a keystore must
-    // never make a fresh key, because a fresh key does not open the old file.
+    // Resolved here, sealed later. Generated *only* here: a node that already
+    // has a keystore must never make a fresh key, because a fresh key does not
+    // open the old file.
     let (seal_key, seal_source) = keystore::resolve_seal_key(app_dir, true)?
         .ok_or_else(|| anyhow!("no seal key could be resolved or generated"))?;
 
-    let keystore = Keystore::provision(app_dir, &secret, public, &seal_key)?;
+    writeln!(
+        writer,
+        "  It will be sealed into {} ({} slot, fingerprint {}) once the Portal has \
+         accepted this identity.",
+        Keystore::path_in(app_dir).display(),
+        seal_source.kind(),
+        seal_key.fingerprint().as_deref().unwrap_or("none")
+    )?;
+
+    Ok(KeySource::Migrating {
+        keys: Box::new(keys),
+        seal_key,
+        seal_source,
+    })
+}
+
+/// Write the keystore a migration has been carrying, now that something has
+/// agreed to it.
+///
+/// Split out from [`open_or_migrate`] rather than inlined at the call site
+/// because of what it has to refuse: the secret and the identity are checked
+/// against each other by [`Keystore::provision`], and getting them from the
+/// onboarding result — which is where they come back from — is the one place
+/// they could be mismatched.
+///
+/// # Errors
+/// If the secret is not the key `public` names, or the file cannot be written.
+pub fn seal_migrated_keys(
+    app_dir: &Path,
+    keypair: &BlsKeyPair,
+    public: Option<PublicIdentity>,
+    seal_key: &SealKey,
+    seal_source: SealKeySource,
+    writer: &mut impl Write,
+    migrated_from_a_mnemonic: bool,
+) -> Result<Keystore> {
+    let keystore = Keystore::provision(app_dir, &keypair.secret_key_hex(), public, seal_key)?;
 
     writeln!(
         writer,
@@ -532,7 +615,7 @@ pub async fn open_or_migrate(
         seal_source.kind(),
         seal_key.fingerprint().as_deref().unwrap_or("none")
     )?;
-    if mnemonic.is_some() {
+    if migrated_from_a_mnemonic {
         writeln!(
             writer,
             "  {MNEMONIC_ENV} is no longer needed and should be removed from this \
@@ -540,12 +623,7 @@ pub async fn open_or_migrate(
         )?;
     }
 
-    Ok(KeySource::Open {
-        keystore: Box::new(keystore),
-        keys: Box::new(keys),
-        seal_key,
-        seal_source,
-    })
+    Ok(keystore)
 }
 
 /// Report an environment that disagrees with the keystore, without acting on it.
@@ -917,6 +995,95 @@ mod tests {
         .await
     }
 
+    /// A whole migration, as [`crate::app::runtime`] performs one: derive, and
+    /// then seal because onboarding did not refuse the identity.
+    ///
+    /// The tests below are about the sealed node that comes out the far end, so
+    /// they stand in for onboarding by simply agreeing. What they must not do is
+    /// call [`open_or_migrate`] alone and expect a keystore — the whole point of
+    /// the split is that there is not one yet, and
+    /// [`a_migration_writes_nothing_until_it_is_accepted`] is the test that says
+    /// so.
+    async fn migrate_and_seal(
+        app_dir: &Path,
+        key_path: &Path,
+        mnemonic: Option<&MnemonicSettings>,
+    ) -> Result<KeySource> {
+        let KeySource::Migrating {
+            keys,
+            seal_key,
+            seal_source,
+        } = migrate(app_dir, key_path, mnemonic).await?
+        else {
+            panic!("this volume had nothing to migrate");
+        };
+
+        let mut buffer = Vec::new();
+        let keystore = seal_migrated_keys(
+            app_dir,
+            keys.keypair(),
+            keys.public()?,
+            &seal_key,
+            seal_source,
+            &mut buffer,
+            keys.seed().is_some(),
+        )?;
+
+        Ok(KeySource::Open {
+            keystore: Box::new(keystore),
+            keys,
+            seal_key,
+            seal_source,
+        })
+    }
+
+    /// The rule the account guard rests on.
+    ///
+    /// Onboarding is the only thing that checks a migrated account against the
+    /// Portal, and it runs after this. A keystore written here would already
+    /// outrank the variable the operator would go on to correct — and the next
+    /// start would open it, find no seed, skip the sibling scan entirely, and
+    /// register the account the guard had refused.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_migration_writes_nothing_until_it_is_accepted() {
+        let _env = MigrationEnv::capture();
+        let dir = tempfile::tempdir().unwrap();
+
+        let source = migrate(
+            dir.path(),
+            &dir.path().join("bls_key.enc"),
+            Some(&settings(2)),
+        )
+        .await
+        .unwrap();
+
+        let KeySource::Migrating { keys, .. } = source else {
+            panic!("legacy material must come out unsealed");
+        };
+        assert!(
+            keys.seed().is_some(),
+            "and with its seed, which is what the sibling scan needs"
+        );
+        assert!(
+            !Keystore::path_in(dir.path()).exists(),
+            "nothing has agreed to this identity yet"
+        );
+
+        // Starting again reaches the same place rather than an unopenable
+        // keystore, which is what makes correcting the variable work.
+        assert!(matches!(
+            migrate(
+                dir.path(),
+                &dir.path().join("bls_key.enc"),
+                Some(&settings(5))
+            )
+            .await
+            .unwrap(),
+            KeySource::Migrating { .. }
+        ));
+    }
+
     /// The ordinary case now: an empty volume is a node waiting for its wizard,
     /// not an error and not something to prompt about.
     #[tokio::test]
@@ -942,7 +1109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let expected = MnemonicIdentity::derive(&settings(2)).unwrap();
 
-        let source = migrate(
+        let source = migrate_and_seal(
             dir.path(),
             &dir.path().join("bls_key.enc"),
             Some(&settings(2)),
@@ -985,7 +1152,7 @@ mod tests {
             .await
             .unwrap();
 
-        let source = migrate(dir.path(), &key_path, None).await.unwrap();
+        let source = migrate_and_seal(dir.path(), &key_path, None).await.unwrap();
 
         let KeySource::Open { keystore, keys, .. } = source else {
             panic!("a key file must migrate into an open keystore");
@@ -1006,7 +1173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        migrate(dir.path(), &key_path, Some(&settings(2)))
+        migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         let sealed = MnemonicIdentity::derive(&settings(2)).unwrap();
@@ -1031,7 +1198,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        migrate(dir.path(), &key_path, Some(&settings(2)))
+        migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
@@ -1059,7 +1226,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+        let source = migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         let KeySource::Open {
@@ -1108,7 +1275,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+        let source = migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         let KeySource::Open {
@@ -1168,7 +1335,7 @@ mod tests {
             mut keystore,
             seal_key,
             ..
-        } = migrate(dir.path(), &key_path, Some(&settings(2)))
+        } = migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap()
         else {
@@ -1209,7 +1376,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        migrate(dir.path(), &key_path, Some(&settings(2)))
+        migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         std::fs::remove_file(dir.path().join(keystore::SEAL_KEY_FILENAME)).unwrap();
@@ -1234,7 +1401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("bls_key.enc");
 
-        let source = migrate(dir.path(), &key_path, Some(&settings(2)))
+        let source = migrate_and_seal(dir.path(), &key_path, Some(&settings(2)))
             .await
             .unwrap();
         let KeySource::Open {
@@ -1279,15 +1446,21 @@ mod tests {
     #[test]
     fn get_key_path_returns_custom_path_when_configured() {
         let custom_path = PathBuf::from("/custom/path/key.enc");
-        assert_eq!(get_key_path(Some(&custom_path)).unwrap(), custom_path);
+        assert_eq!(
+            get_key_path(Path::new("/data"), Some(&custom_path)),
+            custom_path
+        );
     }
 
+    /// The whole reason this takes a directory: the answer follows the one the
+    /// process resolved, including when it came from `--app-dir` rather than
+    /// from `KONTOR_APP_DIR`.
     #[test]
-    fn get_key_path_returns_default_path_when_not_configured() {
-        // This test may fail in an environment without a data directory.
-        if let Ok(path) = get_key_path(None) {
-            assert!(path.to_string_lossy().contains(BLS_KEY_FILENAME));
-        }
+    fn get_key_path_follows_the_application_directory_it_is_given() {
+        assert_eq!(
+            get_key_path(Path::new("/somewhere/else"), None),
+            PathBuf::from("/somewhere/else").join(BLS_KEY_FILENAME)
+        );
     }
 
     #[test]

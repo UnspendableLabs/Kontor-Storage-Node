@@ -123,17 +123,40 @@ impl SealStatus {
         }
     }
 
-    /// Whether some slot could be supplied by the machine itself at boot.
+    /// Whether a restarted process could open this keystore without a human.
     ///
-    /// The same question [`Keystore::can_boot_unattended`] answers, asked of the
-    /// copy `/admin` can see. It is what decides whether a restart is a recovery
-    /// or an outage that waits for a human, and it lives here rather than being
-    /// captured once at startup because the slots change while the node runs:
-    /// a node provisioned through the wizard gains its first machine slot after
-    /// the server is already answering requests.
+    /// It is what decides whether a restart is a recovery or an outage, and it
+    /// lives here rather than being captured once at startup because the answer
+    /// changes while the node runs: a node provisioned through the wizard gains
+    /// its first machine slot after the server is already answering requests.
+    ///
+    /// # Why the record beats the slots
+    ///
+    /// [`keystore::slots_can_boot_unattended`] asks which *kinds* of slot exist,
+    /// which is the right question for [`Keystore::remove_slot`] — it is about
+    /// to change them, and there is no boot to consult. Here there is one, and
+    /// it has already run the experiment: a node that came up through a machine
+    /// slot demonstrably can do it again, and one that needed a human
+    /// demonstrably could not.
+    ///
+    /// The two answers come apart on exactly the node this design exists to
+    /// rescue. Lose `.seal-key`, and the keystore still records a `file` slot —
+    /// a slot nothing on the machine can open. Unseal with a passphrase, as
+    /// [`crate::server::admin::seal::unseal`] exists for, and the slots would
+    /// say a restart is safe about a node that has just proved it is not: it
+    /// would come back in [`Phase::Sealed`], waiting for somebody to type the
+    /// passphrase again. That is the outage `restart_available` is there to
+    /// refuse, offered by the very flag meant to refuse it.
     #[must_use]
     pub fn can_boot_unattended(&self) -> bool {
-        keystore::slots_can_boot_unattended(&self.slots)
+        match self.opened_with {
+            Some(kind) => kind.is_unattended(),
+            // Nothing opened it, so there is no boot to read and the slots are
+            // the best answer available. A locked keystore with a machine slot
+            // may well come back on the next start — this one simply had no key
+            // for it, and the reason may be gone by then.
+            None => keystore::slots_can_boot_unattended(&self.slots),
+        }
     }
 
     /// Whether `/admin` may offer to reseal this node at all.
@@ -536,6 +559,43 @@ mod tests {
         assert_eq!(seal.fingerprint, None);
         // And a node held open only by a human cannot be restarted into one.
         assert!(!runtime.can_restart());
+    }
+
+    /// The case the slots get wrong on their own, and the reason
+    /// [`SealStatus::can_boot_unattended`] reads the boot record first.
+    ///
+    /// A node whose `.seal-key` went missing still carries a `file` slot — the
+    /// slot is in the keystore, the key that opens it is not on the machine.
+    /// Rescuing it with a passphrase is exactly what `POST /api/admin/unseal`
+    /// is for, and the node that comes out of it is running normally. Asked
+    /// whether it could restart, the slots say yes and are wrong: nothing here
+    /// can supply either of them at boot, so it would come back sealed.
+    #[test]
+    fn a_node_rescued_by_passphrase_does_not_offer_a_restart_it_cannot_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = SealKey::generate(SlotKind::File);
+        let passphrase = SealKey::passphrase("a passphrase long enough to be accepted");
+        let keypair = crate::crypto::BlsKeyPair::generate().unwrap();
+
+        let mut keystore =
+            Keystore::provision(dir.path(), &keypair.secret_key_hex(), None, &file).unwrap();
+        keystore.add_slot(&file, &passphrase).unwrap();
+
+        // The slots alone still say a machine could open this.
+        assert!(keystore::slots_can_boot_unattended(&keystore.slots()));
+
+        let runtime = NodeRuntime::new(Phase::Sealed, SealStatus::default());
+        runtime.opened(&keystore, &passphrase, SealKeySource::Passphrase);
+
+        assert_eq!(
+            runtime.seal().slots,
+            vec![SlotKind::File, SlotKind::Passphrase]
+        );
+        assert!(
+            !runtime.can_restart(),
+            "the file slot is there and its key is not; this boot proved it by \
+             needing a human"
+        );
     }
 
     /// The restart offer follows the slots, and has to keep following them: a
