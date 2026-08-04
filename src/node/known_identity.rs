@@ -44,7 +44,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::crypto::MnemonicIdentity;
+use crate::crypto::PublicIdentity;
 
 /// File name inside `storage_dir`. Dotted, like `.portal-daemon.lock`, since it
 /// is bookkeeping rather than served content.
@@ -102,12 +102,12 @@ impl KnownIdentity {
     /// If the file cannot be written. Callers treat that as a warning: a node
     /// that is up and running should not be brought down by bookkeeping, and
     /// the cost of losing it is one refused registration after a Portal reset.
-    pub async fn store(storage_dir: &Path, identity: &MnemonicIdentity) -> Result<()> {
+    pub async fn store(storage_dir: &Path, identity: &PublicIdentity) -> Result<()> {
         let record = Self {
             node_id: identity.node_id.clone(),
             account: identity.account,
             network: identity.network.to_string(),
-            bls_pubkey: identity.bls_pubkey(),
+            bls_pubkey: identity.bls_pubkey.clone(),
         };
 
         let path = Self::path(storage_dir);
@@ -119,7 +119,7 @@ impl KnownIdentity {
 
     /// Whether this record names the identity now being derived.
     #[must_use]
-    pub fn matches(&self, identity: &MnemonicIdentity) -> bool {
+    pub fn matches(&self, identity: &PublicIdentity) -> bool {
         self.node_id == identity.node_id
     }
 
@@ -134,11 +134,11 @@ impl KnownIdentity {
     /// So a record that matches but disagrees is rewritten on the way up, and
     /// nothing has to be migrated by hand.
     #[must_use]
-    pub fn describes(&self, identity: &MnemonicIdentity) -> bool {
+    pub fn describes(&self, identity: &PublicIdentity) -> bool {
         self.matches(identity)
             && self.account == identity.account
             && self.network == identity.network.to_string()
-            && self.bls_pubkey == identity.bls_pubkey()
+            && self.bls_pubkey == identity.bls_pubkey
     }
 }
 
@@ -146,7 +146,7 @@ impl KnownIdentity {
 ///
 /// Called on the way up from a node that has just onboarded, where the write is
 /// the least important thing that happened.
-pub async fn remember(storage_dir: &Path, identity: &MnemonicIdentity) {
+pub async fn remember(storage_dir: &Path, identity: &PublicIdentity) {
     if let Err(e) = KnownIdentity::store(storage_dir, identity).await {
         tracing::warn!(
             error = %format!("{e:#}"),
@@ -165,12 +165,14 @@ mod tests {
     const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                                abandon abandon abandon about";
 
-    fn identity(account: u32) -> MnemonicIdentity {
-        MnemonicIdentity::derive(&MnemonicSettings::new(
+    fn identity(account: u32) -> PublicIdentity {
+        crate::crypto::MnemonicIdentity::derive(&MnemonicSettings::new(
             TEST_PHRASE,
             BitcoinNetwork::Signet,
             account,
         ))
+        .unwrap()
+        .public()
         .unwrap()
     }
 
@@ -193,7 +195,7 @@ mod tests {
         assert!(record.matches(&identity));
         assert_eq!(record.account, 2);
         assert_eq!(record.network, "signet");
-        assert_eq!(record.bls_pubkey, identity.bls_pubkey());
+        assert_eq!(record.bls_pubkey, identity.bls_pubkey);
     }
 
     /// The whole point of keying on `node_id`: a different account is a
@@ -217,11 +219,13 @@ mod tests {
         let signet = identity(2);
         KnownIdentity::store(dir.path(), &signet).await.unwrap();
 
-        let mainnet = MnemonicIdentity::derive(&MnemonicSettings::new(
+        let mainnet = crate::crypto::MnemonicIdentity::derive(&MnemonicSettings::new(
             TEST_PHRASE,
             BitcoinNetwork::Mainnet,
             2,
         ))
+        .unwrap()
+        .public()
         .unwrap();
 
         let record = KnownIdentity::load(dir.path()).await.unwrap();

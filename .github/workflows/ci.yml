@@ -36,6 +36,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --all-features --locked
 
+  # The browser half of the sealed admin channel. `cargo test` cannot reach it:
+  # it pins the WebCrypto names the page uses and plays the client in Rust, and
+  # neither of those runs the page's own code. This job slices the three
+  # functions out of index.html and drives them against a live binary.
+  envelope:
+    name: sealed channel, browser half
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cargo build --locked
+      - run: node scripts/envelope-harness.mjs
+
   coverage:
     name: cargo llvm-cov
     runs-on: ubuntu-latest

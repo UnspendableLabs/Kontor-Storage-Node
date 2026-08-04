@@ -1,0 +1,633 @@
+//! `POST /api/admin/setup/provision` — give an unconfigured node its identity.
+//!
+//! # The one thing this endpoint must never do
+//!
+//! Take a seed phrase in the clear.
+//!
+//! It does not: the phrase arrives sealed to a one-shot key only this process
+//! holds, and what crosses the edge, the proxy and the error reporter is
+//! ciphertext. [`crate::server::admin::envelope`] is that channel, and the
+//! reasoning for it — along with what it deliberately does not defend against —
+//! lives there rather than here.
+//!
+//! # After decryption
+//!
+//! The mnemonic exists in this process for as long as it takes to derive a key,
+//! inside `Zeroizing` throughout, and is never written anywhere. What persists
+//! is the sealed BLS key and the public identity — see
+//! [`crate::crypto::identity`] for why that is enough forever.
+
+use anyhow::Result;
+use axum::http::StatusCode;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use zeroize::Zeroizing;
+
+use crate::app::lifecycle::{Activation, Phase};
+use crate::crypto::keystore::{self, Keystore, SealKey};
+use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, MnemonicSettings};
+use crate::server::admin::envelope::{self, SealedRequest};
+use crate::server::admin::seal::MIN_PASSPHRASE_LEN;
+use crate::server::admin::{error_codes, ApiError};
+use crate::server::state::DownloadServerState;
+
+/// What the browser sealed. Never logged, never echoed.
+#[derive(Deserialize)]
+struct ProvisionPayload {
+    mnemonic: String,
+    #[serde(default = "default_account")]
+    account: u32,
+    #[serde(default)]
+    network: Option<String>,
+    /// An optional second way into the keystore, offered here because this is
+    /// the only moment an operator is reliably looking at the node: by the time
+    /// a seal key is lost, it is far too late to add one.
+    #[serde(default)]
+    passphrase: Option<String>,
+}
+
+fn default_account() -> u32 {
+    crate::crypto::mnemonic::FIRST_ACCOUNT
+}
+
+/// `POST /api/admin/setup/provision` — derive, seal, and activate.
+///
+/// # Errors
+/// - `409 SETUP_UNAVAILABLE` on a node that already has a keystore.
+/// - `400 INVALID_ENVELOPE` when the envelope is unknown, expired, or the
+///   payload does not authenticate.
+/// - `400 INVALID_SETUP` when what it contained is not a usable seed phrase.
+/// - `400 WEAK_PASSWORD` when the optional passphrase is too short.
+/// - `500` when the keystore cannot be written, and — the one error this
+///   endpoint answers about a node it nonetheless brought up — when the optional
+///   recovery password could not be sealed into a slot of its own.
+pub async fn provision(
+    request: &SealedRequest,
+    state: &DownloadServerState,
+) -> Result<Value, ApiError> {
+    // Held across the whole of provisioning, and the phase is read *inside* it.
+    // Two tabs would otherwise both see `Uninitialized`, both derive, and the
+    // second would write its keystore over the first — leaving a node whose
+    // identity is whichever request happened to finish last, and a `.seal-key`
+    // that opens only one of the two.
+    let _guard = state.admin.lock_keystore().await;
+    require_uninitialized(state)?;
+
+    let (_session, payload) = envelope::open_as::<ProvisionPayload>(request, state)?;
+
+    // Checked before anything is derived or written, so a passphrase this node
+    // would refuse costs a retry on a form the operator is still looking at,
+    // rather than a provisioned node whose second slot silently never happened.
+    let passphrase = optional_passphrase(payload.passphrase)?;
+
+    // From here on the phrase lives in `Zeroizing` and nothing else. It is not
+    // logged, not echoed in the response, and not written to disk in any form.
+    let phrase = Zeroizing::new(payload.mnemonic);
+    let identity = derive(&phrase, payload.account, payload.network.as_deref())
+        .map_err(|e| ApiError::bad_request(error_codes::INVALID_SETUP, format!("{e:#}")))?;
+    drop(phrase);
+
+    let public = identity
+        .public()
+        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+    let secret = identity.keypair.secret_key_hex();
+    drop(identity);
+
+    let app_dir = state.admin.app_dir();
+    let (seal_key, source) = keystore::resolve_seal_key(app_dir, true)
+        .map_err(|e| ApiError::server_error(format!("{e:#}")))?
+        .ok_or_else(|| ApiError::server_error("no seal key could be resolved or generated"))?;
+
+    let keystore = Keystore::provision(app_dir, &secret, Some(public.clone()), &seal_key)
+        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+
+    // Failure here is reported, not returned: the identity is already sealed on
+    // disk and openable, so the node is set up — it is the recovery it asked for
+    // that is missing. Returning early would leave a keystore on the volume and
+    // a process still in `Uninitialized`, which is the one combination that
+    // matters: the guard above reads the phase, so the next attempt from the
+    // same page would provision straight over the identity just written.
+    let (keystore, passphrase_error) = seal_passphrase_slot(keystore, &seal_key, passphrase).await;
+    let has_passphrase_slot = keystore.slots().contains(&keystore::SlotKind::Passphrase);
+
+    // Rebuilt from the secret that was just sealed rather than left for the
+    // supervisor to unwrap: it is the same key either way, and handing it over
+    // is what keeps the supervisor off the unsealing path entirely. Cheap here
+    // — this is a curve operation, not a key derivation.
+    let keypair = BlsKeyPair::from_secret_key_hex(&secret)
+        .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
+    drop(secret);
+
+    tracing::info!(
+        node_id = %public.node_id,
+        seal_slot = %source.kind(),
+        passphrase_slot = has_passphrase_slot,
+        "Node provisioned from /admin; sealing complete"
+    );
+
+    let body = json!({
+        "node_id": public.node_id,
+        "account": public.account,
+        "network": public.network.to_string(),
+        "taproot_address": public.taproot_address,
+        "bls_pubkey": public.bls_pubkey,
+        "seal_slot": source.kind().to_string(),
+        "seal_fingerprint": seal_key.fingerprint(),
+        "passphrase_slot": has_passphrase_slot,
+    });
+
+    // Published here rather than left to the supervisor, which announces the
+    // same thing when it picks the activation up. This endpoint has just sealed
+    // the keystore with this key, so it knows the answer, and the supervisor may
+    // be a scheduling quantum away: in between, `GET /api/admin/seal` would tell
+    // an operator their node cannot open its own keystore and `restart_available`
+    // would say no — about a node that was provisioned a moment ago, and on the
+    // very poll that decides whether the reset card's restart box is usable.
+    state.runtime.opened(&keystore, &seal_key, source);
+
+    // Entered here rather than left to the supervisor. The phase *is* the lock
+    // this endpoint checks, so publishing it before the guard is dropped is what
+    // makes the check above mean anything: a second request that arrives while
+    // the supervisor is still waking up now sees a node that already has a key.
+    state.runtime.enter(Phase::Activating);
+    state.runtime.request(Activation::Open {
+        keystore: Box::new(keystore),
+        keypair: Box::new(keypair),
+        seal_key,
+        source,
+    });
+
+    // Answered last, once the node it describes is really on its way up. The
+    // operator has to hear that the password they typed does not open anything,
+    // even though everything else worked.
+    if let Some(error) = passphrase_error {
+        return Err(error);
+    }
+
+    Ok(body)
+}
+
+/// Read the optional recovery passphrase off the payload.
+///
+/// Blank and absent are the same thing — an operator who left the field alone —
+/// and neither is an error. Anything shorter than [`MIN_PASSPHRASE_LEN`] is,
+/// because this is the one secret on the node that sits behind no login
+/// throttle: whoever holds the keystore file can try it offline.
+fn optional_passphrase(raw: Option<String>) -> Result<Option<Zeroizing<String>>, ApiError> {
+    let Some(passphrase) = raw.map(Zeroizing::new).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(ApiError::bad_request(
+            error_codes::WEAK_PASSWORD,
+            format!("The recovery password must be at least {MIN_PASSPHRASE_LEN} characters."),
+        ));
+    }
+
+    Ok(Some(passphrase))
+}
+
+/// Add the passphrase slot, if one was asked for, to the keystore that was just
+/// written.
+///
+/// Added *alongside* the file slot rather than instead of it, which is what
+/// keeps the node restarting unattended: the passphrase is a way back in, not
+/// the way in.
+///
+/// Hands back a keystore either way — the caller has a node to bring up whether
+/// or not the second slot happened, and the error travels beside it rather than
+/// in place of it. On failure that keystore is the one `provision` wrote, not
+/// the copy the task mutated: `add_slot` pushes the slot before it writes, so a
+/// write that failed would otherwise leave an in-memory keystore claiming a slot
+/// the file does not have.
+async fn seal_passphrase_slot(
+    keystore: Keystore,
+    unlock: &SealKey,
+    passphrase: Option<Zeroizing<String>>,
+) -> (Keystore, Option<ApiError>) {
+    let Some(passphrase) = passphrase else {
+        return (keystore, None);
+    };
+
+    let sealed = keystore.clone();
+
+    // Off the executor: wrapping under a passphrase is 64 MiB of Argon2id, and
+    // this runs on the same runtime that is serving the rest of `/admin`.
+    let unlock = unlock.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut keystore = keystore;
+        keystore
+            .add_slot(&unlock, &SealKey::passphrase(passphrase.as_str()))
+            .map(|()| keystore)
+    })
+    .await;
+
+    // The identity itself is already on disk and openable through the file slot,
+    // so this is a node that works minus the recovery it asked for. Which half
+    // failed goes in the *message*, not the detail: `ApiError::server_error`
+    // keeps its argument out of the body, so an operator whose node came up fine
+    // would read "Internal error" and have no way to tell a node that is running
+    // without a recovery password from a setup that did not happen.
+    let failed = |reason: String| {
+        (
+            sealed,
+            Some(
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "The node was set up and is starting, but the recovery password could not \
+                     be added — it opens nothing. Add one from /admin, or set the node up again.",
+                )
+                .with_detail(reason),
+            ),
+        )
+    };
+
+    match joined {
+        Ok(Ok(keystore)) => (keystore, None),
+        Ok(Err(e)) => failed(format!("{e:#}")),
+        Err(e) => failed(format!("sealing task failed: {e}")),
+    }
+}
+
+/// Derive an identity from what the operator typed, with the account and
+/// network they picked.
+fn derive(phrase: &str, account: u32, network: Option<&str>) -> Result<MnemonicIdentity> {
+    let network = match network {
+        Some(name) => BitcoinNetwork::parse(name)?,
+        None => BitcoinNetwork::Signet,
+    };
+    MnemonicIdentity::derive(&MnemonicSettings::for_setup(phrase, network, account)?)
+}
+
+/// Refuse to provision a node that already holds a key.
+///
+/// The check is on the phase rather than on the file, because the phase is what
+/// the rest of the process agrees on — and because a node that is merely
+/// [`Phase::Sealed`] must be refused too. Provisioning over a keystore nobody
+/// can currently open would replace an identity that is only temporarily out of
+/// reach.
+fn require_uninitialized(state: &DownloadServerState) -> Result<(), ApiError> {
+    if state.runtime.phase() == Phase::Uninitialized {
+        return Ok(());
+    }
+
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        error_codes::SETUP_UNAVAILABLE,
+        "This node already has a key. Setup is only available on a node that has none.",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::app::lifecycle::{NodeRuntime, SealStatus};
+    use crate::app::restart::RestartHandle;
+    use crate::app::tasks::downloadagreements::StorageBackend;
+    use crate::server::admin::credentials::AdminCredential;
+    use crate::server::admin::envelope::testing::Client;
+    use crate::server::admin::AdminState;
+    use crate::testutils::{setup_in_memory_db, tempdir};
+
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                          abandon abandon abandon about";
+
+    /// A node in the phase the wizard is for, with a real application directory
+    /// under it so a provision actually lands on disk.
+    async fn uninitialized_node() -> (DownloadServerState, tempfile::TempDir) {
+        let dir = tempdir();
+        let runtime = NodeRuntime::new(Phase::Uninitialized, SealStatus::default());
+
+        let state = DownloadServerState {
+            db: setup_in_memory_db().await,
+            storage_dir: dir.path().to_path_buf(),
+            storage_backend: StorageBackend::local(),
+            runtime: runtime.clone(),
+            admin: AdminState::new(
+                AdminCredential::Disabled,
+                dir.path().to_path_buf(),
+                RestartHandle::new(),
+                runtime,
+            ),
+        };
+        (state, dir)
+    }
+
+    /// Fetch an envelope and seal a setup payload against it, as the page does.
+    fn sealed_setup(state: &DownloadServerState, account: u32) -> SealedRequest {
+        sealed_setup_with(state, account, None)
+    }
+
+    /// The same, with whatever the optional recovery-password field held.
+    fn sealed_setup_with(
+        state: &DownloadServerState,
+        account: u32,
+        passphrase: Option<&str>,
+    ) -> SealedRequest {
+        let envelope = envelope::issue(state);
+        let session_id = envelope["session_id"].as_str().unwrap();
+        let client = Client::greet(envelope["node_pubkey"].as_str().unwrap(), session_id);
+
+        client.seal(
+            session_id,
+            &serde_json::to_vec(&json!({
+                "mnemonic": PHRASE,
+                "account": account,
+                "network": "signet",
+                "passphrase": passphrase,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sealed_phrase_provisions_the_node_it_names() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 2);
+
+        let body = provision(&request, &state).await.unwrap();
+
+        assert_eq!(body["account"], 2);
+        assert_eq!(body["network"], "signet");
+        assert_eq!(body["seal_slot"], "file");
+
+        // The keystore landed, and it holds the identity the response named.
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(keystore.public().unwrap().node_id, body["node_id"]);
+
+        // And the phase moved before the supervisor had a chance to run.
+        assert_eq!(state.runtime.phase(), Phase::Activating);
+
+        // So did the seal status. The supervisor announces the same thing when
+        // it picks the activation up, but it may be a scheduling quantum away —
+        // and in between `GET /api/admin/seal` would tell an operator that the
+        // node they just provisioned cannot open its own keystore, and
+        // `restart_available` would say no. The page caches the seal card per
+        // phase, so that answer would then stand for the whole of activation.
+        let seal = state.runtime.seal();
+        assert!(seal.is_open());
+        assert_eq!(
+            seal.opened_with,
+            Some(crate::crypto::keystore::SlotKind::File)
+        );
+        assert!(
+            state.runtime.can_restart(),
+            "a node that has just sealed a file slot can plainly come back on it"
+        );
+    }
+
+    /// The wizard is the only moment an operator is reliably looking at a node,
+    /// so the recovery slot has to be addable right here — and *alongside* the
+    /// file slot, or the node would stop restarting unattended the moment
+    /// somebody filled the field in.
+    #[tokio::test]
+    async fn a_recovery_password_becomes_a_second_slot() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup_with(&state, 1, Some("a recovery password long enough"));
+
+        let body = provision(&request, &state).await.unwrap();
+
+        assert_eq!(body["passphrase_slot"], true);
+        assert_eq!(body["seal_slot"], "file");
+
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        let slots = keystore.slots();
+        assert!(slots.contains(&keystore::SlotKind::Passphrase), "{slots:?}");
+        assert!(
+            slots.contains(&keystore::SlotKind::File),
+            "the machine slot has to survive, or the node needs a human to boot: {slots:?}"
+        );
+        assert!(
+            state.runtime.can_restart(),
+            "a node that kept its file slot can still come back on its own"
+        );
+    }
+
+    /// The field is optional, and a node set up without it is exactly the node
+    /// this branch's zero-config path produces.
+    #[tokio::test]
+    async fn no_recovery_password_leaves_a_single_slot() {
+        let (state, dir) = uninitialized_node().await;
+
+        let body = provision(&sealed_setup(&state, 1), &state).await.unwrap();
+
+        assert_eq!(body["passphrase_slot"], false);
+        assert_eq!(
+            Keystore::load(dir.path()).await.unwrap().unwrap().slots(),
+            vec![keystore::SlotKind::File]
+        );
+    }
+
+    /// Refused *before* anything is derived or written. A node provisioned with
+    /// the recovery it asked for silently missing is the one outcome this must
+    /// not produce, so the check runs while the operator is still on the form.
+    #[tokio::test]
+    async fn a_short_recovery_password_leaves_the_node_untouched() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup_with(&state, 1, Some("too short"));
+
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, error_codes::WEAK_PASSWORD);
+
+        assert!(Keystore::load(dir.path()).await.unwrap().is_none());
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
+    }
+
+    /// A field left alone arrives as `""` or not at all, and neither is an
+    /// operator asking for a slot the node should then refuse as too short.
+    #[test]
+    fn a_blank_recovery_password_is_the_same_as_none() {
+        assert!(optional_passphrase(None).unwrap().is_none());
+        assert!(optional_passphrase(Some(String::new())).unwrap().is_none());
+        assert!(optional_passphrase(Some("short".into())).is_err());
+        assert!(
+            optional_passphrase(Some("a recovery password long enough".into()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A slot that cannot be added must not cost the node the identity it just
+    /// sealed. The keystore comes back so the caller can still bring the node
+    /// up — and it is the one on disk, without the slot that failed, or the
+    /// seal card would report a way in that does not exist.
+    #[tokio::test]
+    async fn a_recovery_password_that_cannot_be_added_still_yields_the_node() {
+        let dir = tempdir();
+        let (seal_key, _) = keystore::resolve_seal_key(dir.path(), true)
+            .unwrap()
+            .unwrap();
+        let identity = MnemonicIdentity::derive(
+            &MnemonicSettings::for_setup(PHRASE, BitcoinNetwork::Signet, 1).unwrap(),
+        )
+        .unwrap();
+        let keystore = Keystore::provision(
+            dir.path(),
+            &identity.keypair.secret_key_hex(),
+            Some(identity.public().unwrap()),
+            &seal_key,
+        )
+        .unwrap();
+
+        // Not the key this keystore was sealed with, so unwrapping the data key
+        // fails and the slot is never written.
+        let wrong = SealKey::passphrase("a recovery password long enough");
+        let (keystore, error) = seal_passphrase_slot(
+            keystore,
+            &wrong,
+            Some(Zeroizing::new("another one long enough".to_string())),
+        )
+        .await;
+
+        let error = error.expect("adding a slot under the wrong key cannot succeed");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error.message.contains("recovery password"),
+            "the operator reads `message`, and it has to say which half failed: {}",
+            error.message
+        );
+        assert_eq!(
+            keystore.slots(),
+            vec![keystore::SlotKind::File],
+            "the keystore handed back is the one on disk, not the mutated copy"
+        );
+    }
+
+    /// The window the phase change closes. A second tab posting its own
+    /// envelope must not be able to write a second identity over the first.
+    #[tokio::test]
+    async fn a_second_provision_cannot_overwrite_the_first() {
+        let (state, dir) = uninitialized_node().await;
+
+        let first = sealed_setup(&state, 1);
+        provision(&first, &state).await.unwrap();
+        let node_id = Keystore::load(dir.path())
+            .await
+            .unwrap()
+            .unwrap()
+            .public()
+            .unwrap()
+            .node_id
+            .clone();
+
+        let second = sealed_setup(&state, 3);
+        let err = provision(&second, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::SETUP_UNAVAILABLE);
+
+        // The identity on disk is still the first one.
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(keystore.public().unwrap().node_id, node_id);
+    }
+
+    /// An envelope is good for one attempt, successful or not. Replaying a body
+    /// captured off the wire must not provision anything.
+    #[tokio::test]
+    async fn a_replayed_body_is_refused() {
+        let (state, _dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 1);
+
+        // A wrong ciphertext consumes the envelope just as a right one does.
+        let spent = SealedRequest {
+            session_id: request.session_id.clone(),
+            client_pubkey: request.client_pubkey.clone(),
+            nonce: request.nonce.clone(),
+            ciphertext: format!("ff{}", &request.ciphertext[2..]),
+        };
+        assert_eq!(
+            provision(&spent, &state).await.unwrap_err().code,
+            error_codes::INVALID_ENVELOPE
+        );
+
+        // And the original body, valid as it is, has nothing left to open it.
+        assert_eq!(
+            provision(&request, &state).await.unwrap_err().code,
+            error_codes::INVALID_ENVELOPE
+        );
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
+    }
+
+    /// A phrase that is not one has to come back as the operator's mistake, not
+    /// as a 500 — and must leave the node exactly as it was.
+    #[tokio::test]
+    async fn an_unusable_phrase_leaves_the_node_alone() {
+        let (state, dir) = uninitialized_node().await;
+
+        let envelope = envelope::issue(&state);
+        let session_id = envelope["session_id"].as_str().unwrap();
+        let client = Client::greet(envelope["node_pubkey"].as_str().unwrap(), session_id);
+        let request = client.seal(
+            session_id,
+            &serde_json::to_vec(&json!({ "mnemonic": "not a seed phrase", "account": 1 })).unwrap(),
+        );
+
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_SETUP);
+
+        assert!(Keystore::load(dir.path()).await.unwrap().is_none());
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
+    }
+
+    /// Setup is for a node with no key. One that is merely sealed must be
+    /// refused too: provisioning over a keystore nobody can open right now would
+    /// replace an identity that is only temporarily out of reach.
+    #[tokio::test]
+    async fn a_sealed_node_is_not_offered_the_wizard() {
+        let (state, _dir) = uninitialized_node().await;
+        let request = sealed_setup(&state, 1);
+        state.runtime.enter(Phase::Sealed);
+
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::SETUP_UNAVAILABLE);
+    }
+
+    #[test]
+    fn derive_picks_the_network_and_account_the_operator_chose() {
+        let phrase = PHRASE;
+
+        let signet = derive(phrase, 2, Some("signet")).unwrap();
+        assert_eq!(signet.account, 2);
+        assert_eq!(signet.network, BitcoinNetwork::Signet);
+
+        let mainnet = derive(phrase, 1, Some("mainnet")).unwrap();
+        assert_eq!(mainnet.network, BitcoinNetwork::Mainnet);
+        assert_ne!(mainnet.node_id, signet.node_id);
+
+        // Absent means signet, the network a node is most likely being set up on.
+        assert_eq!(
+            derive(phrase, 1, None).unwrap().network,
+            BitcoinNetwork::Signet
+        );
+
+        assert!(derive(phrase, 1, Some("dogecoin")).is_err());
+        assert!(derive("not a mnemonic", 1, None).is_err());
+        assert!(derive("", 1, None).is_err());
+    }
+
+    /// `0` is refused by name rather than read as the first account, and the
+    /// refusal has to say so: the page sends what the operator typed, so this
+    /// message is what they see. Quietly setting up account 1 instead would
+    /// leave them a node that is not the one they meant, discoverable only
+    /// after it registers.
+    #[test]
+    fn account_zero_is_refused_in_the_operator_s_own_terms() {
+        let refused = derive(PHRASE, 0, None).unwrap_err().to_string();
+        assert!(refused.contains("from 1"), "{refused}");
+        assert!(refused.contains("got 0"), "{refused}");
+    }
+
+    /// The default the payload carries when the page leaves the field blank. It
+    /// has to be the wallet's first account, not the derivation path's zero.
+    #[test]
+    fn a_payload_without_an_account_means_the_first_one() {
+        let parsed: ProvisionPayload =
+            serde_json::from_value(json!({ "mnemonic": PHRASE })).unwrap();
+        assert_eq!(parsed.account, crate::crypto::mnemonic::FIRST_ACCOUNT);
+        assert!(parsed.network.is_none());
+    }
+}

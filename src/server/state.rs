@@ -1,5 +1,6 @@
 //! Server state types.
 
+use crate::app::lifecycle::NodeRuntime;
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::server::admin::AdminState;
 use sea_orm::DatabaseConnection;
@@ -11,12 +12,14 @@ pub struct DownloadServerState {
     pub db: DatabaseConnection,
     pub storage_dir: PathBuf,
     pub storage_backend: StorageBackend,
-    /// `None` while the node is unregistered: the Portal assigns the id at
-    /// registration, so a node the Portal has never heard of does not have one
-    /// yet. The server still runs — that is the only way `/admin` is reachable
-    /// to fix it — so every reader has to cope with its absence.
-    pub node_id: Option<String>,
-    /// Credentials for the operator UI. [`AdminState::disabled`] when no
-    /// `ADMIN_PASSWORD` is configured, which is the default.
+    /// What the node currently is: which phase, which node id, which key.
+    ///
+    /// The server now starts before any of that is known — that is the whole
+    /// point of a node that can be configured through its own UI — so none of
+    /// it can be a constant fixed when this struct is built. Readers have to
+    /// cope with every field being absent, which on a node still in setup they
+    /// all are.
+    pub runtime: NodeRuntime,
+    /// Credentials for the operator UI.
     pub admin: AdminState,
 }

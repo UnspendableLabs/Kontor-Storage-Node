@@ -25,10 +25,10 @@ use bip32::ExtendedKey;
 use crate::clients::kontor_op::{
     build_signing_message, Inst, InstKind, SignerRef, REGISTER_BLS_KEY_GAS_LIMIT,
 };
-use crate::clients::portal::RegisterNodeRequest;
+use crate::clients::portal::{RegisterNodeRequest, WhitelistRequestBody};
 use crate::clients::PortalClient;
 use crate::crypto::mnemonic::{ACCOUNT_INDEX_ENV, FIRST_ACCOUNT, REGISTER_NEW_ACCOUNT_ENV};
-use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity};
+use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, PublicIdentity};
 use crate::node::known_identity::KnownIdentity;
 
 /// Prefix the Portal signs over to bind a BLS key to a Taproot identity.
@@ -94,26 +94,35 @@ fn bls_binding_message(x_only: &[u8; 32]) -> Vec<u8> {
     msg
 }
 
-/// Build the full `POST /api/nodes/register` body for this node's BLS key.
+/// The proof that this node holds both keys it names, shared by a
+/// registration and a whitelist request.
+///
+/// Both Portal endpoints verify the same three bindings — the xpub's x-only
+/// key, the Schnorr signature over the BLS key, and the BLS signature over the
+/// x-only key — so both bodies are built from this one struct.
+struct BindingProof {
+    xpubkey: String,
+    bls_pubkey: String,
+    schnorr_sig: String,
+    bls_sig: String,
+    x_only: [u8; 32],
+}
+
+/// Validate the wallet-supplied fields and produce the BLS half of the proof.
 ///
 /// `bls_sig` is recomputed rather than taken from the wallet: BLS signing is
 /// deterministic, so the value is identical, and producing it here proves the
-/// node actually holds the key it is about to register.
-///
-/// The op is signed with `nonce = 0` and `sponsored = true`, matching what the
-/// Portal rebuilds in `verify_registration_signature`. Both are inside the
-/// signed bytes — the registration has no account to draw a nonce from or gas
-/// from yet, so the Portal publishes it and pays.
+/// node actually holds the key it is about to bind.
 ///
 /// # Errors
-/// If the wallet-supplied fields are malformed, if `bls_pubkey` is not this
-/// node's own key, or if the op cannot be serialized.
-pub fn build_registration_request(
+/// If the wallet-supplied fields are malformed, or if `bls_pubkey` is not this
+/// node's own key.
+fn build_binding_proof(
     keypair: &BlsKeyPair,
     xpubkey: &str,
     bls_pubkey: &str,
     schnorr_sig: &str,
-) -> Result<RegisterNodeRequest> {
+) -> Result<BindingProof> {
     let bls_pubkey = bls_pubkey.trim().to_ascii_lowercase();
     let schnorr_sig = schnorr_sig.trim().to_ascii_lowercase();
     let xpubkey = xpubkey.trim();
@@ -138,55 +147,215 @@ pub fn build_registration_request(
     let x_only = x_only_from_xpub(xpubkey)?;
     let bls_sig = keypair.sign_kontor_op_message(&bls_binding_message(&x_only))?;
 
-    let inst = Inst {
-        gas_limit: REGISTER_BLS_KEY_GAS_LIMIT,
-        kind: InstKind::RegisterBlsKey {
-            bls_pubkey: hex::decode(&bls_pubkey).context("decoding bls_pubkey")?,
-            schnorr_sig: hex::decode(&schnorr_sig).context("decoding schnorr_sig")?,
-            bls_sig: hex::decode(&bls_sig).context("decoding bls_sig")?,
-        },
-    };
-    let message = build_signing_message(&SignerRef::XOnlyPubkey(x_only), 0, true, &inst)?;
-    let registration_signature = keypair.sign_kontor_op_message(&message)?;
-
-    Ok(RegisterNodeRequest {
+    Ok(BindingProof {
         xpubkey: xpubkey.to_string(),
         bls_pubkey,
         schnorr_sig,
         bls_sig,
+        x_only,
+    })
+}
+
+/// Build the full `POST /api/nodes/register` body for this node's BLS key.
+///
+/// The op is signed with `nonce = 0` and `sponsored = true`, matching what the
+/// Portal rebuilds in `verify_registration_signature`. Both are inside the
+/// signed bytes — the registration has no account to draw a nonce from or gas
+/// from yet, so the Portal publishes it and pays.
+///
+/// # Errors
+/// If the wallet-supplied fields are malformed, if `bls_pubkey` is not this
+/// node's own key, or if the op cannot be serialized.
+pub fn build_registration_request(
+    keypair: &BlsKeyPair,
+    xpubkey: &str,
+    bls_pubkey: &str,
+    schnorr_sig: &str,
+) -> Result<RegisterNodeRequest> {
+    let proof = build_binding_proof(keypair, xpubkey, bls_pubkey, schnorr_sig)?;
+
+    let inst = Inst {
+        gas_limit: REGISTER_BLS_KEY_GAS_LIMIT,
+        kind: InstKind::RegisterBlsKey {
+            bls_pubkey: hex::decode(&proof.bls_pubkey).context("decoding bls_pubkey")?,
+            schnorr_sig: hex::decode(&proof.schnorr_sig).context("decoding schnorr_sig")?,
+            bls_sig: hex::decode(&proof.bls_sig).context("decoding bls_sig")?,
+        },
+    };
+    let message = build_signing_message(&SignerRef::XOnlyPubkey(proof.x_only), 0, true, &inst)?;
+    let registration_signature = keypair.sign_kontor_op_message(&message)?;
+
+    Ok(RegisterNodeRequest {
+        xpubkey: proof.xpubkey,
+        bls_pubkey: proof.bls_pubkey,
+        schnorr_sig: proof.schnorr_sig,
+        bls_sig: proof.bls_sig,
         registration_signature,
     })
 }
 
-/// Build the registration for a mnemonic-derived identity.
+/// Build this node's own registration from its public identity.
 ///
-/// The wallet-driven path gets `xpubkey` and `schnorr_sig` from a browser; a
-/// node holding the seed phrase signs the Schnorr half itself, and everything
-/// downstream is the same code.
+/// The Schnorr signature is read off the record rather than produced, which is
+/// the whole point of writing it down at setup: it is a signature over a fixed
+/// digest, it carries no nonce, and the Portal accepts the same bytes forever.
+/// A node that threw its seed away registers exactly as well as one that kept
+/// it.
 ///
 /// # Errors
-/// If the Schnorr signature cannot be produced, or the request cannot be built.
-pub fn build_self_registration(identity: &MnemonicIdentity) -> Result<RegisterNodeRequest> {
-    // The Portal recovers the x-only key from the xpub and verifies both halves
-    // of the proof of possession against it, while the node signs with the key
-    // it derived directly. They are the same key by construction — this catches
-    // the construction being wrong, here rather than as an opaque 400.
-    let from_xpub = x_only_from_xpub(&identity.xpubkey)?;
-    if from_xpub != identity.x_only {
+/// If the recorded fields are malformed, or if `keypair` is not the key the
+/// identity names.
+pub fn build_registration_from_public(
+    keypair: &BlsKeyPair,
+    public: &PublicIdentity,
+) -> Result<RegisterNodeRequest> {
+    build_registration_request(
+        keypair,
+        &public.xpubkey,
+        &public.bls_pubkey,
+        &public.schnorr_binding_sig,
+    )
+}
+
+/// The operator's contact details on a whitelist request, as the Portal admin
+/// reviewing the queue will see them.
+#[derive(Debug, Clone)]
+pub struct WhitelistContact {
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    pub company: Option<String>,
+}
+
+/// The Portal's own field caps, mirrored so a body that cannot pass review
+/// there is refused here instead. This matters more than usual politeness:
+/// whitelist submissions are quota'd per IP, and the Portal charges the quota
+/// *before* validating — a malformed body spends an attempt and fixes nothing.
+const CONTACT_NAME_MAX: usize = 100;
+const CONTACT_EMAIL_MAX: usize = 320;
+const CONTACT_COMPANY_MAX: usize = 200;
+
+impl WhitelistContact {
+    /// Trim every field and refuse what the Portal would refuse.
+    ///
+    /// The email check is the same shallow shape test the Portal applies — one
+    /// `@`, no whitespace, a domain with a dot — not a deliverability check;
+    /// its job is to catch a pasted-in-the-wrong-field mistake before it costs
+    /// a quota attempt.
+    ///
+    /// # Errors
+    /// If a required field is empty, over the Portal's cap, or the email is
+    /// not shaped like one.
+    fn normalized(&self) -> Result<Self> {
+        let first_name = normalized_name(&self.first_name, "first name")?;
+        let last_name = normalized_name(&self.last_name, "last name")?;
+
+        let email = self.email.trim();
+        if email.is_empty() {
+            return Err(anyhow!("the contact email is required"));
+        }
+        if email.len() > CONTACT_EMAIL_MAX {
+            return Err(anyhow!(
+                "the contact email must be at most {CONTACT_EMAIL_MAX} characters"
+            ));
+        }
+        let parts: Vec<&str> = email.split('@').collect();
+        let domain_has_a_dot = parts
+            .get(1)
+            .is_some_and(|domain| domain.split('.').filter(|label| !label.is_empty()).count() >= 2);
+        if email.chars().any(char::is_whitespace)
+            || parts.len() != 2
+            || parts[0].is_empty()
+            || !domain_has_a_dot
+        {
+            return Err(anyhow!("'{email}' is not a valid email address"));
+        }
+
+        // Blank means absent: an empty string is what an untouched form field
+        // sends, and the Portal stores `null` for it either way.
+        let company = self
+            .company
+            .as_deref()
+            .map(str::trim)
+            .filter(|company| !company.is_empty());
+        if company.is_some_and(|company| company.len() > CONTACT_COMPANY_MAX) {
+            return Err(anyhow!(
+                "the company name must be at most {CONTACT_COMPANY_MAX} characters"
+            ));
+        }
+
+        Ok(Self {
+            first_name,
+            last_name,
+            email: email.to_string(),
+            company: company.map(str::to_string),
+        })
+    }
+}
+
+fn normalized_name(value: &str, field: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("the contact {field} is required"));
+    }
+    if value.len() > CONTACT_NAME_MAX {
         return Err(anyhow!(
-            "the derived Taproot key does not match its own extended public key \
-             (xpub carries {}, signing with {})",
-            hex::encode(from_xpub),
-            hex::encode(identity.x_only),
+            "the contact {field} must be at most {CONTACT_NAME_MAX} characters"
         ));
     }
+    Ok(value.to_string())
+}
 
-    let schnorr_sig = identity.schnorr_binding_sig()?;
-    build_registration_request(
-        &identity.keypair,
-        &identity.xpubkey,
-        &identity.bls_pubkey(),
-        &schnorr_sig,
+/// Build the full `POST /api/nodes/whitelist/request` body.
+///
+/// The proof of possession is the registration's own, minus the op signature —
+/// the Portal wants to know the requester holds both keys before it queues
+/// anything, and deriving the P2TR address from `xpubkey` itself is what keeps
+/// anyone from requesting a whitelist entry for an address they do not own.
+///
+/// # Errors
+/// If the key fields are malformed, if `bls_pubkey` is not this node's own
+/// key, or if the contact details would not pass the Portal's validation.
+pub fn build_whitelist_request(
+    keypair: &BlsKeyPair,
+    xpubkey: &str,
+    bls_pubkey: &str,
+    schnorr_sig: &str,
+    contact: &WhitelistContact,
+) -> Result<WhitelistRequestBody> {
+    let contact = contact.normalized()?;
+    let proof = build_binding_proof(keypair, xpubkey, bls_pubkey, schnorr_sig)?;
+
+    Ok(WhitelistRequestBody {
+        xpubkey: proof.xpubkey,
+        bls_pubkey: proof.bls_pubkey,
+        schnorr_sig: proof.schnorr_sig,
+        bls_sig: proof.bls_sig,
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        email: contact.email,
+        company: contact.company,
+    })
+}
+
+/// Build this node's own whitelist request from its public identity — the
+/// mnemonic-node counterpart of [`build_whitelist_request`], reading the
+/// Schnorr signature off the record exactly as
+/// [`build_registration_from_public`] does.
+///
+/// # Errors
+/// See [`build_whitelist_request`].
+pub fn build_whitelist_from_public(
+    keypair: &BlsKeyPair,
+    public: &PublicIdentity,
+    contact: &WhitelistContact,
+) -> Result<WhitelistRequestBody> {
+    build_whitelist_request(
+        keypair,
+        &public.xpubkey,
+        &public.bls_pubkey,
+        &public.schnorr_binding_sig,
+        contact,
     )
 }
 
@@ -311,14 +480,49 @@ pub async fn find_registered_siblings(
     found
 }
 
+/// The account guard's refusal, as a type the caller can recognise.
+///
+/// A distinct error rather than a bare `anyhow!` for one reason:
+/// [`crate::app::runtime`] retries a failed activation on a backoff, and this is
+/// the one failure that must not be retried. The guard only runs on a node that
+/// still holds its seed — it derives neighbouring accounts to reach its verdict
+/// — and the supervisor's retry re-opens the keystore, which by design has no
+/// seed in it. So a second attempt would not reach the guard at all: it would
+/// quietly do the thing the guard has just refused, thirty seconds later, and
+/// register the second identity this error exists to prevent.
+///
+/// Retrying it is not trying again. It is going around it.
+#[derive(Debug)]
+pub struct WrongAccount(String);
+
+impl std::fmt::Display for WrongAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WrongAccount {}
+
+/// Whether a failure is [`WrongAccount`], anywhere in its chain.
+///
+/// Asked of the whole chain rather than the head, so wrapping the error in
+/// context on the way up — which every layer between the guard and the
+/// supervisor is free to do — cannot quietly turn a refusal back into something
+/// retryable.
+#[must_use]
+pub fn refusal_is_the_account_guard(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<WrongAccount>())
+}
+
 /// The error an operator sees when the configured account may not be the
 /// registered one.
 ///
-/// Fatal by default, because the two things it can mean are not equally
-/// recoverable: a mistyped [`ACCOUNT_INDEX_ENV`] strands a running node's
-/// agreements behind a second identity, while a genuine second node is one
-/// environment variable away from starting. So the message names both readings
-/// and the variable that picks between them.
+/// Fatal, and permanently so: see [`WrongAccount`] for why it must not be
+/// retried. The two things it can mean are not equally recoverable — a mistyped
+/// [`ACCOUNT_INDEX_ENV`] strands a running node's agreements behind a second
+/// identity, while a genuine second node is one environment variable away from
+/// starting. So the message names both readings and the variable that picks
+/// between them.
 ///
 /// `known` is the identity this node last onboarded under, when there is one.
 /// Reaching this error with a record that does not match means the account
@@ -326,14 +530,29 @@ pub async fn find_registered_siblings(
 /// is the most actionable thing that can be said here — so it is said first,
 /// and it stands on its own: that branch never reads `siblings`, which is what
 /// lets the caller raise this on a record alone when the scan came back empty.
+///
+/// The advice it gives — correct the variable and start again — is only true
+/// because nothing has been sealed yet when this is raised. See
+/// [`crate::node::onboarding::key_management::KeySource::Migrating`], which is
+/// what keeps the keystore out of the way until the identity has been accepted.
 #[must_use]
 pub fn wrong_account_error(
     identity: &MnemonicIdentity,
     siblings: &[RegisteredSibling],
     known: Option<&KnownIdentity>,
 ) -> anyhow::Error {
+    anyhow::Error::new(WrongAccount(wrong_account_message(
+        identity, siblings, known,
+    )))
+}
+
+fn wrong_account_message(
+    identity: &MnemonicIdentity,
+    siblings: &[RegisteredSibling],
+    known: Option<&KnownIdentity>,
+) -> String {
     if let Some(record) = known {
-        return anyhow!(
+        return format!(
             "This node has already run as {} (account {}, {}), and {} = {} derives a \
              different identity.\n  \
                derived BLS key: {}\n  \
@@ -363,7 +582,7 @@ pub fn wrong_account_error(
         .collect::<Vec<_>>()
         .join("\n");
 
-    anyhow!(
+    format!(
         "No node is registered for {} = {} ({}).\n  \
            derived BLS key: {}\n  \
            derived address: {}\n\n  \
@@ -554,7 +773,8 @@ mod tests {
     #[test]
     fn a_self_registration_is_shaped_like_a_wallet_one() {
         let identity = derived(2);
-        let request = build_self_registration(&identity).unwrap();
+        let request =
+            build_registration_from_public(&identity.keypair, &identity.public().unwrap()).unwrap();
 
         assert_eq!(request.xpubkey, identity.xpubkey);
         assert_eq!(request.bls_pubkey, identity.bls_pubkey());
@@ -572,8 +792,9 @@ mod tests {
     #[test]
     fn a_self_registration_is_deterministic() {
         let identity = derived(3);
-        let first = build_self_registration(&identity).unwrap();
-        let second = build_self_registration(&identity).unwrap();
+        let public = identity.public().unwrap();
+        let first = build_registration_from_public(&identity.keypair, &public).unwrap();
+        let second = build_registration_from_public(&identity.keypair, &public).unwrap();
 
         assert_eq!(first.schnorr_sig, second.schnorr_sig);
         assert_eq!(first.bls_sig, second.bls_sig);
@@ -604,6 +825,32 @@ mod tests {
         assert!(rendered.contains(&real.taproot_address), "{rendered}");
         assert!(rendered.contains(&identity.taproot_address), "{rendered}");
         assert!(rendered.contains("second node"), "{rendered}");
+    }
+
+    /// What [`crate::app::runtime`] reads to decide not to retry.
+    ///
+    /// Through a wrapper, because the supervisor sees this error after
+    /// onboarding has had every chance to add context to it, and a check that
+    /// only looked at the head of the chain would silently turn a refusal back
+    /// into something worth trying again in thirty seconds.
+    #[test]
+    fn the_account_guards_refusal_is_recognisable_through_context() {
+        let refusal = wrong_account_error(&derived(1), &[sibling_of(&derived(3))], None);
+        assert!(refusal_is_the_account_guard(&refusal));
+
+        let wrapped = refusal.context("onboarding failed").context("activating");
+        assert!(
+            refusal_is_the_account_guard(&wrapped),
+            "the whole chain is asked, not just what is on top"
+        );
+        // And the operator still reads the message rather than the wrapper's
+        // idea of it.
+        assert!(format!("{wrapped:#}").contains(ACCOUNT_INDEX_ENV));
+
+        assert!(
+            !refusal_is_the_account_guard(&anyhow!("the Portal was not reachable")),
+            "everything else is a failure worth retrying"
+        );
     }
 
     /// The same message has to serve the operator whose account index is right
@@ -731,6 +978,144 @@ mod tests {
         assert!(rendered.contains("leaves behind"), "{rendered}");
         // No siblings were found, so the notice must not gesture at a list.
         assert!(!rendered.contains("It joins"), "{rendered}");
+    }
+
+    fn contact() -> WhitelistContact {
+        WhitelistContact {
+            first_name: "Ada".to_string(),
+            last_name: "Lovelace".to_string(),
+            email: "ada@example.com".to_string(),
+            company: None,
+        }
+    }
+
+    /// The whitelist request carries the registration's own proof of
+    /// possession: same fields, same bytes. Anything else and the Portal would
+    /// accept one and refuse the other for the same keys.
+    #[test]
+    fn a_whitelist_request_carries_the_registrations_own_proof() {
+        let identity = derived(2);
+        let public = identity.public().unwrap();
+        let registration = build_registration_from_public(&identity.keypair, &public).unwrap();
+        let whitelist =
+            build_whitelist_from_public(&identity.keypair, &public, &contact()).unwrap();
+
+        assert_eq!(whitelist.xpubkey, registration.xpubkey);
+        assert_eq!(whitelist.bls_pubkey, registration.bls_pubkey);
+        assert_eq!(whitelist.schnorr_sig, registration.schnorr_sig);
+        assert_eq!(whitelist.bls_sig, registration.bls_sig);
+        assert_eq!(whitelist.first_name, "Ada");
+        assert_eq!(whitelist.last_name, "Lovelace");
+        assert_eq!(whitelist.email, "ada@example.com");
+        assert_eq!(whitelist.company, None);
+    }
+
+    /// Whatever surrounds what the operator typed is not part of it, and a
+    /// blank company is an absent one — the Portal stores `null` either way.
+    #[test]
+    fn whitelist_contact_fields_are_trimmed_and_blank_company_is_absent() {
+        let keypair = keypair();
+        let request = build_whitelist_request(
+            &keypair,
+            BIP32_XPUB,
+            &keypair.public_key_hex(),
+            &"ab".repeat(64),
+            &WhitelistContact {
+                first_name: "  Ada ".to_string(),
+                last_name: " Lovelace  ".to_string(),
+                email: " ada@example.com ".to_string(),
+                company: Some("   ".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(request.first_name, "Ada");
+        assert_eq!(request.last_name, "Lovelace");
+        assert_eq!(request.email, "ada@example.com");
+        assert_eq!(request.company, None);
+    }
+
+    /// Submissions are quota'd per IP and the Portal charges the quota before
+    /// validating, so everything it would refuse has to be refused here first.
+    #[test]
+    fn a_contact_the_portal_would_refuse_never_leaves_the_node() {
+        let keypair = keypair();
+        let build = |contact: WhitelistContact| {
+            build_whitelist_request(
+                &keypair,
+                BIP32_XPUB,
+                &keypair.public_key_hex(),
+                &"ab".repeat(64),
+                &contact,
+            )
+        };
+
+        for (label, broken) in [
+            (
+                "an empty first name",
+                WhitelistContact {
+                    first_name: " ".to_string(),
+                    ..contact()
+                },
+            ),
+            (
+                "an over-long last name",
+                WhitelistContact {
+                    last_name: "x".repeat(101),
+                    ..contact()
+                },
+            ),
+            (
+                "an email with no @",
+                WhitelistContact {
+                    email: "ada.example.com".to_string(),
+                    ..contact()
+                },
+            ),
+            (
+                "an email with a bare domain",
+                WhitelistContact {
+                    email: "ada@example".to_string(),
+                    ..contact()
+                },
+            ),
+            (
+                "an email with whitespace",
+                WhitelistContact {
+                    email: "ada lovelace@example.com".to_string(),
+                    ..contact()
+                },
+            ),
+            (
+                "an over-long company",
+                WhitelistContact {
+                    company: Some("x".repeat(201)),
+                    ..contact()
+                },
+            ),
+        ] {
+            assert!(build(broken).is_err(), "{label} must be refused locally");
+        }
+    }
+
+    /// Same guard as the registration path: a request naming a key this node
+    /// cannot sign for would queue an entry for somebody else's address.
+    #[test]
+    fn a_whitelist_request_for_a_foreign_bls_key_is_refused() {
+        let mine = keypair();
+        let other = keypair();
+        let err = build_whitelist_request(
+            &mine,
+            BIP32_XPUB,
+            &other.public_key_hex(),
+            &"ab".repeat(64),
+            &contact(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match this node's key"),
+            "{err:#}"
+        );
     }
 
     /// The two signatures answer different questions — "this BLS key accepts

@@ -56,7 +56,7 @@ aes = "0.8"
 cipher = { version = "0.4", features = ["block-padding"] }
 ctr = "0.9"
 argon2 = "0.5"
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 rpassword = "7.3"
 # Mnemonic-derived identity, byte-compatible with Horizon Wallet. All pure Rust:
 # the node deliberately keeps `bitcoin` and its secp256k1 C bindings out of the
@@ -67,12 +67,23 @@ rpassword = "7.3"
 bip39 = "2"
 bip32 = { version = "0.5", default-features = false, features = ["std", "secp256k1"] }
 k256 = { version = "0.13", features = ["schnorr"] }
+# P-256 ECDH + HKDF: the sealed envelope the setup wizard posts a mnemonic
+# through. P-256 rather than X25519 because WebCrypto supports it in every
+# browser, and the page must run with no external script at all.
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
 bech32 = "0.11"
 # HTTP signature (RFC 9421)
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 postcard = { version = "1.1", features = ["alloc"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Only for `flock`, which is how the daemon lock tells a live holder from one
+# left behind by a SIGKILL — the kernel releases it either way. Already in the
+# tree via tokio, so naming it here costs nothing to build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

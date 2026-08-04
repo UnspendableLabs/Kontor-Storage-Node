@@ -97,6 +97,10 @@ mod tests {
     /// block it keys off, the route it posts to, and the three wallet fields it
     /// forwards. A rename on either side leaves an operator with a button that
     /// does nothing on the one node that needs it.
+    ///
+    /// No `result.restarting` here any more, and its absence is the point: a
+    /// registration is carried out in the running process, so the page has no
+    /// exit to announce and nothing to sign back into.
     #[test]
     fn admin_html_speaks_the_same_registration_api_as_the_server() {
         for key in [
@@ -104,10 +108,37 @@ mod tests {
             "registration.registered",
             "registration.bls_pubkey",
             "/api/admin/register-node",
-            "result.restarting",
             "pop.xpubkey",
             "pop.blsPubkey",
             "pop.schnorrSig",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
+    /// The whitelist form is the one path onto the Portal's whitelist that
+    /// does not require finding an admin out of band, and it is driven
+    /// entirely by these names: the route both halves share, the four contact
+    /// fields the operator types, and the status fields the page renders the
+    /// wait from. A rename on either side leaves an unwhitelisted node — the
+    /// one state an operator cannot fix any other way from here — with a form
+    /// that quietly does nothing.
+    #[test]
+    fn admin_html_speaks_the_same_whitelist_api_as_the_server() {
+        for key in [
+            "/api/admin/whitelist-request",
+            "first_name",
+            "last_name",
+            "email:",
+            "company:",
+            "view.status",
+            "view.request_id",
+            "view.review_note",
+            "view.whitelisted",
+            "view.bitcoin_address",
+            "whitelist-form",
+            "function submitWhitelist",
+            "function loadWhitelist",
         ] {
             assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
         }
@@ -125,6 +156,237 @@ mod tests {
             !ADMIN_HTML.contains("signMessageBLS"),
             "the node signs the registration op with its own BLS key"
         );
+    }
+
+    /// The setup wizard is the whole of zero-configuration on the browser side,
+    /// and it is driven entirely by these names: the endpoints it calls, the
+    /// bootstrap fields it switches panes on, and the four sealed-envelope
+    /// fields it posts. A rename on either side leaves an operator with a form
+    /// that cannot set their node up — on the one node that has no other way in.
+    #[test]
+    fn admin_html_speaks_the_same_setup_api_as_the_server() {
+        for key in [
+            "/api/admin/bootstrap",
+            "/api/admin/claim",
+            "/api/admin/envelope",
+            "/api/admin/setup/provision",
+            "/api/admin/unseal",
+            "info.claimed",
+            "setup_token_fingerprint",
+            "envelope.session_id",
+            "envelope.node_pubkey",
+            "client_pubkey",
+            "ciphertext",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
+    /// The envelope is only as good as the primitives on both sides agreeing.
+    /// These are the exact WebCrypto names that have to match
+    /// [`crate::server::admin::envelope`]: P-256 ECDH, HKDF-SHA256 salted with
+    /// the session id, AES-GCM with that same id as additional authenticated
+    /// data.
+    #[test]
+    fn admin_html_seals_with_the_agreed_primitives() {
+        for key in [
+            "P-256",
+            "ECDH",
+            "HKDF",
+            "SHA-256",
+            "AES-GCM",
+            "deriveBits",
+            "additionalData",
+            "KONTOR_ADMIN_ENVELOPE_V1",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
+    /// Both directions, expanded from one HKDF call. 512 bits is the number
+    /// that has to match [`crate::server::admin::envelope`]: expand to 256 and
+    /// the page would derive one key where the node derives two, and every
+    /// sealed reply would fail to open with nothing saying why.
+    #[test]
+    fn admin_html_derives_a_key_for_each_direction() {
+        assert!(
+            ADMIN_HTML.contains("ikm, 512"),
+            "the page must expand HKDF to two keys"
+        );
+        for key in ["openEnvelope", "sealRequest", "openResponse"] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+        // One encrypt key and one decrypt key, not a single reversible one.
+        assert!(ADMIN_HTML.contains(r#"["encrypt"]"#));
+        assert!(ADMIN_HTML.contains(r#"["decrypt"]"#));
+    }
+
+    /// The account is the one field on this page a typo cannot be recovered
+    /// from: an off-by-one derives a different node entirely, registers it, and
+    /// leaves the original's agreements behind. `0` is refused by name rather
+    /// than read as the first account — see [`crate::crypto::mnemonic`] — and
+    /// that refusal only reaches the operator if the page sends what they typed
+    /// instead of coercing it.
+    #[test]
+    fn admin_html_sends_the_account_as_typed() {
+        assert!(
+            !ADMIN_HTML.contains("|| 1"),
+            "a falsy default would turn a typed 0 into account 1, silently"
+        );
+        assert!(ADMIN_HTML.contains("account: account"));
+    }
+
+    /// The one thing this page must never do. Neither of the two secrets it
+    /// sends may appear in a request body outside the sealed envelope: a seed
+    /// phrase cannot be rotated after a leak, and a seal passphrase opens the
+    /// keystore. Both are read into the object that gets sealed and nowhere
+    /// else.
+    #[test]
+    fn admin_html_never_posts_a_bare_secret() {
+        assert!(ADMIN_HTML.contains("mnemonic: phrase"));
+        assert!(ADMIN_HTML.contains("passphrase: passphrase"));
+        // And the phrase is cleared as soon as it has been sent.
+        assert!(ADMIN_HTML.contains(r#"$("setup-mnemonic").value = "";"#));
+
+        for bare in ["body: { mnemonic", "body: { passphrase"] {
+            assert!(
+                !ADMIN_HTML.contains(bare),
+                "{bare}: a secret must never be posted outside the sealed envelope"
+            );
+        }
+    }
+
+    /// The two rules that make `hidden` mean anything on this page, and both of
+    /// them were learned the hard way.
+    ///
+    /// `[hidden]` only exists in the user agent's stylesheet, so any author rule
+    /// setting `display` silently outranks it — `#login { display: grid }` did
+    /// exactly that, and an unclaimed node rendered a full-viewport sign-in
+    /// screen over the claim form that was its only way in. And a box that
+    /// ships `hidden` stays hidden unless something clears it: `show` writing
+    /// only `textContent` is why the one-time `KONTOR_SEAL_KEY` reveal
+    /// displayed nothing at all, on the one screen where the value is never
+    /// shown twice.
+    #[test]
+    fn admin_html_makes_the_hidden_attribute_authoritative() {
+        assert!(
+            ADMIN_HTML.contains("[hidden] { display: none !important; }"),
+            "an author `display` rule would otherwise beat the attribute"
+        );
+        assert!(
+            ADMIN_HTML.contains("el.hidden = !text;"),
+            "`show` must reveal the box it writes into, or a message box that \
+             ships `hidden` can never be read"
+        );
+    }
+
+    /// One function decides which of the three screens is up. The state that
+    /// broke was the one nobody wrote down — login hidden *and* claim shown —
+    /// so the page must not go back to setting them one at a time.
+    #[test]
+    fn admin_html_switches_screens_in_one_place() {
+        assert!(ADMIN_HTML.contains("function showScreen"));
+        for screen in [
+            "showScreen(\"login\")",
+            "showScreen(\"claim\")",
+            "showScreen(\"app\")",
+        ] {
+            assert!(
+                ADMIN_HTML.contains(screen),
+                "the page must still use {screen}"
+            );
+        }
+        assert!(
+            !ADMIN_HTML.contains("$(\"login\").style.display")
+                && !ADMIN_HTML.contains("$(\"app\").style.display"),
+            "the screens are switched by `showScreen`, not by inline styles"
+        );
+    }
+
+    /// Every sealed exchange goes through one helper. Four copies of
+    /// envelope-then-seal-then-post is four chances for one of them to drop the
+    /// envelope and post a secret in the clear.
+    #[test]
+    fn admin_html_seals_every_request_through_one_helper() {
+        assert!(ADMIN_HTML.contains("function sealedPost"));
+        for path in [
+            "sealedPost(\"/api/admin/setup/provision\"",
+            "sealedPost(\"/api/admin/unseal\"",
+        ] {
+            assert!(ADMIN_HTML.contains(path), "the page must still use {path}");
+        }
+    }
+
+    /// Every lifecycle card ships `hidden` and is revealed by the phase alone.
+    /// A card with no `renderPhase` branch is a card an operator can never
+    /// reach — and on a fresh node the setup wizard is the only way in, so that
+    /// failure is a node nobody can configure.
+    #[test]
+    fn admin_html_reveals_each_lifecycle_card_from_the_phase() {
+        assert!(ADMIN_HTML.contains("function renderPhase"));
+        assert!(
+            ADMIN_HTML.contains("renderPhase(data)"),
+            "the status poll must drive the phase, or the cards never move"
+        );
+
+        for branch in [
+            r#"$("setup").hidden = phase !== "uninitialized""#,
+            r#"$("unseal").hidden = phase !== "sealed""#,
+        ] {
+            assert!(
+                ADMIN_HTML.contains(branch),
+                "the page must still use {branch}"
+            );
+        }
+        assert!(ADMIN_HTML.contains("phase-notice"));
+    }
+
+    /// The recovery password is the only way back into a keystore whose seal key
+    /// is gone, and it can only be added while the node still holds what opens
+    /// that keystore. It therefore rides along with setup — the one moment an
+    /// operator is reliably looking at the node — rather than sitting behind a
+    /// card they have to know to visit. A page that stopped offering it would
+    /// leave the unseal card, which it still has, unreachable in practice.
+    #[test]
+    fn admin_html_offers_the_recovery_password_at_setup() {
+        assert!(
+            ADMIN_HTML.contains(r#"id="setup-passphrase""#),
+            "the setup form must carry the optional recovery password"
+        );
+        assert!(
+            ADMIN_HTML.contains("passphrase: passphrase === \"\" ? null : passphrase"),
+            "an untouched field must arrive as absent, not as a passphrase the \
+             node then refuses as too short"
+        );
+        // Cleared once sent, exactly as the seed phrase above it is.
+        assert!(ADMIN_HTML.contains(r#"$("setup-passphrase").value = "";"#));
+        assert!(
+            ADMIN_HTML.contains("result.passphrase_slot"),
+            "the page must tell the operator when a slot was actually added"
+        );
+    }
+
+    /// The slot-management card is gone, and with it every button that reshaped
+    /// a live keystore from the browser. The endpoints survive for scripted use;
+    /// what must not come back is a page that offers an operator a `KONTOR_SEAL_KEY`
+    /// to paste, since the page can no longer explain the two-step flow that
+    /// makes it safe.
+    #[test]
+    fn admin_html_no_longer_manages_seal_slots() {
+        for gone in [
+            "/api/admin/seal/env-slot",
+            "/api/admin/seal/drop-file-slot",
+            "/api/admin/seal/passphrase",
+            "seal-add-env",
+            "seal-drop-file",
+            "seal-passphrase-submit",
+            "function loadSeal",
+        ] {
+            assert!(
+                !ADMIN_HTML.contains(gone),
+                "{gone}: the seal-slot card was removed from /admin"
+            );
+        }
     }
 
     /// The ledger block is the only place a stopped prover shows up: the row
