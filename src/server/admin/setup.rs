@@ -58,7 +58,9 @@ fn default_account() -> u32 {
 ///   payload does not authenticate.
 /// - `400 INVALID_SETUP` when what it contained is not a usable seed phrase.
 /// - `400 WEAK_PASSWORD` when the optional passphrase is too short.
-/// - `500` when the keystore cannot be written.
+/// - `500` when the keystore cannot be written, and — the one error this
+///   endpoint answers about a node it nonetheless brought up — when the optional
+///   recovery password could not be sealed into a slot of its own.
 pub async fn provision(
     request: &SealedRequest,
     state: &DownloadServerState,
@@ -99,7 +101,13 @@ pub async fn provision(
     let keystore = Keystore::provision(app_dir, &secret, Some(public.clone()), &seal_key)
         .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
 
-    let keystore = seal_passphrase_slot(keystore, &seal_key, passphrase).await?;
+    // Failure here is reported, not returned: the identity is already sealed on
+    // disk and openable, so the node is set up — it is the recovery it asked for
+    // that is missing. Returning early would leave a keystore on the volume and
+    // a process still in `Uninitialized`, which is the one combination that
+    // matters: the guard above reads the phase, so the next attempt from the
+    // same page would provision straight over the identity just written.
+    let (keystore, passphrase_error) = seal_passphrase_slot(keystore, &seal_key, passphrase).await;
     let has_passphrase_slot = keystore.slots().contains(&keystore::SlotKind::Passphrase);
 
     // Rebuilt from the secret that was just sealed rather than left for the
@@ -149,6 +157,13 @@ pub async fn provision(
         source,
     });
 
+    // Answered last, once the node it describes is really on its way up. The
+    // operator has to hear that the password they typed does not open anything,
+    // even though everything else worked.
+    if let Some(error) = passphrase_error {
+        return Err(error);
+    }
+
     Ok(body)
 }
 
@@ -179,35 +194,61 @@ fn optional_passphrase(raw: Option<String>) -> Result<Option<Zeroizing<String>>,
 /// Added *alongside* the file slot rather than instead of it, which is what
 /// keeps the node restarting unattended: the passphrase is a way back in, not
 /// the way in.
+///
+/// Hands back a keystore either way — the caller has a node to bring up whether
+/// or not the second slot happened, and the error travels beside it rather than
+/// in place of it. On failure that keystore is the one `provision` wrote, not
+/// the copy the task mutated: `add_slot` pushes the slot before it writes, so a
+/// write that failed would otherwise leave an in-memory keystore claiming a slot
+/// the file does not have.
 async fn seal_passphrase_slot(
     keystore: Keystore,
     unlock: &SealKey,
     passphrase: Option<Zeroizing<String>>,
-) -> Result<Keystore, ApiError> {
+) -> (Keystore, Option<ApiError>) {
     let Some(passphrase) = passphrase else {
-        return Ok(keystore);
+        return (keystore, None);
     };
+
+    let sealed = keystore.clone();
 
     // Off the executor: wrapping under a passphrase is 64 MiB of Argon2id, and
     // this runs on the same runtime that is serving the rest of `/admin`.
     let unlock = unlock.clone();
-    tokio::task::spawn_blocking(move || {
+    let joined = tokio::task::spawn_blocking(move || {
         let mut keystore = keystore;
         keystore
             .add_slot(&unlock, &SealKey::passphrase(passphrase.as_str()))
             .map(|()| keystore)
     })
-    .await
-    .map_err(|e| ApiError::server_error(format!("sealing task failed: {e}")))?
-    .map_err(|e| {
-        // The identity itself is already on disk and openable through the file
-        // slot, so this is a node that works minus the recovery it asked for.
-        // Say which half failed rather than let it read as a failed setup.
-        ApiError::server_error(format!(
-            "the node was set up, but the recovery password could not be added \
-             (it can be added later from /admin): {e:#}"
-        ))
-    })
+    .await;
+
+    // The identity itself is already on disk and openable through the file slot,
+    // so this is a node that works minus the recovery it asked for. Which half
+    // failed goes in the *message*, not the detail: `ApiError::server_error`
+    // keeps its argument out of the body, so an operator whose node came up fine
+    // would read "Internal error" and have no way to tell a node that is running
+    // without a recovery password from a setup that did not happen.
+    let failed = |reason: String| {
+        (
+            sealed,
+            Some(
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "The node was set up and is starting, but the recovery password could not \
+                     be added — it opens nothing. Add one from /admin, or set the node up again.",
+                )
+                .with_detail(reason),
+            ),
+        )
+    };
+
+    match joined {
+        Ok(Ok(keystore)) => (keystore, None),
+        Ok(Err(e)) => failed(format!("{e:#}")),
+        Err(e) => failed(format!("sealing task failed: {e}")),
+    }
 }
 
 /// Derive an identity from what the operator typed, with the account and
@@ -407,6 +448,52 @@ mod tests {
             optional_passphrase(Some("a recovery password long enough".into()))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A slot that cannot be added must not cost the node the identity it just
+    /// sealed. The keystore comes back so the caller can still bring the node
+    /// up — and it is the one on disk, without the slot that failed, or the
+    /// seal card would report a way in that does not exist.
+    #[tokio::test]
+    async fn a_recovery_password_that_cannot_be_added_still_yields_the_node() {
+        let dir = tempdir();
+        let (seal_key, _) = keystore::resolve_seal_key(dir.path(), true)
+            .unwrap()
+            .unwrap();
+        let identity = MnemonicIdentity::derive(
+            &MnemonicSettings::for_setup(PHRASE, BitcoinNetwork::Signet, 1).unwrap(),
+        )
+        .unwrap();
+        let keystore = Keystore::provision(
+            dir.path(),
+            &identity.keypair.secret_key_hex(),
+            Some(identity.public().unwrap()),
+            &seal_key,
+        )
+        .unwrap();
+
+        // Not the key this keystore was sealed with, so unwrapping the data key
+        // fails and the slot is never written.
+        let wrong = SealKey::passphrase("a recovery password long enough");
+        let (keystore, error) = seal_passphrase_slot(
+            keystore,
+            &wrong,
+            Some(Zeroizing::new("another one long enough".to_string())),
+        )
+        .await;
+
+        let error = error.expect("adding a slot under the wrong key cannot succeed");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error.message.contains("recovery password"),
+            "the operator reads `message`, and it has to say which half failed: {}",
+            error.message
+        );
+        assert_eq!(
+            keystore.slots(),
+            vec![keystore::SlotKind::File],
+            "the keystore handed back is the one on disk, not the mutated copy"
         );
     }
 

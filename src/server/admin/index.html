@@ -693,7 +693,15 @@
     // once registered, the address was on the list by definition.
     whitelistDerived = !!registration.derived;
     $("whitelist").hidden = registered;
-    if (!registered) { loadWhitelist(); }
+    // A node that registers has left this section behind; forgetting the answer
+    // is what makes a later re-registration ask again rather than render what
+    // the Portal said before the key changed.
+    if (registered) {
+      whitelistLoaded = false;
+      whitelistFailed = false;
+    } else {
+      refreshWhitelist();
+    }
 
     if (registered) {
       $("registration-title").textContent = "Portal registration";
@@ -899,12 +907,21 @@
   // proof of possession: the node itself, or Horizon Wallet.
   var whitelistDerived = false;
   var whitelistInFlight = false;
+  // Whether the Portal has answered once in this session, and what it said.
+  // Together they are what keeps `refreshWhitelist` from asking again when the
+  // answer cannot have changed.
+  var whitelistLoaded = false;
+  var whitelistStatus = "none";
+  var whitelistFailed = false;
 
   function renderWhitelist(view) {
     var status = (view && view.status) || "none";
     var form = $("whitelist-form");
     var box = $("whitelist-status");
 
+    whitelistLoaded = true;
+    whitelistFailed = false;
+    whitelistStatus = status;
     if (view && view.bitcoin_address) { whitelistAddress = view.bitcoin_address; }
 
     if (status === "pending") {
@@ -941,7 +958,25 @@
     }
   }
 
-  function loadWhitelist() {
+  // Asked once when the section appears, and after that only while a request is
+  // pending — the one state that can change without this page doing anything,
+  // since a Portal admin approves or rejects it on their own time. "none" and
+  // the two settled verdicts are only ever left through the form below, so
+  // re-asking on every 30 s poll would be a Portal round trip per poll that
+  // could not answer anything new.
+  function refreshWhitelist() {
+    if (whitelistInFlight) { return; }
+    if (whitelistLoaded && whitelistStatus !== "pending") { return; }
+    // A Portal that cannot be reached is still retried on every poll, so the
+    // section fills in by itself once it comes back — but it is said out loud
+    // once, not once per poll.
+    loadWhitelist(whitelistLoaded || whitelistFailed);
+  }
+
+  // `background` suppresses the error box: a poll that could not reach the
+  // Portal tells the operator nothing they can act on, and saying it every
+  // 30 s buries the message that comes from something they did.
+  function loadWhitelist(background) {
     var path = "/api/admin/whitelist-request";
     if (whitelistAddress) {
       path += "?bitcoin_address=" + encodeURIComponent(whitelistAddress);
@@ -949,7 +984,8 @@
     api(path).then(function (view) {
       renderWhitelist(view);
     }).catch(function (error) {
-      report($("whitelist-error"), error);
+      whitelistFailed = true;
+      if (!background) { report($("whitelist-error"), error); }
     });
   }
 
