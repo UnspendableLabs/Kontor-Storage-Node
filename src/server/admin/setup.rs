@@ -24,9 +24,10 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::app::lifecycle::{Activation, Phase};
-use crate::crypto::keystore::{self, Keystore};
+use crate::crypto::keystore::{self, Keystore, SealKey};
 use crate::crypto::{BitcoinNetwork, BlsKeyPair, MnemonicIdentity, MnemonicSettings};
 use crate::server::admin::envelope::{self, SealedRequest};
+use crate::server::admin::seal::MIN_PASSPHRASE_LEN;
 use crate::server::admin::{error_codes, ApiError};
 use crate::server::state::DownloadServerState;
 
@@ -38,6 +39,11 @@ struct ProvisionPayload {
     account: u32,
     #[serde(default)]
     network: Option<String>,
+    /// An optional second way into the keystore, offered here because this is
+    /// the only moment an operator is reliably looking at the node: by the time
+    /// a seal key is lost, it is far too late to add one.
+    #[serde(default)]
+    passphrase: Option<String>,
 }
 
 fn default_account() -> u32 {
@@ -51,6 +57,7 @@ fn default_account() -> u32 {
 /// - `400 INVALID_ENVELOPE` when the envelope is unknown, expired, or the
 ///   payload does not authenticate.
 /// - `400 INVALID_SETUP` when what it contained is not a usable seed phrase.
+/// - `400 WEAK_PASSWORD` when the optional passphrase is too short.
 /// - `500` when the keystore cannot be written.
 pub async fn provision(
     request: &SealedRequest,
@@ -65,6 +72,11 @@ pub async fn provision(
     require_uninitialized(state)?;
 
     let (_session, payload) = envelope::open_as::<ProvisionPayload>(request, state)?;
+
+    // Checked before anything is derived or written, so a passphrase this node
+    // would refuse costs a retry on a form the operator is still looking at,
+    // rather than a provisioned node whose second slot silently never happened.
+    let passphrase = optional_passphrase(payload.passphrase)?;
 
     // From here on the phrase lives in `Zeroizing` and nothing else. It is not
     // logged, not echoed in the response, and not written to disk in any form.
@@ -87,6 +99,9 @@ pub async fn provision(
     let keystore = Keystore::provision(app_dir, &secret, Some(public.clone()), &seal_key)
         .map_err(|e| ApiError::server_error(format!("{e:#}")))?;
 
+    let keystore = seal_passphrase_slot(keystore, &seal_key, passphrase).await?;
+    let has_passphrase_slot = keystore.slots().contains(&keystore::SlotKind::Passphrase);
+
     // Rebuilt from the secret that was just sealed rather than left for the
     // supervisor to unwrap: it is the same key either way, and handing it over
     // is what keeps the supervisor off the unsealing path entirely. Cheap here
@@ -98,6 +113,7 @@ pub async fn provision(
     tracing::info!(
         node_id = %public.node_id,
         seal_slot = %source.kind(),
+        passphrase_slot = has_passphrase_slot,
         "Node provisioned from /admin; sealing complete"
     );
 
@@ -109,6 +125,7 @@ pub async fn provision(
         "bls_pubkey": public.bls_pubkey,
         "seal_slot": source.kind().to_string(),
         "seal_fingerprint": seal_key.fingerprint(),
+        "passphrase_slot": has_passphrase_slot,
     });
 
     // Published here rather than left to the supervisor, which announces the
@@ -116,9 +133,8 @@ pub async fn provision(
     // the keystore with this key, so it knows the answer, and the supervisor may
     // be a scheduling quantum away: in between, `GET /api/admin/seal` would tell
     // an operator their node cannot open its own keystore and `restart_available`
-    // would say no — about a node that was provisioned a moment ago. The page
-    // caches the seal card per phase, so that answer would then stick for as long
-    // as activation takes.
+    // would say no — about a node that was provisioned a moment ago, and on the
+    // very poll that decides whether the reset card's restart box is usable.
     state.runtime.opened(&keystore, &seal_key, source);
 
     // Entered here rather than left to the supervisor. The phase *is* the lock
@@ -134,6 +150,64 @@ pub async fn provision(
     });
 
     Ok(body)
+}
+
+/// Read the optional recovery passphrase off the payload.
+///
+/// Blank and absent are the same thing — an operator who left the field alone —
+/// and neither is an error. Anything shorter than [`MIN_PASSPHRASE_LEN`] is,
+/// because this is the one secret on the node that sits behind no login
+/// throttle: whoever holds the keystore file can try it offline.
+fn optional_passphrase(raw: Option<String>) -> Result<Option<Zeroizing<String>>, ApiError> {
+    let Some(passphrase) = raw.map(Zeroizing::new).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(ApiError::bad_request(
+            error_codes::WEAK_PASSWORD,
+            format!("The recovery password must be at least {MIN_PASSPHRASE_LEN} characters."),
+        ));
+    }
+
+    Ok(Some(passphrase))
+}
+
+/// Add the passphrase slot, if one was asked for, to the keystore that was just
+/// written.
+///
+/// Added *alongside* the file slot rather than instead of it, which is what
+/// keeps the node restarting unattended: the passphrase is a way back in, not
+/// the way in.
+async fn seal_passphrase_slot(
+    keystore: Keystore,
+    unlock: &SealKey,
+    passphrase: Option<Zeroizing<String>>,
+) -> Result<Keystore, ApiError> {
+    let Some(passphrase) = passphrase else {
+        return Ok(keystore);
+    };
+
+    // Off the executor: wrapping under a passphrase is 64 MiB of Argon2id, and
+    // this runs on the same runtime that is serving the rest of `/admin`.
+    let unlock = unlock.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut keystore = keystore;
+        keystore
+            .add_slot(&unlock, &SealKey::passphrase(passphrase.as_str()))
+            .map(|()| keystore)
+    })
+    .await
+    .map_err(|e| ApiError::server_error(format!("sealing task failed: {e}")))?
+    .map_err(|e| {
+        // The identity itself is already on disk and openable through the file
+        // slot, so this is a node that works minus the recovery it asked for.
+        // Say which half failed rather than let it read as a failed setup.
+        ApiError::server_error(format!(
+            "the node was set up, but the recovery password could not be added \
+             (it can be added later from /admin): {e:#}"
+        ))
+    })
 }
 
 /// Derive an identity from what the operator typed, with the account and
@@ -203,6 +277,15 @@ mod tests {
 
     /// Fetch an envelope and seal a setup payload against it, as the page does.
     fn sealed_setup(state: &DownloadServerState, account: u32) -> SealedRequest {
+        sealed_setup_with(state, account, None)
+    }
+
+    /// The same, with whatever the optional recovery-password field held.
+    fn sealed_setup_with(
+        state: &DownloadServerState,
+        account: u32,
+        passphrase: Option<&str>,
+    ) -> SealedRequest {
         let envelope = envelope::issue(state);
         let session_id = envelope["session_id"].as_str().unwrap();
         let client = Client::greet(envelope["node_pubkey"].as_str().unwrap(), session_id);
@@ -213,6 +296,7 @@ mod tests {
                 "mnemonic": PHRASE,
                 "account": account,
                 "network": "signet",
+                "passphrase": passphrase,
             }))
             .unwrap(),
         )
@@ -251,6 +335,78 @@ mod tests {
         assert!(
             state.runtime.can_restart(),
             "a node that has just sealed a file slot can plainly come back on it"
+        );
+    }
+
+    /// The wizard is the only moment an operator is reliably looking at a node,
+    /// so the recovery slot has to be addable right here — and *alongside* the
+    /// file slot, or the node would stop restarting unattended the moment
+    /// somebody filled the field in.
+    #[tokio::test]
+    async fn a_recovery_password_becomes_a_second_slot() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup_with(&state, 1, Some("a recovery password long enough"));
+
+        let body = provision(&request, &state).await.unwrap();
+
+        assert_eq!(body["passphrase_slot"], true);
+        assert_eq!(body["seal_slot"], "file");
+
+        let keystore = Keystore::load(dir.path()).await.unwrap().unwrap();
+        let slots = keystore.slots();
+        assert!(slots.contains(&keystore::SlotKind::Passphrase), "{slots:?}");
+        assert!(
+            slots.contains(&keystore::SlotKind::File),
+            "the machine slot has to survive, or the node needs a human to boot: {slots:?}"
+        );
+        assert!(
+            state.runtime.can_restart(),
+            "a node that kept its file slot can still come back on its own"
+        );
+    }
+
+    /// The field is optional, and a node set up without it is exactly the node
+    /// this branch's zero-config path produces.
+    #[tokio::test]
+    async fn no_recovery_password_leaves_a_single_slot() {
+        let (state, dir) = uninitialized_node().await;
+
+        let body = provision(&sealed_setup(&state, 1), &state).await.unwrap();
+
+        assert_eq!(body["passphrase_slot"], false);
+        assert_eq!(
+            Keystore::load(dir.path()).await.unwrap().unwrap().slots(),
+            vec![keystore::SlotKind::File]
+        );
+    }
+
+    /// Refused *before* anything is derived or written. A node provisioned with
+    /// the recovery it asked for silently missing is the one outcome this must
+    /// not produce, so the check runs while the operator is still on the form.
+    #[tokio::test]
+    async fn a_short_recovery_password_leaves_the_node_untouched() {
+        let (state, dir) = uninitialized_node().await;
+        let request = sealed_setup_with(&state, 1, Some("too short"));
+
+        let err = provision(&request, &state).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, error_codes::WEAK_PASSWORD);
+
+        assert!(Keystore::load(dir.path()).await.unwrap().is_none());
+        assert_eq!(state.runtime.phase(), Phase::Uninitialized);
+    }
+
+    /// A field left alone arrives as `""` or not at all, and neither is an
+    /// operator asking for a slot the node should then refuse as too short.
+    #[test]
+    fn a_blank_recovery_password_is_the_same_as_none() {
+        assert!(optional_passphrase(None).unwrap().is_none());
+        assert!(optional_passphrase(Some(String::new())).unwrap().is_none());
+        assert!(optional_passphrase(Some("short".into())).is_err());
+        assert!(
+            optional_passphrase(Some("a recovery password long enough".into()))
+                .unwrap()
+                .is_some()
         );
     }
 

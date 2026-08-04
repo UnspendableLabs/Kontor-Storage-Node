@@ -171,17 +171,12 @@ mod tests {
             "/api/admin/envelope",
             "/api/admin/setup/provision",
             "/api/admin/unseal",
-            "/api/admin/seal",
-            "/api/admin/seal/env-slot",
-            "/api/admin/seal/drop-file-slot",
             "info.claimed",
             "setup_token_fingerprint",
             "envelope.session_id",
             "envelope.node_pubkey",
             "client_pubkey",
             "ciphertext",
-            // The reply direction: the seal key arrives under `sealed`.
-            "result.sealed",
         ] {
             assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
         }
@@ -316,8 +311,6 @@ mod tests {
         assert!(ADMIN_HTML.contains("function sealedPost"));
         for path in [
             "sealedPost(\"/api/admin/setup/provision\"",
-            "sealedPost(\"/api/admin/seal/passphrase\"",
-            "sealedPost(\"/api/admin/seal/env-slot\"",
             "sealedPost(\"/api/admin/unseal\"",
         ] {
             assert!(ADMIN_HTML.contains(path), "the page must still use {path}");
@@ -345,31 +338,55 @@ mod tests {
                 "the page must still use {branch}"
             );
         }
-        // The seal card is the exception: it is loaded rather than toggled,
-        // because its contents come from an endpoint.
-        assert!(ADMIN_HTML.contains("loadSeal()"));
         assert!(ADMIN_HTML.contains("phase-notice"));
     }
 
-    /// The passphrase slot is the only recovery from a lost seal key, and it
-    /// can only be added while the node still holds what opened its keystore.
-    /// A page that did not offer it would leave the unseal card — which it does
-    /// have — permanently unreachable in practice.
+    /// The recovery password is the only way back into a keystore whose seal key
+    /// is gone, and it can only be added while the node still holds what opens
+    /// that keystore. It therefore rides along with setup — the one moment an
+    /// operator is reliably looking at the node — rather than sitting behind a
+    /// card they have to know to visit. A page that stopped offering it would
+    /// leave the unseal card, which it still has, unreachable in practice.
     #[test]
-    fn admin_html_offers_the_passphrase_slot_the_seal_api_describes() {
-        for key in [
-            "/api/admin/seal/passphrase",
-            "seal.can_add_passphrase_slot",
-            "seal.has_passphrase_slot",
-            "seal.min_passphrase_len",
-            "seal-passphrase-submit",
-            "function addPassphraseSlot",
-        ] {
-            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
-        }
+    fn admin_html_offers_the_recovery_password_at_setup() {
+        assert!(
+            ADMIN_HTML.contains(r#"id="setup-passphrase""#),
+            "the setup form must carry the optional recovery password"
+        );
+        assert!(
+            ADMIN_HTML.contains("passphrase: passphrase === \"\" ? null : passphrase"),
+            "an untouched field must arrive as absent, not as a passphrase the \
+             node then refuses as too short"
+        );
+        // Cleared once sent, exactly as the seed phrase above it is.
+        assert!(ADMIN_HTML.contains(r#"$("setup-passphrase").value = "";"#));
+        assert!(
+            ADMIN_HTML.contains("result.passphrase_slot"),
+            "the page must tell the operator when a slot was actually added"
+        );
+    }
 
-        // Sealed on the way up like the seed phrase, and cleared once sent.
-        assert!(ADMIN_HTML.contains(r#"field.value = "";"#));
+    /// The slot-management card is gone, and with it every button that reshaped
+    /// a live keystore from the browser. The endpoints survive for scripted use;
+    /// what must not come back is a page that offers an operator a `KONTOR_SEAL_KEY`
+    /// to paste, since the page can no longer explain the two-step flow that
+    /// makes it safe.
+    #[test]
+    fn admin_html_no_longer_manages_seal_slots() {
+        for gone in [
+            "/api/admin/seal/env-slot",
+            "/api/admin/seal/drop-file-slot",
+            "/api/admin/seal/passphrase",
+            "seal-add-env",
+            "seal-drop-file",
+            "seal-passphrase-submit",
+            "function loadSeal",
+        ] {
+            assert!(
+                !ADMIN_HTML.contains(gone),
+                "{gone}: the seal-slot card was removed from /admin"
+            );
+        }
     }
 
     /// The ledger block is the only place a stopped prover shows up: the row

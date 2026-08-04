@@ -196,18 +196,12 @@ async function checkTheReveal() {
     "and no screen is hidden by a display rule the attribute cannot override",
   );
 
-  // Visible is not the same as legible. The reveal is written with blank lines
-  // around the key, and `show` writes `textContent` — so without `pre-wrap` the
-  // whole thing collapses into one run-on line with a 44-character base64 blob
-  // wedged between two sentences. It is shown exactly once, is not recoverable,
-  // and is copied by hand.
+  // Visible is not the same as legible. `show` writes `textContent`, so without
+  // `pre-wrap` every message written with blank lines in it collapses into one
+  // run-on paragraph.
   check(
     /\.msg\s*\{[^}]*white-space:\s*pre-wrap/.test(page),
     "and messages keep the line breaks they were written with",
-  );
-  check(
-    /show\(\$\("seal-key-reveal"\),[\s\S]{0,400}?\\n\\n/.test(page),
-    "which is what the one-time seal key reveal relies on",
   );
 
   // The same failure one card over. `renderPhase` hides `#setup` the moment the

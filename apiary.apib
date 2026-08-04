@@ -484,7 +484,9 @@ This defends against **passive capture** — an edge that logs bodies, an APM ag
 
 Gives a node with no key its identity. Available only in the `uninitialized` phase — a node that is merely `sealed` is refused too, because provisioning over a keystore nobody can currently open would replace an identity that is only temporarily out of reach.
 
-The sealed payload is `{"mnemonic": ..., "account": ..., "network": ...}`. `account` is numbered as Horizon Wallet numbers it, from 1; `0` is refused by name rather than read as the first account. The phrase lives in the process only as long as it takes to derive a key and is never written anywhere: what persists is the sealed BLS key and the public identity.
+The sealed payload is `{"mnemonic": ..., "account": ..., "network": ..., "passphrase": ...}`. `account` is numbered as Horizon Wallet numbers it, from 1; `0` is refused by name rather than read as the first account. The phrase lives in the process only as long as it takes to derive a key and is never written anywhere: what persists is the sealed BLS key and the public identity.
+
+`passphrase` is optional — absent, `null` and `""` all mean the same thing — and adds a recovery slot *alongside* the file slot the node seals with, never instead of it, so the node still restarts unattended. It is offered here because this is the only moment an operator is reliably present: by the time a seal key is the thing that went missing, no slot can be added any more. Anything shorter than 20 characters is refused with `WEAK_PASSWORD`, and refused before anything is derived or written, so the node is left exactly as it was.
 
 On success the node enters the `activating` phase before answering, so a second request cannot provision a different identity over the first.
 
@@ -511,14 +513,15 @@ On success the node enters the `activating` phase before answering, so a second 
                 "taproot_address": "tb1p...",
                 "bls_pubkey": "a1b2...",
                 "seal_slot": "file",
-                "seal_fingerprint": "2bd8450f"
+                "seal_fingerprint": "2bd8450f",
+                "passphrase_slot": false
             }
 
-    `taproot_address` is what a Portal admin has to whitelist before the node can register.
+    `taproot_address` is what a Portal admin has to whitelist before the node can register. `passphrase_slot` says whether a recovery slot was actually added, so a caller never has to assume one is there.
 
 + Response 400 (application/json)
 
-    The envelope is unknown, expired or its payload did not authenticate (`INVALID_ENVELOPE`), or what it contained is not a usable seed phrase (`INVALID_SETUP`). Nothing is written in either case.
+    The envelope is unknown, expired or its payload did not authenticate (`INVALID_ENVELOPE`), what it contained is not a usable seed phrase (`INVALID_SETUP`), or the recovery passphrase is too short (`WEAK_PASSWORD`). Nothing is written in any of the three cases.
 
 + Response 401 (application/json)
 

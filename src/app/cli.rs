@@ -22,8 +22,16 @@ pub fn migrate_legacy_env_vars() {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
 pub struct Cli {
-    /// Portal API base URL (e.g. <https://portal.example.com/api>)
-    #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
+    /// Portal API base URL (e.g. <https://portal.example.com/api>).
+    ///
+    /// Defaults to the develop Portal, so a node with no configuration at all
+    /// has something to register against — the point of the zero-config path.
+    /// A production deployment sets this.
+    #[arg(
+        long,
+        env = "PORTAL_API_URL",
+        default_value = "https://portal-application-develop.up.railway.app"
+    )]
     pub portal_url: String,
 
     /// Database connection string (default: local SQLite file)

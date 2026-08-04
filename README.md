@@ -26,7 +26,7 @@ The node can be configured via command-line arguments or environment variables:
 
 | Option | Environment Variable | Default | Description |
 |--------|---------------------|---------|-------------|
-| `--portal-url` | `PORTAL_API_URL` | `http://localhost:8080` | Portal API base URL |
+| `--portal-url` | `PORTAL_API_URL` | `https://portal-application-develop.up.railway.app` | Portal API base URL. The default is the develop Portal, so an unconfigured node has something to register against; a production deployment sets this. |
 | `--portal-polling-interval-secs` | `PORTAL_POLLING_INTERVAL` | `30` | Interval in seconds between portal polling runs (env: `PORTAL_POOLING_INTERVAL` is also accepted for backward compatibility but deprecated.) |
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
@@ -111,6 +111,12 @@ through the rest:
    phrase in your browser before sending it — see [How the seed phrase
    travels](#how-the-seed-phrase-travels).
 
+   The same form offers an optional **recovery password**. It is the only way
+   back into the node's key if the file it is sealed with is ever lost, and this
+   is the only moment it can be set from the browser — see [If the seal key is
+   lost](#if-the-seal-key-is-lost). It is an *extra* way in, not a replacement,
+   so a node that has one still restarts unattended.
+
 4. **Whitelist the address.** The node shows the Taproot address it derived. A
    Portal admin has to whitelist it; until then the Portal answers
    `403 ADDRESS_NOT_WHITELISTED` and the node re-offers the same registration
@@ -149,7 +155,7 @@ move in both directions:
 | Secret | Direction |
 |---|---|
 | the seed phrase, at setup | browser → node |
-| a seal passphrase, when adding a slot or unlocking a sealed node | browser → node |
+| the recovery password, at setup or when unlocking a sealed node | browser → node |
 | the key for `KONTOR_SEAL_KEY`, when adding an env slot | node → browser |
 
 All three go through one sealed envelope:
@@ -209,13 +215,13 @@ configured uses the `file` slot, which is what makes zero configuration possible
 On a platform that holds both your environment and your volume, neither slot
 defends against the platform itself.
 
-The Sealing card reports a short fingerprint of the key the node opened with, so
-you can compare it against the node's own logs. A **passphrase has none, by
-design**: that response is not sealed, and four bytes of a hash of a secret a
-human chose would let anyone who saw the body confirm guesses offline at one
-`SHA-256` each — against the 64 MiB of Argon2id per guess that trying the
-keystore itself costs. A random 32-byte key has no such weakness, which is why it
-is fingerprinted and a passphrase is not.
+The node logs a short fingerprint of the key it opened with on every start.
+`GET /api/admin/seal` reports the same one. A **passphrase has none, by design**:
+that response is not sealed, and four bytes of a hash of a secret a human chose
+would let anyone who saw the body confirm guesses offline at one `SHA-256` each —
+against the 64 MiB of Argon2id per guess that trying the keystore itself costs. A
+random 32-byte key has no such weakness, which is why it is fingerprinted and a
+passphrase is not.
 
 What both do defend against is the thing being replaced. A stolen seal key plus a
 stolen keystore yields **one node's signing key** — revocable, re-registerable,
@@ -224,17 +230,20 @@ every account, on every network, forever.
 
 #### Hardening: moving the key into the environment
 
-Two steps, with a redeploy in between, because the obvious one-step version is a
-door that only opens one way.
+An operator task, not a browser one: `/admin` shows no seal-slot controls, and the
+three calls below are made against the node's API with an admin session. Two
+steps, with a redeploy in between, because the obvious one-step version is a door
+that only opens one way.
 
-1. In `/admin`, **generate a key for `KONTOR_SEAL_KEY`**. It comes back sealed to
-   your browser, is shown once, and the node does not keep it. The file slot is
-   untouched, so the node still starts exactly as before.
+1. `POST /api/admin/seal/env-slot` **generates a key for `KONTOR_SEAL_KEY`**. It
+   comes back sealed to the caller, is returned once, and the node does not keep
+   it. The file slot is untouched, so the node still starts exactly as before.
 2. Set `KONTOR_SEAL_KEY` on the deployment and restart. The node records which
    slot it actually opened through.
-3. Only once that record says `env` does `/admin` offer to **remove the seal key
-   file**. By then the environment slot is not a claim — it is something the node
-   has demonstrably started on.
+3. Only once `GET /api/admin/seal` reports `env` does
+   `POST /api/admin/seal/drop-file-slot` agree to **remove the seal key file**. By
+   then the environment slot is not a claim — it is something the node has
+   demonstrably started on.
 
 A mistyped paste, a variable set on the wrong service, or a deploy that did not
 pick it up therefore costs a retry rather than the key.
@@ -252,10 +261,10 @@ failed —
 ✓ Keystore opened (file slot, fingerprint 2bd8450f)
 ```
 
-Falling back does not count as hardening. `/admin` asks *which slot this boot
-came in through*, so a node that fell back still reports `file` and is still
-refused step 3 — the fallback keeps the node up without ever letting a bad
-variable be followed by deleting the key that still works.
+Falling back does not count as hardening. The record is *which slot this boot came
+in through*, so a node that fell back still reports `file` and is still refused
+step 3 — the fallback keeps the node up without ever letting a bad variable be
+followed by deleting the key that still works.
 
 Only when **nothing** on the machine opens the keystore does the node come up in
 the `sealed` phase, serving `/admin` with the reason on the page. And only a
@@ -265,13 +274,18 @@ one over the top of it.
 
 #### If the seal key is lost
 
-Add a **seal passphrase** from `/admin` while the node is still open. It is an
-additional slot, not a replacement, so unattended restarts keep working. Without
-one, a node that loses both its `.seal-key` and its `KONTOR_SEAL_KEY` starts in
-the `sealed` phase and stays there: the key is there and nothing can open it.
+Set the optional **recovery password** when the node is set up — that is where
+`/admin` offers it, and it is the only screen that does. It is an additional slot,
+not a replacement, so unattended restarts keep working. Without one, a node that
+loses both its `.seal-key` and its `KONTOR_SEAL_KEY` starts in the `sealed` phase
+and stays there: the key is there and nothing can open it.
 
 With one, `/admin` on a sealed node offers to unlock it, and the node onboards
 from there without restarting.
+
+An already-running node that was set up without one can still be given a slot
+through `POST /api/admin/seal/passphrase`, which takes it over the same sealed
+envelope the browser uses.
 
 A node rescued that way is running, but it is not one that can be restarted: the
 slot it came up through is the passphrase, and nothing on the machine can supply
@@ -546,10 +560,10 @@ Endpoints:
 | `POST /api/admin/reset-database` | Wipe the node's database, optionally restarting the node (session required) |
 | `POST /api/admin/register-node` | Register the node's BLS key on the Portal and onboard again in place (session required) |
 | `GET /api/admin/envelope` | Mint a one-shot sealed channel for the secrets below (session required) |
-| `POST /api/admin/setup/provision` | Give an unconfigured node its identity, from a sealed seed phrase (session required) |
-| `POST /api/admin/seal/env-slot` | Add a `KONTOR_SEAL_KEY` slot; the key comes back sealed (session required) |
-| `POST /api/admin/seal/drop-file-slot` | Remove `.seal-key`, once the node has booted on the env slot (session required) |
-| `POST /api/admin/seal/passphrase` | Add a slot only a human can open, from a sealed passphrase (session required) |
+| `POST /api/admin/setup/provision` | Give an unconfigured node its identity, from a sealed seed phrase and an optional sealed recovery password (session required) |
+| `POST /api/admin/seal/env-slot` | Add a `KONTOR_SEAL_KEY` slot; the key comes back sealed. Operator API — `/admin` does not call it (session required) |
+| `POST /api/admin/seal/drop-file-slot` | Remove `.seal-key`, once the node has booted on the env slot. Operator API — `/admin` does not call it (session required) |
+| `POST /api/admin/seal/passphrase` | Add a slot only a human can open, from a sealed passphrase. Operator API — `/admin` sets one at setup instead (session required) |
 | `POST /api/admin/unseal` | Open a sealed node with a sealed passphrase (session required) |
 
 CORS is permissive (`Access-Control-Allow-Origin: *`) on the serving routes, which are all public — see [`src/server/routes.rs`](src/server/routes.rs) for the security model. The `/admin` routes are deliberately outside that CORS layer and carry their own password gate. See [`apiary.apib`](apiary.apib) for the full API specification.
