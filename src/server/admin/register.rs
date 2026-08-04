@@ -127,7 +127,10 @@ fn reonboard(identity: &NodeIdentity, state: &DownloadServerState) {
 /// Its error bodies are `{"error": {"code", "message"}}`; the message is the
 /// only part an operator can act on, and flattening it would hide the one case
 /// — an address that is not whitelisted — that needs somebody else entirely.
-fn portal_error(err: anyhow::Error) -> ApiError {
+///
+/// `pub(super)` because the whitelist-request endpoint forwards Portal
+/// refusals the same way, and two copies of this mapping would drift.
+pub(super) fn portal_error(err: anyhow::Error) -> ApiError {
     let Some(status_error) = err.downcast_ref::<HttpStatusError>() else {
         return ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -139,7 +142,7 @@ fn portal_error(err: anyhow::Error) -> ApiError {
 
     let message = portal_message(&status_error.body).unwrap_or_else(|| {
         format!(
-            "The Portal refused the registration (HTTP {}).",
+            "The Portal refused the request (HTTP {}).",
             status_error.status
         )
     });

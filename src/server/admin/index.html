@@ -287,6 +287,31 @@
     </p>
     <p class="muted" id="register-wallet-state"></p>
     <button class="primary" id="register-submit" disabled>Register with Horizon Wallet</button>
+
+    <!-- The way onto the whitelist, for a node that is not on it. Shown only
+         while unregistered: the operator fills in who they are, the node signs
+         and submits the proof of possession itself, and the registration
+         replay already running every 30 s is what turns an approval into a
+         running node — no restart, no second step. -->
+    <div id="whitelist" hidden>
+      <div class="divider"></div>
+      <h3>Request whitelisting</h3>
+      <div class="msg err" id="whitelist-error"></div>
+      <div class="msg ok" id="whitelist-success"></div>
+      <div class="msg warn" id="whitelist-status" hidden></div>
+      <p class="muted" id="whitelist-note">
+        If the Taproot address above is not on the Portal's whitelist, submit a
+        request here. A Portal admin reviews it; the node keeps watching and
+        starts on its own once it is approved.
+      </p>
+      <form id="whitelist-form" class="stack" hidden>
+        <input type="text" id="whitelist-first-name" placeholder="First name" autocomplete="given-name">
+        <input type="text" id="whitelist-last-name" placeholder="Last name" autocomplete="family-name">
+        <input type="text" id="whitelist-email" placeholder="Email" autocomplete="email">
+        <input type="text" id="whitelist-company" placeholder="Company (optional)" autocomplete="organization">
+        <button class="primary" type="submit" id="whitelist-submit">Request whitelisting</button>
+      </form>
+    </div>
   </div>
 
   <div class="grid kpis" id="kpis"></div>
@@ -705,6 +730,12 @@
     $("register-bls-pubkey").textContent = registration.bls_pubkey || "—";
     renderDerived(registration.derived, registered);
 
+    // The whitelist section only exists for a node the Portal will not have:
+    // once registered, the address was on the list by definition.
+    whitelistDerived = !!registration.derived;
+    $("whitelist").hidden = registered;
+    if (!registered) { loadWhitelist(); }
+
     if (registered) {
       $("registration-title").textContent = "Portal registration";
       $("registration-intro").textContent = registration.signer_id === null
@@ -763,9 +794,9 @@
         "sealed identity; binding a different one means setting up a second node."
       : "This node holds its own Taproot account, so it registers itself — no wallet " +
         "needed. It is still unregistered, which almost always means the Taproot address " +
-        "above is not on the Portal's whitelist yet. Ask a Portal admin to add it: the " +
+        "above is not on the Portal's whitelist yet. Request whitelisting below: the " +
         "node keeps offering the same registration every 30 seconds, so it comes up on " +
-        "its own shortly after they do. No restart needed.";
+        "its own shortly after the request is approved. No restart needed.";
     note.hidden = false;
 
     // Nothing here for a browser to sign.
@@ -892,6 +923,133 @@
       loadStatus();
     }).catch(function (error) {
       report($("register-error"), error);
+      button.disabled = false;
+      button.textContent = label;
+    });
+  }
+
+  /* ---------------- whitelisting ---------------- */
+
+  // The address the status is polled for on a wallet node, learned from the
+  // Portal's answer to a submission. A mnemonic node sends nothing: the
+  // server knows its own address. Session-scoped on purpose — a pending
+  // request survives on the Portal, and the next GET after a wallet
+  // submission in this session finds it by this address.
+  var whitelistAddress = null;
+  // Whether the node holds its own Taproot account. Decides who produces the
+  // proof of possession: the node itself, or Horizon Wallet.
+  var whitelistDerived = false;
+  var whitelistInFlight = false;
+
+  function renderWhitelist(view) {
+    var status = (view && view.status) || "none";
+    var form = $("whitelist-form");
+    var box = $("whitelist-status");
+
+    if (view && view.bitcoin_address) { whitelistAddress = view.bitcoin_address; }
+
+    if (status === "pending") {
+      form.hidden = true;
+      show(box,
+        "Whitelisting request" + (view.request_id ? " #" + view.request_id : "") +
+        " is waiting for a Portal admin. The node checks every 30 seconds and starts " +
+        "on its own once it is approved — leave it running.",
+        true);
+    } else if (status === "rejected") {
+      form.hidden = false;
+      show(box,
+        "The whitelisting request was rejected" +
+        (view.review_note ? ": " + view.review_note : ".") +
+        " You can amend it and submit again.",
+        true);
+    } else if (status === "approved" && view.whitelisted === true) {
+      form.hidden = true;
+      show(box,
+        "The whitelisting request was approved. The node registers itself and starts " +
+        "on its own shortly — no restart needed.",
+        true);
+    } else if (status === "approved") {
+      // Approved once, but the address has since been removed from the list.
+      // The verdict on file will not bring the node up; a new request will.
+      form.hidden = false;
+      show(box,
+        "An earlier request was approved, but the address is no longer on the " +
+        "whitelist. Submit a new request, or ask a Portal admin.",
+        true);
+    } else {
+      form.hidden = false;
+      show(box, "", true);
+    }
+  }
+
+  function loadWhitelist() {
+    var path = "/api/admin/whitelist-request";
+    if (whitelistAddress) {
+      path += "?bitcoin_address=" + encodeURIComponent(whitelistAddress);
+    }
+    api(path).then(function (view) {
+      renderWhitelist(view);
+    }).catch(function (error) {
+      report($("whitelist-error"), error);
+    });
+  }
+
+  function whitelistBody() {
+    return {
+      first_name: $("whitelist-first-name").value,
+      last_name: $("whitelist-last-name").value,
+      email: $("whitelist-email").value,
+      company: $("whitelist-company").value
+    };
+  }
+
+  function submitWhitelist(event) {
+    event.preventDefault();
+    if (whitelistInFlight) { return; }
+
+    var button = $("whitelist-submit");
+    var label = button.textContent;
+    show($("whitelist-error"), "");
+    show($("whitelist-success"), "");
+    whitelistInFlight = true;
+    button.disabled = true;
+
+    // A mnemonic node signs the whole request itself. An imported key needs
+    // the same wallet proof a registration does, so the browser fetches it
+    // first — one prompt, exactly as registering raises.
+    var prepared;
+    if (whitelistDerived) {
+      prepared = Promise.resolve(whitelistBody());
+    } else if (walletProvider) {
+      button.textContent = "Waiting for Horizon Wallet…";
+      prepared = walletRequest("getAddresses").then(function (result) {
+        return walletRequest("getBLSPoP", { address: taprootAddress(result) });
+      }).then(function (pop) {
+        var body = whitelistBody();
+        body.xpubkey = pop.xpubkey;
+        body.bls_pubkey = pop.blsPubkey;
+        body.schnorr_sig = pop.schnorrSig;
+        return body;
+      });
+    } else {
+      prepared = Promise.reject(new Error(
+        "Horizon Wallet is needed to prove which Taproot address to whitelist. " +
+        "Install and unlock the extension, then reload this page."));
+    }
+
+    prepared.then(function (body) {
+      button.textContent = "Submitting…";
+      return api("/api/admin/whitelist-request", { method: "POST", body: body });
+    }).then(function (view) {
+      show($("whitelist-success"),
+        "Request sent for " + view.bitcoin_address + ". A Portal admin has to approve " +
+        "it; the node keeps checking and starts on its own once they do.",
+        true);
+      renderWhitelist(view);
+    }).catch(function (error) {
+      report($("whitelist-error"), error);
+    }).then(function () {
+      whitelistInFlight = false;
       button.disabled = false;
       button.textContent = label;
     });
@@ -1442,6 +1600,7 @@
   $("seal-passphrase-submit").addEventListener("click", addPassphraseSlot);
   $("reset-form").addEventListener("submit", resetDatabase);
   $("register-submit").addEventListener("click", registerNode);
+  $("whitelist-form").addEventListener("submit", submitWhitelist);
 
   $("reset-confirm").addEventListener("input", function () {
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;

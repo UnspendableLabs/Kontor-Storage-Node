@@ -373,9 +373,10 @@ async fn self_register(
                 writer,
                 "\nThe Portal refused the registration: {e:#}\n  \
                    Taproot address: {}\n  \
-                 If this is ADDRESS_NOT_WHITELISTED, ask a Portal admin to whitelist that \
-                 address. This node keeps retrying the registration in the background, so \
-                 it comes up on its own once they have.",
+                 If this is ADDRESS_NOT_WHITELISTED, request whitelisting from the /admin \
+                 page (or ask a Portal admin directly). This node keeps retrying the \
+                 registration in the background, so it comes up on its own once the \
+                 address is whitelisted.",
                 identity.taproot_address
             )?;
             Ok(SelfRegistration {

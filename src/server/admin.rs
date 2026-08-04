@@ -50,6 +50,7 @@ pub mod session;
 pub mod setup;
 pub mod status;
 pub mod ui;
+pub mod whitelist;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -443,6 +444,11 @@ pub mod error_codes {
     /// The wallet-supplied registration fields were malformed or named the
     /// wrong BLS key.
     pub const INVALID_REGISTRATION: &str = "INVALID_REGISTRATION";
+    /// A whitelist request was made on a node that cannot build one — no BLS
+    /// key, or no source for the proof of possession.
+    pub const WHITELIST_UNAVAILABLE: &str = "WHITELIST_UNAVAILABLE";
+    /// A whitelist request carried fields the Portal would refuse.
+    pub const INVALID_WHITELIST_REQUEST: &str = "INVALID_WHITELIST_REQUEST";
     /// The Portal refused the registration, or could not be reached.
     pub const PORTAL_ERROR: &str = "PORTAL_ERROR";
     /// A database read or write failed.
@@ -562,6 +568,10 @@ pub fn router() -> Router<DownloadServerState> {
         .route("/api/admin/status", get(status_handler))
         .route("/api/admin/reset-database", post(reset_handler))
         .route("/api/admin/register-node", post(register_handler))
+        .route(
+            "/api/admin/whitelist-request",
+            get(whitelist_status_handler).post(whitelist_submit_handler),
+        )
         .route("/api/admin/envelope", get(envelope_handler))
         .route("/api/admin/setup/provision", post(provision_handler))
         .route("/api/admin/seal", get(seal_handler))
@@ -717,6 +727,24 @@ async fn register_handler(
     Json(request): Json<register::RegisterNodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     register::register_node(&request, &state).await.map(Json)
+}
+
+/// `POST /api/admin/whitelist-request`
+async fn whitelist_submit_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<whitelist::SubmitWhitelistRequest>,
+) -> Result<Json<Value>, ApiError> {
+    whitelist::submit(&request, &state).await.map(Json)
+}
+
+/// `GET /api/admin/whitelist-request`
+async fn whitelist_status_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    axum::extract::Query(query): axum::extract::Query<whitelist::WhitelistStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    whitelist::status(&query, &state).await.map(Json)
 }
 
 #[cfg(test)]
@@ -1231,6 +1259,11 @@ mod tests {
                 ("POST", "/api/admin/seal/drop-file-slot"),
                 ("POST", "/api/admin/seal/passphrase"),
                 ("POST", "/api/admin/unseal"),
+                // The whitelist pair reaches the Portal with a body the node
+                // signs, so like registration it sits behind the session even
+                // though the Portal end takes no credential.
+                ("GET", "/api/admin/whitelist-request"),
+                ("POST", "/api/admin/whitelist-request"),
             ] {
                 let (status, payload) = call(
                     &state,

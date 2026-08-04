@@ -769,8 +769,9 @@ impl Supervisor {
         ));
         self.runtime.set_notice(Some(
             "The Portal does not know this node's key yet. If its Taproot address is not \
-             whitelisted, ask a Portal admin to whitelist it — the node keeps offering its \
-             registration and starts on its own once they have."
+             whitelisted, request whitelisting from the registration card below — the node \
+             keeps offering its registration and starts on its own once the request is \
+             approved."
                 .to_string(),
         ));
         self.runtime.enter(Phase::Unregistered);

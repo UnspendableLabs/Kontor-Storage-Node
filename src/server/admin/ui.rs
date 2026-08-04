@@ -116,6 +116,34 @@ mod tests {
         }
     }
 
+    /// The whitelist form is the one path onto the Portal's whitelist that
+    /// does not require finding an admin out of band, and it is driven
+    /// entirely by these names: the route both halves share, the four contact
+    /// fields the operator types, and the status fields the page renders the
+    /// wait from. A rename on either side leaves an unwhitelisted node — the
+    /// one state an operator cannot fix any other way from here — with a form
+    /// that quietly does nothing.
+    #[test]
+    fn admin_html_speaks_the_same_whitelist_api_as_the_server() {
+        for key in [
+            "/api/admin/whitelist-request",
+            "first_name",
+            "last_name",
+            "email:",
+            "company:",
+            "view.status",
+            "view.request_id",
+            "view.review_note",
+            "view.whitelisted",
+            "view.bitcoin_address",
+            "whitelist-form",
+            "function submitWhitelist",
+            "function loadWhitelist",
+        ] {
+            assert!(ADMIN_HTML.contains(key), "the page must still use {key}");
+        }
+    }
+
     /// The wallet is reached through the extension's injected global, and only
     /// these two calls. `signMessageBLS` in particular must not come back: the
     /// node signs the op itself, which is what keeps this to one prompt.
