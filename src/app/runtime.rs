@@ -1489,12 +1489,29 @@ mod tests {
             command: Commands::Run,
         };
 
-        let shutdown = async {
-            sleep(Duration::from_millis(50)).await;
-            Ok(())
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Stopped by the line the assertions below look for, not by a timer.
+        // A fixed 50ms was a bet that onboarding would finish inside it, and on
+        // a loaded machine it does not — this test failed exactly that way once
+        // while the rest of the suite was competing for the CPU. Waiting for the
+        // line costs nothing when it arrives early and does not lie when it
+        // arrives late.
+        let shutdown = {
+            let captured = captured.clone();
+            async move {
+                let onboarded = captured
+                    .wait_for("Node onboarding complete", Duration::from_secs(30))
+                    .await;
+                assert!(
+                    onboarded,
+                    "the node has to onboard before shutdown: {}",
+                    captured.text()
+                );
+                Ok(())
+            }
         };
 
-        let (writer, captured) = SharedWriter::buffer();
         run_with_shutdown(cli, writer, shutdown).await.unwrap();
         let output = captured.text();
 

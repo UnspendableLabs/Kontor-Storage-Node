@@ -35,6 +35,13 @@ It runs the same three commands the `fmt`, `clippy` and `test` CI jobs run.
   harness slices the three functions out of `index.html` and drives them
   against a live binary. If you touch the sealed envelope on either side, run
   it locally.
+- `scripts/migrate-backends.sh` — the migrations against a real Postgres and a
+  real MySQL. `cargo test` runs them on SQLite only, so a statement that SQLite
+  accepts and another server does not passes everything else. If you add or
+  change a migration, this is the job that has an opinion about it.
+- `cargo check` on the `rust-version` in Cargo.toml. Every other job resolves
+  its toolchain through [rust-toolchain.toml](rust-toolchain.toml), so the
+  declared minimum is only ever compiled by this one.
 - `cargo llvm-cov` — coverage is gated at 95%. New code needs tests.
 
 ## Working on the crypto paths

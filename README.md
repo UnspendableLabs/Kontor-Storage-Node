@@ -521,6 +521,10 @@ rows and so goes true *before* the next rebuild fails.
 
 - Default: SQLite file at `<data_dir>/Kontor-Storage-Node/storage.db` (auto-created).
 - First launch on a new SQLite file triggers automatic migrations; for Postgres/MySQL run migrations manually.
+- MySQL must be 8.0.13 or later. The `agreements` table has JSON columns with
+  defaults, and that is the release where MySQL started accepting a default on
+  a JSON column at all. CI runs the migrations against a real Postgres and a
+  real MySQL on every push, so this is a tested claim rather than a hopeful one.
 
 #### Running migrations manually
 

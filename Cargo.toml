@@ -26,6 +26,12 @@ exclude = [
     "/codecov.yml",
     "/scripts",
     "/tests",
+    # Kept out deliberately. `cargo install` never reads it — rustup picks a
+    # toolchain from the working directory, not from the crate it is building —
+    # but anyone who unpacks the tarball and builds it would have 1.95.0 forced
+    # on them by a file they did not write, which is the opposite of what
+    # `rust-version` above promises.
+    "/rust-toolchain.toml",
 ]
 
 [lints.rust]
@@ -52,7 +58,14 @@ hex = "0.4"
 # `Database::connect` dispatches on `#[cfg(feature)]` alone: without the arm for
 # a scheme, it does not fail to authenticate, it answers "has no supporting
 # driver" for every URL of that shape.
-sea-orm = { version = "2.0.0-rc.7", features = [
+#
+# Pinned exactly, and only because it is a release candidate. `cargo install`
+# re-resolves — the same reason `rust-version` above cannot rely on the
+# lockfile — so `2.0.0-rc.7` would have meant "whatever rc, or the 2.0.0 final,
+# that exists on the day someone installs this". Between two release candidates
+# that is a coin toss on the API, and the failure lands on the installing user,
+# not on CI. Bumping this is a deliberate act with the tests run against it.
+sea-orm = { version = "=2.0.0-rc.21", features = [
     "sqlx-sqlite",
     "sqlx-postgres",
     "sqlx-mysql",
@@ -66,7 +79,10 @@ sea-orm = { version = "2.0.0-rc.7", features = [
 # `default-features = false` drops the `cli` feature, and with it the whole
 # `sea-orm-cli` binary. Nothing needs it: the `cli` feature exists to build a
 # `sea-orm-cli`-style migration binary, which the `migrate` subcommand replaced.
-sea-orm-migration = { version = "2.0.0-rc.7", default-features = false, features = [
+# Pinned with `sea-orm`, and to the same release candidate: the two share a
+# `sea-query` and a `sqlx`, and a mismatched pair is a type error in a
+# dependency rather than a message anyone can act on.
+sea-orm-migration = { version = "=2.0.0-rc.21", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlx-sqlite",
     "sqlx-postgres",

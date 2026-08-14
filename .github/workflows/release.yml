@@ -44,22 +44,66 @@ jobs:
     # publish the wrong version under the right name.
     if: always() && needs.verify.result != 'failure' && needs.verify.result != 'cancelled'
     environment: crates-io
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kontor
+          POSTGRES_PASSWORD: kontor
+          POSTGRES_DB: kontor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U kontor"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: kontor
+          MYSQL_DATABASE: kontor
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pkontor"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=30s
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Publishing is irreversible, so the same three gates CI runs on every
-      # push run again here against the exact commit being released.
+      # Publishing is irreversible, so every gate CI runs on a push runs again
+      # here against the exact commit being released — including the migrations
+      # against real servers, since a schema that only SQLite accepts is the
+      # kind of defect a release makes permanent.
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo build --locked
+      - run: |
+          scripts/migrate-backends.sh \
+            "postgres://kontor:kontor@127.0.0.1:5432/kontor" \
+            "mysql://root:kontor@127.0.0.1:3306/kontor"
 
+      # Builds and verifies the exact tarball that would go to the registry,
+      # from its extracted contents rather than from the checkout — which is the
+      # whole content of a dry run, and why the publish below does not repeat
+      # the identical build.
       - name: Package and verify
         run: cargo package --locked
 
+      # A dispatch off a *branch* is a dry run and nothing else. `verify` only
+      # runs on a tag ref, so without the `ref_type` clause a dispatch on a
+      # branch with `dry_run: false` would publish whatever version the manifest
+      # happened to carry, with nothing having checked it — the same
+      # irreversible mistake `verify` exists to prevent, reached by the other
+      # door.
       - name: Publish to crates.io
-        if: github.event_name == 'push' || inputs.dry_run == false
-        run: cargo publish --locked
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.dry_run == false)
+        run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
