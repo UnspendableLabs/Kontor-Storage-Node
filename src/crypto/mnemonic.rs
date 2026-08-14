@@ -58,6 +58,7 @@ use k256::{
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::crypto::identity::PublicIdentity;
 use crate::crypto::BlsKeyPair;
 
 /// The seed phrase this node derives its identity from.
@@ -158,7 +159,11 @@ impl BitcoinNetwork {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    /// Parse a network by its configured name.
+    ///
+    /// # Errors
+    /// If the name is not one this node knows.
+    pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mainnet" | "bitcoin" => Ok(Self::Mainnet),
             "testnet" | "testnet4" => Ok(Self::Testnet),
@@ -168,6 +173,22 @@ impl BitcoinNetwork {
                 "{NETWORK_ENV} must be one of mainnet, testnet, signet, regtest (got {other:?})"
             )),
         }
+    }
+}
+
+// Serialized as its configured name rather than as a variant index, for the same
+// reason `KnownIdentity` stores it that way: these files get read by whoever is
+// debugging a node at 3am, and `"signet"` says more than `2` does.
+impl serde::Serialize for BitcoinNetwork {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BitcoinNetwork {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -214,7 +235,7 @@ impl std::fmt::Debug for MnemonicSettings {
 impl MnemonicSettings {
     /// Build settings from a phrase already in hand.
     ///
-    /// Test-only, as [`crate::crypto::BlsKeyPair::generate`] is: production
+    /// Test-only, as `BlsKeyPair::generate` is: production
     /// reads the phrase from the environment and nowhere else, and the tests
     /// that need one would otherwise have to set a process-wide variable and
     /// serialize against every other test that reads it.
@@ -222,6 +243,32 @@ impl MnemonicSettings {
     /// # Panics
     /// If `account` is below [`FIRST_ACCOUNT`], which is not an account any
     /// operator can configure — see [`Self::from_env`].
+    /// Settings from an operator filling in the setup wizard.
+    ///
+    /// Fallible where the test-only `Self::new` asserts: the account index arrives from a
+    /// form rather than from a constant, so one below [`FIRST_ACCOUNT`] is
+    /// something to report back to the person who typed it.
+    ///
+    /// # Errors
+    /// If `account` is below [`FIRST_ACCOUNT`], or the phrase is blank.
+    pub fn for_setup(phrase: &str, network: BitcoinNetwork, account: u32) -> Result<Self> {
+        if phrase.trim().is_empty() {
+            return Err(anyhow!("no seed phrase was supplied"));
+        }
+        if account < FIRST_ACCOUNT {
+            return Err(anyhow!(
+                "accounts are numbered the way Horizon Wallet numbers them, from \
+                 {FIRST_ACCOUNT} (got {account})"
+            ));
+        }
+        Ok(Self {
+            phrase: Zeroizing::new(phrase.trim().to_string()),
+            network,
+            account,
+            allow_new_account: false,
+        })
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn new(phrase: impl Into<String>, network: BitcoinNetwork, account: u32) -> Self {
@@ -354,20 +401,6 @@ fn parse_flag(value: &str, name: &str) -> Result<bool> {
     }
 }
 
-/// What `/admin` may know about a mnemonic-derived node.
-///
-/// Carries no key material, so it can be cloned into the server state and
-/// serialized to a browser. The Taproot address is the reason it exists: on a
-/// node the Portal has not whitelisted yet, that string is the entire remaining
-/// task, and reading it off a page beats grepping a container's logs.
-#[derive(Clone, Debug)]
-pub struct DerivedIdentityInfo {
-    pub account: u32,
-    pub network: BitcoinNetwork,
-    pub taproot_address: String,
-    pub node_id: String,
-}
-
 /// Every key and identifier this node needs, derived from the seed phrase.
 pub struct MnemonicIdentity {
     pub keypair: BlsKeyPair,
@@ -466,15 +499,39 @@ impl MnemonicIdentity {
     }
 
     /// The public half of this identity: what the operator UI is allowed to
-    /// show, and the only part that outlives onboarding.
-    #[must_use]
-    pub fn info(&self) -> DerivedIdentityInfo {
-        DerivedIdentityInfo {
+    /// show, and the only part that outlives the seed phrase.
+    ///
+    /// # Errors
+    /// If the Schnorr binding signature cannot be produced.
+    pub fn public(&self) -> Result<PublicIdentity> {
+        // The Portal recovers the x-only key from the xpub and verifies both
+        // halves of the proof of possession against it, while this node signs
+        // with the key it derived directly. They are the same key by
+        // construction — this catches the construction being wrong, here rather
+        // than as an opaque 400 at every registration for the rest of the node's
+        // life. Checked once, at the moment the identity is committed to.
+        let from_xpub = crate::node::registration::x_only_from_xpub(&self.xpubkey)?;
+        if from_xpub != self.x_only {
+            return Err(anyhow!(
+                "the derived Taproot key does not match its own extended public key \
+                 (xpub carries {}, signing with {})",
+                hex::encode(from_xpub),
+                hex::encode(self.x_only),
+            ));
+        }
+
+        Ok(PublicIdentity {
             account: self.account,
             network: self.network,
+            xpubkey: self.xpubkey.clone(),
             taproot_address: self.taproot_address.clone(),
             node_id: self.node_id.clone(),
-        }
+            bls_pubkey: self.bls_pubkey(),
+            // Signed here, once, while the Taproot key still exists. See
+            // [`crate::crypto::identity`] for why the result keeps working
+            // forever without it.
+            schnorr_binding_sig: self.schnorr_binding_sig()?,
+        })
     }
 
     /// The same mnemonic's identity at another account, or on the other coin

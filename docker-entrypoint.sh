@@ -7,7 +7,7 @@ set -e
 # write to its own storage directory.
 if [ "$(id -u)" = "0" ]; then
     chown -R kontor:kontor /data
-    exec gosu kontor /app/Kontor-Storage-Node "$@"
+    exec gosu kontor /app/kontor-storage-node "$@"
 fi
 
-exec /app/Kontor-Storage-Node "$@"
+exec /app/kontor-storage-node "$@"

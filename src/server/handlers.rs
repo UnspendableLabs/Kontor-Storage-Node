@@ -21,15 +21,43 @@ use tracing::error;
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 100;
 
+/// What `GET /api/info` says about this node.
+///
+/// # Why `phase` and `serving` are here
+///
+/// The HTTP server now starts before the node knows anything about itself — it
+/// has to, since `/admin` is how it learns — so answering this request is no
+/// longer evidence that the node works. A container health check pointed at
+/// this endpoint reports a node awaiting its setup wizard, or one whose
+/// activation failed, as healthy.
+///
+/// Rather than make the endpoint fail — a node waiting for a Portal admin to
+/// whitelist its address is *supposed* to stay up, and restarting it would only
+/// lose the `/admin` page explaining that — the two facts are published. A
+/// platform check keeps using the status code for liveness; a monitor that
+/// wants to know whether the node is actually proving storage reads `serving`.
+///
+/// Public, and it costs nothing to be: `phase` is already unauthenticated on
+/// `/api/admin/bootstrap`, because the login screen has to know which pane to
+/// render before anyone has logged in.
 #[derive(Serialize)]
 pub struct NodeInfoResponse {
     /// `null` on a node that is not registered with the Portal yet.
     node_id: Option<String>,
+    /// Where the node is in its life: `uninitialized`, `sealed`, `activating`,
+    /// `unregistered`, `running`, `failed`. See [`crate::app::lifecycle::Phase`].
+    phase: &'static str,
+    /// Whether the node is serving files and proving storage — `true` only in
+    /// `running`. This is the field to alert on.
+    serving: bool,
 }
 
 pub async fn node_info(State(state): State<DownloadServerState>) -> Json<NodeInfoResponse> {
+    let phase = state.runtime.phase();
     Json(NodeInfoResponse {
-        node_id: state.node_id.clone(),
+        node_id: state.runtime.node_id(),
+        phase: phase.as_str(),
+        serving: phase.is_serving(),
     })
 }
 

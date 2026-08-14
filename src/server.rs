@@ -3,6 +3,7 @@
 //! Provides a REST API for downloading stored files and listing available files.
 
 pub mod admin;
+pub mod assets;
 pub mod handlers;
 pub mod routes;
 pub mod state;
@@ -48,6 +49,7 @@ mod tests {
     use crate::app::tasks::downloadagreements::StorageBackend;
     use crate::clients::gcs::GcsClient;
     use crate::entities::agreements;
+    use crate::migration::{Migrator, MigratorTrait};
     use crate::server::admin::AdminState;
     use crate::server::handlers::{DownloadError, FilesResponse, ListFilesError};
     use crate::testutils::{unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY};
@@ -56,7 +58,6 @@ mod tests {
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use http_body_util::BodyExt;
-    use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, DatabaseConnection};
     use std::fs;
     use std::net::SocketAddr;
@@ -158,7 +159,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -198,7 +199,7 @@ mod tests {
             db: db.clone(),
             storage_dir: storage_dir.clone(),
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -230,7 +231,7 @@ mod tests {
             db: db.clone(),
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -262,7 +263,7 @@ mod tests {
             db,
             storage_dir: PathBuf::new(),
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         });
         let response = next
@@ -295,7 +296,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -323,7 +324,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -358,7 +359,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-socket".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-socket"), None),
             admin: AdminState::with_password(AdminPassword::new(Some(PASSWORD))),
         };
 
@@ -425,7 +426,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -455,7 +456,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -480,7 +481,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -519,7 +520,7 @@ mod tests {
                 method: StorageMethod::Gcs,
                 gcs_client: None,
             },
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -544,7 +545,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key("not-a-key").await,
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -620,7 +621,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-info-test".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-info-test"), None),
             admin: AdminState::disabled(),
         };
 
@@ -639,6 +640,48 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["node_id"], "NODE-info-test");
+        // The server answers this request in every phase, so the phase has to
+        // be in the answer: without it, a node waiting for its setup wizard and
+        // a node proving storage are indistinguishable to a health check.
+        assert_eq!(json["phase"], "running");
+        assert_eq!(json["serving"], true);
+    }
+
+    /// The case the two new fields exist for: the server is up, and the node is
+    /// not doing its job.
+    #[tokio::test]
+    async fn node_info_reports_a_node_that_is_up_but_not_serving() {
+        let db = setup_db().await;
+        let storage_dir = unique_storage_dir("server");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+
+        let state = DownloadServerState {
+            db,
+            storage_dir,
+            storage_backend: StorageBackend::local(),
+            runtime: crate::app::lifecycle::NodeRuntime::new(
+                crate::app::lifecycle::Phase::Uninitialized,
+                crate::app::lifecycle::SealStatus::default(),
+            ),
+            admin: AdminState::disabled(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "liveness is unaffected");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["phase"], "uninitialized");
+        assert_eq!(json["serving"], false);
+        assert!(json["node_id"].is_null());
     }
 
     #[tokio::test]
@@ -651,7 +694,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-dash".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-dash"), None),
             admin: AdminState::disabled(),
         };
 
@@ -699,7 +742,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -754,7 +797,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -799,7 +842,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -842,7 +885,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         })
         .oneshot(
@@ -892,7 +935,7 @@ mod tests {
             db,
             storage_dir,
             storage_backend: gcs_backend_with_key(TEST_PRIVATE_KEY).await,
-            node_id: Some("NODE-TEST".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
             admin: AdminState::disabled(),
         };
 
@@ -919,6 +962,50 @@ mod tests {
         assert!(
             location.contains("inline"),
             "expected inline disposition in signed URL, got {location}"
+        );
+    }
+
+    /// The route the dashboard's `<link>` and `<script>` tags resolve to. It is
+    /// wired to the embedded assets, not to a directory, so it answers the same
+    /// whether the node was installed with `cargo install` or unpacked from the
+    /// image — see [`crate::server::assets`].
+    #[tokio::test]
+    async fn static_assets_are_served_from_the_binary() {
+        let db = setup_db().await;
+        let state = DownloadServerState {
+            db,
+            storage_dir: unique_storage_dir("server"),
+            storage_backend: StorageBackend::local(),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
+            admin: AdminState::disabled(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/static/storage.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/css")
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            crate::server::assets::get("storage.css")
+                .expect("storage.css is embedded")
+                .data
+                .as_ref()
         );
     }
 }

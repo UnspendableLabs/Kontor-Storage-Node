@@ -22,8 +22,16 @@ pub fn migrate_legacy_env_vars() {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Kontor Storage Node CLI")]
 pub struct Cli {
-    /// Portal API base URL (e.g. https://portal.example.com/api)
-    #[arg(long, env = "PORTAL_API_URL", default_value = "http://localhost:8080")]
+    /// Portal API base URL (e.g. <https://portal.example.com/api>).
+    ///
+    /// Defaults to the develop Portal, so a node with no configuration at all
+    /// has something to register against — the point of the zero-config path.
+    /// A production deployment sets this.
+    #[arg(
+        long,
+        env = "PORTAL_API_URL",
+        default_value = "https://portal-application-develop.up.railway.app"
+    )]
     pub portal_url: String,
 
     /// Database connection string (default: local SQLite file)
@@ -37,6 +45,14 @@ pub struct Cli {
     /// Directory used to store downloaded files (default: app data dir/files)
     #[arg(long, env = "STORAGE_DIR")]
     pub storage_dir: Option<PathBuf>,
+
+    /// Application data directory: the keystore, the admin credential and the
+    /// SQLite database live here (default: platform data dir, `/data` in Docker).
+    ///
+    /// This is the one directory that must survive a restart for the node to
+    /// come back unattended.
+    #[arg(long, env = "KONTOR_APP_DIR")]
+    pub app_dir: Option<PathBuf>,
 
     /// Interval in seconds between portal polling runs
     #[arg(long, env = "PORTAL_POLLING_INTERVAL", default_value_t = 30)]
@@ -70,7 +86,7 @@ pub struct Cli {
     #[arg(long, env = "SERVER_ADDRESS", default_value = "0.0.0.0:8081")]
     pub server_address: String,
 
-    /// Public URL where this node is reachable for file downloads (e.g. https://node1.example.com)
+    /// Public URL where this node is reachable for file downloads (e.g. <https://node1.example.com>)
     #[arg(long, env = "PUBLIC_URL", default_value = "http://localhost:8081")]
     pub public_url: String,
 
@@ -110,6 +126,29 @@ pub enum Commands {
     Ping,
     /// Run the node background workers
     Run,
+    /// Apply, roll back or inspect database migrations
+    ///
+    /// A SQLite node migrates itself the moment it connects, so this exists
+    /// for the databases that do not — Postgres and MySQL — and for operators
+    /// who would rather run the schema change before the deploy than during it.
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateAction {
+    /// Apply every pending migration
+    Up,
+    /// Roll back the most recently applied migrations
+    Down {
+        /// How many migrations to roll back
+        #[arg(short = 'n', long = "num", default_value_t = 1)]
+        num: u32,
+    },
+    /// List every migration and whether it has been applied
+    Status,
 }
 
 #[cfg(test)]

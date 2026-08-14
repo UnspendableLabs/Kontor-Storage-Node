@@ -3,6 +3,7 @@ mod clients;
 mod crypto;
 mod database;
 mod entities;
+mod migration;
 mod node;
 mod server;
 
@@ -10,7 +11,7 @@ mod server;
 pub mod testutils;
 
 use anyhow::{anyhow, Context, Result};
-use app::{cli::migrate_legacy_env_vars, run, Cli, Outcome, RESTART_EXIT_CODE};
+use app::{cli::migrate_legacy_env_vars, run, Cli, Outcome, SharedWriter, RESTART_EXIT_CODE};
 use clap::Parser;
 use std::io::{self, Write};
 use std::sync::Once;
@@ -22,9 +23,9 @@ async fn main() -> Result<()> {
     load_local_env()?;
     migrate_legacy_env_vars();
     let cli = Cli::parse();
-    let mut stdout = io::stdout();
+    let mut writer = SharedWriter::stdout();
 
-    match run(cli, &mut stdout).await? {
+    match run(cli, writer.clone()).await? {
         Outcome::Shutdown => Ok(()),
         // Returning would exit `0`, which the on-failure restart policies that
         // Railway and Docker Compose default to read as "stay down". Exiting
@@ -36,7 +37,7 @@ async fn main() -> Result<()> {
         // `Outcome::Restart` tests in `app::runtime`.
         // LCOV_EXCL_START
         Outcome::Restart => {
-            let _ = stdout.flush();
+            let _ = writer.flush();
             std::process::exit(RESTART_EXIT_CODE)
         } // LCOV_EXCL_STOP
     }

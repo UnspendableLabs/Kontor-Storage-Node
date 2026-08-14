@@ -42,27 +42,48 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; font-weight: 600; }
   button.danger { background: var(--red); border-color: var(--red); color: #2a0a0a; font-weight: 600; }
-  input[type="password"], input[type="text"] {
+  /* Every control on the page, not only the two the login screen uses. The
+     setup card is the first thing an operator ever sees, and its seed phrase
+     box, account number and network picker were left at the user agent's
+     defaults — three light widgets on a dark page. */
+  input[type="password"], input[type="text"], input[type="number"], textarea, select {
     font: inherit;
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 8px 12px;
-    width: 100%;
   }
-  input:focus { outline: none; border-color: var(--accent); }
+  input[type="password"], input[type="text"], textarea { width: 100%; }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+  /* Inside a `.row`, which is `space-between`: full width would push the label
+     off the line. */
+  .row input[type="number"] { width: 7em; text-align: right; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
   a { color: var(--blue); }
 
-  /* ---- login ---- */
-  #login { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-  #login .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
-  #login h1 { margin: 0 0 4px; font-size: 20px; }
-  #login p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
-  #login button { width: 100%; margin-top: 14px; }
+  /* `hidden` has to win.
+     The attribute is only `[hidden] { display: none }` in the user agent's own
+     stylesheet, and *any* author rule setting `display` beats it — origin
+     outranks specificity. So `#login { display: grid }` quietly made
+     `$("login").hidden = true` do nothing, and an unclaimed node rendered a
+     full-viewport sign-in screen with the claim form, its only way in, pushed
+     below the fold. One `!important` makes the attribute mean what every
+     reader of this file already assumes it means, for the three screens and
+     for every card inside them alike. */
+  [hidden] { display: none !important; }
+
+  /* ---- the two pre-session screens ----
+     Identical furniture, and exactly one of the three screens is ever shown;
+     `showScreen` is the only thing that decides which. */
+  #login, #claim { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  #login .card, #claim .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; }
+  #login h1, #claim h1 { margin: 0 0 4px; font-size: 20px; }
+  #login p.sub, #claim p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  #login button, #claim button { width: 100%; margin-top: 14px; }
 
   /* ---- shell ---- */
-  #app { display: none; max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
+  #app { max-width: 900px; margin: 0 auto; padding: 24px 20px 60px; }
   header.bar { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
   header.bar h1 { font-size: 18px; margin: 0; }
   header.bar .spacer { flex: 1; }
@@ -73,6 +94,7 @@
   .kpis { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
   .card h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 14px; text-transform: uppercase; letter-spacing: .04em; }
+  .card h3 { font-size: 13px; font-weight: 600; color: var(--text); margin: 0 0 6px; }
   .kpi .value { font-size: 32px; font-weight: 700; line-height: 1.1; }
   .kpi .label { color: var(--muted); font-size: 13px; margin-top: 2px; }
   .divider { border-top: 1px solid var(--border); margin: 14px 0; }
@@ -81,7 +103,12 @@
   .trunc { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 
   /* ---- misc ---- */
-  .msg { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; border: 1px solid; }
+  /* `pre-wrap`, because `show()` writes `textContent` and the messages that
+     matter most are written with blank lines in them. Without it the one-time
+     KONTOR_SEAL_KEY reveal collapses into a single run-on line with the key
+     wedged between two sentences — and that key is shown exactly once, is not
+     recoverable, and is copied by hand. */
+  .msg { border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; border: 1px solid; white-space: pre-wrap; }
   .msg.err { background: rgba(248,113,113,.1); border-color: var(--red); color: var(--red); }
   .msg.ok { background: rgba(52,211,153,.1); border-color: var(--green); color: var(--green); }
   .msg.warn { background: rgba(251,191,36,.1); border-color: var(--amber); color: var(--amber); }
@@ -113,7 +140,25 @@
   </form>
 </div>
 
-<div id="app">
+<div id="claim" hidden>
+  <form class="card" id="claim-form">
+    <h1>Kontor Storage Node</h1>
+    <p class="sub">First-time setup</p>
+    <div class="msg err" id="claim-error"></div>
+    <p class="muted">
+      Nobody has claimed this node yet. Paste the setup token it printed on
+      startup and choose an admin password.
+    </p>
+    <p class="muted" id="claim-fingerprint" hidden></p>
+    <input type="text" id="claim-token" placeholder="Setup token" autocomplete="off"
+           spellcheck="false" autofocus required>
+    <input type="password" id="claim-password" placeholder="New admin password (16+ characters)"
+           autocomplete="new-password" required>
+    <button class="primary" type="submit" id="claim-submit">Claim this node</button>
+  </form>
+</div>
+
+<div id="app" hidden>
   <header class="bar">
     <h1>Storage Node · Admin</h1>
     <span class="spacer"></span>
@@ -124,6 +169,80 @@
   </header>
 
   <div class="msg err" id="status-error"></div>
+  <div class="msg warn" id="phase-notice"></div>
+
+  <!-- Outside the card it reports on, and that is the whole reason it is here.
+       Provisioning enters `Phase::Activating` before it answers, so the very
+       next status poll hides `#setup` — and a message inside it would be gone
+       in the time one request takes. This one names the node id and the Taproot
+       address a Portal admin has to whitelist, which is the entire remaining
+       task at that moment. It outlives the form that produced it. -->
+  <div class="msg ok" id="setup-success"></div>
+  <p class="muted" id="setup-envelope" hidden></p>
+
+  <!-- Shown on a node with no key at all. The seed phrase is encrypted in the
+       browser before it leaves it; see `server::admin::setup` for what that
+       does and does not defend against. -->
+  <div class="card" id="setup" hidden>
+    <h2>Set up this node's identity</h2>
+    <div class="msg err" id="setup-error"></div>
+    <div class="msg err" id="setup-insecure" hidden>
+      This page is not running in a secure context, so the browser will not
+      provide the cryptography needed to encrypt your seed phrase before sending
+      it. Open this node over TLS, or through localhost, before setting it up.
+    </div>
+    <p class="muted">
+      Your seed phrase is encrypted in this browser, used once to derive this
+      node's key, and then discarded. It is never stored.
+    </p>
+    <textarea id="setup-mnemonic" rows="3" spellcheck="false" autocomplete="off"
+              placeholder="Your 12-word seed phrase"></textarea>
+    <div class="row">
+      <span class="k">Wallet account</span>
+      <input type="number" id="setup-account" min="1" step="1" value="1">
+    </div>
+    <div class="row">
+      <span class="k">Network</span>
+      <select id="setup-network">
+        <option value="signet" selected>signet</option>
+        <option value="mainnet">mainnet</option>
+        <option value="testnet">testnet</option>
+        <option value="regtest">regtest</option>
+      </select>
+    </div>
+
+    <!-- Offered here because here is the only moment an operator is reliably
+         looking at the node. By the time the seal key is the thing that went
+         missing, adding a way back in is no longer possible. -->
+    <div class="divider"></div>
+    <input type="password" id="setup-passphrase" autocomplete="new-password"
+           placeholder="Recovery password (optional)">
+    <p class="muted">
+      The node locks its key with a file it keeps beside it. If that file is
+      ever lost, this password is the only way back in — otherwise the node has
+      to be set up again from scratch. At least 20 characters.
+    </p>
+    <p class="muted">
+      This is not a 25th seed word: it does not change which wallet account this
+      node uses, and the node still restarts on its own without it.
+    </p>
+    <button class="primary" id="setup-submit">Encrypt and set up</button>
+  </div>
+
+  <!-- The exit from a sealed node, and the only one: without it a lost seal key
+       is permanent. Reachable only by a node that was given a recovery password
+       at setup. -->
+  <div class="card" id="unseal" hidden>
+    <h2>This node is locked</h2>
+    <div class="msg err" id="unseal-error"></div>
+    <p class="muted">
+      The file this node locks its key with is gone, so it cannot start. Restore
+      it and restart, or enter the recovery password if one was set at setup.
+    </p>
+    <input type="password" id="unseal-passphrase" placeholder="Recovery password"
+           autocomplete="off">
+    <button class="primary" id="unseal-submit">Unlock</button>
+  </div>
 
   <!-- Shown only while the Portal has no node for this BLS key. Until then the
        node has no signer id, so nothing below it is running. -->
@@ -153,6 +272,31 @@
     </p>
     <p class="muted" id="register-wallet-state"></p>
     <button class="primary" id="register-submit" disabled>Register with Horizon Wallet</button>
+
+    <!-- The way onto the whitelist, for a node that is not on it. Shown only
+         while unregistered: the operator fills in who they are, the node signs
+         and submits the proof of possession itself, and the registration
+         replay already running every 30 s is what turns an approval into a
+         running node — no restart, no second step. -->
+    <div id="whitelist" hidden>
+      <div class="divider"></div>
+      <h3>Request whitelisting</h3>
+      <div class="msg err" id="whitelist-error"></div>
+      <div class="msg ok" id="whitelist-success"></div>
+      <div class="msg warn" id="whitelist-status" hidden></div>
+      <p class="muted" id="whitelist-note">
+        If the Taproot address above is not on the Portal's whitelist, submit a
+        request here. A Portal admin reviews it; the node keeps watching and
+        starts on its own once it is approved.
+      </p>
+      <form id="whitelist-form" class="stack" hidden>
+        <input type="text" id="whitelist-first-name" placeholder="First name" autocomplete="given-name">
+        <input type="text" id="whitelist-last-name" placeholder="Last name" autocomplete="family-name">
+        <input type="text" id="whitelist-email" placeholder="Email" autocomplete="email">
+        <input type="text" id="whitelist-company" placeholder="Company (optional)" autocomplete="organization">
+        <button class="primary" type="submit" id="whitelist-submit">Request whitelisting</button>
+      </form>
+    </div>
   </div>
 
   <div class="grid kpis" id="kpis"></div>
@@ -257,12 +401,21 @@
   // The pending timeout is tracked on the element itself: without that, a
   // second message shown within the 6 s window inherits the first one's
   // countdown and disappears almost immediately.
+  //
+  // `hidden` is set alongside the text, and that is not decoration. Several of
+  // these boxes ship `hidden` in the markup, and nothing else ever clears it —
+  // so a `show()` that only wrote `textContent` left the message invisible.
+  // That is how the one-time `KONTOR_SEAL_KEY` reveal came to display nothing
+  // at all: the node hands the key back once, the page never showed it, and the
+  // env slot it had just committed became a slot nobody could open.
   function show(el, text, keep) {
     if (el.msgTimer) { window.clearTimeout(el.msgTimer); el.msgTimer = null; }
     el.textContent = text || "";
+    el.hidden = !text;
     if (text && !keep) {
       el.msgTimer = window.setTimeout(function () {
         el.textContent = "";
+        el.hidden = true;
         el.msgTimer = null;
       }, 6000);
     }
@@ -295,6 +448,15 @@
     return response.text().then(function (text) {
       try { return text ? JSON.parse(text) : null; } catch (e) { return null; }
     });
+  }
+
+  // Every `api()` caller ends the same way: show the failure, unless it was the
+  // session dying — `api` has already dropped the page back to the sign-in
+  // screen for that, and a second message next to a login form would only
+  // describe a request nobody is waiting for any more.
+  function report(box, error) {
+    if (error.status === 401 || error.status === 403) { return; }
+    show(box, error.message, true);
   }
 
   function apiErrorFrom(response, payload) {
@@ -372,18 +534,26 @@
     if (statusTimer) { window.clearInterval(statusTimer); statusTimer = null; }
   }
 
+  // Exactly one of the three top-level screens, every time. Written as one
+  // function rather than as pairs of assignments scattered across `signOut`,
+  // `openApp` and `chooseScreen`, because the state that mattered was the one
+  // nobody wrote down: "login hidden *and* claim shown".
+  function showScreen(which) {
+    $("login").hidden = which !== "login";
+    $("claim").hidden = which !== "claim";
+    $("app").hidden = which !== "app";
+  }
+
   function signOut() {
     token = null;
     sessionStorage.removeItem(TOKEN_KEY);
     stopPolling();
-    $("app").style.display = "none";
-    $("login").style.display = "grid";
+    showScreen("login");
     $("password").focus();
   }
 
   function openApp() {
-    $("login").style.display = "none";
-    $("app").style.display = "block";
+    showScreen("app");
     loadStatus();
     if (!statusTimer) { statusTimer = window.setInterval(loadStatus, STATUS_POLL_MS); }
   }
@@ -395,16 +565,18 @@
       '</div><div class="label">' + esc(label) + "</div></div>";
   }
 
-  // A node with no BLS password in its environment would stop at the key
-  // prompt on the way back up, so the API refuses to restart it. Saying so
-  // here beats letting the operator find out after typing RESET.
+  // A node whose keystore has no slot this machine can supply would come back
+  // up locked, waiting for someone to type a recovery password, so the API
+  // refuses to restart it. Saying so here beats letting the operator find out
+  // after typing RESET. Re-read on every poll: a node set up through the wizard
+  // gains its first machine slot while this page is open.
   function setRestartAvailable(available) {
     var box = $("reset-restart");
     box.disabled = !available;
     if (!available) { box.checked = false; }
     $("reset-restart-note").textContent = available
       ? "Re-runs onboarding, so the node picks up its signer id, token and announced URL from the Portal again."
-      : "Unavailable: BLS_PASSWORD is not set, so a restarted node would stop at the key password prompt. Restart it yourself after the wipe.";
+      : "Unavailable: nothing on this machine could open this node's key again, so it would come back up locked. Restart it yourself after the wipe.";
   }
 
   function renderStatus(data) {
@@ -434,7 +606,31 @@
       $("storage-directory-row").style.display = "none";
     }
     renderLedger(data.ledger || {});
+    renderPhase(data);
     $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  }
+
+  // Which of the lifecycle cards this node is currently in. The server starts
+  // its HTTP listener before it has a key, so "the page rendered" says nothing
+  // about what the node can do — the phase is the only thing that does, and
+  // every card below is reachable in exactly one of them.
+  //
+  // Re-run on every status poll rather than once at sign-in: setup, unsealing
+  // and registration all take effect in the running process, so the operator
+  // watches the node move between these without reloading.
+  function renderPhase(data) {
+    var phase = data.phase || "";
+
+    $("setup").hidden = phase !== "uninitialized";
+    $("unseal").hidden = phase !== "sealed";
+
+    // The one thing an operator cannot infer from the counters: why the node
+    // is where it is. Kept on screen, since it describes a standing condition.
+    if (data.notice) {
+      show($("phase-notice"), data.notice, true);
+    } else {
+      show($("phase-notice"), "");
+    }
   }
 
   // The counts above stay healthy while proving is dead — a blocked rebuild is
@@ -465,11 +661,12 @@
 
   function loadStatus() {
     api("/api/admin/status").then(function (data) {
-      $("status-error").textContent = "";
+      // Cleared through `show` like every other message box, so the `hidden`
+      // it manages and the text it manages never disagree.
+      show($("status-error"), "");
       renderStatus(data);
     }).catch(function (error) {
-      if (error.status === 401 || error.status === 403) { return; }
-      show($("status-error"), error.message, true);
+      report($("status-error"), error);
     });
   }
 
@@ -491,6 +688,20 @@
     card.setAttribute("data-registered", registered ? "true" : "false");
     $("register-bls-pubkey").textContent = registration.bls_pubkey || "—";
     renderDerived(registration.derived, registered);
+
+    // The whitelist section only exists for a node the Portal will not have:
+    // once registered, the address was on the list by definition.
+    whitelistDerived = !!registration.derived;
+    $("whitelist").hidden = registered;
+    // A node that registers has left this section behind; forgetting the answer
+    // is what makes a later re-registration ask again rather than render what
+    // the Portal said before the key changed.
+    if (registered) {
+      whitelistLoaded = false;
+      whitelistFailed = false;
+    } else {
+      refreshWhitelist();
+    }
 
     if (registered) {
       $("registration-title").textContent = "Portal registration";
@@ -517,8 +728,9 @@
     detectWallet();
   }
 
-  // Mnemonic mode: the node derived its own keys, so what matters is which
-  // account it derived and which address a Portal admin has to whitelist.
+  // The node knows its own Taproot account — it was set up from a seed phrase,
+  // here or in an older release — so what matters is which account that is and
+  // which address a Portal admin has to whitelist.
   function renderDerived(derived, registered) {
     var accountRow = $("register-derived-account-row");
     var addressRow = $("register-derived-address-row");
@@ -544,14 +756,14 @@
     addressRow.hidden = false;
 
     note.textContent = registered
-      ? "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself " +
-        "and needs no wallet. Change KONTOR_STORAGE_ACCOUNT_INDEX and restart to bind " +
-        "a different account."
-      : "These keys come from KONTOR_STORAGE_MNEMONIC, so this node registers itself — " +
-        "no wallet needed. It is still unregistered, which almost always means the " +
-        "Taproot address above is not on the Portal's whitelist yet. Ask a Portal admin " +
-        "to add it: the node keeps offering the same registration every 30 seconds, so " +
-        "it comes up on its own shortly after they do. No restart needed.";
+      ? "This node holds its own Taproot account, so it registers itself and needs no " +
+        "wallet. The account was chosen when the node was set up and is now part of its " +
+        "sealed identity; binding a different one means setting up a second node."
+      : "This node holds its own Taproot account, so it registers itself — no wallet " +
+        "needed. It is still unregistered, which almost always means the Taproot address " +
+        "above is not on the Portal's whitelist yet. Request whitelisting below: the " +
+        "node keeps offering the same registration every 30 seconds, so it comes up on " +
+        "its own shortly after the request is approved. No restart needed.";
     note.hidden = false;
 
     // Nothing here for a browser to sign.
@@ -666,31 +878,173 @@
     }).then(function (result) {
       show($("register-success"), "Registered as " + result.node_id, true);
 
-      // Same reasoning as the reset: the process is going away, and its session
-      // key goes with it.
-      if (result.restarting) {
-        stopPolling();
-        show($("register-restarting"),
-          "The node is restarting to onboard. The Portal still has to confirm the " +
-          "RegisterBlsKey transaction on-chain, which the node waits for on the way up. " +
-          "Sign in again once it is back.",
-          true);
-        button.disabled = true;
-        button.textContent = label;
-        return;
-      }
-
+      // The node onboards again in this process, so the session survives and
+      // the phase below moves on its own. Nothing to sign back into.
       show($("register-restarting"),
-        "Registered, but this node cannot restart itself: BLS_PASSWORD is not set. " +
-        "Restart it yourself once the Portal has confirmed the key on-chain.",
+        "The node is onboarding again. The Portal still has to confirm the RegisterBlsKey " +
+        "transaction on-chain, which the node waits for — watch the phase above; it needs " +
+        "no restart and no second sign-in.",
         true);
       button.disabled = false;
       button.textContent = label;
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) {
-        show($("register-error"), error.message, true);
-      }
+      report($("register-error"), error);
+      button.disabled = false;
+      button.textContent = label;
+    });
+  }
+
+  /* ---------------- whitelisting ---------------- */
+
+  // The address the status is polled for on a wallet node, learned from the
+  // Portal's answer to a submission. A mnemonic node sends nothing: the
+  // server knows its own address. Session-scoped on purpose — a pending
+  // request survives on the Portal, and the next GET after a wallet
+  // submission in this session finds it by this address.
+  var whitelistAddress = null;
+  // Whether the node holds its own Taproot account. Decides who produces the
+  // proof of possession: the node itself, or Horizon Wallet.
+  var whitelistDerived = false;
+  var whitelistInFlight = false;
+  // Whether the Portal has answered once in this session, and what it said.
+  // Together they are what keeps `refreshWhitelist` from asking again when the
+  // answer cannot have changed.
+  var whitelistLoaded = false;
+  var whitelistStatus = "none";
+  var whitelistFailed = false;
+
+  function renderWhitelist(view) {
+    var status = (view && view.status) || "none";
+    var form = $("whitelist-form");
+    var box = $("whitelist-status");
+
+    whitelistLoaded = true;
+    whitelistFailed = false;
+    whitelistStatus = status;
+    if (view && view.bitcoin_address) { whitelistAddress = view.bitcoin_address; }
+
+    if (status === "pending") {
+      form.hidden = true;
+      show(box,
+        "Whitelisting request" + (view.request_id ? " #" + view.request_id : "") +
+        " is waiting for a Portal admin. The node checks every 30 seconds and starts " +
+        "on its own once it is approved — leave it running.",
+        true);
+    } else if (status === "rejected") {
+      form.hidden = false;
+      show(box,
+        "The whitelisting request was rejected" +
+        (view.review_note ? ": " + view.review_note : ".") +
+        " You can amend it and submit again.",
+        true);
+    } else if (status === "approved" && view.whitelisted === true) {
+      form.hidden = true;
+      show(box,
+        "The whitelisting request was approved. The node registers itself and starts " +
+        "on its own shortly — no restart needed.",
+        true);
+    } else if (status === "approved") {
+      // Approved once, but the address has since been removed from the list.
+      // The verdict on file will not bring the node up; a new request will.
+      form.hidden = false;
+      show(box,
+        "An earlier request was approved, but the address is no longer on the " +
+        "whitelist. Submit a new request, or ask a Portal admin.",
+        true);
+    } else {
+      form.hidden = false;
+      show(box, "", true);
+    }
+  }
+
+  // Asked once when the section appears, and after that only while a request is
+  // pending — the one state that can change without this page doing anything,
+  // since a Portal admin approves or rejects it on their own time. "none" and
+  // the two settled verdicts are only ever left through the form below, so
+  // re-asking on every 30 s poll would be a Portal round trip per poll that
+  // could not answer anything new.
+  function refreshWhitelist() {
+    if (whitelistInFlight) { return; }
+    if (whitelistLoaded && whitelistStatus !== "pending") { return; }
+    // A Portal that cannot be reached is still retried on every poll, so the
+    // section fills in by itself once it comes back — but it is said out loud
+    // once, not once per poll.
+    loadWhitelist(whitelistLoaded || whitelistFailed);
+  }
+
+  // `background` suppresses the error box: a poll that could not reach the
+  // Portal tells the operator nothing they can act on, and saying it every
+  // 30 s buries the message that comes from something they did.
+  function loadWhitelist(background) {
+    var path = "/api/admin/whitelist-request";
+    if (whitelistAddress) {
+      path += "?bitcoin_address=" + encodeURIComponent(whitelistAddress);
+    }
+    api(path).then(function (view) {
+      renderWhitelist(view);
+    }).catch(function (error) {
+      whitelistFailed = true;
+      if (!background) { report($("whitelist-error"), error); }
+    });
+  }
+
+  function whitelistBody() {
+    return {
+      first_name: $("whitelist-first-name").value,
+      last_name: $("whitelist-last-name").value,
+      email: $("whitelist-email").value,
+      company: $("whitelist-company").value
+    };
+  }
+
+  function submitWhitelist(event) {
+    event.preventDefault();
+    if (whitelistInFlight) { return; }
+
+    var button = $("whitelist-submit");
+    var label = button.textContent;
+    show($("whitelist-error"), "");
+    show($("whitelist-success"), "");
+    whitelistInFlight = true;
+    button.disabled = true;
+
+    // A mnemonic node signs the whole request itself. An imported key needs
+    // the same wallet proof a registration does, so the browser fetches it
+    // first — one prompt, exactly as registering raises.
+    var prepared;
+    if (whitelistDerived) {
+      prepared = Promise.resolve(whitelistBody());
+    } else if (walletProvider) {
+      button.textContent = "Waiting for Horizon Wallet…";
+      prepared = walletRequest("getAddresses").then(function (result) {
+        return walletRequest("getBLSPoP", { address: taprootAddress(result) });
+      }).then(function (pop) {
+        var body = whitelistBody();
+        body.xpubkey = pop.xpubkey;
+        body.bls_pubkey = pop.blsPubkey;
+        body.schnorr_sig = pop.schnorrSig;
+        return body;
+      });
+    } else {
+      prepared = Promise.reject(new Error(
+        "Horizon Wallet is needed to prove which Taproot address to whitelist. " +
+        "Install and unlock the extension, then reload this page."));
+    }
+
+    prepared.then(function (body) {
+      button.textContent = "Submitting…";
+      return api("/api/admin/whitelist-request", { method: "POST", body: body });
+    }).then(function (view) {
+      show($("whitelist-success"),
+        "Request sent for " + view.bitcoin_address + ". A Portal admin has to approve " +
+        "it; the node keeps checking and starts on its own once they do.",
+        true);
+      renderWhitelist(view);
+    }).catch(function (error) {
+      report($("whitelist-error"), error);
+    }).then(function () {
+      whitelistInFlight = false;
       button.disabled = false;
       button.textContent = label;
     });
@@ -756,27 +1110,343 @@
       }
       loadStatus();
     }).catch(function (error) {
-      if (error.status !== 401 && error.status !== 403) { show($("reset-error"), error.message, true); }
+      report($("reset-error"), error);
     }).then(function () {
       button.disabled = $("reset-confirm").value !== CONFIRMATION_PHRASE;
     });
   }
 
+
+  /* ---------------- sealed channel ---------------- */
+
+  // The browser half of `server::admin::envelope`. WebCrypto only: the page's
+  // CSP forbids loading anything, so every primitive here has to be one the
+  // browser already has. ECDH P-256, HKDF-SHA256 and AES-GCM all are.
+  //
+  // Three things travel through here and none of them may appear in a body a
+  // proxy might log: the seed phrase at setup, the seal passphrase, and the
+  // seal key the node hands back. The last one is why there are two keys rather
+  // than one — a reply sealed under the request key could be replayed as a
+  // request.
+  var ENVELOPE_INFO = "KONTOR_ADMIN_ENVELOPE_V1";
+
+  function hexToBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i += 1) {
+      out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return out;
+  }
+
+  function bytesToHex(bytes) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i += 1) {
+      out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    }
+    return out;
+  }
+
+  function utf8(text) { return new TextEncoder().encode(text); }
+
+  // `crypto.subtle` only exists in a secure context. Saying so up front beats
+  // an undefined-property error at the moment the operator submits a seed
+  // phrase.
+  function cryptoAvailable() {
+    return typeof crypto !== "undefined" && !!crypto.subtle;
+  }
+
+  // Fetch an envelope and do the browser half of the exchange: one ECDH, then
+  // HKDF expanded to 64 bytes and split into the two directional AES-GCM keys
+  // the node derives on its side.
+  function openEnvelope() {
+    return api("/api/admin/envelope").then(function (envelope) {
+      var sessionId = hexToBytes(envelope.session_id);
+      var subtle = crypto.subtle;
+
+      return Promise.all([
+        subtle.importKey("raw", hexToBytes(envelope.node_pubkey),
+                         { name: "ECDH", namedCurve: "P-256" }, false, []),
+        subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])
+      ]).then(function (keys) {
+        var pair = keys[1];
+        return Promise.all([
+          subtle.deriveBits({ name: "ECDH", public: keys[0] }, pair.privateKey, 256),
+          subtle.exportKey("raw", pair.publicKey)
+        ]);
+      }).then(function (parts) {
+        var clientPublic = new Uint8Array(parts[1]);
+
+        return subtle.importKey("raw", new Uint8Array(parts[0]), "HKDF", false, ["deriveBits"])
+          .then(function (ikm) {
+            return subtle.deriveBits(
+              { name: "HKDF", hash: "SHA-256", salt: sessionId, info: utf8(ENVELOPE_INFO) },
+              ikm, 512);
+          })
+          .then(function (okm) {
+            var bytes = new Uint8Array(okm);
+            // First half seals browser to node, second half node to browser.
+            return Promise.all([
+              subtle.importKey("raw", bytes.slice(0, 32), { name: "AES-GCM" }, false, ["encrypt"]),
+              subtle.importKey("raw", bytes.slice(32), { name: "AES-GCM" }, false, ["decrypt"])
+            ]);
+          })
+          .then(function (aes) {
+            return {
+              envelope: envelope,
+              sessionId: sessionId,
+              clientPubkey: bytesToHex(clientPublic),
+              toNode: aes[0],
+              toClient: aes[1]
+            };
+          });
+      });
+    });
+  }
+
+  // Seal a payload for the node. The session id as additional authenticated
+  // data is what binds this ciphertext to the one envelope it was made for.
+  function sealRequest(channel, payload) {
+    var nonce = crypto.getRandomValues(new Uint8Array(12));
+
+    return crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, additionalData: channel.sessionId, tagLength: 128 },
+      channel.toNode, utf8(JSON.stringify(payload))
+    ).then(function (sealed) {
+      return {
+        session_id: channel.envelope.session_id,
+        client_pubkey: channel.clientPubkey,
+        nonce: bytesToHex(nonce),
+        ciphertext: bytesToHex(new Uint8Array(sealed))
+      };
+    });
+  }
+
+  // Open what the node sealed back, under the other direction's key.
+  //
+  // No card calls this today — the one that did, the seal-key reveal, is gone —
+  // but the node still seals replies on the env-slot endpoint, and this is the
+  // half of that channel `scripts/envelope-harness.mjs` slices out of this file
+  // verbatim and drives against a live binary. Deleting it would leave the reply
+  // direction with no test at all.
+  function openResponse(channel, sealed) {
+    return crypto.subtle.decrypt(
+      {
+        name: "AES-GCM", iv: hexToBytes(sealed.nonce),
+        additionalData: channel.sessionId, tagLength: 128
+      },
+      channel.toClient, hexToBytes(sealed.ciphertext)
+    ).then(function (plain) {
+      return JSON.parse(new TextDecoder().decode(plain));
+    });
+  }
+
+  // Fetch an envelope, seal `payload` into it, and post it — the whole of what
+  // the four sealed endpoints have in common.
+  //
+  // Resolves to `{ result, channel }`: the channel is kept because a reply may
+  // come back sealed too, and only the browser that derived these keys can open
+  // it. Callers that send nothing up still go through here — a browser that
+  // cannot produce a ciphertext this process opens cannot read the answer
+  // either, and finding that out after the node has committed a slot is the
+  // wrong order.
+  function sealedPost(path, payload) {
+    var channel;
+    return openEnvelope().then(function (opened) {
+      channel = opened;
+      return sealRequest(channel, payload);
+    }).then(function (body) {
+      return api(path, { method: "POST", body: body });
+    }).then(function (result) {
+      return { result: result, channel: channel };
+    });
+  }
+
+  // Shown wherever a secret would otherwise have to travel in the clear. The
+  // honest answer is to refuse rather than to fall back.
+  var NO_CRYPTO = "This browser will not encrypt here; see the note above.";
+
+  function provisionNode() {
+    var button = $("setup-submit");
+    var phrase = $("setup-mnemonic").value;
+
+    show($("setup-error"), "");
+    show($("setup-success"), "");
+    show($("setup-envelope"), "");
+
+    if (!cryptoAvailable()) {
+      show($("setup-error"), NO_CRYPTO, true);
+      return;
+    }
+    if (!phrase.trim()) {
+      show($("setup-error"), "Enter your seed phrase.", true);
+      return;
+    }
+
+    // Sent as typed rather than coerced, and `0` is the reason. It is what
+    // somebody types who believes the wallet counts from zero — every account
+    // they meant would then be off by one — so the node refuses it by name
+    // instead of quietly reading it as account 1. Only a blank field defaults.
+    var typed = $("setup-account").value.trim();
+    var account = typed === "" ? 1 : Number(typed);
+    if (!isFinite(account) || account !== Math.floor(account) || account < 0) {
+      show($("setup-error"),
+        "The account must be a whole number, as Horizon Wallet shows it.", true);
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Encrypting…";
+
+    // Sent only when it was filled in: an empty string here would be a slot the
+    // node refuses as too short, on behalf of an operator who typed nothing.
+    var passphrase = $("setup-passphrase").value;
+
+    sealedPost("/api/admin/setup/provision", {
+      mnemonic: phrase,
+      account: account,
+      network: $("setup-network").value,
+      passphrase: passphrase === "" ? null : passphrase
+    }).then(function (sealed) {
+      // Kept, like the success box below it and for the same reason: both live
+      // outside `#setup`, which the next status poll hides.
+      show($("setup-envelope"),
+        "Envelope fingerprint " + sealed.channel.envelope.fingerprint +
+        " — it appears in the node's own logs; compare them if you want to be sure " +
+        "this page is talking to the node itself.",
+        true);
+
+      // Cleared as soon as they have been sent: there is no reason for either
+      // to stay in a field on a page that may be left open.
+      $("setup-mnemonic").value = "";
+      $("setup-passphrase").value = "";
+      var result = sealed.result;
+      show($("setup-success"),
+        "Set up as " + result.node_id + " (account " + result.account + ", " +
+        result.network + "). Whitelist " + result.taproot_address +
+        " on the Portal if it is not already. The node is onboarding now." +
+        (result.passphrase_slot
+          ? " Keep the recovery password somewhere this node's disk is not — it is what opens this key if the node's own key file is lost."
+          : ""),
+        true);
+      loadStatus();
+    }).catch(function (error) {
+      report($("setup-error"), error);
+    }).then(function () {
+      button.disabled = false;
+      button.textContent = "Encrypt and set up";
+    });
+  }
+
+  /* ---------------- unsealing ---------------- */
+
+  function unsealNode() {
+    var button = $("unseal-submit");
+    button.disabled = true;
+    show($("unseal-error"), "");
+
+    if (!cryptoAvailable()) {
+      show($("unseal-error"), NO_CRYPTO, true);
+      button.disabled = false;
+      return;
+    }
+
+    // Sealed for the same reason the seed phrase is: a passphrase that opens
+    // the keystore must not sit in a request body an edge is free to log.
+    var passphrase = $("unseal-passphrase").value;
+    sealedPost("/api/admin/unseal", { passphrase: passphrase }).then(function () {
+      $("unseal-passphrase").value = "";
+      loadStatus();
+    }).catch(function (error) {
+      report($("unseal-error"), error);
+    }).then(function () { button.disabled = false; });
+  }
+
+  /* ---------------- claiming ---------------- */
+
+  function claimNode(event) {
+    event.preventDefault();
+    var button = $("claim-submit");
+    var errorBox = $("claim-error");
+    errorBox.textContent = "";
+    button.disabled = true;
+
+    // Same reasoning as `signIn`: a 401 here is a mistyped token, not a dead
+    // session, so it must not route through `api()` and sign the operator out.
+    fetch("/api/admin/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        token: $("claim-token").value.trim(),
+        password: $("claim-password").value
+      })
+    }).then(function (response) {
+      return readBody(response).then(function (payload) {
+        if (!response.ok) { throw apiErrorFrom(response, payload); }
+        return payload;
+      });
+    }).then(function (payload) {
+      token = payload.token;
+      sessionStorage.setItem(TOKEN_KEY, token);
+      $("claim-token").value = "";
+      $("claim-password").value = "";
+      openApp();
+    }).catch(function (error) {
+      errorBox.textContent = error.message;
+    }).then(function () {
+      button.disabled = false;
+    });
+  }
+
+  /* ---------------- which screen ---------------- */
+
+  // Asked before anything else, because it is the only question a browser with
+  // no session can get an answer to: is there a password to type at all.
+  function chooseScreen() {
+    return fetch("/api/admin/bootstrap", { headers: { Accept: "application/json" } })
+      .then(readBody)
+      .then(function (info) {
+        if (info && info.claimed === false) {
+          showScreen("claim");
+          if (info.setup_token_fingerprint) {
+            var note = $("claim-fingerprint");
+            note.textContent = "Token fingerprint " + info.setup_token_fingerprint +
+              " — the node logs the same one, so you can check you have the right token.";
+            note.hidden = false;
+          }
+          $("claim-token").focus();
+          return;
+        }
+        if (token) { openApp(); } else { signOut(); }
+      })
+      .catch(function () {
+        // The node may simply not be up yet. The login screen is the safe
+        // fallback: its first request will say what is really wrong.
+        if (token) { openApp(); } else { signOut(); }
+      });
+  }
+
   /* ---------------- wiring ---------------- */
 
   $("login-form").addEventListener("submit", signIn);
+  $("claim-form").addEventListener("submit", claimNode);
   $("logout").addEventListener("click", signOut);
+  $("setup-submit").addEventListener("click", provisionNode);
+  $("unseal-submit").addEventListener("click", unsealNode);
   $("reset-form").addEventListener("submit", resetDatabase);
   $("register-submit").addEventListener("click", registerNode);
+  $("whitelist-form").addEventListener("submit", submitWhitelist);
 
   $("reset-confirm").addEventListener("input", function () {
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;
   });
 
+  if (!cryptoAvailable()) { $("setup-insecure").hidden = false; }
+
   // A token in sessionStorage is only a hint — it may be expired or signed
-  // with a key this process no longer has. Show the app optimistically; the
-  // first API call demotes us to the login screen if it is no good.
-  if (token) { openApp(); } else { signOut(); }
+  // with a key this process no longer has. `chooseScreen` decides between the
+  // claim, login and app screens; the first API call after that demotes us to
+  // the login screen if the token is no good.
+  chooseScreen();
 }());
 </script>
 </body>

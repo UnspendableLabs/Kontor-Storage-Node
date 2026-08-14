@@ -1,8 +1,16 @@
 //! Database migrations for Kontor Storage Node.
 //!
 //! Keep migrations ordered here so they are applied sequentially.
+//!
+//! These used to be a separate `migration` crate driven by `sea-orm-cli`.
+//! They live in the binary now because a path dependency cannot be published
+//! to crates.io, and a second crate on the registry would only exist to be
+//! version-locked to this one. The `migrate` subcommand replaces the old
+//! `cargo run -p migration -- …` for the databases that need it (Postgres and
+//! MySQL); SQLite still migrates itself on connect.
 
 pub use sea_orm_migration::prelude::{MigrationTrait, MigratorTrait};
+pub use sea_orm_migration::MigrationStatus;
 
 pub mod m20250127_000001_create_challenges_table;
 pub mod m20251217_000001_create_agreements_table;

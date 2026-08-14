@@ -23,7 +23,10 @@ use crate::server::state::DownloadServerState;
 /// will be signed out instead of finding out mid-reset. `restart_available`
 /// answers the same question ahead of time for the restart checkbox: the page
 /// disables it rather than letting the operator meet a `RESTART_UNAVAILABLE`
-/// only once they have typed the confirmation phrase.
+/// only once they have typed the confirmation phrase. It is read from the live
+/// seal status on every poll, so a node that gains its first machine slot part
+/// way through a session — which is what the setup wizard does — sees the
+/// checkbox come alive without a reload.
 ///
 /// # Errors
 /// `500 DATABASE_ERROR` if any of the counts cannot be read.
@@ -58,7 +61,12 @@ pub async fn node_status(
     };
 
     Ok(json!({
-        "node_id": state.node_id,
+        "node_id": state.runtime.node_id(),
+        "phase": state.runtime.phase().as_str(),
+        "serving": state.runtime.phase().is_serving(),
+        // Why the node is where it is, when that needs saying. The one thing an
+        // operator cannot infer from the counters below.
+        "notice": state.runtime.notice(),
         "registration": registration_status(state),
         "storage": {
             "method": state.storage_backend.method.to_string(),
@@ -73,7 +81,7 @@ pub async fn node_status(
             "total": challenges_total,
         },
         "ledger": ledger,
-        "restart_available": state.admin.restart().is_available(),
+        "restart_available": state.runtime.can_restart(),
         "session_expires_at": session_expires_at,
     }))
 }
@@ -87,9 +95,9 @@ pub async fn node_status(
 /// a key was loaded at all, which is the difference between "register it" and
 /// "there is nothing here to register".
 ///
-/// A mnemonic node adds `derived`. It needs no wallet flow at all — it
-/// registers itself at startup — so what an operator wants from this page is
-/// the Taproot address to whitelist, and which account it came from.
+/// A node that knows its Taproot account adds `derived`. It needs no wallet
+/// flow at all — it registers itself at startup — so what an operator wants from
+/// this page is the address to whitelist, and which account it came from.
 fn registration_status(state: &DownloadServerState) -> Value {
     let Some(identity) = state.admin.identity() else {
         return json!({ "supported": false, "registered": false });
@@ -102,11 +110,11 @@ fn registration_status(state: &DownloadServerState) -> Value {
         "bls_pubkey": identity.keypair().public_key_hex(),
         "node_id": registered.map(|node| node.node_id.clone()),
         "signer_id": registered.map(|node| node.signer_id),
-        "derived": identity.derived().map(|derived| json!({
-            "account": derived.account,
-            "network": derived.network.to_string(),
-            "taproot_address": derived.taproot_address,
-            "node_id": derived.node_id,
+        "derived": identity.public().map(|public| json!({
+            "account": public.account,
+            "network": public.network.to_string(),
+            "taproot_address": public.taproot_address,
+            "node_id": public.node_id,
         })),
     })
 }
@@ -241,7 +249,7 @@ mod tests {
             db,
             storage_dir: dir.path().to_path_buf(),
             storage_backend: StorageBackend::local(),
-            node_id: Some("NODE-status".to_string()),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-status"), None),
             admin: AdminState::disabled(),
         };
         (state, dir)
@@ -283,7 +291,7 @@ mod tests {
         let (mut state, dir) = state_with(&[]).await;
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let pubkey = keypair.public_key_hex();
-        state.node_id = None;
+        state.runtime = crate::app::lifecycle::NodeRuntime::for_tests(None, None);
         state.admin = AdminState::with_identity(
             NodeIdentity::new(
                 keypair,
@@ -291,7 +299,7 @@ mod tests {
                 None,
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -323,7 +331,7 @@ mod tests {
                 }),
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -340,25 +348,28 @@ mod tests {
     async fn status_reports_the_derived_account_and_address() {
         use crate::app::restart::RestartHandle;
         use crate::clients::PortalClient;
-        use crate::crypto::mnemonic::DerivedIdentityInfo;
-        use crate::crypto::{BitcoinNetwork, BlsKeyPair};
+        use crate::crypto::{BitcoinNetwork, BlsKeyPair, PublicIdentity};
         use crate::server::admin::NodeIdentity;
         use std::sync::Arc;
 
         let (mut state, dir) = state_with(&[]).await;
+        let keypair = BlsKeyPair::generate().unwrap();
         state.admin = AdminState::with_identity(
             NodeIdentity::new(
-                Arc::new(BlsKeyPair::generate().unwrap()),
+                Arc::new(BlsKeyPair::from_secret_key_hex(&keypair.secret_key_hex()).unwrap()),
                 PortalClient::try_new("http://portal.invalid", dir.path()).unwrap(),
                 None,
-                Some(DerivedIdentityInfo {
+                Some(PublicIdentity {
                     account: 2,
                     network: BitcoinNetwork::Signet,
+                    xpubkey: "tpubExample".to_string(),
                     taproot_address: "tb1pexample".to_string(),
                     node_id: "node-derived".to_string(),
+                    bls_pubkey: keypair.public_key_hex(),
+                    schnorr_binding_sig: "bb".repeat(64),
                 }),
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -391,7 +402,7 @@ mod tests {
                 None,
                 None,
             ),
-            RestartHandle::unavailable(),
+            RestartHandle::new(),
         );
 
         let value = node_status(&state, SESSION_EXPIRY).await.unwrap();
@@ -414,18 +425,32 @@ mod tests {
 
     /// The page needs this before the operator commits to anything, so the
     /// restart checkbox can be disabled with a reason rather than rejected.
+    ///
+    /// It follows the slots, and has to: a node set up through the wizard has
+    /// no keystore when its `/admin` first answers and a machine slot moments
+    /// later, in the same process and the same session.
     #[tokio::test]
     async fn status_reports_whether_a_restart_is_available() {
-        let (mut state, _dir) = state_with(&[]).await;
+        use crate::crypto::keystore::SlotKind;
+
+        let (state, _dir) = state_with(&[]).await;
 
         assert_eq!(
             node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
             false,
-            "AdminState::disabled carries a handle that refuses restarts"
+            "a node with no keystore has nothing to come back up on"
         );
 
-        state.admin = AdminState::with_restart(crate::app::restart::RestartHandle::available());
+        state.runtime.set_slots(vec![SlotKind::Passphrase]);
+        assert_eq!(
+            node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
+            false,
+            "a slot only a human can supply is not a way back from a restart"
+        );
 
+        state
+            .runtime
+            .set_slots(vec![SlotKind::File, SlotKind::Passphrase]);
         assert_eq!(
             node_status(&state, SESSION_EXPIRY).await.unwrap()["restart_available"],
             true

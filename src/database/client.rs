@@ -6,8 +6,12 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{migration, sqlite};
+use super::{migration, redact_credentials, sqlite};
 
+/// Deliberately still capitalised, and deliberately not the crate name. The
+/// package was renamed to `kontor-storage-node` for crates.io; this string is
+/// the directory a running node keeps its keystore and database in, so
+/// following the rename would strand every existing node's data one path over.
 const DEFAULT_DB_DIR: &str = "Kontor-Storage-Node";
 const DEFAULT_DB_FILE: &str = "storage.db";
 const DEFAULT_FILES_DIR: &str = "files";
@@ -128,6 +132,18 @@ pub fn default_storage_dir() -> PathBuf {
     }
 }
 
+/// Opens the database without applying anything, for the `migrate`
+/// subcommand: it is the one caller that decides for itself which direction
+/// the schema moves, so [`DBClient::new`]'s unconditional `up` would defeat
+/// the point of asking for `down`.
+///
+/// # Errors
+/// If the SQLite file cannot be prepared, or the database is unreachable.
+pub async fn connect_without_migrating(database_url: &str) -> Result<DatabaseConnection> {
+    sqlite::prepare_sqlite(database_url)?;
+    connect(database_url).await
+}
+
 /// Establishes a database connection using SeaORM.
 async fn connect(database_url: &str) -> Result<DatabaseConnection> {
     let mut options = ConnectOptions::new(database_url);
@@ -141,7 +157,16 @@ async fn connect(database_url: &str) -> Result<DatabaseConnection> {
 
     Database::connect(options)
         .await
-        .with_context(|| format!("unable to connect to database {database_url}"))
+        // The URL without its password. This message is the one an operator
+        // pastes into a chat window when the deploy will not come up, and a
+        // failed connection is exactly when the credentials are worth quoting
+        // least and worth leaking most.
+        .with_context(|| {
+            format!(
+                "unable to connect to database {}",
+                redact_credentials(database_url)
+            )
+        })
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use crate::app::cli::Cli;
-use crate::database::default_storage_dir;
+use crate::database::{default_app_dir, default_storage_dir};
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
 use std::fmt;
@@ -88,6 +88,10 @@ pub struct Config {
     pub portal_url: String,
     pub database_url: String,
     pub storage_dir: PathBuf,
+    /// Where the keystore, the admin credential and the database live. Resolved
+    /// once here so nothing downstream has to re-read `KONTOR_APP_DIR` and
+    /// disagree about the answer.
+    pub app_dir: PathBuf,
     pub portal_polling_interval: Duration,
     pub storage_capacity: Option<u64>,
     pub storage_max_files: Option<u64>,
@@ -126,6 +130,22 @@ impl Config {
             return Err(anyhow!("KONTOR_CONTRACT_ADDRESS cannot be empty"));
         }
 
+        // Every secret this node keeps at rest is written here, so a platform
+        // with no data directory and no override has nowhere to be a node from.
+        // Better to say that by name than to fail later on a path that was
+        // silently built from the current working directory.
+        let app_dir = cli
+            .app_dir
+            .clone()
+            .or_else(default_app_dir)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no application data directory could be determined. \
+                     Set KONTOR_APP_DIR to a directory that survives restarts — \
+                     it holds this node's sealed key and its database."
+                )
+            })?;
+
         let admin_password = AdminPassword::new(cli.admin_password.as_deref());
         if !admin_password.is_empty()
             && admin_password.expose().chars().count() < MIN_ADMIN_PASSWORD_LEN
@@ -154,6 +174,7 @@ impl Config {
             portal_url: cli.portal_url.clone(),
             database_url: cli.database_url.clone(),
             storage_dir: cli.storage_dir.clone().unwrap_or_else(default_storage_dir),
+            app_dir,
             portal_polling_interval: Duration::from_secs(cli.portal_polling_interval_secs),
             storage_capacity,
             storage_max_files: cli.storage_max_files,
@@ -204,6 +225,7 @@ mod tests {
         Cli {
             portal_url: "https://portal.example/api".to_string(),
             database_url: "sqlite://localhost/mydb".to_string(),
+            app_dir: None,
             storage_dir: Some(PathBuf::from("/tmp/files")),
             portal_polling_interval_secs: 10,
             storage_capacity: None,
@@ -373,6 +395,7 @@ mod tests {
     #[test]
     fn config_from_cli_uses_default_storage_dir_when_none() {
         let cli = Cli {
+            app_dir: None,
             storage_dir: None,
             ..make_cli()
         };

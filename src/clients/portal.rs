@@ -453,6 +453,53 @@ impl PortalClient {
             .context("failed to deserialize node registration response")
     }
 
+    /// Ask the Portal to whitelist this node's Taproot address.
+    ///
+    /// Unauthenticated like [`Self::register_node`], and for the same reason:
+    /// a node that needs whitelisting has no credential at all. The Portal
+    /// takes the same proof of possession a registration carries — which is
+    /// what stops a stranger queueing requests for someone else's address —
+    /// plus the operator's contact details, and holds the request until a
+    /// Portal admin approves or rejects it.
+    ///
+    /// Submissions are quota'd per IP (and the quota is charged before the
+    /// signatures are checked), so callers should validate what they can
+    /// locally rather than let the Portal refuse a malformed body.
+    pub async fn submit_whitelist_request(
+        &self,
+        request: &WhitelistRequestBody,
+    ) -> Result<WhitelistRequestView> {
+        let url = format!("{}/api/nodes/whitelist/request", self.base_url);
+        let resp = self.http.post(&url).json(request).send().await?;
+        let resp = check_response_status(resp, "submit whitelist request").await?;
+        resp.json::<WhitelistRequestView>()
+            .await
+            .context("failed to deserialize whitelist request response")
+    }
+
+    /// Where a whitelist request for `bitcoin_address` stands.
+    ///
+    /// Public and unauthenticated. Answers 404 when the address has neither a
+    /// request in the queue nor a whitelist entry; an address whitelisted by
+    /// hand, without ever going through the queue, answers with
+    /// `status: "approved"` and no `request_id`.
+    pub async fn whitelist_request_status(
+        &self,
+        bitcoin_address: &str,
+    ) -> Result<WhitelistRequestView> {
+        let url = format!("{}/api/nodes/whitelist/request", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("bitcoin_address", bitcoin_address)])
+            .send()
+            .await?;
+        let resp = check_response_status(resp, "check whitelist request status").await?;
+        resp.json::<WhitelistRequestView>()
+            .await
+            .context("failed to deserialize whitelist request status")
+    }
+
     /// Request a login challenge for the given user/node ID.
     pub async fn login_challenge(&self, user_id: &str) -> Result<LoginChallenge> {
         let url = format!("{}/api/users/login", self.base_url);
@@ -1028,6 +1075,44 @@ pub struct RegisterNodeResponse {
     pub x_only_pubkey: String,
     #[allow(dead_code)]
     pub bls_public_key: String,
+}
+
+/// Body of `POST /api/nodes/whitelist/request`.
+///
+/// Built by [`crate::node::registration::build_whitelist_request`]. The first
+/// four fields are the same proof of possession a registration carries — the
+/// Portal derives the P2TR address from `xpubkey` itself, which is why no
+/// address travels here — and the rest are the operator's contact details for
+/// the Portal admin reviewing the queue.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhitelistRequestBody {
+    pub xpubkey: String,
+    pub bls_pubkey: String,
+    pub schnorr_sig: String,
+    pub bls_sig: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+}
+
+/// What both whitelist-request endpoints answer.
+///
+/// `whitelisted` is the field a waiting node acts on — `status` is the
+/// reviewer's verdict, and the two can differ if the address is removed from
+/// the whitelist after an approval. `request_id` is absent for an address that
+/// was whitelisted by hand without ever going through the queue.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhitelistRequestView {
+    pub request_id: Option<i64>,
+    pub bitcoin_address: String,
+    pub status: String,
+    pub whitelisted: bool,
+    pub review_note: Option<String>,
+    pub requested_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub reviewed_at: Option<String>,
 }
 
 #[allow(dead_code)]

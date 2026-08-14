@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Package and verify without publishing'
+        type: boolean
+        default: true
+
+jobs:
+  # The tag is the only thing saying which version this is, and nothing checks
+  # it against the manifest. A tag one digit off would publish the wrong
+  # version under the right name, which crates.io does not let you take back.
+  verify:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag to package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kontor-storage-node") | .version')
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+
+  # Publishing is irreversible, so every gate CI runs on a push runs again here
+  # against the exact commit being released — including `cargo package`, the
+  # MSRV the manifest declares, and the migrations against real Postgres and
+  # MySQL servers. It is the same file CI calls, which is the only way that
+  # sentence stays true: a hand-copied subset would drift a job at a time, and
+  # a defect a release makes permanent is exactly the kind that hides in the
+  # job someone left out.
+  gates:
+    uses: ./.github/workflows/gates.yml
+
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    needs: [verify, gates]
+    # `needs` on a skipped job would skip this one too, and `verify` is skipped
+    # whenever the dispatch runs off a branch — hence `always()` plus an explicit
+    # verdict. What it must NOT do is treat a dispatch as permission to ignore a
+    # check that ran: a dispatch CAN target a tag ref, `verify` runs, and a tag
+    # that disagrees with the manifest has to stop the release rather than
+    # publish the wrong version under the right name. `gates` is never skipped,
+    # so it is held to the stricter test.
+    if: >-
+      always()
+      && needs.verify.result != 'failure'
+      && needs.verify.result != 'cancelled'
+      && needs.gates.result == 'success'
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A dispatch off a *branch* is a dry run and nothing else. `verify` only
+      # runs on a tag ref, so without the `ref_type` clause a dispatch on a
+      # branch with `dry_run: false` would publish whatever version the manifest
+      # happened to carry, with nothing having checked it — the same
+      # irreversible mistake `verify` exists to prevent, reached by the other
+      # door.
+      #
+      # No `--no-verify`: the tarball was built and verified in `gates`, but on
+      # another runner. Letting `cargo publish` rebuild it costs one compile and
+      # is the last chance to catch a tarball that does not build, on the one
+      # action that cannot be taken back.
+      - name: Publish to crates.io
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.dry_run == false)
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Dry run — nothing published
+        if: ${{ !(github.ref_type == 'tag' && (github.event_name == 'push' || inputs.dry_run == false)) }}
+        run: |
+          echo "Every gate passed and \`cargo package\` built and verified the tarball."
+          echo "Nothing was published: a release needs a tag ref and dry_run: false."
