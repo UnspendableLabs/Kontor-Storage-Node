@@ -22,7 +22,7 @@
 //! function and an exit code to get back out of; it is now just a phase the
 //! supervisor leaves when the Portal changes its mind.
 
-use crate::app::cli::{Cli, Commands};
+use crate::app::cli::{Cli, Commands, MigrateAction};
 use crate::app::config::{Config, StorageMethod};
 use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
 use crate::app::lifecycle::{Activation, NodeRuntime, Phase, SealStatus};
@@ -183,6 +183,14 @@ pub async fn run_with_shutdown(
     let config = Config::from_cli(&cli)?;
 
     print_config_info(&config, &mut writer)?;
+
+    // Before the storage directory and the Portal client, because `migrate`
+    // needs neither: it is the command an operator runs against a database
+    // from a machine that is not the node.
+    if let Commands::Migrate { action } = cli.command {
+        return migrate(&config, action, &mut writer).await;
+    }
+
     setup_storage_directory(&config)?;
 
     let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
@@ -195,7 +203,53 @@ pub async fn run_with_shutdown(
             Ok(Outcome::Shutdown)
         }
         Commands::Run => serve(config, client, writer, shutdown).await,
+        // Handled above, before the Portal client this arm cannot reach.
+        Commands::Migrate { .. } => unreachable!("migrate returns before this match"),
     }
+}
+
+/// Move the database schema, in whichever direction was asked for.
+async fn migrate(
+    config: &Config,
+    action: MigrateAction,
+    writer: &mut SharedWriter,
+) -> Result<Outcome> {
+    use crate::migration::{MigrationStatus, Migrator, MigratorTrait};
+
+    let db = crate::database::connect_without_migrating(&config.database_url).await?;
+
+    match action {
+        MigrateAction::Up => {
+            let pending = Migrator::get_pending_migrations(&db)
+                .await
+                .context("failed to read migration status")?
+                .len();
+            Migrator::up(&db, None)
+                .await
+                .context("failed to apply database migrations")?;
+            writeln!(writer, "Applied {pending} migration(s).")?;
+        }
+        MigrateAction::Down { num } => {
+            Migrator::down(&db, Some(num))
+                .await
+                .context("failed to roll back database migrations")?;
+            writeln!(writer, "Rolled back {num} migration(s).")?;
+        }
+        MigrateAction::Status => {
+            for migration in Migrator::get_migration_with_status(&db)
+                .await
+                .context("failed to read migration status")?
+            {
+                let status = match migration.status() {
+                    MigrationStatus::Applied => "applied",
+                    MigrationStatus::Pending => "pending",
+                };
+                writeln!(writer, "{:<8} {}", status, migration.name())?;
+            }
+        }
+    }
+
+    Ok(Outcome::Shutdown)
 }
 
 /// Bring the node up: server first, then whatever the volume allows.
@@ -1498,6 +1552,175 @@ mod tests {
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         }
+    }
+
+    /// A `Cli` that does nothing but move the schema of `database_url`. The
+    /// Portal URL is deliberately unreachable: `migrate` must not contact it,
+    /// and a test that passes with a live Portal would not prove that.
+    fn migrate_cli(database_url: String, action: MigrateAction) -> Cli {
+        Cli {
+            portal_url: "http://portal.invalid".to_string(),
+            database_url,
+            app_dir: None,
+            storage_dir: Some(PathBuf::from("/nonexistent/migrate")),
+            portal_polling_interval_secs: 30,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
+            bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
+            command: Commands::Migrate { action },
+        }
+    }
+
+    /// The storage directory in `migrate_cli` does not exist and could not be
+    /// created. Reaching `setup_storage_directory` would fail, so this passing
+    /// is what proves `migrate` returns before it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_up_applies_every_pending_migration() {
+        let guard = TempAppDirGuard::new("migrate_up");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+        let expected = {
+            use crate::migration::MigratorTrait;
+            crate::migration::Migrator::migrations().len()
+        };
+
+        let (writer, captured) = SharedWriter::buffer();
+        let outcome = run(migrate_cli(url, MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, Outcome::Shutdown));
+        assert!(
+            captured
+                .text()
+                .contains(&format!("Applied {expected} migration(s).")),
+            "expected every migration to be reported as applied, got: {}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_up_is_idempotent_and_reports_nothing_pending() {
+        let guard = TempAppDirGuard::new("migrate_twice");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        assert!(
+            captured.text().contains("Applied 0 migration(s)."),
+            "a second `up` should have nothing to do, got: {}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_status_reports_pending_then_applied() {
+        let guard = TempAppDirGuard::new("migrate_status");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        let before = captured.text();
+        assert!(
+            before.contains("pending") && !before.contains("applied"),
+            "a fresh database should list every migration as pending, got: {before}"
+        );
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        let after = captured.text();
+        assert!(
+            after.contains("applied") && !after.contains("pending"),
+            "every migration should be applied after `up`, got: {after}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_down_rolls_back_the_requested_number() {
+        let guard = TempAppDirGuard::new("migrate_down");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(
+            migrate_cli(url.clone(), MigrateAction::Down { num: 1 }),
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            captured.text().contains("Rolled back 1 migration(s)."),
+            "unexpected output: {}",
+            captured.text()
+        );
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        assert!(
+            captured.text().contains("pending"),
+            "the rolled-back migration should be pending again, got: {}",
+            captured.text()
+        );
+    }
+
+    /// The error path: an unreachable database has to surface as a failure
+    /// rather than a silent no-op, or a deploy would carry on against a schema
+    /// that never moved.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_fails_when_the_database_is_unreachable() {
+        let _guard = TempAppDirGuard::new("migrate_bad_db");
+
+        let (writer, _) = SharedWriter::buffer();
+        let err = run(
+            migrate_cli("postgres://127.0.0.1:1/nope".to_string(), MigrateAction::Up),
+            writer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unable to connect to database"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The whole point of the unregistered path: a node the Portal has never

@@ -48,6 +48,7 @@ mod tests {
     use crate::app::tasks::downloadagreements::StorageBackend;
     use crate::clients::gcs::GcsClient;
     use crate::entities::agreements;
+    use crate::migration::{Migrator, MigratorTrait};
     use crate::server::admin::AdminState;
     use crate::server::handlers::{DownloadError, FilesResponse, ListFilesError};
     use crate::testutils::{unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY};
@@ -56,7 +57,6 @@ mod tests {
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use http_body_util::BodyExt;
-    use migration::{Migrator, MigratorTrait};
     use sea_orm::{ActiveModelTrait, DatabaseConnection};
     use std::fs;
     use std::net::SocketAddr;

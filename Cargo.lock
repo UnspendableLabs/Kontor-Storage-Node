@@ -3,68 +3,6 @@
 version = 4
 
 [[package]]
-name = "Kontor-Storage-Node"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "anyhow",
- "argon2",
- "assert_cmd",
- "axum",
- "base64",
- "bech32",
- "bip32",
- "bip39",
- "blst",
- "byte-unit",
- "bytes",
- "chrono",
- "cipher",
- "clap",
- "ctr",
- "dirs",
- "dotenvy",
- "ff",
- "futures-util",
- "halo2curves",
- "hex",
- "hkdf",
- "http",
- "http-body-util",
- "jsonwebtoken",
- "k256",
- "kontor-crypto",
- "libc",
- "migration",
- "p256",
- "pasta_curves",
- "postcard",
- "rand",
- "reqwest",
- "rpassword",
- "rsa",
- "sea-orm",
- "sea-orm-migration",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
 name = "addchain"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1987,9 +1925,9 @@ dependencies = [
 
 [[package]]
 name = "keccak"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecc2af9a1119c51f12a14607e783cb977bde58bc069ff0c3da1095e635d70654"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
 dependencies = [
  "cpufeatures",
 ]
@@ -2038,6 +1976,68 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kontor-storage-node"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "assert_cmd",
+ "async-trait",
+ "axum",
+ "base64",
+ "bech32",
+ "bip32",
+ "bip39",
+ "blst",
+ "byte-unit",
+ "bytes",
+ "chrono",
+ "cipher",
+ "clap",
+ "ctr",
+ "dirs",
+ "dotenvy",
+ "ff",
+ "futures-util",
+ "halo2curves",
+ "hex",
+ "hkdf",
+ "http",
+ "http-body-util",
+ "jsonwebtoken",
+ "k256",
+ "kontor-crypto",
+ "libc",
+ "p256",
+ "pasta_curves",
+ "postcard",
+ "rand",
+ "reqwest",
+ "rpassword",
+ "rsa",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -2149,15 +2149,6 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
-
-[[package]]
-name = "migration"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "sea-orm-migration",
- "tokio",
-]
 
 [[package]]
 name = "mime"
@@ -3231,8 +3222,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "973e773ee4f4c5961a7731e7b43f2e92f270bed263d27d3b53df2be66a6f8056"
 dependencies = [
  "chrono",
- "clap",
- "dotenvy",
  "glob",
  "indoc",
  "regex",
@@ -3266,8 +3255,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af6661212b7f62e812150bd78aed67a439e6a7f3f4dadbbe02fb8649767ea0f2"
 dependencies = [
  "async-trait",
- "clap",
- "dotenvy",
  "sea-orm",
  "sea-orm-cli",
  "sea-schema",
@@ -3625,9 +3612,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]

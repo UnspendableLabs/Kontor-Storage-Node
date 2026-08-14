@@ -1,16 +1,38 @@
 [package]
-name = "Kontor-Storage-Node"
+name = "kontor-storage-node"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+description = "Storage node for the Kontor distributed storage network: stores files under contract, answers challenges with BLS proofs, and configures itself from a browser."
+authors = ["Unspendable Labs"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UnspendableLabs/Kontor-Storage-Node"
+homepage = "https://github.com/UnspendableLabs/Kontor-Storage-Node"
+documentation = "https://github.com/UnspendableLabs/Kontor-Storage-Node#readme"
+readme = "README.md"
+keywords = ["kontor", "storage", "node", "bitcoin", "proof-of-storage"]
+categories = ["command-line-utilities", "cryptography", "database"]
+# The published tarball is the node and what it serves, nothing else. The API
+# blueprint, the CI plumbing and the browser-half test harness are part of
+# developing this crate, not of running it.
+exclude = [
+    "/.github",
+    "/.githooks",
+    "/apiary.apib",
+    "/codecov.yml",
+    "/scripts",
+    "/tests",
+]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [workspace]
-members = [".", "migration"]
+members = ["."]
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -26,8 +48,18 @@ sea-orm = { version = "2.0.0-rc.7", features = [
     "runtime-tokio-rustls",
     "macros"
 ] }
-sea-orm-migration = "2.0.0-rc.7"
-migration = { path = "migration" }
+# The features must be named here, not inherited. They used to arrive through
+# feature unification with the separate `migration` crate; now that it is a
+# module, nothing else asks for them, and without `sqlx-sqlite` the schema
+# manager answers "operation not supported by backend Sqlite".
+# `default-features = false` drops the `cli` feature, and with it `sea-orm-cli`
+# and its `home` crate — which alone would have set this crate's MSRV to 1.88.
+# Nothing needs it: the `cli` feature exists to build a `sea-orm-cli`-style
+# migration binary, which the `migrate` subcommand replaced.
+sea-orm-migration = { version = "2.0.0-rc.7", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+] }
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

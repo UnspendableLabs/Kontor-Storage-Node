@@ -42,7 +42,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PAGE = join(ROOT, "src", "server", "admin", "index.html");
-const BINARY = join(ROOT, "target", "debug", "Kontor-Storage-Node");
+const BINARY = join(ROOT, "target", "debug", "kontor-storage-node");
 
 /// The canonical BIP-39 phrase. Nothing is registered, so it goes nowhere.
 const PHRASE =

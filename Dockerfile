@@ -6,7 +6,6 @@ FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY migration/ ./migration/
 COPY src/ ./src/
 COPY static/ ./static/
 
@@ -21,7 +20,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/Kontor-Storage-Node /app/
+COPY --from=builder /build/target/release/kontor-storage-node /app/
 COPY static/ /app/static/
 
 RUN groupadd --system --gid 1001 kontor \

@@ -126,6 +126,29 @@ pub enum Commands {
     Ping,
     /// Run the node background workers
     Run,
+    /// Apply, roll back or inspect database migrations
+    ///
+    /// A SQLite node migrates itself the moment it connects, so this exists
+    /// for the databases that do not — Postgres and MySQL — and for operators
+    /// who would rather run the schema change before the deploy than during it.
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateAction {
+    /// Apply every pending migration
+    Up,
+    /// Roll back the most recently applied migrations
+    Down {
+        /// How many migrations to roll back
+        #[arg(short = 'n', long = "num", default_value_t = 1)]
+        num: u32,
+    },
+    /// List every migration and whether it has been applied
+    Status,
 }
 
 #[cfg(test)]
