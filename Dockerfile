@@ -7,6 +7,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src/ ./src/
+# Needed to *build*: the dashboard's assets are embedded into the binary.
 COPY static/ ./static/
 
 RUN cargo build --release --locked
@@ -20,8 +21,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# The binary is the whole node: `static/` is compiled in, so nothing has to
+# sit beside it and no working directory has to be the right one.
 COPY --from=builder /build/target/release/kontor-storage-node /app/
-COPY static/ /app/static/
 
 RUN groupadd --system --gid 1001 kontor \
     && useradd --system --uid 1001 --gid 1001 --create-home --home-dir /home/kontor kontor \

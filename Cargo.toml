@@ -2,7 +2,11 @@
 name = "kontor-storage-node"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Set by `home 0.5.12`, which arrives under `sqlx-postgres` (via `etcetera`, for
+# `~/.pgpass`). Compiling the Postgres and MySQL drivers in is what makes the
+# `DATABASE_URL` values this README advertises actually connect, and this is
+# their price. Everything else in the graph tops out at 1.85.
+rust-version = "1.88"
 description = "Storage node for the Kontor distributed storage network: stores files under contract, answers challenges with BLS proofs, and configures itself from a browser."
 authors = ["Unspendable Labs"]
 license = "MIT OR Apache-2.0"
@@ -43,8 +47,15 @@ tokio-util = "0.7"
 futures-util = "0.3"
 ff = "0.13"
 hex = "0.4"
+# A node runs on SQLite; `migrate` exists for the operators who point it at a
+# shared Postgres or MySQL instead, so all three drivers have to be compiled in.
+# `Database::connect` dispatches on `#[cfg(feature)]` alone: without the arm for
+# a scheme, it does not fail to authenticate, it answers "has no supporting
+# driver" for every URL of that shape.
 sea-orm = { version = "2.0.0-rc.7", features = [
     "sqlx-sqlite",
+    "sqlx-postgres",
+    "sqlx-mysql",
     "runtime-tokio-rustls",
     "macros"
 ] }
@@ -52,13 +63,14 @@ sea-orm = { version = "2.0.0-rc.7", features = [
 # feature unification with the separate `migration` crate; now that it is a
 # module, nothing else asks for them, and without `sqlx-sqlite` the schema
 # manager answers "operation not supported by backend Sqlite".
-# `default-features = false` drops the `cli` feature, and with it `sea-orm-cli`
-# and its `home` crate — which alone would have set this crate's MSRV to 1.88.
-# Nothing needs it: the `cli` feature exists to build a `sea-orm-cli`-style
-# migration binary, which the `migrate` subcommand replaced.
+# `default-features = false` drops the `cli` feature, and with it the whole
+# `sea-orm-cli` binary. Nothing needs it: the `cli` feature exists to build a
+# `sea-orm-cli`-style migration binary, which the `migrate` subcommand replaced.
 sea-orm-migration = { version = "2.0.0-rc.7", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlx-sqlite",
+    "sqlx-postgres",
+    "sqlx-mysql",
 ] }
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -109,7 +121,12 @@ bech32 = "0.11"
 base64 = "0.22"
 uuid = { version = "1.11", features = ["v4"] }
 postcard = { version = "1.1", features = ["alloc"] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["cors"] }
+# The dashboard's CSS, JS and logo, compiled into the binary rather than read
+# from `./static` at runtime — see `server::assets`. `debug-embed` makes debug
+# builds embed too, so the tests exercise the same bytes a release serves
+# instead of the working directory's.
+rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
 
 # Only for `flock`, which is how the daemon lock tells a live holder from one
 # left behind by a SIGKILL — the kernel releases it either way. Already in the

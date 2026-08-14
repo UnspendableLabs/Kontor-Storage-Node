@@ -11,7 +11,7 @@ A node stores files under contract, answers the Portal's challenges with BLS pro
 
 ## Prerequisites
 
-- Rust 1.85 or later (the exact channel is pinned in [rust-toolchain.toml](rust-toolchain.toml))
+- Rust 1.88 or later (the exact channel is pinned in [rust-toolchain.toml](rust-toolchain.toml))
 - A running Kontor Portal instance
 
 ## Installation

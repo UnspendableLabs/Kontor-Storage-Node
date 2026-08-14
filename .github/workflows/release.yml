@@ -36,9 +36,13 @@ jobs:
     name: cargo publish
     runs-on: ubuntu-latest
     needs: [verify]
-    # `needs` on a skipped job would skip this one too, so the dispatch path
-    # has to say explicitly that it does not need the tag check.
-    if: always() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')
+    # `needs` on a skipped job would skip this one too, and `verify` is skipped
+    # whenever the dispatch runs off a branch — hence `always()` plus an explicit
+    # verdict. What it must NOT do is treat a dispatch as permission to ignore a
+    # check that ran: a dispatch CAN target a tag ref, `verify` runs, and a tag
+    # that disagrees with the manifest has to stop the release rather than
+    # publish the wrong version under the right name.
+    if: always() && needs.verify.result != 'failure' && needs.verify.result != 'cancelled'
     environment: crates-io
     steps:
       - uses: actions/checkout@v4

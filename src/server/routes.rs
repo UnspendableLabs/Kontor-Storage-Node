@@ -26,12 +26,12 @@
 //! another origin their responses.
 
 use crate::server::admin;
+use crate::server::assets;
 use crate::server::handlers::{dashboard, download_file, list_files, node_info};
 use crate::server::state::DownloadServerState;
 use axum::{routing::get, Router};
 use http::{header, Method};
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
 
 /// Create the router with all routes.
 pub fn router(state: DownloadServerState) -> Router {
@@ -50,7 +50,9 @@ pub fn router(state: DownloadServerState) -> Router {
         .route("/api/info", get(node_info))
         .route("/files", get(list_files))
         .route("/files/:file_id", get(download_file))
-        .nest_service("/static", ServeDir::new("static"))
+        // Served out of the binary, not out of the working directory — an
+        // installed node has no `static/` beside it. See [`crate::server::assets`].
+        .route("/static/*path", get(assets::serve))
         .layer(cors)
         .merge(admin::router())
         .with_state(state)

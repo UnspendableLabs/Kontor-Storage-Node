@@ -29,7 +29,9 @@ First public release.
 - Storage backends: local filesystem and Google Cloud Storage, with capacity,
   file-count and per-file size limits.
 - Public HTTP server for file downloads, a status dashboard, and a
-  password-gated operator UI at `/admin`.
+  password-gated operator UI at `/admin`. The dashboard's assets are compiled
+  into the binary, so `cargo install kontor-storage-node` serves the same page
+  the Docker image does, from any working directory.
 - `migrate` subcommand for the databases that do not migrate themselves
   (Postgres, MySQL). SQLite still migrates on connect.
 

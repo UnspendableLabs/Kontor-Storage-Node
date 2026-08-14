@@ -3,6 +3,7 @@
 //! Provides a REST API for downloading stored files and listing available files.
 
 pub mod admin;
+pub mod assets;
 pub mod handlers;
 pub mod routes;
 pub mod state;
@@ -961,6 +962,50 @@ mod tests {
         assert!(
             location.contains("inline"),
             "expected inline disposition in signed URL, got {location}"
+        );
+    }
+
+    /// The route the dashboard's `<link>` and `<script>` tags resolve to. It is
+    /// wired to the embedded assets, not to a directory, so it answers the same
+    /// whether the node was installed with `cargo install` or unpacked from the
+    /// image — see [`crate::server::assets`].
+    #[tokio::test]
+    async fn static_assets_are_served_from_the_binary() {
+        let db = setup_db().await;
+        let state = DownloadServerState {
+            db,
+            storage_dir: unique_storage_dir("server"),
+            storage_backend: StorageBackend::local(),
+            runtime: crate::app::lifecycle::NodeRuntime::for_tests(Some("NODE-TEST"), None),
+            admin: AdminState::disabled(),
+        };
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/static/storage.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/css")
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            crate::server::assets::get("storage.css")
+                .expect("storage.css is embedded")
+                .data
+                .as_ref()
         );
     }
 }

@@ -230,10 +230,21 @@ async fn migrate(
             writeln!(writer, "Applied {pending} migration(s).")?;
         }
         MigrateAction::Down { num } => {
+            // `down` stops silently once the applied stack runs out, so the
+            // number asked for is not the number moved. Reporting the request
+            // would tell an operator a fresh database had just been rolled
+            // back. Count what is actually there, as `Up` does.
+            let applied = Migrator::get_migration_with_status(&db)
+                .await
+                .context("failed to read migration status")?
+                .iter()
+                .filter(|migration| matches!(migration.status(), MigrationStatus::Applied))
+                .count();
+            let rolled_back = applied.min(num as usize);
             Migrator::down(&db, Some(num))
                 .await
                 .context("failed to roll back database migrations")?;
-            writeln!(writer, "Rolled back {num} migration(s).")?;
+            writeln!(writer, "Rolled back {rolled_back} migration(s).")?;
         }
         MigrateAction::Status => {
             for migration in Migrator::get_migration_with_status(&db)
@@ -1704,6 +1715,12 @@ mod tests {
     /// The error path: an unreachable database has to surface as a failure
     /// rather than a silent no-op, or a deploy would carry on against a schema
     /// that never moved.
+    ///
+    /// The assertion reaches past the `with_context` wrapper, which every
+    /// `connect()` failure carries alike. Matching only on the wrapper would
+    /// let this pass for the wrong reason — a missing Postgres driver reads
+    /// exactly the same from out there, which is how the command shipped once
+    /// claiming to migrate Postgres while compiled without it.
     #[tokio::test]
     #[serial_test::serial]
     async fn migrate_fails_when_the_database_is_unreachable() {
@@ -1720,6 +1737,66 @@ mod tests {
         assert!(
             err.to_string().contains("unable to connect to database"),
             "unexpected error: {err}"
+        );
+
+        let root = format!("{:#}", err);
+        assert!(
+            !root.contains("no supporting driver"),
+            "the postgres driver is not compiled in, so this failed to dispatch \
+             rather than to connect: {root}"
+        );
+        assert!(
+            root.contains("Connection Error"),
+            "expected the postgres driver to have tried and failed to reach \
+             port 1, got: {root}"
+        );
+    }
+
+    /// `down` stops when the applied stack runs out. Asking for more than exist
+    /// used to print the number asked for, so a fresh database answered
+    /// `Rolled back 3 migration(s).` having rolled back nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_down_reports_what_it_actually_rolled_back() {
+        let guard = TempAppDirGuard::new("migrate_down_count");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+        let applied = {
+            use crate::migration::MigratorTrait;
+            crate::migration::Migrator::migrations().len()
+        };
+
+        // Nothing applied yet: asking for 99 rolls back none of them.
+        let (writer, captured) = SharedWriter::buffer();
+        run(
+            migrate_cli(url.clone(), MigrateAction::Down { num: 99 }),
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            captured.text().contains("Rolled back 0 migration(s)."),
+            "an unmigrated database has nothing to roll back, got: {}",
+            captured.text()
+        );
+
+        // With the schema up, the same over-large request is capped at what is
+        // there — not at the 99 that were asked for.
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Down { num: 99 }), writer)
+            .await
+            .unwrap();
+        assert!(
+            captured
+                .text()
+                .contains(&format!("Rolled back {applied} migration(s).")),
+            "expected the applied count, not the requested one, got: {}",
+            captured.text()
         );
     }
 
