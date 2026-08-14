@@ -2,21 +2,35 @@
 
 [![CI](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node/graph/badge.svg?token=Rwusewkjbh)](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node)
+[![crates.io](https://img.shields.io/crates/v/kontor-storage-node.svg)](https://crates.io/crates/kontor-storage-node)
+[![Licence](https://img.shields.io/crates/l/kontor-storage-node.svg)](#licence)
 
 A storage node CLI for the Kontor distributed storage network. This node communicates with the Kontor Portal API to participate in the storage network.
 
+A node stores files under contract, answers the Portal's challenges with BLS proofs, and submits an aggregated ledger. It needs no configuration file and no key material to start: give it an admin password, open `/admin` in a browser, and provision it from there.
+
 ## Prerequisites
 
-- Rust stable (managed via [rust-toolchain.toml](rust-toolchain.toml))
+- Rust 1.88 or later (the exact channel is pinned in [rust-toolchain.toml](rust-toolchain.toml))
 - A running Kontor Portal instance
 
 ## Installation
 
+From crates.io:
+
 ```bash
+cargo install kontor-storage-node
+```
+
+From source:
+
+```bash
+git clone https://github.com/UnspendableLabs/Kontor-Storage-Node
+cd Kontor-Storage-Node
 cargo build --release
 ```
 
-The binary will be available at `target/release/Kontor-Storage-Node`.
+The binary will be available at `target/release/kontor-storage-node`.
 
 ## Usage
 
@@ -507,14 +521,23 @@ rows and so goes true *before* the next rebuild fails.
 
 - Default: SQLite file at `<data_dir>/Kontor-Storage-Node/storage.db` (auto-created).
 - First launch on a new SQLite file triggers automatic migrations; for Postgres/MySQL run migrations manually.
+- MySQL must be 8.0.13 or later. The `agreements` table has JSON columns with
+  defaults, and that is the release where MySQL started accepting a default on
+  a JSON column at all. CI runs the migrations against a real Postgres and a
+  real MySQL on every push, so this is a tested claim rather than a hopeful one.
 
 #### Running migrations manually
 
 ```bash
-cargo run -p migration -- up          # apply all
-cargo run -p migration -- status      # check status
-cargo run -p migration -- down -n 1   # rollback last
+./kontor-storage-node migrate up          # apply all pending
+./kontor-storage-node migrate status      # list each migration and its state
+./kontor-storage-node migrate down -n 1   # roll back the last one
 ```
+
+`migrate` reads `--database-url`/`DATABASE_URL` like every other command and
+touches nothing else, so it can be pointed at a database from a machine that is
+not the node — which is the usual way to run the schema change before the
+deploy rather than during it.
 
 ### Commands
 
@@ -523,25 +546,25 @@ cargo run -p migration -- down -n 1   # rollback last
 Check connectivity with the Portal API:
 
 ```bash
-./Kontor-Storage-Node ping
+./kontor-storage-node ping
 ```
 
 Or with a custom portal URL:
 
 ```bash
-./Kontor-Storage-Node --portal-url https://portal.example.com/api ping
+./kontor-storage-node --portal-url https://portal.example.com/api ping
 ```
 
 Using environment variable:
 
 ```bash
 export PORTAL_API_URL=https://portal.example.com/api
-./Kontor-Storage-Node ping
+./kontor-storage-node ping
 ```
 
 ### HTTP Server
 
-When the daemon runs (`./Kontor-Storage-Node run`), it exposes a public HTTP server on `0.0.0.0:8081` by default (override via `--server-address` or `SERVER_ADDRESS`) for serving downloaded files and a dashboard.
+When the daemon runs (`./kontor-storage-node run`), it exposes a public HTTP server on `0.0.0.0:8081` by default (override via `--server-address` or `SERVER_ADDRESS`) for serving downloaded files and a dashboard.
 
 Endpoints:
 
@@ -645,11 +668,29 @@ cargo run -- --portal-url http://localhost:3000 ping
 cargo run -- --database-url sqlite://./local.db ping
 ```
 
-## Architecture
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test and lint commands CI runs,
+and for the pre-commit hook that runs them before you push.
 
-See `docs/workflow.typ` for the complete system workflow diagram.
+## Contributing
 
-## License
+Issues and pull requests are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-To be defined. See `LICENSE` (file pending) for terms.
+Found a security problem? Please do not open a public issue — see
+[SECURITY.md](SECURITY.md).
+
+## Licence
+
+Dual-licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT licence ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you state otherwise, any contribution you intentionally submit for
+inclusion in this work, as defined in the Apache-2.0 licence, shall be
+dual-licensed as above, with no additional terms or conditions.
 

@@ -3,6 +3,7 @@ mod clients;
 mod crypto;
 mod database;
 mod entities;
+mod migration;
 mod node;
 mod server;
 

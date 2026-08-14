@@ -22,7 +22,7 @@
 //! function and an exit code to get back out of; it is now just a phase the
 //! supervisor leaves when the Portal changes its mind.
 
-use crate::app::cli::{Cli, Commands};
+use crate::app::cli::{Cli, Commands, MigrateAction};
 use crate::app::config::{Config, StorageMethod};
 use crate::app::daemon::{spawn_portal_daemon, StorageLimits};
 use crate::app::lifecycle::{Activation, NodeRuntime, Phase, SealStatus};
@@ -78,7 +78,14 @@ pub async fn run(cli: Cli, writer: SharedWriter) -> Result<Outcome> {
 /// Print configuration information to the writer.
 fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
-    writeln!(writer, "Database URL: {}", config.database_url)?;
+    // Without the password: `migrate` is documented for Postgres and MySQL,
+    // whose URLs carry one, and this banner is the first thing every command
+    // prints — into deploy logs that outlive the terminal.
+    writeln!(
+        writer,
+        "Database URL: {}",
+        crate::database::redact_credentials(&config.database_url)
+    )?;
     writeln!(writer, "App directory: {}", config.app_dir.display())?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
 
@@ -183,6 +190,14 @@ pub async fn run_with_shutdown(
     let config = Config::from_cli(&cli)?;
 
     print_config_info(&config, &mut writer)?;
+
+    // Before the storage directory and the Portal client, because `migrate`
+    // needs neither: it is the command an operator runs against a database
+    // from a machine that is not the node.
+    if let Commands::Migrate { action } = cli.command {
+        return migrate(&config, action, &mut writer).await;
+    }
+
     setup_storage_directory(&config)?;
 
     let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
@@ -195,7 +210,64 @@ pub async fn run_with_shutdown(
             Ok(Outcome::Shutdown)
         }
         Commands::Run => serve(config, client, writer, shutdown).await,
+        // Handled above, before the Portal client this arm cannot reach.
+        Commands::Migrate { .. } => unreachable!("migrate returns before this match"),
     }
+}
+
+/// Move the database schema, in whichever direction was asked for.
+async fn migrate(
+    config: &Config,
+    action: MigrateAction,
+    writer: &mut SharedWriter,
+) -> Result<Outcome> {
+    use crate::migration::{MigrationStatus, Migrator, MigratorTrait};
+
+    let db = crate::database::connect_without_migrating(&config.database_url).await?;
+
+    match action {
+        MigrateAction::Up => {
+            let pending = Migrator::get_pending_migrations(&db)
+                .await
+                .context("failed to read migration status")?
+                .len();
+            Migrator::up(&db, None)
+                .await
+                .context("failed to apply database migrations")?;
+            writeln!(writer, "Applied {pending} migration(s).")?;
+        }
+        MigrateAction::Down { num } => {
+            // `down` stops silently once the applied stack runs out, so the
+            // number asked for is not the number moved. Reporting the request
+            // would tell an operator a fresh database had just been rolled
+            // back. Count what is actually there, as `Up` does.
+            let applied = Migrator::get_migration_with_status(&db)
+                .await
+                .context("failed to read migration status")?
+                .iter()
+                .filter(|migration| matches!(migration.status(), MigrationStatus::Applied))
+                .count();
+            let rolled_back = applied.min(num as usize);
+            Migrator::down(&db, Some(num))
+                .await
+                .context("failed to roll back database migrations")?;
+            writeln!(writer, "Rolled back {rolled_back} migration(s).")?;
+        }
+        MigrateAction::Status => {
+            for migration in Migrator::get_migration_with_status(&db)
+                .await
+                .context("failed to read migration status")?
+            {
+                let status = match migration.status() {
+                    MigrationStatus::Applied => "applied",
+                    MigrationStatus::Pending => "pending",
+                };
+                writeln!(writer, "{:<8} {}", status, migration.name())?;
+            }
+        }
+    }
+
+    Ok(Outcome::Shutdown)
 }
 
 /// Bring the node up: server first, then whatever the volume allows.
@@ -1424,12 +1496,29 @@ mod tests {
             command: Commands::Run,
         };
 
-        let shutdown = async {
-            sleep(Duration::from_millis(50)).await;
-            Ok(())
+        let (writer, captured) = SharedWriter::buffer();
+
+        // Stopped by the line the assertions below look for, not by a timer.
+        // A fixed 50ms was a bet that onboarding would finish inside it, and on
+        // a loaded machine it does not — this test failed exactly that way once
+        // while the rest of the suite was competing for the CPU. Waiting for the
+        // line costs nothing when it arrives early and does not lie when it
+        // arrives late.
+        let shutdown = {
+            let captured = captured.clone();
+            async move {
+                let onboarded = captured
+                    .wait_for("Node onboarding complete", Duration::from_secs(30))
+                    .await;
+                assert!(
+                    onboarded,
+                    "the node has to onboard before shutdown: {}",
+                    captured.text()
+                );
+                Ok(())
+            }
         };
 
-        let (writer, captured) = SharedWriter::buffer();
         run_with_shutdown(cli, writer, shutdown).await.unwrap();
         let output = captured.text();
 
@@ -1498,6 +1587,279 @@ mod tests {
             kontor_contract_address: "filestorage_0_0".to_string(),
             command: Commands::Run,
         }
+    }
+
+    /// A `Cli` that does nothing but move the schema of `database_url`. The
+    /// Portal URL is deliberately unreachable: `migrate` must not contact it,
+    /// and a test that passes with a live Portal would not prove that.
+    fn migrate_cli(database_url: String, action: MigrateAction) -> Cli {
+        Cli {
+            portal_url: "http://portal.invalid".to_string(),
+            database_url,
+            app_dir: None,
+            storage_dir: Some(PathBuf::from("/nonexistent/migrate")),
+            portal_polling_interval_secs: 30,
+            storage_capacity: None,
+            storage_max_file_size: None,
+            storage_max_files: None,
+            storage_method: "local".to_string(),
+            storage_gcs_bucket_name: None,
+            storage_gcs_service_account_json: None,
+            server_address: "127.0.0.1:0".to_string(),
+            public_url: "http://localhost:8081".to_string(),
+            bls_key_path: None,
+            admin_password: None,
+            kontor_contract_address: "filestorage_0_0".to_string(),
+            command: Commands::Migrate { action },
+        }
+    }
+
+    /// The storage directory in `migrate_cli` does not exist and could not be
+    /// created. Reaching `setup_storage_directory` would fail, so this passing
+    /// is what proves `migrate` returns before it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_up_applies_every_pending_migration() {
+        let guard = TempAppDirGuard::new("migrate_up");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+        let expected = {
+            use crate::migration::MigratorTrait;
+            crate::migration::Migrator::migrations().len()
+        };
+
+        let (writer, captured) = SharedWriter::buffer();
+        let outcome = run(migrate_cli(url, MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, Outcome::Shutdown));
+        assert!(
+            captured
+                .text()
+                .contains(&format!("Applied {expected} migration(s).")),
+            "expected every migration to be reported as applied, got: {}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_up_is_idempotent_and_reports_nothing_pending() {
+        let guard = TempAppDirGuard::new("migrate_twice");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        assert!(
+            captured.text().contains("Applied 0 migration(s)."),
+            "a second `up` should have nothing to do, got: {}",
+            captured.text()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_status_reports_pending_then_applied() {
+        let guard = TempAppDirGuard::new("migrate_status");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        let before = captured.text();
+        assert!(
+            before.contains("pending") && !before.contains("applied"),
+            "a fresh database should list every migration as pending, got: {before}"
+        );
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        let after = captured.text();
+        assert!(
+            after.contains("applied") && !after.contains("pending"),
+            "every migration should be applied after `up`, got: {after}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_down_rolls_back_the_requested_number() {
+        let guard = TempAppDirGuard::new("migrate_down");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(
+            migrate_cli(url.clone(), MigrateAction::Down { num: 1 }),
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            captured.text().contains("Rolled back 1 migration(s)."),
+            "unexpected output: {}",
+            captured.text()
+        );
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Status), writer)
+            .await
+            .unwrap();
+        assert!(
+            captured.text().contains("pending"),
+            "the rolled-back migration should be pending again, got: {}",
+            captured.text()
+        );
+    }
+
+    /// The error path: an unreachable database has to surface as a failure
+    /// rather than a silent no-op, or a deploy would carry on against a schema
+    /// that never moved.
+    ///
+    /// The assertion reaches past the `with_context` wrapper, which every
+    /// `connect()` failure carries alike. Matching only on the wrapper would
+    /// let this pass for the wrong reason — a missing Postgres driver reads
+    /// exactly the same from out there, which is how the command shipped once
+    /// claiming to migrate Postgres while compiled without it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_fails_when_the_database_is_unreachable() {
+        let _guard = TempAppDirGuard::new("migrate_bad_db");
+
+        let (writer, _) = SharedWriter::buffer();
+        let err = run(
+            migrate_cli("postgres://127.0.0.1:1/nope".to_string(), MigrateAction::Up),
+            writer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unable to connect to database"),
+            "unexpected error: {err}"
+        );
+
+        let root = format!("{:#}", err);
+        assert!(
+            !root.contains("no supporting driver"),
+            "the postgres driver is not compiled in, so this failed to dispatch \
+             rather than to connect: {root}"
+        );
+        assert!(
+            root.contains("Connection Error"),
+            "expected the postgres driver to have tried and failed to reach \
+             port 1, got: {root}"
+        );
+    }
+
+    /// `migrate` is the command documented for Postgres and MySQL, so it is the
+    /// one whose URL carries a password — and it prints a configuration banner
+    /// before it does anything and a URL-bearing context when it fails. Both
+    /// land in a deploy log. This covers them together because a redaction
+    /// applied to one of the two is the same leak as none.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_prints_neither_the_banner_nor_the_error_with_a_password() {
+        let _guard = TempAppDirGuard::new("migrate_secret_db");
+
+        let (writer, captured) = SharedWriter::buffer();
+        let err = run(
+            migrate_cli(
+                "postgres://kontor:hunter2@127.0.0.1:1/nope".to_string(),
+                MigrateAction::Up,
+            ),
+            writer,
+        )
+        .await
+        .unwrap_err();
+
+        let banner = captured.text();
+        assert!(
+            banner.contains("postgres://kontor:***@127.0.0.1:1/nope"),
+            "the banner should still say which database, and as whom: {banner}"
+        );
+        assert!(
+            !banner.contains("hunter2"),
+            "the configuration banner leaked the password: {banner}"
+        );
+
+        let reported = format!("{err:#}");
+        assert!(
+            !reported.contains("hunter2"),
+            "the connection error leaked the password: {reported}"
+        );
+    }
+
+    /// `down` stops when the applied stack runs out. Asking for more than exist
+    /// used to print the number asked for, so a fresh database answered
+    /// `Rolled back 3 migration(s).` having rolled back nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_down_reports_what_it_actually_rolled_back() {
+        let guard = TempAppDirGuard::new("migrate_down_count");
+        let db = guard.dir.join("schema.db");
+        let url = format!("sqlite://{}", db.display());
+        let applied = {
+            use crate::migration::MigratorTrait;
+            crate::migration::Migrator::migrations().len()
+        };
+
+        // Nothing applied yet: asking for 99 rolls back none of them.
+        let (writer, captured) = SharedWriter::buffer();
+        run(
+            migrate_cli(url.clone(), MigrateAction::Down { num: 99 }),
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            captured.text().contains("Rolled back 0 migration(s)."),
+            "an unmigrated database has nothing to roll back, got: {}",
+            captured.text()
+        );
+
+        // With the schema up, the same over-large request is capped at what is
+        // there — not at the 99 that were asked for.
+        let (writer, _) = SharedWriter::buffer();
+        run(migrate_cli(url.clone(), MigrateAction::Up), writer)
+            .await
+            .unwrap();
+
+        let (writer, captured) = SharedWriter::buffer();
+        run(migrate_cli(url, MigrateAction::Down { num: 99 }), writer)
+            .await
+            .unwrap();
+        assert!(
+            captured
+                .text()
+                .contains(&format!("Rolled back {applied} migration(s).")),
+            "expected the applied count, not the requested one, got: {}",
+            captured.text()
+        );
     }
 
     /// The whole point of the unregistered path: a node the Portal has never

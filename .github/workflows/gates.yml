@@ -1,0 +1,146 @@
+name: Gates
+
+# Every check that has to pass before a commit is worth releasing, in one
+# place. Both callers use *this file* rather than their own copy: `ci.yml` on
+# every push, and `release.yml` again against the exact commit being published.
+#
+# It is reusable for that second caller alone. A release that re-ran a
+# hand-copied subset would drift from CI one job at a time, and the job most
+# likely to be left out is the one whose absence a release makes permanent —
+# `cargo publish` cannot be undone, only yanked.
+on:
+  workflow_call:
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --all-features --locked
+
+  # `rust-version` in Cargo.toml is a promise to whoever runs `cargo install`,
+  # and nothing here was keeping it. Every other job resolves its toolchain
+  # through rust-toolchain.toml, which pins 1.95.0 and silently overrides the
+  # `@stable` above — so the declared minimum had never once been compiled.
+  # Removing the file is what lets the requested toolchain actually be used.
+  msrv:
+    name: cargo check on the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # First, so the reading below does not itself pull down 1.95.0.
+      - run: rm rust-toolchain.toml
+      - name: Read rust-version from the manifest
+        id: msrv
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kontor-storage-node") | .rust_version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares rust-version = $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` checks the graph the repository actually pins. It cannot
+      # speak for the one `cargo install` resolves without a lockfile, which is
+      # why the release candidates in the manifest are pinned exactly.
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  # The tarball, built and then built *again* from its own extracted contents,
+  # which is what `cargo package` verifies. It is the only job that sees what
+  # `cargo install` sees: an `exclude` that drops a file the build needs — or a
+  # `static/` that stopped being embedded — fails here and nowhere else.
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package --locked
+
+  # The migrations against the databases the README says the node accepts.
+  # `cargo test` covers SQLite only, and the DDL test in the agreements
+  # migration asserts the statement a backend *would* be sent — neither asks a
+  # real server whether it accepts it. A JSON column default that MySQL rejects
+  # at parse time passed both and would have shipped.
+  migrations:
+    name: migrations on Postgres and MySQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kontor
+          POSTGRES_PASSWORD: kontor
+          POSTGRES_DB: kontor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U kontor"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: kontor
+          MYSQL_DATABASE: kontor
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pkontor"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+          --health-start-period=30s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: |
+          scripts/migrate-backends.sh \
+            "postgres://kontor:kontor@127.0.0.1:5432/kontor" \
+            "mysql://root:kontor@127.0.0.1:3306/kontor"
+
+  # The browser half of the sealed admin channel. `cargo test` cannot reach it:
+  # it pins the WebCrypto names the page uses and plays the client in Rust, and
+  # neither of those runs the page's own code. This job slices the three
+  # functions out of index.html and drives them against a live binary.
+  envelope:
+    name: sealed channel, browser half
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cargo build --locked
+      - run: node scripts/envelope-harness.mjs
