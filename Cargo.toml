@@ -65,6 +65,13 @@ hex = "0.4"
 # that exists on the day someone installs this". Between two release candidates
 # that is a coin toss on the API, and the failure lands on the installing user,
 # not on CI. Bumping this is a deliberate act with the tests run against it.
+#
+# Pinning it also *moved* it: the caret on `rc.7` had been resolving to `rc.21`
+# through the lockfile for some time, so `rc.21` is the version the suite has
+# actually been running against and the one now written down. Unpin when 2.0.0
+# is final — an exact pin on a prerelease stops any consumer converging on the
+# release, which matters the moment this crate is a dependency and not just a
+# binary.
 sea-orm = { version = "=2.0.0-rc.21", features = [
     "sqlx-sqlite",
     "sqlx-postgres",

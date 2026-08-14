@@ -26,9 +26,17 @@ It runs the same three commands the `fmt`, `clippy` and `test` CI jobs run.
 
 ## What CI checks
 
+These live in [.github/workflows/gates.yml](.github/workflows/gates.yml), which
+both CI and the release workflow call. A release runs the same file rather than
+a copy, so nothing here can be true on a push and quietly absent on a publish.
+
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - `cargo test --workspace --all-targets --all-features --locked`
+- `cargo package --locked` — builds the tarball and then builds it again from
+  its own extracted contents. It is the only check that sees what `cargo
+  install` sees, so an `exclude` that drops a file the build needs fails here
+  and nowhere else.
 - `node scripts/envelope-harness.mjs` — the browser half of the sealed admin
   channel. `cargo test` cannot reach it: the Rust tests play the client in Rust
   and pin the WebCrypto names, but neither runs the page's own code. This
@@ -42,7 +50,21 @@ It runs the same three commands the `fmt`, `clippy` and `test` CI jobs run.
 - `cargo check` on the `rust-version` in Cargo.toml. Every other job resolves
   its toolchain through [rust-toolchain.toml](rust-toolchain.toml), so the
   declared minimum is only ever compiled by this one.
-- `cargo llvm-cov` — coverage is gated at 95%. New code needs tests.
+- `cargo llvm-cov` — coverage is gated at 95%. New code needs tests. This one
+  runs in CI only, not in the release: it depends on a third-party service
+  being up, and a release blocked by a Codecov outage would be the tail wagging
+  the dog.
+
+## Migrations
+
+A migration that has been released is history, not source. Editing one changes
+the schema new installations get while every existing database keeps what it
+was given, and nothing reports the divergence. Correct a released migration
+with a new migration.
+
+`scripts/migrate-backends.sh` is the check with an opinion here — run it
+locally against a throwaway Postgres and MySQL if you touch this area, because
+SQLite accepts statements neither of the others will.
 
 ## Working on the crypto paths
 

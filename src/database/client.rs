@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{migration, sqlite};
+use super::{migration, redact_credentials, sqlite};
 
 /// Deliberately still capitalised, and deliberately not the crate name. The
 /// package was renamed to `kontor-storage-node` for crates.io; this string is
@@ -157,7 +157,16 @@ async fn connect(database_url: &str) -> Result<DatabaseConnection> {
 
     Database::connect(options)
         .await
-        .with_context(|| format!("unable to connect to database {database_url}"))
+        // The URL without its password. This message is the one an operator
+        // pastes into a chat window when the deploy will not come up, and a
+        // failed connection is exactly when the credentials are worth quoting
+        // least and worth leaking most.
+        .with_context(|| {
+            format!(
+                "unable to connect to database {}",
+                redact_credentials(database_url)
+            )
+        })
 }
 
 #[cfg(test)]

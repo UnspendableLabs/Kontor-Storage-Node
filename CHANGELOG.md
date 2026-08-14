@@ -34,6 +34,9 @@ First public release.
   the Docker image does, from any working directory.
 - `migrate` subcommand for the databases that do not migrate themselves
   (Postgres, MySQL). SQLite still migrates on connect.
+- Database URLs are printed and reported without their password — both in the
+  configuration banner every command opens with and in the context on a failed
+  connection, which are the two that reach a deploy log.
 
 [Unreleased]: https://github.com/UnspendableLabs/Kontor-Storage-Node/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/UnspendableLabs/Kontor-Storage-Node/releases/tag/v0.1.0

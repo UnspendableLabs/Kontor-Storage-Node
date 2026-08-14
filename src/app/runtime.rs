@@ -78,7 +78,14 @@ pub async fn run(cli: Cli, writer: SharedWriter) -> Result<Outcome> {
 /// Print configuration information to the writer.
 fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
     writeln!(writer, "Portal URL: {}", config.portal_url)?;
-    writeln!(writer, "Database URL: {}", config.database_url)?;
+    // Without the password: `migrate` is documented for Postgres and MySQL,
+    // whose URLs carry one, and this banner is the first thing every command
+    // prints — into deploy logs that outlive the terminal.
+    writeln!(
+        writer,
+        "Database URL: {}",
+        crate::database::redact_credentials(&config.database_url)
+    )?;
     writeln!(writer, "App directory: {}", config.app_dir.display())?;
     writeln!(writer, "Storage method: {}", config.storage_method)?;
 
@@ -1766,6 +1773,44 @@ mod tests {
             root.contains("Connection Error"),
             "expected the postgres driver to have tried and failed to reach \
              port 1, got: {root}"
+        );
+    }
+
+    /// `migrate` is the command documented for Postgres and MySQL, so it is the
+    /// one whose URL carries a password — and it prints a configuration banner
+    /// before it does anything and a URL-bearing context when it fails. Both
+    /// land in a deploy log. This covers them together because a redaction
+    /// applied to one of the two is the same leak as none.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrate_prints_neither_the_banner_nor_the_error_with_a_password() {
+        let _guard = TempAppDirGuard::new("migrate_secret_db");
+
+        let (writer, captured) = SharedWriter::buffer();
+        let err = run(
+            migrate_cli(
+                "postgres://kontor:hunter2@127.0.0.1:1/nope".to_string(),
+                MigrateAction::Up,
+            ),
+            writer,
+        )
+        .await
+        .unwrap_err();
+
+        let banner = captured.text();
+        assert!(
+            banner.contains("postgres://kontor:***@127.0.0.1:1/nope"),
+            "the banner should still say which database, and as whom: {banner}"
+        );
+        assert!(
+            !banner.contains("hunter2"),
+            "the configuration banner leaked the password: {banner}"
+        );
+
+        let reported = format!("{err:#}");
+        assert!(
+            !reported.contains("hunter2"),
+            "the connection error leaked the password: {reported}"
         );
     }
 
