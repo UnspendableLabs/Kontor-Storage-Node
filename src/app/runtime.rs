@@ -1180,6 +1180,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1248,6 +1249,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1305,6 +1307,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1362,6 +1365,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1424,6 +1428,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1564,6 +1569,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 
@@ -1662,6 +1668,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         }
     }
@@ -2503,6 +2510,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 
@@ -2647,6 +2655,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 

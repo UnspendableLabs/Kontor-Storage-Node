@@ -19,7 +19,13 @@
 //!   next cycle's auto-stake can bond them.
 //! - **Join budget.** Before a ready agreement is downloaded, its collateral is
 //!   checked against the unreserved stake, minus what this node has already
-//!   committed to joins that have not executed yet.
+//!   committed to joins that have not executed yet. The Portal composes joins
+//!   into the same batch as the agreement's `create-agreement`, so at join time
+//!   the collateral is almost never known yet: those joins are budgeted at an
+//!   estimate instead (see [`JoinBudget::decide`]).
+//! - **Exit.** Once the operator's `begin-unstake` has executed, the node leaves
+//!   its agreements one op per cycle and, when none is left, withdraws the bond
+//!   (see [`ExitInputs`]).
 //!
 //! # Knowing when an op has landed
 //!
@@ -57,9 +63,10 @@ use crate::clients::kor::Kor;
 use crate::clients::portal::{NodeOp, RegistryEntry};
 use crate::clients::PortalClient;
 use chrono::{DateTime, Utc};
+use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -85,6 +92,35 @@ pub const CLAIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// each time; waiting lets the next few registry reads catch up.
 pub const JOIN_REFUSAL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
+/// Joins of unknown collateral allowed in one cycle, whatever the budget says.
+///
+/// The estimate is a guess, so the number of guesses is bounded too: a node
+/// that underestimates by a lot still takes on a handful of agreements per
+/// cycle rather than every ready one. Being wrong is cheap — Kontor refuses a
+/// join the stake cannot cover, which is not slashable — but each wrong guess
+/// costs a download and a fee.
+pub const MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE: usize = 3;
+
+/// How long a collateral seen on an agreement informs the estimate for
+/// agreements whose collateral is not known yet.
+pub const COLLATERAL_MEMORY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Kontor's `WITHDRAWAL_DELAY`: `2016 + ACTIVATION_DELAY (12)` blocks between
+/// `begin-unstake` and the first height `withdraw-stake` accepts
+/// (`native-contracts/staking`).
+pub const WITHDRAWAL_DELAY_BLOCKS: u64 = 2028;
+
+/// Block interval assumed to turn that delay into a time. The node has no
+/// view of the chain tip, so it times the delay from when it first saw the
+/// withdrawal height; faster blocks only make it wait longer than it had to,
+/// and the operator can always withdraw by hand from `/admin`.
+pub const ASSUMED_BLOCK_TIME: Duration = Duration::from_secs(600);
+
+/// How often an automatic `withdraw-stake` is retried after one that executed
+/// without returning the bond (too early, or an obligation the node did not
+/// know about).
+pub const WITHDRAW_RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// How the node manages its bond (contract "Storage-node stake policy").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StakePolicy {
@@ -97,6 +133,10 @@ pub struct StakePolicy {
     pub stake_target: Option<Kor>,
     /// Claim rewards once at least this much is claimable.
     pub claim_threshold: Kor,
+    /// What a join whose collateral is not known yet is budgeted at — the
+    /// floor of the estimate, raised to the largest collateral seen in the
+    /// last [`COLLATERAL_MEMORY`].
+    pub unknown_collateral_estimate: Kor,
 }
 
 impl Default for StakePolicy {
@@ -106,6 +146,7 @@ impl Default for StakePolicy {
             gas_reserve: Kor::whole(5),
             stake_target: None,
             claim_threshold: Kor::ONE,
+            unknown_collateral_estimate: Kor::whole(10),
         }
     }
 }
@@ -215,8 +256,12 @@ pub enum SkipReason {
     RecentlyRefused(String),
     /// Not in this cycle's ready listing, so its collateral is unknown.
     NotListed,
-    /// The Portal has not reconciled the creating transaction yet.
+    /// The collateral is not known and this cycle's guesses are used up
+    /// ([`MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE`]), or the Portal sent one
+    /// the node cannot read.
     CollateralUnknown,
+    /// The operator has started leaving: an unstake is queued or in flight.
+    Leaving,
     /// Kontor refuses joins on an agreement that requires nothing.
     NoCollateralRequirement,
     InsufficientCollateral,
@@ -231,7 +276,10 @@ impl fmt::Display for SkipReason {
             SkipReason::StakeUnknown => f.write_str("stake unknown this cycle"),
             SkipReason::RecentlyRefused(code) => write!(f, "Portal refused a join ({code})"),
             SkipReason::NotListed => f.write_str("not in the ready listing"),
-            SkipReason::CollateralUnknown => f.write_str("required collateral not known yet"),
+            SkipReason::CollateralUnknown => {
+                f.write_str("collateral unknown and this cycle's estimates used up")
+            }
+            SkipReason::Leaving => f.write_str("leaving: unstake requested"),
             SkipReason::NoCollateralRequirement => f.write_str("no collateral requirement"),
             SkipReason::InsufficientCollateral => f.write_str("insufficient unreserved stake"),
         }
@@ -278,6 +326,41 @@ struct TrackerState {
     operator_request: Option<NodeOp>,
     /// Last thing worth telling the operator about, with when.
     last_event: Option<(DateTime<Utc>, String)>,
+    /// Collaterals seen on agreements lately, for the unknown-collateral
+    /// estimate.
+    recent_collateral: Vec<(Instant, Kor)>,
+    /// Agreements a `leave-agreement` has executed for, this process.
+    left: HashSet<String>,
+    /// When this process first saw the withdrawal height: the start of the
+    /// withdrawal delay as far as the node can tell.
+    unstake_seen: Option<Instant>,
+    last_withdraw: Option<Instant>,
+    /// The bond came back: the operator left the network. Nothing more is
+    /// bonded automatically, whatever auto-stake says.
+    exited: bool,
+    /// The exit as of the last plan, for `/admin`.
+    exit: Option<ExitInputs>,
+}
+
+/// Where the node's exit stands, worked out by the daemon from its own rows.
+///
+/// The Portal keeps a membership row after a leave, so which memberships are
+/// gone is only known to the node — from the `leave-agreement` ops it has seen
+/// execute in this process. After a restart those are sent again; Kontor
+/// refuses a leave for a membership that is gone, which costs a fee and
+/// nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitInputs {
+    /// Agreements this node holds a membership in, by its own rows.
+    pub memberships: Vec<String>,
+    /// Those of them with a challenge still `active`. Leaving one is allowed
+    /// and not penalised by Kontor, but changes nothing: the reservation is
+    /// only released once the challenge resolves, and the challenge must still
+    /// be proved or it is slashed. So they are left after it resolves.
+    pub deferred: Vec<String>,
+    /// Challenges not resolved yet (`active`, or proved and waiting). Kontor
+    /// refuses `withdraw-stake` while any exists.
+    pub unresolved_challenges: usize,
 }
 
 /// What the daemon knows about its bond across cycles, shared with `/admin`.
@@ -309,6 +392,36 @@ impl StakeTracker {
     #[must_use]
     pub fn snapshot(&self) -> Option<StakeSnapshot> {
         self.lock().snapshot.clone()
+    }
+
+    /// Remember a collateral the Portal reported on an agreement — this
+    /// node's own, or one in the ready listing — for the unknown-collateral
+    /// estimate.
+    pub fn note_collateral(&self, raw: Option<&str>, now: Instant) {
+        let Some(amount) = raw.and_then(|raw| Kor::parse(raw).ok()) else {
+            return;
+        };
+        let mut state = self.lock();
+        state
+            .recent_collateral
+            .retain(|(seen, _)| now.duration_since(*seen) < COLLATERAL_MEMORY);
+        state.recent_collateral.push((now, amount));
+        // Only the largest matters; keep the list from growing with the network.
+        if state.recent_collateral.len() > 256 {
+            state
+                .recent_collateral
+                .sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
+            state.recent_collateral.truncate(64);
+        }
+    }
+
+    /// Whether the node is in its exit: the operator's unstake has executed.
+    #[must_use]
+    pub fn exiting(&self) -> bool {
+        self.lock()
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.withdrawal_height.is_some())
     }
 
     /// Fold in this cycle's registry read: `None` when it failed outright.
@@ -354,6 +467,38 @@ impl StakeTracker {
             }
         }
 
+        match &landed {
+            Some(NodeOp::LeaveAgreement(agreement_id)) => {
+                info!("left agreement {agreement_id}");
+                state.left.insert(agreement_id.clone());
+            }
+            Some(NodeOp::WithdrawStake) if !snapshot.stake.is_zero() => {
+                // Executed, and the bond is still there: too early, or an
+                // obligation the node's own rows did not show (a leave that
+                // failed on chain, say). Forget which leaves "worked" so they
+                // are sent again, and retry later.
+                warn!(
+                    "withdraw-stake executed without returning the bond; leaves will be resent \
+                     and the withdrawal retried in {} hours",
+                    WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
+                );
+                state.left.clear();
+            }
+            Some(NodeOp::WithdrawStake) => {
+                warn!(
+                    "the bond has been withdrawn: this node bonds nothing more on its own. Set \
+                     KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
+                );
+                state.exited = true;
+            }
+            _ => {}
+        }
+        if snapshot.withdrawal_height.is_some() {
+            state.unstake_seen.get_or_insert(now);
+        } else {
+            state.unstake_seen = None;
+        }
+
         state.pending_joins.retain(|join| {
             snapshot.next_nonce <= join.nonce && now.duration_since(join.sent) < OP_LANDING_TIMEOUT
         });
@@ -378,9 +523,17 @@ impl StakeTracker {
 
     /// The op this cycle should send, if any. At most one: the next waits
     /// until this one has landed.
+    ///
+    /// `exit` is the daemon's view of its memberships, passed while the node is
+    /// [`exiting`](Self::exiting). The exit was started by the operator and is
+    /// carried through whatever auto-stake says: leave every membership whose
+    /// challenges are settled, one per cycle, then withdraw once none is left
+    /// and the delay has (by the node's reckoning) passed.
     #[must_use]
-    pub fn plan(&self, now: Instant) -> Option<NodeOp> {
-        let state = self.lock();
+    pub fn plan(&self, now: Instant, exit: Option<&ExitInputs>) -> Option<NodeOp> {
+        let mut state = self.lock();
+        state.exit = exit.cloned();
+        let state = &*state;
         let snapshot = state.snapshot.as_ref()?;
         if state.in_flight.is_some() {
             return None;
@@ -388,16 +541,24 @@ impl StakeTracker {
 
         // The operator's own request outranks the policy, and is honoured
         // whatever auto-stake says: it was asked for by hand.
-        if let Some(op) = state.operator_request {
-            return Some(op);
+        if let Some(op) = &state.operator_request {
+            return Some(op.clone());
+        }
+
+        if let (Some(_), Some(exit)) = (snapshot.withdrawal_height, exit) {
+            if let Some(op) = next_exit_op(state, exit, now) {
+                return Some(op);
+            }
         }
 
         if !state.policy.auto_stake {
             return None;
         }
 
-        if let Some(amount) = top_up_amount(&state.policy, snapshot) {
-            return Some(NodeOp::AddStake(amount));
+        if !state.exited {
+            if let Some(amount) = top_up_amount(&state.policy, snapshot) {
+                return Some(NodeOp::AddStake(amount));
+            }
         }
 
         let claim_due = state
@@ -412,30 +573,34 @@ impl StakeTracker {
     /// The relay accepted `op` at `nonce`.
     pub fn record_sent(&self, op: NodeOp, nonce: u64, now: Instant) {
         let mut state = self.lock();
-        if op == NodeOp::ClaimRewards {
-            state.last_claim = Some(now);
+        match op {
+            NodeOp::ClaimRewards => state.last_claim = Some(now),
+            NodeOp::WithdrawStake => state.last_withdraw = Some(now),
+            _ => {}
         }
-        if state.operator_request == Some(op) {
+        if state.operator_request.as_ref() == Some(&op) {
             state.operator_request = None;
         }
+        state.last_event = Some((Utc::now(), describe_sent(&op, nonce)));
         state.in_flight = Some(InFlight {
             op,
             nonce,
             sent: now,
             sent_at: Utc::now(),
         });
-        state.last_event = Some((Utc::now(), describe_sent(op, nonce)));
     }
 
     /// The relay refused `op`. A refusal is not retried until something
     /// changes: a claim waits its interval, an operator request is dropped (the
     /// operator sees why and can ask again).
-    pub fn record_refused(&self, op: NodeOp, reason: &str, now: Instant) {
+    pub fn record_refused(&self, op: &NodeOp, reason: &str, now: Instant) {
         let mut state = self.lock();
-        if op == NodeOp::ClaimRewards {
-            state.last_claim = Some(now);
+        match op {
+            NodeOp::ClaimRewards => state.last_claim = Some(now),
+            NodeOp::WithdrawStake => state.last_withdraw = Some(now),
+            _ => {}
         }
-        if state.operator_request == Some(op) {
+        if state.operator_request.as_ref() == Some(op) {
             state.operator_request = None;
         }
         state.last_event = Some((Utc::now(), format!("{} refused: {reason}", op.name())));
@@ -454,8 +619,8 @@ impl StakeTracker {
         if state.operator_request.is_some() {
             return Err("another request is already waiting for the next cycle");
         }
-        state.operator_request = Some(op);
         state.last_event = Some((Utc::now(), format!("{} requested from /admin", op.name())));
+        state.operator_request = Some(op);
         Ok(())
     }
 
@@ -469,9 +634,18 @@ impl StakeTracker {
             }
         }
 
+        // An unstake on its way: no join from the moment the operator asked,
+        // not only from the block it executes in.
+        let leaving = matches!(state.operator_request, Some(NodeOp::BeginUnstake))
+            || state
+                .in_flight
+                .as_ref()
+                .is_some_and(|op| op.op == NodeOp::BeginUnstake);
+
         let mode = match (&state.snapshot, &state.joins_paused) {
             (None, _) if !state.portal_reports_stake => BudgetMode::Unmetered,
             (None, _) => BudgetMode::Closed(SkipReason::StakeUnknown),
+            (Some(_), _) if leaving => BudgetMode::Closed(SkipReason::Leaving),
             (Some(_), Some((_, code))) => {
                 BudgetMode::Closed(SkipReason::RecentlyRefused(code.clone()))
             }
@@ -481,8 +655,17 @@ impl StakeTracker {
                     let held = state.pending_joins.iter().fold(Kor::ZERO, |sum, join| {
                         sum.checked_add(join.collateral).unwrap_or(sum)
                     });
+                    let seen = state
+                        .recent_collateral
+                        .iter()
+                        .filter(|(at, _)| now.duration_since(*at) < COLLATERAL_MEMORY)
+                        .map(|(_, amount)| *amount)
+                        .max()
+                        .unwrap_or(Kor::ZERO);
                     BudgetMode::Metered {
                         remaining: snapshot.available.saturating_sub(held),
+                        estimate: state.policy.unknown_collateral_estimate.max(seen),
+                        guesses_left: MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE,
                     }
                 }
             },
@@ -550,7 +733,30 @@ impl StakeTracker {
                 "nonce": join.nonce,
             })).collect::<Vec<_>>(),
             "joins_paused": state.joins_paused.as_ref().map(|(_, code)| code.clone()),
-            "operator_request": state.operator_request.map(NodeOp::name),
+            "operator_request": state.operator_request.as_ref().map(NodeOp::name),
+            "exit": state.exit.as_ref().filter(|_| {
+                state.snapshot.as_ref().is_some_and(|s| s.withdrawal_height.is_some())
+            }).map(|exit| {
+                let remaining: Vec<&String> = exit
+                    .memberships
+                    .iter()
+                    .filter(|id| !state.left.contains(*id))
+                    .collect();
+                let delay = ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32);
+                let withdraw_from = state.unstake_seen.map(|seen| {
+                    let left = delay.saturating_sub(seen.elapsed());
+                    (Utc::now() + chrono::Duration::from_std(left).unwrap_or_default())
+                        .to_rfc3339()
+                });
+                json!({
+                    "memberships_left": remaining,
+                    "deferred": exit.deferred,
+                    "left": state.left.len(),
+                    "unresolved_challenges": exit.unresolved_challenges,
+                    "withdraw_estimated_from": withdraw_from,
+                })
+            }),
+            "exited": state.exited,
             "last_event": state.last_event.as_ref().map(|(at, what)| json!({
                 "at": at.to_rfc3339(),
                 "message": what,
@@ -559,11 +765,41 @@ impl StakeTracker {
     }
 }
 
-fn describe_sent(op: NodeOp, nonce: u64) -> String {
-    match op.amount() {
-        Some(amount) => format!("{} {amount} KOR sent (nonce {nonce})", op.name()),
-        None => format!("{} sent (nonce {nonce})", op.name()),
+fn describe_sent(op: &NodeOp, nonce: u64) -> String {
+    match (op.amount(), op.agreement_id()) {
+        (Some(amount), _) => format!("{} {amount} KOR sent (nonce {nonce})", op.name()),
+        (None, Some(agreement_id)) => {
+            format!("{} {agreement_id} sent (nonce {nonce})", op.name())
+        }
+        (None, None) => format!("{} sent (nonce {nonce})", op.name()),
     }
+}
+
+/// The next step of the exit, if one is due.
+fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
+    if let Some(agreement_id) = exit
+        .memberships
+        .iter()
+        .find(|id| !state.left.contains(*id) && !exit.deferred.contains(id))
+    {
+        return Some(NodeOp::LeaveAgreement(agreement_id.clone()));
+    }
+    let all_left = exit.memberships.iter().all(|id| state.left.contains(id));
+    (all_left && exit.unresolved_challenges == 0 && withdraw_due(state, now))
+        .then_some(NodeOp::WithdrawStake)
+}
+
+/// The delay has passed by the node's reckoning, and the last automatic
+/// attempt is far enough back.
+fn withdraw_due(state: &TrackerState, now: Instant) -> bool {
+    let Some(seen) = state.unstake_seen else {
+        return false;
+    };
+    let delay = ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32);
+    now.duration_since(seen) >= delay
+        && state
+            .last_withdraw
+            .is_none_or(|last| now.duration_since(last) >= WITHDRAW_RETRY_INTERVAL)
 }
 
 /// Log, and return for the status page, what changed between two reads that
@@ -627,8 +863,13 @@ enum BudgetMode {
     Unmetered,
     /// No new join this cycle, for this reason.
     Closed(SkipReason),
-    /// Unreserved stake left for this cycle's joins.
-    Metered { remaining: Kor },
+    /// Unreserved stake left for this cycle's joins, what a join of unknown
+    /// collateral is assumed to take, and how many of those are still allowed.
+    Metered {
+        remaining: Kor,
+        estimate: Kor,
+        guesses_left: usize,
+    },
 }
 
 /// Whether to download (and join) one pending agreement.
@@ -662,6 +903,14 @@ impl JoinBudget {
     /// `listed` is the agreement's entry in this cycle's ready listing: `None`
     /// when it is not listed, `Some(None)` when it is but the Portal does not
     /// know its collateral yet.
+    ///
+    /// A known collateral is checked exactly. An unknown one — the usual case,
+    /// since the Portal joins in the same batch that creates the agreement — is
+    /// a guess: allowed while any unreserved stake is left, at most
+    /// [`MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE`] per cycle, and charged the
+    /// estimate (or whatever is left, if less) so a few of them use the budget
+    /// up. A guess that turns out short costs a refused join on chain, which is
+    /// not slashable: only the download is wasted.
     pub fn decide(&mut self, already_member: bool, listed: Option<Option<&str>>) -> JoinDecision {
         if already_member {
             return JoinDecision::Join { collateral: None };
@@ -671,9 +920,26 @@ impl JoinBudget {
                 collateral: listed.flatten().and_then(|raw| Kor::parse(raw).ok()),
             },
             BudgetMode::Closed(reason) => JoinDecision::Skip(reason.clone()),
-            BudgetMode::Metered { remaining } => match listed {
+            BudgetMode::Metered {
+                remaining,
+                estimate,
+                guesses_left,
+            } => match listed {
                 None => JoinDecision::Skip(SkipReason::NotListed),
-                Some(None) => JoinDecision::Skip(SkipReason::CollateralUnknown),
+                Some(None) if remaining.is_zero() => {
+                    JoinDecision::Skip(SkipReason::InsufficientCollateral)
+                }
+                Some(None) if *guesses_left == 0 => {
+                    JoinDecision::Skip(SkipReason::CollateralUnknown)
+                }
+                Some(None) => {
+                    let charged = (*estimate).min(*remaining);
+                    *remaining = remaining.saturating_sub(charged);
+                    *guesses_left -= 1;
+                    JoinDecision::Join {
+                        collateral: Some(charged),
+                    }
+                }
                 Some(Some(raw)) => match Kor::parse(raw) {
                     Err(err) => {
                         warn!("ignoring an unreadable required_collateral: {err:#}");
@@ -703,7 +969,8 @@ impl JoinBudget {
     /// Give back what [`Self::decide`] set aside for a join that did not
     /// happen.
     pub fn refund(&mut self, collateral: Option<Kor>) {
-        if let (BudgetMode::Metered { remaining }, Some(amount)) = (&mut self.mode, collateral) {
+        if let (BudgetMode::Metered { remaining, .. }, Some(amount)) = (&mut self.mode, collateral)
+        {
             *remaining = remaining.checked_add(amount).unwrap_or(*remaining);
         }
     }
@@ -730,25 +997,96 @@ impl JoinBudget {
     }
 }
 
+/// Agreement statuses under which this node cannot hold a membership on chain
+/// yet, or any more: a `ready`/`pending` agreement is not created yet (the
+/// Portal joins in the batch that creates it), a `failed` one never was.
+const NOT_ON_CHAIN: [&str; 3] = ["ready", "pending", "failed"];
+
+/// Challenge statuses that are not resolved yet: still to prove, or proved
+/// and waiting for the verdict.
+const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
+
+/// Read the node's memberships and open challenges from its own rows.
+///
+/// A membership is an agreement on chain whose `nodes` lists this node with
+/// any status but `failed` (old rows store bare node-id strings, which count).
+///
+/// # Errors
+/// If the rows cannot be read.
+pub async fn exit_inputs(
+    database: &DatabaseConnection,
+    node_id: &str,
+) -> anyhow::Result<ExitInputs> {
+    use crate::entities::prelude::{Agreements, Challenges};
+    use sea_orm::EntityTrait;
+
+    let mut memberships: Vec<String> = Agreements::find()
+        .all(database)
+        .await?
+        .into_iter()
+        .filter(|agreement| !NOT_ON_CHAIN.contains(&agreement.status.as_str()))
+        .filter(|agreement| is_live_member(&agreement.nodes, node_id))
+        .map(|agreement| agreement.agreement_id)
+        .collect();
+    memberships.sort();
+
+    let challenges = Challenges::find().all(database).await?;
+    let unresolved_challenges = challenges
+        .iter()
+        .filter(|challenge| UNRESOLVED.contains(&challenge.status.as_str()))
+        .count();
+    let mut deferred: Vec<String> = challenges
+        .iter()
+        .filter(|challenge| challenge.status == "active")
+        .map(|challenge| challenge.agreement_id.clone())
+        .filter(|agreement_id| memberships.contains(agreement_id))
+        .collect();
+    deferred.sort();
+    deferred.dedup();
+
+    Ok(ExitInputs {
+        memberships,
+        deferred,
+        unresolved_challenges,
+    })
+}
+
+fn is_live_member(nodes: &Value, node_id: &str) -> bool {
+    nodes.as_array().is_some_and(|nodes| {
+        nodes.iter().any(|node| {
+            node.as_str() == Some(node_id)
+                || (node.get("node_id").and_then(Value::as_str) == Some(node_id)
+                    && node.get("status").and_then(Value::as_str) != Some("failed"))
+        })
+    })
+}
+
 /// Apply the policy for this cycle: send at most one stake or claim op.
 ///
 /// Never fails the cycle. A stake op that does not go out this time is
 /// re-planned from fresh state on the next one.
-pub async fn manage_stake(client: &PortalClient, tracker: &StakeTracker) -> Option<NodeOp> {
+///
+/// `exit` is the daemon's view of its memberships while the node is exiting
+/// (see [`exit_inputs`]); `None` otherwise.
+pub async fn manage_stake(
+    client: &PortalClient,
+    tracker: &StakeTracker,
+    exit: Option<&ExitInputs>,
+) -> Option<NodeOp> {
     client.node_id()?;
-    let op = tracker.plan(Instant::now())?;
+    let op = tracker.plan(Instant::now(), exit)?;
     send(client, tracker, op).await
 }
 
 async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Option<NodeOp> {
-    match client.submit_node_op(op).await {
+    match client.submit_node_op(&op).await {
         Ok(response) => {
             let nonce = response.nonce.unwrap_or_default();
             match op.amount() {
                 Some(amount) => info!(nonce, "{}: {amount} KOR queued by the Portal", op.name()),
                 None => info!(nonce, "{} queued by the Portal", op.name()),
             }
-            tracker.record_sent(op, nonce, Instant::now());
+            tracker.record_sent(op.clone(), nonce, Instant::now());
             Some(op)
         }
         Err(err) => {
@@ -756,7 +1094,7 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
                 Some((status, code)) if (400..500).contains(&status) => {
                     let code = code.unwrap_or_else(|| status.to_string());
                     warn!("the Portal refused {} ({code}): {err:#}", op.name());
-                    tracker.record_refused(op, &code, Instant::now());
+                    tracker.record_refused(&op, &code, Instant::now());
                 }
                 // Unreachable, or a 5xx: whether it was kept is unknown. The
                 // next cycle's resync says, and the plan is made again.
@@ -809,7 +1147,7 @@ pub async fn bootstrap_stake(
         )?;
     }
 
-    if let Some(op) = manage_stake(client, tracker).await {
+    if let Some(op) = manage_stake(client, tracker, None).await {
         if let Some(amount) = op.amount() {
             writeln!(writer, "✓ Staking {amount} KOR as collateral")?;
         }
@@ -942,9 +1280,9 @@ mod tests {
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
 
-        let op = tracker.plan(t0).unwrap();
+        let op = tracker.plan(t0, None).unwrap();
         assert_eq!(op, NodeOp::AddStake(kor("995")));
-        tracker.record_sent(op, 10, t0);
+        tracker.record_sent(op.clone(), 10, t0);
 
         // Next cycle: Kontor has not run it yet, nonce 10 still next.
         observed(
@@ -952,14 +1290,14 @@ mod tests {
             &entry(Some("0"), Some("0")),
             t0 + Duration::from_secs(30),
         );
-        assert_eq!(tracker.plan(t0 + Duration::from_secs(30)), None);
+        assert_eq!(tracker.plan(t0 + Duration::from_secs(30), None), None);
 
         // It executed: the nonce moved on, the balance went into the bond.
         let mut landed = entry(Some("995"), Some("995"));
         landed.next_nonce = 11;
         landed.kor_balance = Some("5".into());
         observed(&tracker, &landed, t0 + Duration::from_secs(60));
-        assert_eq!(tracker.plan(t0 + Duration::from_secs(60)), None);
+        assert_eq!(tracker.plan(t0 + Duration::from_secs(60), None), None);
     }
 
     /// An op that consumed its nonce without moving the balance — it failed on
@@ -975,7 +1313,7 @@ mod tests {
         consumed.next_nonce = 12;
         observed(&tracker, &consumed, t0 + Duration::from_secs(30));
         assert_eq!(
-            tracker.plan(t0 + Duration::from_secs(30)),
+            tracker.plan(t0 + Duration::from_secs(30), None),
             Some(NodeOp::AddStake(kor("995")))
         );
     }
@@ -989,7 +1327,10 @@ mod tests {
 
         let later = t0 + OP_LANDING_TIMEOUT;
         observed(&tracker, &entry(Some("0"), Some("0")), later);
-        assert_eq!(tracker.plan(later), Some(NodeOp::AddStake(kor("995"))));
+        assert_eq!(
+            tracker.plan(later, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
     }
 
     #[test]
@@ -1002,11 +1343,11 @@ mod tests {
         let mut e = entry(Some("0"), Some("0"));
         e.reward_balance = Some("50".into());
         observed(&tracker, &e, t0);
-        assert_eq!(tracker.plan(t0), None);
+        assert_eq!(tracker.plan(t0, None), None);
 
         // An operator request is still carried out.
         tracker.request(NodeOp::BeginUnstake).unwrap();
-        assert_eq!(tracker.plan(t0), Some(NodeOp::BeginUnstake));
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::BeginUnstake));
     }
 
     #[test]
@@ -1017,11 +1358,11 @@ mod tests {
         e.kor_balance = Some("5".into());
         e.reward_balance = Some("0.99".into());
         observed(&tracker, &e, t0);
-        assert_eq!(tracker.plan(t0), None, "below the threshold");
+        assert_eq!(tracker.plan(t0, None), None, "below the threshold");
 
         e.reward_balance = Some("1".into());
         observed(&tracker, &e, t0);
-        assert_eq!(tracker.plan(t0), Some(NodeOp::ClaimRewards));
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::ClaimRewards));
         tracker.record_sent(NodeOp::ClaimRewards, 10, t0);
 
         // Landed, but the claim is rate-limited even if more is claimable.
@@ -1029,11 +1370,11 @@ mod tests {
         e.reward_balance = Some("2".into());
         let soon = t0 + Duration::from_secs(60);
         observed(&tracker, &e, soon);
-        assert_eq!(tracker.plan(soon), None);
+        assert_eq!(tracker.plan(soon, None), None);
 
         let later = t0 + CLAIM_INTERVAL;
         observed(&tracker, &e, later);
-        assert_eq!(tracker.plan(later), Some(NodeOp::ClaimRewards));
+        assert_eq!(tracker.plan(later, None), Some(NodeOp::ClaimRewards));
     }
 
     #[test]
@@ -1043,7 +1384,7 @@ mod tests {
         let mut e = entry(Some("0"), Some("0"));
         e.reward_balance = Some("50".into());
         observed(&tracker, &e, t0);
-        assert_eq!(tracker.plan(t0), Some(NodeOp::AddStake(kor("995"))));
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
     }
 
     #[test]
@@ -1057,7 +1398,7 @@ mod tests {
         // Sent: the request is done, another may follow.
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("10"), Some("10")), t0);
-        assert_eq!(tracker.plan(t0), Some(NodeOp::WithdrawStake));
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::WithdrawStake));
         tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
         assert!(tracker.request(NodeOp::BeginUnstake).is_ok());
     }
@@ -1111,7 +1452,8 @@ mod tests {
         );
         assert_eq!(
             budget.decide(false, Some(None)),
-            JoinDecision::Skip(SkipReason::CollateralUnknown)
+            JoinDecision::Skip(SkipReason::InsufficientCollateral),
+            "nothing left: an unknown collateral is not a free pass"
         );
         assert_eq!(
             budget.decide(false, None),
@@ -1136,7 +1478,7 @@ mod tests {
         );
         let summary = budget.summary().unwrap();
         assert!(
-            summary.contains("1 × insufficient unreserved stake"),
+            summary.contains("2 × insufficient unreserved stake"),
             "{summary}"
         );
     }
@@ -1283,5 +1625,307 @@ mod tests {
         assert_eq!(status["in_flight"]["op"], "add_stake");
         assert_eq!(status["in_flight"]["amount"], "0.25");
         assert_eq!(status["in_flight"]["nonce"], 10);
+    }
+
+    /// The usual case: the Portal joins in the batch that creates the
+    /// agreement, so the collateral is not known yet. Joined anyway while
+    /// stake is free, charged the estimate, at most a few per cycle.
+    #[test]
+    fn unknown_collateral_is_budgeted_at_the_estimate_and_capped_per_cycle() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("1000"), Some("1000")), t0);
+
+        let mut budget = tracker.join_budget(t0);
+        for _ in 0..MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE {
+            assert_eq!(
+                budget.decide(false, Some(None)),
+                JoinDecision::Join {
+                    collateral: Some(kor("10"))
+                }
+            );
+        }
+        assert_eq!(
+            budget.decide(false, Some(None)),
+            JoinDecision::Skip(SkipReason::CollateralUnknown),
+            "the cycle's guesses are used up"
+        );
+        assert_eq!(
+            budget.decide(false, Some(Some("500"))),
+            JoinDecision::Join {
+                collateral: Some(kor("500"))
+            },
+            "a known collateral is not limited by the guess cap"
+        );
+    }
+
+    /// A small bond still gets to try one: the guess is charged at most what
+    /// is left, which then closes the budget.
+    #[test]
+    fn an_estimate_above_what_is_left_takes_the_rest() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("4"), Some("4")), t0);
+
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(None)),
+            JoinDecision::Join {
+                collateral: Some(kor("4"))
+            }
+        );
+        assert_eq!(
+            budget.decide(false, Some(None)),
+            JoinDecision::Skip(SkipReason::InsufficientCollateral)
+        );
+    }
+
+    /// The estimate follows what agreements have actually cost lately, never
+    /// below the configured floor, and forgets after a day.
+    #[test]
+    fn the_estimate_rises_to_the_largest_collateral_seen_recently() {
+        let tracker = StakeTracker::new(StakePolicy {
+            unknown_collateral_estimate: kor("2"),
+            ..StakePolicy::default()
+        });
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("1000"), Some("1000")), t0);
+        tracker.note_collateral(Some("1.5"), t0);
+        tracker.note_collateral(Some("37.25"), t0);
+        tracker.note_collateral(None, t0);
+        tracker.note_collateral(Some("garbage"), t0);
+
+        let charged = |at| match tracker.join_budget(at).decide(false, Some(None)) {
+            JoinDecision::Join { collateral } => collateral.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(charged(t0), kor("37.25"));
+        assert_eq!(charged(t0 + COLLATERAL_MEMORY), kor("2"), "forgotten");
+    }
+
+    /// From the moment the operator asks to unstake, nothing new is joined —
+    /// not only once the unstake has executed.
+    #[test]
+    fn an_unstake_request_stops_joins_at_once() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::Leaving)
+        );
+
+        tracker.record_sent(NodeOp::BeginUnstake, 10, t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(None)),
+            JoinDecision::Skip(SkipReason::Leaving),
+            "still while it is in flight"
+        );
+    }
+
+    fn exiting_entry(next_nonce: u64, stake: &str) -> RegistryEntry {
+        let mut e = entry(Some(stake), Some("0"));
+        e.next_nonce = next_nonce;
+        e.kor_balance = Some("5".into());
+        e.stake_withdrawal_height = Some(5000);
+        e
+    }
+
+    /// The exit: leave each membership one op at a time, skipping one whose
+    /// challenge is still open, then withdraw once nothing is held and the
+    /// delay has run — and never re-bond what came back.
+    #[test]
+    fn the_exit_leaves_each_membership_then_withdraws() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert!(tracker.exiting());
+
+        let mut exit = ExitInputs {
+            memberships: vec!["AGR-a".into(), "AGR-b".into()],
+            deferred: vec!["AGR-a".into()],
+            unresolved_challenges: 1,
+        };
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-b".into())),
+            "AGR-a has an open challenge: it waits"
+        );
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-b".into()), 10, t0);
+        assert_eq!(tracker.plan(t0, Some(&exit)), None, "one op at a time");
+
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        assert_eq!(tracker.plan(t0, Some(&exit)), None, "AGR-a still deferred");
+
+        exit.deferred.clear();
+        exit.unresolved_challenges = 0;
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-a".into()))
+        );
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 11, t0);
+        observed(&tracker, &exiting_entry(12, "100"), t0);
+
+        // Nothing held; but the delay has not run by the node's reckoning.
+        assert_eq!(tracker.plan(t0, Some(&exit)), None);
+        let status = tracker.status();
+        assert_eq!(status["exit"]["memberships_left"], json!([]));
+        assert_eq!(status["exit"]["left"], 2);
+
+        let later = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+        assert_eq!(
+            tracker.plan(later, Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+        tracker.record_sent(NodeOp::WithdrawStake, 12, later);
+
+        // Withdrawn: the bond is back in the balance, and stays there.
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = 13;
+        withdrawn.kor_balance = Some("105".into());
+        observed(&tracker, &withdrawn, later);
+        assert!(!tracker.exiting());
+        assert_eq!(
+            tracker.plan(later, None),
+            None,
+            "no re-bonding after an exit"
+        );
+        assert_eq!(tracker.status()["exited"], true);
+    }
+
+    /// A withdrawal that executed without returning the bond means a leave
+    /// did not take: they are all sent again, and the withdrawal retried later.
+    #[test]
+    fn a_withdrawal_that_did_not_take_resends_the_leaves() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+
+        let later = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+        assert_eq!(
+            tracker.plan(later, Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+        tracker.record_sent(NodeOp::WithdrawStake, 11, later);
+        observed(&tracker, &exiting_entry(12, "100"), later);
+
+        assert_eq!(
+            tracker.plan(later, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-a".into()))
+        );
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 12, later);
+        observed(&tracker, &exiting_entry(13, "100"), later);
+        assert_eq!(tracker.plan(later, Some(&exit)), None, "retry interval");
+        assert_eq!(
+            tracker.plan(later + WITHDRAW_RETRY_INTERVAL, Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+    }
+
+    /// Without the operator's unstake there is no exit, whatever the rows say.
+    #[test]
+    fn no_exit_without_an_unstake() {
+        let tracker = StakeTracker::new(StakePolicy {
+            auto_stake: false,
+            ..StakePolicy::default()
+        });
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        assert!(!tracker.exiting());
+        assert_eq!(tracker.plan(t0, Some(&exit)), None);
+    }
+
+    #[tokio::test]
+    async fn exit_inputs_reads_memberships_and_open_challenges_from_the_rows() {
+        use crate::testutils::{setup_in_memory_db, AgreementFixture};
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let db = setup_in_memory_db().await;
+        for (id, status, nodes) in [
+            (
+                "AGR-live",
+                "confirmed",
+                json!([{"node_id": "NODE-me", "status": "valid"}]),
+            ),
+            ("AGR-bare", "confirmed", json!(["NODE-me"])),
+            (
+                "AGR-open",
+                "confirmed",
+                json!([{"node_id": "NODE-me", "status": "valid"}]),
+            ),
+            (
+                "AGR-failed-join",
+                "confirmed",
+                json!([{"node_id": "NODE-me", "status": "failed"}]),
+            ),
+            (
+                "AGR-not-yet",
+                "ready",
+                json!([{"node_id": "NODE-me", "status": "valid"}]),
+            ),
+            (
+                "AGR-failed",
+                "failed",
+                json!([{"node_id": "NODE-me", "status": "valid"}]),
+            ),
+            (
+                "AGR-other",
+                "confirmed",
+                json!([{"node_id": "NODE-other", "status": "valid"}]),
+            ),
+        ] {
+            AgreementFixture {
+                status: status.into(),
+                nodes,
+                ..AgreementFixture::new(id, format!("F-{id}"))
+            }
+            .into_active_model()
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        for (id, agreement, status) in [
+            ("c1", "AGR-open", "active"),
+            ("c2", "AGR-live", "proved"),
+            ("c3", "AGR-live", "resolved"),
+            ("c4", "AGR-bare", "failed"),
+        ] {
+            crate::entities::challenges::ActiveModel {
+                challenge_id: Set(id.into()),
+                agreement_id: Set(agreement.into()),
+                block_height: Set(1),
+                challenge_count: Set(1),
+                seed: Set("00".into()),
+                prover_id: Set("42".into()),
+                deadline_height: Set(10),
+                status: Set(status.into()),
+                proof: Set(None),
+                bls_signature: Set(None),
+                created_at: Set(chrono::Utc::now().fixed_offset()),
+                updated_at: Set(chrono::Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let exit = exit_inputs(&db, "NODE-me").await.unwrap();
+        assert_eq!(exit.memberships, vec!["AGR-bare", "AGR-live", "AGR-open"]);
+        assert_eq!(exit.deferred, vec!["AGR-open"]);
+        assert_eq!(
+            exit.unresolved_challenges, 2,
+            "active and proved-but-unsettled"
+        );
     }
 }

@@ -69,6 +69,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--stake-target-kor` | `KONTOR_STORAGE_STAKE_TARGET_KOR` | _unset_ | Cap on the total bonded stake. Unset bonds everything above the gas reserve. |
 | `--faucet-amount-kor` | `KONTOR_STORAGE_FAUCET_AMOUNT_KOR` | `1000` | KOR requested from the Portal faucet when the node starts with an empty balance. The Portal caps it (`PORTAL_FAUCET_MAX_AMOUNT_KOR`); a node asking for more is told the cap and asks again for exactly that. |
 | `--claim-threshold-kor` | `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` | `1` | Claim storage rewards once at least this much is claimable (at most once an hour). |
+| `--unknown-collateral-estimate-kor` | `KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR` | `10` | What a join is budgeted at when the agreement's collateral is not known yet — the usual case. Raised automatically to the largest collateral seen in the last day. |
 
 All KOR amounts are exact decimals with up to 18 fractional digits (`2.5`,
 `0.000000000000000001`); exponents and signs are refused rather than rounded.
@@ -497,9 +498,17 @@ Each sync cycle the node reads its bond from the Portal (`GET
    it — 1000 KOR by default, so 995 bonded — before it looks at any agreement.
 2. **Joins only what the bond covers.** Before downloading a ready agreement it
    checks the agreement's collateral against the unreserved stake, less what
-   this cycle and still-unexecuted earlier joins have already committed. An
-   agreement whose collateral the Portal does not know yet is left for a later
-   cycle. Nothing it cannot join is downloaded.
+   this cycle and still-unexecuted earlier joins have already committed.
+   Nothing it cannot join is downloaded.
+
+   Usually the collateral is not known yet: the Portal sends a join in the same
+   batch as the transaction that creates the agreement, and Kontor only fixes
+   the collateral then. Such an agreement is still joined while any stake is
+   unreserved, but charged an estimate — `KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR`
+   (10 KOR), or the largest collateral the node has seen on an agreement in the
+   last day if that is more — and no more than 3 per cycle. A guess that turns
+   out short costs a download: Kontor refuses a join the stake cannot cover,
+   and a refused join is not slashed. A known collateral is checked exactly.
 3. **Claims rewards** once `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` (1 KOR) is
    claimable, at most hourly, so the next cycle bonds them.
 
@@ -553,12 +562,32 @@ why challenges were missed — a node slashed into cleanup once will be again.
 
 #### Leaving
 
-`/admin` → **Withdraw the collateral** queues `begin-unstake` or
-`withdraw-stake` for the daemon to sign (type `UNSTAKE` / `WITHDRAW` to
-confirm). An unstake starts Kontor's withdrawal delay (about two weeks of
-blocks) and stops every new join and top-up for good, but the node must keep
-proving what it holds. The withdrawal succeeds only once the delay has passed
-and no agreement or open challenge holds any of the bond.
+Leaving takes one action: `/admin` → **Withdraw the collateral** → **Begin
+unstake** (type `UNSTAKE`). The rest is the daemon's, one op per cycle:
+
+1. **No new joins** from the moment the request is queued.
+2. Once `begin-unstake` has executed — starting Kontor's withdrawal delay of
+   2028 blocks, about two weeks — the node **leaves each agreement** it holds
+   with `leave-agreement`. An agreement with a challenge still open is left
+   after the challenge is proved. Kontor would allow leaving earlier, and does
+   not penalise it, but it changes nothing: the challenge must still be proved
+   or it is slashed, and its collateral stays reserved until it resolves. The
+   node keeps proving throughout.
+3. When no agreement is held, no challenge is unresolved, and the delay has
+   passed, it sends **`withdraw-stake`**, which returns the whole bond to the
+   node's balance. After that it bonds nothing again in this process.
+
+The node cannot see the chain tip, so it times the delay from when it first saw
+the withdrawal height, assuming 10-minute blocks; **Withdraw** (type
+`WITHDRAW`) tries it by hand at any time. A withdrawal that executes without
+returning the bond is retried every 6 hours, re-sending the leaves first.
+
+Two things this does not survive. The Portal keeps a membership row after a
+leave, so which agreements the node has left lives only in the running process:
+after a restart it sends those leaves again, and Kontor refuses each one for a
+fee. And a node restarted after its withdrawal with auto-stake still on bonds
+its balance again — set `KONTOR_STORAGE_AUTO_STAKE=false` first; the log says
+so when the bond comes back.
 
 ### Download and preparation pipeline
 

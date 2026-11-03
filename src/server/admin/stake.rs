@@ -10,14 +10,16 @@
 //!
 //! What each does on Kontor:
 //!
-//! - `begin_unstake` sets the bond's withdrawal height (about two weeks out).
-//!   From the moment it executes the node joins nothing and stakes nothing
-//!   more; the agreements it already holds still have to be proved, and a
+//! - `begin_unstake` sets the bond's withdrawal height (2028 blocks out) and
+//!   starts the exit: joins stop as soon as it is queued, and once it has
+//!   executed the daemon leaves each membership and finally withdraws on its
+//!   own (see [`ExitInputs`](crate::app::tasks::stake::ExitInputs)). The
+//!   agreements still held have to be proved until they are left, and a
 //!   missed proof is still slashed.
-//! - `withdraw_stake` returns the whole bond once that height has passed *and*
-//!   no agreement or open challenge holds any of it. Kontor refuses it
-//!   otherwise; the refusal shows as an op that landed without the stake
-//!   moving.
+//! - `withdraw_stake` tries the withdrawal now, ahead of the daemon's own
+//!   estimate of when the delay ends. Kontor refuses it before that height or
+//!   while any agreement or open challenge holds part of the bond; the refusal
+//!   shows as an op that landed without the stake moving.
 
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -106,10 +108,11 @@ pub fn request_stake_action(
         _ => {}
     }
 
+    let name = op.name();
     tracker.request(op).map_err(unavailable)?;
 
     Ok(json!({
-        "queued": op.name(),
+        "queued": name,
         "message": "queued: the daemon signs it on its next cycle",
     }))
 }
@@ -173,7 +176,10 @@ mod tests {
             "begin_unstake"
         );
         assert_eq!(
-            state.runtime.staking().plan(std::time::Instant::now()),
+            state
+                .runtime
+                .staking()
+                .plan(std::time::Instant::now(), None),
             Some(NodeOp::BeginUnstake),
             "the daemon's next cycle picks it up"
         );

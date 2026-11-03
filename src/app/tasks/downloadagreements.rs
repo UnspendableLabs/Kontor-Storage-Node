@@ -2925,8 +2925,10 @@ mod tests {
     }
 
     /// The point of the gate: nothing is downloaded — let alone joined — that
-    /// the stake cannot cover or whose cost is not known yet. The agreement
-    /// that fits is taken, and its collateral is held for the next cycle.
+    /// the stake cannot cover. A known collateral is checked exactly; an
+    /// unknown one (the usual case: the Portal joins in the batch that creates
+    /// the agreement) is taken at the estimate. What was set aside for each is
+    /// held for the next cycle.
     #[tokio::test]
     async fn only_agreements_the_stake_covers_are_downloaded() {
         let mock_server = MockServer::start().await;
@@ -2945,7 +2947,7 @@ mod tests {
         let tracker = tracker_with_available("50");
         let listing = listing(vec![
             listed("AGR-fits", Some("30"), &[]),
-            listed("AGR-too-big", Some("30.000000000000000001"), &[]),
+            listed("AGR-too-big", Some("50.000000000000000001"), &[]),
             listed("AGR-unknown", None, &[]),
         ]);
         let mut budget = tracker.join_budget(Instant::now());
@@ -2964,7 +2966,8 @@ mod tests {
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests_to(&requests, "AGR-fits/join"), 1);
-        for skipped in ["AGR-too-big", "AGR-unknown", "AGR-unlisted"] {
+        assert_eq!(requests_to(&requests, "AGR-unknown/join"), 1);
+        for skipped in ["AGR-too-big", "AGR-unlisted"] {
             assert_eq!(
                 requests_to(&requests, skipped),
                 0,
@@ -2979,9 +2982,26 @@ mod tests {
             .unwrap();
         assert!(fits.downloaded);
         let status = tracker.status();
-        assert_eq!(status["pending_joins"][0]["agreement_id"], "AGR-fits");
-        assert_eq!(status["pending_joins"][0]["collateral"], "30");
-        assert_eq!(status["pending_joins"][0]["nonce"], 0);
+        let mut held: Vec<(String, String)> = status["pending_joins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|join| {
+                (
+                    join["agreement_id"].as_str().unwrap().to_string(),
+                    join["collateral"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                ("AGR-fits".to_string(), "30".to_string()),
+                ("AGR-unknown".to_string(), "10".to_string()),
+            ],
+            "the exact collateral, and the default estimate for the unknown one"
+        );
     }
 
     /// A membership already held is an obligation: its file is downloaded

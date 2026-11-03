@@ -5,7 +5,7 @@ use crate::app::tasks::downloadagreements::{
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::app::tasks::reconcile;
-use crate::app::tasks::stake::{manage_stake, JoinBudget, StakeTracker};
+use crate::app::tasks::stake::{exit_inputs, manage_stake, JoinBudget, StakeTracker};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
@@ -210,13 +210,21 @@ async fn sync_portal_once(
     let mut failed_count: usize = 0;
 
     if let Some(node_id) = portal_client.node_id() {
-        failed_count += reconcile::reconcile_from_portal(
+        failed_count += reconcile::reconcile_from_portal_with(
             portal_client,
             database,
             node_id,
             storage_backend,
             storage_dir,
             false,
+            |agreements| {
+                let now = Instant::now();
+                for agreement in agreements {
+                    memory
+                        .staking
+                        .note_collateral(agreement.required_collateral.as_deref(), now);
+                }
+            },
         )
         .await
         .context("reconciling agreements with Portal")?;
@@ -226,6 +234,12 @@ async fn sync_portal_once(
         let listing = sync_ready_agreements(portal_client, database)
             .await
             .context("fetching new agreements failed")?;
+        let now = Instant::now();
+        for agreement in listing.values() {
+            memory
+                .staking
+                .note_collateral(agreement.required_collateral.as_deref(), now);
+        }
         let mut budget = if portal_client.node_id().is_some() {
             memory.staking.join_budget(Instant::now())
         } else {
@@ -279,7 +293,20 @@ async fn sync_portal_once(
         }
     }
 
-    manage_stake(portal_client, &memory.staking).await;
+    // The exit, once the operator's unstake has executed, is worked out from
+    // the node's own rows: which memberships it holds and which challenges
+    // are still open. A read failure only postpones the next exit step.
+    let exit = match portal_client.node_id() {
+        Some(node_id) if memory.staking.exiting() => match exit_inputs(database, node_id).await {
+            Ok(exit) => Some(exit),
+            Err(err) => {
+                warn!("could not read memberships for the exit this cycle: {err:#}");
+                None
+            }
+        },
+        _ => None,
+    };
+    manage_stake(portal_client, &memory.staking, exit.as_ref()).await;
 
     Ok(())
 }
@@ -1481,5 +1508,68 @@ mod tests {
             .unwrap()
             .expect("still recorded as ready, for a later cycle");
         assert!(!stored.downloaded);
+    }
+
+    /// Once the operator's unstake has executed, the cycle's op is the exit:
+    /// a `leave_agreement` for a membership the node's own rows hold.
+    #[tokio::test]
+    async fn an_executed_unstake_turns_the_cycle_s_op_into_a_leave() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        let mut entry = funded_entry(4);
+        entry["kor_balance"] = json!("5");
+        entry["stake"] = json!("100");
+        entry["stake_available"] = json!("70");
+        entry["stake_withdrawal_height"] = json!(9000);
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "op": "leave_agreement",
+                "agreement_id": "AGR-held",
+                "nonce": 4
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": "leave_agreement", "status": "queued", "nonce": 4
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        AgreementFixture {
+            status: "confirmed".into(),
+            downloaded: true,
+            nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+            ..AgreementFixture::new("AGR-held", "FILE-held")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let storage_dir = unique_test_path("daemon_exit");
+        fs::create_dir_all(&storage_dir).ok();
+        let memory = DaemonMemory::default();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+            &memory,
+        )
+        .await
+        .unwrap();
+
+        let status = memory.staking.status();
+        assert_eq!(status["in_flight"]["op"], "leave_agreement");
+        assert_eq!(status["exit"]["memberships_left"], json!(["AGR-held"]));
     }
 }

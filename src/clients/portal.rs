@@ -96,7 +96,7 @@ fn verify_proof_expr(proof_bytes: &[u8], challenge_ids: &[&str]) -> Result<Strin
 /// result. So [`NodeOp::contract_and_expr`] must produce exactly what the Portal
 /// builds — the contract each op targets, and the WAVE expression with the
 /// amount encoded by [`Kor::wave_literal`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeOp {
     /// `staking::add-stake(amount)`: bond more collateral.
     AddStake(Kor),
@@ -109,6 +109,10 @@ pub enum NodeOp {
     /// `filestorage::claim-rewards()`: move accrued storage rewards into the
     /// node's spendable balance, where auto-stake can pick them up.
     ClaimRewards,
+    /// `filestorage::leave-agreement(id)`: give up one membership. Part of
+    /// leaving the network: `withdraw-stake` is refused while any membership
+    /// remains.
+    LeaveAgreement(String),
 }
 
 /// Which contract an op is a call on. The addresses themselves are
@@ -121,27 +125,41 @@ enum OpContract {
 impl NodeOp {
     /// The `op` field of the relay request.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             NodeOp::AddStake(_) => "add_stake",
             NodeOp::BeginUnstake => "begin_unstake",
             NodeOp::WithdrawStake => "withdraw_stake",
             NodeOp::ClaimRewards => "claim_rewards",
+            NodeOp::LeaveAgreement(_) => "leave_agreement",
         }
     }
 
     /// The amount, for the one op that carries one.
     #[must_use]
-    pub fn amount(self) -> Option<Kor> {
+    pub fn amount(&self) -> Option<Kor> {
         match self {
-            NodeOp::AddStake(amount) => Some(amount),
+            NodeOp::AddStake(amount) => Some(*amount),
+            _ => None,
+        }
+    }
+
+    /// The agreement, for the one op that names one.
+    #[must_use]
+    pub fn agreement_id(&self) -> Option<&str> {
+        match self {
+            NodeOp::LeaveAgreement(agreement_id) => Some(agreement_id),
             _ => None,
         }
     }
 
     /// The contract the op calls and its WAVE expression (contract §2 table).
-    fn contract_and_expr(self) -> (OpContract, String) {
-        match self {
+    ///
+    /// `leave-agreement("<id>")` is quoted exactly like `join-agreement`, with
+    /// the same `[A-Za-z0-9_-]` allowlist — the Portal rebuilds it from the
+    /// `agreement_id` field and verifies the signature over it.
+    fn contract_and_expr(&self) -> Result<(OpContract, String)> {
+        Ok(match self {
             NodeOp::AddStake(amount) => (
                 OpContract::Staking,
                 format!("add-stake({})", amount.wave_literal()),
@@ -149,7 +167,11 @@ impl NodeOp {
             NodeOp::BeginUnstake => (OpContract::Staking, "begin-unstake()".to_string()),
             NodeOp::WithdrawStake => (OpContract::Staking, "withdraw-stake()".to_string()),
             NodeOp::ClaimRewards => (OpContract::Filestorage, "claim-rewards()".to_string()),
-        }
+            NodeOp::LeaveAgreement(agreement_id) => (
+                OpContract::Filestorage,
+                format!("leave-agreement({})", wave_string_literal(agreement_id)?),
+            ),
+        })
     }
 }
 
@@ -1026,13 +1048,13 @@ impl PortalClient {
     /// If the client is unauthenticated, the request fails, or the Portal
     /// refuses the op (the [`HttpStatusError`](super::http_helpers::HttpStatusError)
     /// carries the code, e.g. `BOND_CLEANUP_PENDING`).
-    pub async fn submit_node_op(&self, op: NodeOp) -> Result<NodeOpResponse> {
+    pub async fn submit_node_op(&self, op: &NodeOp) -> Result<NodeOpResponse> {
         let node_id = self
             .node_id()
             .ok_or_else(|| anyhow!("authentication required to submit a node op"))?
             .to_string();
 
-        let (contract, expr) = op.contract_and_expr();
+        let (contract, expr) = op.contract_and_expr()?;
         let contract = match contract {
             OpContract::Staking => self.staking_contract_address.clone(),
             OpContract::Filestorage => self.contract_address.clone(),
@@ -1042,6 +1064,7 @@ impl PortalClient {
         let payload = NodeOpRequest {
             op: op.name(),
             amount: op.amount().map(|amount| amount.to_string()),
+            agreement_id: op.agreement_id().map(str::to_string),
             bls_signature,
             nonce,
         };
@@ -1428,6 +1451,8 @@ struct NodeOpRequest {
     op: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agreement_id: Option<String>,
     bls_signature: String,
     nonce: u64,
 }
@@ -2665,22 +2690,24 @@ mod tests {
     /// signature against.
     #[test]
     fn node_ops_target_the_contracts_the_relay_rebuilds() {
-        let (contract, expr) = NodeOp::AddStake(Kor::parse("250.5").unwrap()).contract_and_expr();
+        let (contract, expr) = NodeOp::AddStake(Kor::parse("250.5").unwrap())
+            .contract_and_expr()
+            .unwrap();
         assert!(matches!(contract, OpContract::Staking));
         assert_eq!(
             expr,
             "add-stake({r0: 10692327041775828992, r1: 13, r2: 0, r3: 0, sign: plus})"
         );
 
-        let (contract, expr) = NodeOp::BeginUnstake.contract_and_expr();
+        let (contract, expr) = NodeOp::BeginUnstake.contract_and_expr().unwrap();
         assert!(matches!(contract, OpContract::Staking));
         assert_eq!(expr, "begin-unstake()");
 
-        let (contract, expr) = NodeOp::WithdrawStake.contract_and_expr();
+        let (contract, expr) = NodeOp::WithdrawStake.contract_and_expr().unwrap();
         assert!(matches!(contract, OpContract::Staking));
         assert_eq!(expr, "withdraw-stake()");
 
-        let (contract, expr) = NodeOp::ClaimRewards.contract_and_expr();
+        let (contract, expr) = NodeOp::ClaimRewards.contract_and_expr().unwrap();
         assert!(matches!(contract, OpContract::Filestorage));
         assert_eq!(expr, "claim-rewards()");
 
@@ -2688,6 +2715,19 @@ mod tests {
         assert_eq!(NodeOp::BeginUnstake.name(), "begin_unstake");
         assert_eq!(NodeOp::WithdrawStake.name(), "withdraw_stake");
         assert_eq!(NodeOp::ClaimRewards.name(), "claim_rewards");
+
+        let leave = NodeOp::LeaveAgreement("agr_7f-3c".into());
+        let (contract, expr) = leave.contract_and_expr().unwrap();
+        assert!(matches!(contract, OpContract::Filestorage));
+        assert_eq!(expr, "leave-agreement(\"agr_7f-3c\")");
+        assert_eq!(leave.name(), "leave_agreement");
+        assert_eq!(leave.agreement_id(), Some("agr_7f-3c"));
+        assert!(
+            NodeOp::LeaveAgreement("agr\", \"x".into())
+                .contract_and_expr()
+                .is_err(),
+            "an id that could break out of the literal is refused"
+        );
     }
 
     fn node_op_client(uri: &str, keypair: Arc<BlsKeyPair>, name: &str) -> PortalClient {
@@ -2747,7 +2787,7 @@ mod tests {
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "add_stake");
         let response = client
-            .submit_node_op(NodeOp::AddStake(Kor::parse("250.50").unwrap()))
+            .submit_node_op(&NodeOp::AddStake(Kor::parse("250.50").unwrap()))
             .await
             .unwrap();
 
@@ -2781,7 +2821,7 @@ mod tests {
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "claim")
             .with_contract_address("filestorage_9_1");
-        client.submit_node_op(NodeOp::ClaimRewards).await.unwrap();
+        client.submit_node_op(&NodeOp::ClaimRewards).await.unwrap();
 
         let body = sent_body(&mock_server).await;
         assert_eq!(body["op"], "claim_rewards");
@@ -2802,7 +2842,7 @@ mod tests {
         let keypair = Arc::new(BlsKeyPair::generate().unwrap());
         let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "unstake")
             .with_staking_contract_address("staking_4_2");
-        client.submit_node_op(NodeOp::BeginUnstake).await.unwrap();
+        client.submit_node_op(&NodeOp::BeginUnstake).await.unwrap();
 
         let body = sent_body(&mock_server).await;
         assert_eq!(
@@ -2840,7 +2880,7 @@ mod tests {
         let client = node_op_client(&mock_server.uri(), keypair, "refused");
 
         let err = client
-            .submit_node_op(NodeOp::AddStake(Kor::ONE))
+            .submit_node_op(&NodeOp::AddStake(Kor::ONE))
             .await
             .unwrap_err();
         assert_eq!(
@@ -2850,7 +2890,7 @@ mod tests {
         assert_eq!(client.current_nonce(), Some(7), "refused: nonce released");
 
         client
-            .submit_node_op(NodeOp::ClaimRewards)
+            .submit_node_op(&NodeOp::ClaimRewards)
             .await
             .unwrap_err();
         assert_eq!(client.current_nonce(), Some(8), "5xx: nonce stays consumed");
@@ -2860,7 +2900,7 @@ mod tests {
     async fn submit_node_op_requires_authentication() {
         let client = PortalClient::new("http://localhost:1234", storage_dir("op_no_auth"));
         let err = client
-            .submit_node_op(NodeOp::ClaimRewards)
+            .submit_node_op(&NodeOp::ClaimRewards)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("authentication required"), "{err}");
@@ -2980,6 +3020,33 @@ mod tests {
         assert_eq!(agreements[1].required_collateral, None);
     }
 
+    #[tokio::test]
+    async fn leave_agreement_names_the_agreement_and_signs_the_filestorage_call() {
+        let mock_server = MockServer::start().await;
+        mount_ops_accepting(&mock_server, "leave_agreement").await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "leave");
+        client
+            .submit_node_op(&NodeOp::LeaveAgreement("agr_1".into()))
+            .await
+            .unwrap();
+
+        let body = sent_body(&mock_server).await;
+        assert_eq!(body["op"], "leave_agreement");
+        assert_eq!(body["agreement_id"], "agr_1");
+        assert!(body.get("amount").is_none(), "{body}");
+        assert_eq!(
+            body["bls_signature"],
+            expected_signature(
+                &keypair,
+                DEFAULT_FILESTORAGE_CONTRACT,
+                "leave-agreement(\"agr_1\")",
+                7
+            )
+        );
+    }
+
     /// `409 CONFLICT` is the one 4xx after which the Portal holds something:
     /// another op of this node already has that nonce. Releasing it would sign
     /// the next op at the same, taken, nonce.
@@ -3005,7 +3072,7 @@ mod tests {
         let client = node_op_client(&mock_server.uri(), keypair, "conflict");
 
         let err = client
-            .submit_node_op(NodeOp::ClaimRewards)
+            .submit_node_op(&NodeOp::ClaimRewards)
             .await
             .unwrap_err();
         assert_eq!(

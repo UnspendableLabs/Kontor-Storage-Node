@@ -158,6 +158,10 @@ impl Config {
                 &cli.claim_threshold_kor,
                 "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR",
             )?,
+            unknown_collateral_estimate: parse_kor_positive(
+                &cli.unknown_collateral_estimate_kor,
+                "KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR",
+            )?,
         };
         let faucet_amount =
             parse_kor_positive(&cli.faucet_amount_kor, "KONTOR_STORAGE_FAUCET_AMOUNT_KOR")?;
@@ -292,6 +296,7 @@ mod tests {
             stake_target_kor: None,
             faucet_amount_kor: "1000".to_string(),
             claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         }
     }
@@ -624,6 +629,7 @@ mod tests {
             stake_target_kor: Some("250.000000000000000001".to_string()),
             faucet_amount_kor: "0.1".to_string(),
             claim_threshold_kor: "0.75".to_string(),
+            unknown_collateral_estimate_kor: "2.5".to_string(),
             kontor_staking_contract_address: " staking_3_1 ".to_string(),
             ..make_cli()
         };
@@ -635,6 +641,10 @@ mod tests {
             "250.000000000000000001"
         );
         assert_eq!(config.stake_policy.claim_threshold.to_string(), "0.75");
+        assert_eq!(
+            config.stake_policy.unknown_collateral_estimate.to_string(),
+            "2.5"
+        );
         assert_eq!(config.faucet_amount.to_string(), "0.1");
         assert_eq!(config.kontor_staking_contract_address, "staking_3_1");
     }
@@ -677,6 +687,13 @@ mod tests {
                     ..make_cli()
                 },
                 "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR",
+            ),
+            (
+                Cli {
+                    unknown_collateral_estimate_kor: "0".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR",
             ),
             (
                 Cli {

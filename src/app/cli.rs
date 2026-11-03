@@ -160,6 +160,17 @@ pub struct Cli {
     #[arg(long, env = "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR", default_value = "1")]
     pub claim_threshold_kor: String,
 
+    /// What a join is budgeted at when the agreement's collateral is not known
+    /// yet — the usual case, since the Portal joins in the batch that creates
+    /// the agreement. Raised automatically to the largest collateral seen in
+    /// the last day.
+    #[arg(
+        long,
+        env = "KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR",
+        default_value = "10"
+    )]
+    pub unknown_collateral_estimate_kor: String,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,

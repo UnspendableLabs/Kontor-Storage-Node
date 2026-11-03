@@ -335,6 +335,7 @@
       <div class="row"><span class="k">Available for new joins</span><span class="mono" id="staking-available">—</span></div>
       <div class="row"><span class="k">Claimable rewards</span><span class="mono" id="staking-rewards">—</span></div>
       <div class="row"><span class="k">Waiting to land</span><span id="staking-in-flight">—</span></div>
+      <div class="row" id="staking-exit-row" hidden><span class="k">Exit</span><span id="staking-exit">—</span></div>
     </div>
     <div class="divider"></div>
     <div class="row"><span class="k">Auto-stake</span><span id="staking-policy">—</span></div>
@@ -346,17 +347,21 @@
     <div class="msg err" id="exit-error"></div>
     <div class="msg ok" id="exit-success"></div>
     <p>
-      For a node that is leaving. <strong>Begin unstake</strong> starts Kontor's
-      withdrawal delay (about two weeks of blocks): from the moment it executes
-      this node joins no new agreement and bonds no more stake. The agreements it
-      already holds still have to be proved until they end, and a missed proof is
-      still slashed.
+      For a node that is leaving. <strong>Begin unstake</strong> is the only
+      step you take: from the moment it is queued this node joins nothing new,
+      and once it executes — starting Kontor's withdrawal delay, about two weeks
+      of blocks — the node leaves its agreements on its own, one per cycle, each
+      once its open challenge has been proved. It keeps proving until then: a
+      missed proof is still slashed.
     </p>
     <p class="muted">
-      <strong>Withdraw</strong> returns the whole bond once the delay has passed
-      and no agreement or open challenge holds any of it; Kontor refuses it before
-      then. Neither is signed by this page: the request is queued and the daemon
-      signs it on its next cycle.
+      When nothing is held any more and the delay has passed by the node's
+      count, it withdraws the bond itself, and bonds nothing again. The node
+      cannot see the chain tip, so it times the delay assuming 10-minute blocks;
+      <strong>Withdraw</strong> tries it now, by hand. Kontor refuses a withdrawal
+      while any agreement or open challenge holds part of the bond. Nothing is
+      signed by this page: the request is queued and the daemon signs it on its
+      next cycle.
     </p>
     <form id="exit-form" class="stack">
       <label class="muted" for="exit-action">Action</label>
@@ -743,6 +748,25 @@
     if (pending > 0) { waiting.push(pending + " join(s)"); }
     if (staking.operator_request) { waiting.push(staking.operator_request + " requested"); }
     $("staking-in-flight").textContent = waiting.length ? waiting.join(" · ") : "nothing";
+
+    var exit = staking.exit;
+    $("staking-exit-row").hidden = !exit;
+    if (exit) {
+      var steps = [];
+      var held = (exit.memberships_left || []).length;
+      steps.push(held === 0 ? "no agreement held" : held + " agreement(s) still to leave");
+      if ((exit.deferred || []).length) {
+        steps.push(exit.deferred.length + " waiting for an open challenge");
+      }
+      if (exit.unresolved_challenges) {
+        steps.push(exit.unresolved_challenges + " challenge(s) unresolved");
+      }
+      if (exit.withdraw_estimated_from) {
+        steps.push("withdrawal tried from about " +
+          new Date(exit.withdraw_estimated_from).toLocaleString());
+      }
+      $("staking-exit").textContent = steps.join(" · ");
+    }
 
     var policy = staking.policy || {};
     $("staking-policy").textContent = policy.auto_stake === false
