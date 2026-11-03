@@ -29,6 +29,7 @@ use crate::app::lifecycle::{Activation, NodeRuntime, Phase, SealStatus};
 use crate::app::output::SharedWriter;
 use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
+use crate::app::tasks::stake;
 use crate::clients::PortalClient;
 use crate::crypto::keystore::{Keystore, SealKey, SealKeySource};
 use crate::database::DBClient;
@@ -122,6 +123,25 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Filestorage contract: {}",
         config.kontor_contract_address
     )?;
+    writeln!(
+        writer,
+        "Staking contract: {}",
+        config.kontor_staking_contract_address
+    )?;
+    let policy = &config.stake_policy;
+    if policy.auto_stake {
+        let target = policy.stake_target.map_or_else(
+            || "everything".to_string(),
+            |target| format!("up to {target} KOR"),
+        );
+        writeln!(
+            writer,
+            "Auto-stake: on ({target} above a {} KOR gas reserve; rewards claimed from {} KOR)",
+            policy.gas_reserve, policy.claim_threshold
+        )?;
+    } else {
+        writeln!(writer, "Auto-stake: off")?;
+    }
 
     Ok(())
 }
@@ -201,7 +221,8 @@ pub async fn run_with_shutdown(
     setup_storage_directory(&config)?;
 
     let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
-        .with_contract_address(&config.kontor_contract_address);
+        .with_contract_address(&config.kontor_contract_address)
+        .with_staking_contract_address(&config.kontor_staking_contract_address);
 
     match cli.command {
         Commands::Ping => {
@@ -375,6 +396,7 @@ async fn serve(
 
     let runtime = NodeRuntime::new(phase, seal);
     runtime.set_notice(notice);
+    runtime.staking().set_policy(config.stake_policy.clone());
 
     // The key this boot opened the keystore with, published before the server
     // is: `/admin` reseals with it, and a request can arrive before the
@@ -771,7 +793,8 @@ impl Supervisor {
             token,
             next_nonce,
         )?
-        .with_contract_address(&self.config.kontor_contract_address);
+        .with_contract_address(&self.config.kontor_contract_address)
+        .with_staking_contract_address(&self.config.kontor_staking_contract_address);
 
         if let Err(e) = authenticated.announce_node(&self.config.public_url).await {
             tracing::warn!("Failed to announce node URL: {e}");
@@ -783,7 +806,18 @@ impl Supervisor {
             )?;
         }
 
-        node::ensure_kor_balance(&authenticated, signer_id, &mut self.writer).await?;
+        node::ensure_kor_balance(
+            &authenticated,
+            signer_id,
+            self.config.faucet_amount,
+            &mut self.writer,
+        )
+        .await?;
+
+        // Bond what the faucet just funded before looking at any agreement:
+        // Kontor refuses every join until the stake has landed.
+        let staking = self.runtime.staking();
+        stake::bootstrap_stake(&authenticated, &staking, &mut self.writer).await?;
 
         // The admin UI can re-register an already-registered node, so it gets
         // the same key and an unauthenticated client here as it would on a node
@@ -807,6 +841,7 @@ impl Supervisor {
             },
             self.parts.storage_backend.clone(),
             self.config.storage_dir.clone(),
+            staking,
         ));
 
         writeln!(
@@ -1139,6 +1174,12 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Ping,
         };
 
@@ -1201,6 +1242,12 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Ping,
         };
 
@@ -1252,6 +1299,12 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Ping,
         };
 
@@ -1303,6 +1356,12 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Ping,
         };
 
@@ -1359,6 +1418,12 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Ping,
         };
 
@@ -1493,6 +1558,12 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Run,
         };
 
@@ -1585,6 +1656,12 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: Some("correct horse battery staple".to_string()),
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Run,
         }
     }
@@ -2420,6 +2497,12 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Run,
         };
 
@@ -2558,6 +2641,12 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
             command: Commands::Run,
         };
 

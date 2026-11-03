@@ -1,0 +1,1291 @@
+//! Bonded stake: keeping it topped up, and not joining what it cannot cover.
+//!
+//! Since the staking upgrade Kontor refuses `join-agreement` unless the node
+//! has a bonded stake in the `staking` contract whose *unreserved* part covers
+//! the agreement's `required-collateral`. Each membership then reserves that
+//! amount, and a challenge the node misses is settled by slashing
+//! `30 × required-collateral`. A stake slashed to zero puts the node in bond
+//! cleanup: Kontor unwinds its memberships, and until it is done the node can
+//! neither join nor add stake.
+//!
+//! The node never talks to Kontor. It reads its bond from the Portal's signer
+//! entry (contract §3) once per cycle — the same request the nonce resync
+//! already makes — signs `add-stake` / `claim-rewards` itself, and hands them to
+//! the Portal's relay (§2). This module decides *what* to sign:
+//!
+//! - **Auto-stake.** Everything above a gas reserve goes into the bond, up to an
+//!   optional target, in one `add-stake` per cycle at most.
+//! - **Auto-claim.** Rewards past a threshold are claimed, rate-limited, so the
+//!   next cycle's auto-stake can bond them.
+//! - **Join budget.** Before a ready agreement is downloaded, its collateral is
+//!   checked against the unreserved stake, minus what this node has already
+//!   committed to joins that have not executed yet.
+//!
+//! # Knowing when an op has landed
+//!
+//! The relay answers `202 queued`; nothing tells the node when the op executes.
+//! The nonce does. Kontor's `next_nonce` only moves past an op's nonce once
+//! that op has run, so an op is *in flight* while `next_nonce <= its nonce`,
+//! and landed after. This is deliberately not the same as "succeeded": an op
+//! that executed and failed, or that lost its nonce to another op, also
+//! consumes it. That is fine because every decision here is recomputed from the
+//! state the Portal reports — if a top-up did not happen, the balance is still
+//! there next cycle and a new one is sent. What the in-flight rule prevents is
+//! the other failure: re-sending the same 995 KOR every 30 seconds while the
+//! first one waits for a block.
+//!
+//! An op the Portal accepted and then silently dropped would never consume its
+//! nonce, so in-flight also expires after [`OP_LANDING_TIMEOUT`].
+//!
+//! # Why the op goes out last
+//!
+//! The daemon sends its stake op at the end of the cycle, after joins and
+//! proofs, so it holds the cycle's highest nonce. Should two ops ever collide
+//! on a nonce, the Portal keeps the one it composes first and drops the other;
+//! a dropped proof is a slash, a dropped `add-stake` is a retry. Losing is cheap
+//! for stake ops, and this ordering keeps it that way.
+//!
+//! # Old Portals
+//!
+//! A Portal predating staking sends none of the §3 fields. That is not "zero
+//! stake": the node then keeps its pre-staking behaviour — joins everything,
+//! signs no stake op. Once a Portal *has* reported a stake, a cycle where the
+//! entry cannot be read joins nothing rather than joining blind.
+
+use crate::clients::http_helpers::status_and_code;
+use crate::clients::kor::Kor;
+use crate::clients::portal::{NodeOp, RegistryEntry};
+use crate::clients::PortalClient;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::fmt;
+use std::io::Write;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
+
+/// The smallest free balance worth a top-up (contract stake policy).
+pub const MIN_TOP_UP: Kor = Kor::ONE;
+
+/// How long an accepted op may stay unreflected before the node assumes the
+/// Portal dropped it and decides again. Long enough for a compose round and a
+/// couple of blocks; short enough that a lost top-up is retried the same hour.
+pub const OP_LANDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// At most one automatic `claim-rewards` per this interval. Each claim costs
+/// gas, and rewards accrue per block, so claiming more often only buys dust.
+pub const CLAIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How long joins stay paused after the Portal refuses one with a §5 code.
+///
+/// The refusal means the node's own view of its stake disagreed with the
+/// Portal's. Retrying every cycle would download a file and be refused again
+/// each time; waiting lets the next few registry reads catch up.
+pub const JOIN_REFUSAL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// How the node manages its bond (contract "Storage-node stake policy").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StakePolicy {
+    /// Sign `add-stake` and `claim-rewards` automatically. Off, the node signs
+    /// no money-moving op on its own; joins are still gated on the stake.
+    pub auto_stake: bool,
+    /// KOR kept liquid to pay gas for joins and proofs. Never staked.
+    pub gas_reserve: Kor,
+    /// Cap on the total bond. `None` stakes everything above the reserve.
+    pub stake_target: Option<Kor>,
+    /// Claim rewards once at least this much is claimable.
+    pub claim_threshold: Kor,
+}
+
+impl Default for StakePolicy {
+    fn default() -> Self {
+        Self {
+            auto_stake: true,
+            gas_reserve: Kor::whole(5),
+            stake_target: None,
+            claim_threshold: Kor::ONE,
+        }
+    }
+}
+
+/// The node's bond as one registry read reported it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StakeSnapshot {
+    /// Spendable KOR, `None` if the Portal did not say.
+    pub kor_balance: Option<Kor>,
+    pub stake: Kor,
+    /// Stake held by joined agreements, when reported.
+    pub reserved: Option<Kor>,
+    /// What new joins can still reserve.
+    pub available: Kor,
+    /// Non-null once `begin-unstake` has executed.
+    pub withdrawal_height: Option<u64>,
+    pub bond_cleanup_pending: bool,
+    pub reward_balance: Option<Kor>,
+    /// Kontor's next nonce for this signer at the time of the read.
+    pub next_nonce: u64,
+}
+
+impl StakeSnapshot {
+    /// Parse the §3 fields of a signer entry.
+    ///
+    /// `None` when the Portal does not report a stake — absent, `null`, or
+    /// unreadable — which is what an old Portal looks like. `stake_available`
+    /// falls back to `stake − stake_reserved` when only those two are sent; an
+    /// entry with neither is treated as not reporting a stake at all, because
+    /// joining against a stake whose reservations are unknown is joining blind.
+    #[must_use]
+    pub fn from_entry(entry: &RegistryEntry) -> Option<Self> {
+        let stake = parse_field("stake", entry.stake.as_deref())?;
+        let reserved = parse_field("stake_reserved", entry.stake_reserved.as_deref());
+        let available = parse_field("stake_available", entry.stake_available.as_deref())
+            .or_else(|| reserved.map(|reserved| stake.saturating_sub(reserved)))?;
+
+        Some(Self {
+            kor_balance: parse_field("kor_balance", entry.kor_balance.as_deref()),
+            stake,
+            reserved,
+            available,
+            withdrawal_height: entry.stake_withdrawal_height,
+            bond_cleanup_pending: entry.bond_cleanup_pending.unwrap_or(false),
+            reward_balance: parse_field("reward_balance", entry.reward_balance.as_deref()),
+            next_nonce: entry.next_nonce,
+        })
+    }
+
+    /// Why this bond cannot take on a new agreement at all, if it cannot.
+    fn join_blocker(&self) -> Option<SkipReason> {
+        if self.bond_cleanup_pending {
+            Some(SkipReason::BondCleanupPending)
+        } else if self.withdrawal_height.is_some() {
+            Some(SkipReason::WithdrawalRequested)
+        } else if self.stake.is_zero() {
+            Some(SkipReason::NoStake)
+        } else {
+            None
+        }
+    }
+}
+
+fn parse_field(name: &str, raw: Option<&str>) -> Option<Kor> {
+    let raw = raw?;
+    match Kor::parse(raw) {
+        Ok(amount) => Some(amount),
+        Err(err) => {
+            warn!("ignoring the Portal's {name}: {err:#}");
+            None
+        }
+    }
+}
+
+/// The top-up the policy calls for, if any.
+///
+/// `min(kor_balance − reserve, target − stake)`, sent only when the free part
+/// is at least [`MIN_TOP_UP`] and the target still has room. The amount itself
+/// may be smaller than the minimum when it closes the gap to the target — one
+/// op, then nothing more to do.
+#[must_use]
+pub fn top_up_amount(policy: &StakePolicy, snapshot: &StakeSnapshot) -> Option<Kor> {
+    if snapshot.bond_cleanup_pending || snapshot.withdrawal_height.is_some() {
+        return None;
+    }
+    let free = snapshot.kor_balance?.saturating_sub(policy.gas_reserve);
+    if free < MIN_TOP_UP {
+        return None;
+    }
+    let amount = match policy.stake_target {
+        Some(target) => free.min(target.saturating_sub(snapshot.stake)),
+        None => free,
+    };
+    (!amount.is_zero()).then_some(amount)
+}
+
+/// Why a ready agreement was left alone this cycle.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    BondCleanupPending,
+    WithdrawalRequested,
+    NoStake,
+    /// The registry could not be read this cycle, on a Portal that reports
+    /// stake: joining now would be joining blind.
+    StakeUnknown,
+    /// A recent join was refused by the Portal; the code it gave.
+    RecentlyRefused(String),
+    /// Not in this cycle's ready listing, so its collateral is unknown.
+    NotListed,
+    /// The Portal has not reconciled the creating transaction yet.
+    CollateralUnknown,
+    /// Kontor refuses joins on an agreement that requires nothing.
+    NoCollateralRequirement,
+    InsufficientCollateral,
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SkipReason::BondCleanupPending => f.write_str("bond cleanup pending"),
+            SkipReason::WithdrawalRequested => f.write_str("withdrawal requested"),
+            SkipReason::NoStake => f.write_str("no bonded stake"),
+            SkipReason::StakeUnknown => f.write_str("stake unknown this cycle"),
+            SkipReason::RecentlyRefused(code) => write!(f, "Portal refused a join ({code})"),
+            SkipReason::NotListed => f.write_str("not in the ready listing"),
+            SkipReason::CollateralUnknown => f.write_str("required collateral not known yet"),
+            SkipReason::NoCollateralRequirement => f.write_str("no collateral requirement"),
+            SkipReason::InsufficientCollateral => f.write_str("insufficient unreserved stake"),
+        }
+    }
+}
+
+/// An op the relay accepted and Kontor has not executed yet.
+#[derive(Clone, Debug)]
+struct InFlight {
+    op: NodeOp,
+    nonce: u64,
+    sent: Instant,
+    #[allow(dead_code)] // read by /admin, wired in the next change
+    sent_at: DateTime<Utc>,
+}
+
+/// A join sent but not yet executed: its collateral is not in `stake_reserved`
+/// yet, so it is held back from the budget until the nonce says it is.
+#[derive(Clone, Debug)]
+struct PendingJoin {
+    #[allow(dead_code)] // read by /admin, wired in the next change
+    agreement_id: String,
+    collateral: Kor,
+    nonce: u64,
+    sent: Instant,
+}
+
+#[derive(Debug, Default)]
+struct TrackerState {
+    policy: StakePolicy,
+    /// The latest snapshot, `None` when the last read reported none.
+    snapshot: Option<StakeSnapshot>,
+    /// The last snapshot that was read at all, kept through failed reads so a
+    /// slash that happens across one is still noticed.
+    last_known: Option<StakeSnapshot>,
+    observed_at: Option<DateTime<Utc>>,
+    /// Sticky: this Portal has reported a stake at least once.
+    portal_reports_stake: bool,
+    in_flight: Option<InFlight>,
+    pending_joins: Vec<PendingJoin>,
+    last_claim: Option<Instant>,
+    joins_paused: Option<(Instant, String)>,
+    /// An unstake or withdrawal the operator asked for from `/admin`, waiting
+    /// for the daemon's next cycle — the daemon is the only thing that signs,
+    /// so the nonce counter never has two writers.
+    operator_request: Option<NodeOp>,
+    /// Last thing worth telling the operator about, with when.
+    last_event: Option<(DateTime<Utc>, String)>,
+}
+
+/// What the daemon knows about its bond across cycles, shared with `/admin`.
+#[derive(Debug, Default)]
+pub struct StakeTracker {
+    state: Mutex<TrackerState>,
+}
+
+impl StakeTracker {
+    #[cfg(test)]
+    #[must_use]
+    pub fn new(policy: StakePolicy) -> Self {
+        Self {
+            state: Mutex::new(TrackerState {
+                policy,
+                ..TrackerState::default()
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TrackerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_policy(&self, policy: StakePolicy) {
+        self.lock().policy = policy;
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Option<StakeSnapshot> {
+        self.lock().snapshot.clone()
+    }
+
+    /// Fold in this cycle's registry read: `None` when it failed outright.
+    ///
+    /// Retires in-flight work whose nonce Kontor has consumed (or that has
+    /// waited past [`OP_LANDING_TIMEOUT`]), and says out loud when the stake
+    /// shrank or bond cleanup started — the two things an operator must not
+    /// learn from a dashboard a week later.
+    pub fn observe(&self, entry: Option<&RegistryEntry>, now: Instant) {
+        let snapshot = entry.and_then(StakeSnapshot::from_entry);
+        let mut state = self.lock();
+
+        let Some(snapshot) = snapshot else {
+            if entry.is_some() && state.portal_reports_stake {
+                warn!("the Portal's signer entry no longer reports a stake; joins are paused");
+            }
+            state.snapshot = None;
+            return;
+        };
+        state.portal_reports_stake = true;
+
+        let mut landed = None;
+        if let Some(op) = state.in_flight.take() {
+            if snapshot.next_nonce > op.nonce {
+                info!(
+                    op = op.op.name(),
+                    nonce = op.nonce,
+                    "the {} op has executed on Kontor",
+                    op.op.name()
+                );
+                landed = Some(op.op);
+            } else if now.duration_since(op.sent) >= OP_LANDING_TIMEOUT {
+                warn!(
+                    op = op.op.name(),
+                    nonce = op.nonce,
+                    "the {} op is still not reflected after {} minutes; assuming the Portal \
+                     dropped it and deciding again",
+                    op.op.name(),
+                    OP_LANDING_TIMEOUT.as_secs() / 60
+                );
+            } else {
+                state.in_flight = Some(op);
+            }
+        }
+
+        state.pending_joins.retain(|join| {
+            snapshot.next_nonce <= join.nonce && now.duration_since(join.sent) < OP_LANDING_TIMEOUT
+        });
+
+        if let Some(previous) = &state.last_known {
+            let event = describe_transition(previous, &snapshot, landed);
+            if let Some(event) = event {
+                state.last_event = Some((Utc::now(), event));
+            }
+        } else if snapshot.bond_cleanup_pending {
+            error!(
+                "bond cleanup is pending: this node's stake was slashed to zero. It cannot join \
+                 or add stake until Kontor finishes unwinding its memberships"
+            );
+            state.last_event = Some((Utc::now(), "bond cleanup pending".to_string()));
+        }
+
+        state.last_known = Some(snapshot.clone());
+        state.snapshot = Some(snapshot);
+        state.observed_at = Some(Utc::now());
+    }
+
+    /// The op this cycle should send, if any. At most one: the next waits
+    /// until this one has landed.
+    #[must_use]
+    pub fn plan(&self, now: Instant) -> Option<NodeOp> {
+        let state = self.lock();
+        let snapshot = state.snapshot.as_ref()?;
+        if state.in_flight.is_some() {
+            return None;
+        }
+
+        // The operator's own request outranks the policy, and is honoured
+        // whatever auto-stake says: it was asked for by hand.
+        if let Some(op) = state.operator_request {
+            return Some(op);
+        }
+
+        if !state.policy.auto_stake {
+            return None;
+        }
+
+        if let Some(amount) = top_up_amount(&state.policy, snapshot) {
+            return Some(NodeOp::AddStake(amount));
+        }
+
+        let claim_due = state
+            .last_claim
+            .is_none_or(|last| now.duration_since(last) >= CLAIM_INTERVAL);
+        let claimable = snapshot
+            .reward_balance
+            .is_some_and(|rewards| rewards >= state.policy.claim_threshold);
+        (claim_due && claimable).then_some(NodeOp::ClaimRewards)
+    }
+
+    /// The relay accepted `op` at `nonce`.
+    pub fn record_sent(&self, op: NodeOp, nonce: u64, now: Instant) {
+        let mut state = self.lock();
+        if op == NodeOp::ClaimRewards {
+            state.last_claim = Some(now);
+        }
+        if state.operator_request == Some(op) {
+            state.operator_request = None;
+        }
+        state.in_flight = Some(InFlight {
+            op,
+            nonce,
+            sent: now,
+            sent_at: Utc::now(),
+        });
+        state.last_event = Some((Utc::now(), describe_sent(op, nonce)));
+    }
+
+    /// The relay refused `op`. A refusal is not retried until something
+    /// changes: a claim waits its interval, an operator request is dropped (the
+    /// operator sees why and can ask again).
+    pub fn record_refused(&self, op: NodeOp, reason: &str, now: Instant) {
+        let mut state = self.lock();
+        if op == NodeOp::ClaimRewards {
+            state.last_claim = Some(now);
+        }
+        if state.operator_request == Some(op) {
+            state.operator_request = None;
+        }
+        state.last_event = Some((Utc::now(), format!("{} refused: {reason}", op.name())));
+    }
+
+    /// Queue an unstake or withdrawal for the daemon's next cycle.
+    ///
+    /// # Errors
+    /// If `op` is not one an operator may request, or another request is
+    /// already waiting.
+    #[allow(dead_code)] // the /admin actions that call it come later
+    pub fn request(&self, op: NodeOp) -> Result<(), &'static str> {
+        if !matches!(op, NodeOp::BeginUnstake | NodeOp::WithdrawStake) {
+            return Err("only an unstake or a withdrawal can be requested");
+        }
+        let mut state = self.lock();
+        if state.operator_request.is_some() {
+            return Err("another request is already waiting for the next cycle");
+        }
+        state.operator_request = Some(op);
+        state.last_event = Some((Utc::now(), format!("{} requested from /admin", op.name())));
+        Ok(())
+    }
+
+    /// This cycle's join budget, from the latest snapshot.
+    #[must_use]
+    pub fn join_budget(&self, now: Instant) -> JoinBudget {
+        let mut state = self.lock();
+        if let Some((until, _)) = &state.joins_paused {
+            if now >= *until {
+                state.joins_paused = None;
+            }
+        }
+
+        let mode = match (&state.snapshot, &state.joins_paused) {
+            (None, _) if !state.portal_reports_stake => BudgetMode::Unmetered,
+            (None, _) => BudgetMode::Closed(SkipReason::StakeUnknown),
+            (Some(_), Some((_, code))) => {
+                BudgetMode::Closed(SkipReason::RecentlyRefused(code.clone()))
+            }
+            (Some(snapshot), None) => match snapshot.join_blocker() {
+                Some(reason) => BudgetMode::Closed(reason),
+                None => {
+                    let held = state.pending_joins.iter().fold(Kor::ZERO, |sum, join| {
+                        sum.checked_add(join.collateral).unwrap_or(sum)
+                    });
+                    BudgetMode::Metered {
+                        remaining: snapshot.available.saturating_sub(held),
+                    }
+                }
+            },
+        };
+        JoinBudget {
+            mode,
+            skipped: HashMap::new(),
+        }
+    }
+
+    /// A join was accepted; hold its collateral until it executes.
+    pub fn record_join(&self, agreement_id: &str, collateral: Kor, nonce: u64, now: Instant) {
+        self.lock().pending_joins.push(PendingJoin {
+            agreement_id: agreement_id.to_string(),
+            collateral,
+            nonce,
+            sent: now,
+        });
+    }
+
+    /// The Portal refused a join with `code`; stop trying for a while.
+    pub fn pause_joins(&self, code: &str, now: Instant) {
+        let mut state = self.lock();
+        state.joins_paused = Some((now + JOIN_REFUSAL_COOLDOWN, code.to_string()));
+        state.last_event = Some((
+            Utc::now(),
+            format!(
+                "join refused ({code}); joins paused for {} minutes",
+                JOIN_REFUSAL_COOLDOWN.as_secs() / 60
+            ),
+        ));
+    }
+
+    /// What `GET /api/admin/status` shows under `staking`.
+    #[allow(dead_code)] // wired into /admin in the next change
+    #[must_use]
+    pub fn status(&self) -> Value {
+        let state = self.lock();
+        let policy = &state.policy;
+        json!({
+            "reported": state.snapshot.is_some(),
+            "portal_reports_stake": state.portal_reports_stake,
+            "observed_at": state.observed_at.map(|at| at.to_rfc3339()),
+            "kor_balance": state.snapshot.as_ref().and_then(|s| s.kor_balance),
+            "stake": state.snapshot.as_ref().map(|s| s.stake),
+            "reserved": state.snapshot.as_ref().and_then(|s| s.reserved),
+            "available": state.snapshot.as_ref().map(|s| s.available),
+            "withdrawal_height": state.snapshot.as_ref().and_then(|s| s.withdrawal_height),
+            "bond_cleanup_pending": state.snapshot.as_ref().map(|s| s.bond_cleanup_pending),
+            "reward_balance": state.snapshot.as_ref().and_then(|s| s.reward_balance),
+            "policy": {
+                "auto_stake": policy.auto_stake,
+                "gas_reserve": policy.gas_reserve,
+                "stake_target": policy.stake_target,
+                "claim_threshold": policy.claim_threshold,
+            },
+            "in_flight": state.in_flight.as_ref().map(|op| json!({
+                "op": op.op.name(),
+                "amount": op.op.amount(),
+                "nonce": op.nonce,
+                "sent_at": op.sent_at.to_rfc3339(),
+            })),
+            "pending_joins": state.pending_joins.iter().map(|join| json!({
+                "agreement_id": join.agreement_id,
+                "collateral": join.collateral,
+                "nonce": join.nonce,
+            })).collect::<Vec<_>>(),
+            "joins_paused": state.joins_paused.as_ref().map(|(_, code)| code.clone()),
+            "operator_request": state.operator_request.map(NodeOp::name),
+            "last_event": state.last_event.as_ref().map(|(at, what)| json!({
+                "at": at.to_rfc3339(),
+                "message": what,
+            })),
+        })
+    }
+}
+
+fn describe_sent(op: NodeOp, nonce: u64) -> String {
+    match op.amount() {
+        Some(amount) => format!("{} {amount} KOR sent (nonce {nonce})", op.name()),
+        None => format!("{} sent (nonce {nonce})", op.name()),
+    }
+}
+
+/// Log, and return for the status page, what changed between two reads that
+/// the operator has to know about.
+fn describe_transition(
+    previous: &StakeSnapshot,
+    current: &StakeSnapshot,
+    landed: Option<NodeOp>,
+) -> Option<String> {
+    let mut event = None;
+
+    if current.stake < previous.stake && landed != Some(NodeOp::WithdrawStake) {
+        let lost = previous.stake.saturating_sub(current.stake);
+        error!(
+            "stake dropped from {} to {} KOR (−{lost}): a missed challenge was slashed at 30× \
+             the agreement's collateral",
+            previous.stake, current.stake
+        );
+        event = Some(format!(
+            "stake dropped by {lost} KOR ({} → {}): slashed",
+            previous.stake, current.stake
+        ));
+    }
+
+    if current.bond_cleanup_pending && !previous.bond_cleanup_pending {
+        error!(
+            "bond cleanup is pending: this node's stake was slashed to zero. It cannot join or \
+             add stake until Kontor finishes unwinding its memberships"
+        );
+        event = Some("bond cleanup pending".to_string());
+    } else if previous.bond_cleanup_pending && !current.bond_cleanup_pending {
+        info!("bond cleanup has finished; the node can add stake and join again");
+        event = Some("bond cleanup finished".to_string());
+    }
+
+    match (previous.withdrawal_height, current.withdrawal_height) {
+        (None, Some(height)) => {
+            warn!("withdrawal requested: joins stop, and the stake can be withdrawn from height {height} once no agreement holds it");
+            event = Some(format!("withdrawal requested, unlocks at height {height}"));
+        }
+        (Some(_), None) => {
+            info!("the withdrawal has completed");
+            event = Some("withdrawal completed".to_string());
+        }
+        _ => {}
+    }
+
+    event
+}
+
+/// This cycle's allowance for new joins.
+#[derive(Debug)]
+pub struct JoinBudget {
+    mode: BudgetMode,
+    skipped: HashMap<SkipReason, usize>,
+}
+
+#[derive(Debug)]
+enum BudgetMode {
+    /// The Portal predates staking: join as before.
+    Unmetered,
+    /// No new join this cycle, for this reason.
+    Closed(SkipReason),
+    /// Unreserved stake left for this cycle's joins.
+    Metered { remaining: Kor },
+}
+
+/// Whether to download (and join) one pending agreement.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JoinDecision {
+    /// Go ahead. `collateral` is what was set aside for it, to hold until the
+    /// join executes — `None` when nothing new is reserved.
+    Join {
+        collateral: Option<Kor>,
+    },
+    Skip(SkipReason),
+}
+
+impl JoinBudget {
+    /// A budget that gates nothing, for callers that predate staking.
+    #[must_use]
+    pub fn unmetered() -> Self {
+        Self {
+            mode: BudgetMode::Unmetered,
+            skipped: HashMap::new(),
+        }
+    }
+
+    /// Decide on one agreement.
+    ///
+    /// `already_member` short-circuits everything: a membership the node holds
+    /// already reserved its collateral, and a file it is obligated to store but
+    /// has not downloaded is exactly what a challenge will slash it for — so
+    /// that download is never held back, not even during cleanup.
+    ///
+    /// `listed` is the agreement's entry in this cycle's ready listing: `None`
+    /// when it is not listed, `Some(None)` when it is but the Portal does not
+    /// know its collateral yet.
+    pub fn decide(&mut self, already_member: bool, listed: Option<Option<&str>>) -> JoinDecision {
+        if already_member {
+            return JoinDecision::Join { collateral: None };
+        }
+        let decision = match &mut self.mode {
+            BudgetMode::Unmetered => JoinDecision::Join {
+                collateral: listed.flatten().and_then(|raw| Kor::parse(raw).ok()),
+            },
+            BudgetMode::Closed(reason) => JoinDecision::Skip(reason.clone()),
+            BudgetMode::Metered { remaining } => match listed {
+                None => JoinDecision::Skip(SkipReason::NotListed),
+                Some(None) => JoinDecision::Skip(SkipReason::CollateralUnknown),
+                Some(Some(raw)) => match Kor::parse(raw) {
+                    Err(err) => {
+                        warn!("ignoring an unreadable required_collateral: {err:#}");
+                        JoinDecision::Skip(SkipReason::CollateralUnknown)
+                    }
+                    Ok(required) if required.is_zero() => {
+                        JoinDecision::Skip(SkipReason::NoCollateralRequirement)
+                    }
+                    Ok(required) if required > *remaining => {
+                        JoinDecision::Skip(SkipReason::InsufficientCollateral)
+                    }
+                    Ok(required) => {
+                        *remaining = remaining.saturating_sub(required);
+                        JoinDecision::Join {
+                            collateral: Some(required),
+                        }
+                    }
+                },
+            },
+        };
+        if let JoinDecision::Skip(reason) = &decision {
+            *self.skipped.entry(reason.clone()).or_default() += 1;
+        }
+        decision
+    }
+
+    /// Give back what [`Self::decide`] set aside for a join that did not
+    /// happen.
+    pub fn refund(&mut self, collateral: Option<Kor>) {
+        if let (BudgetMode::Metered { remaining }, Some(amount)) = (&mut self.mode, collateral) {
+            *remaining = remaining.checked_add(amount).unwrap_or(*remaining);
+        }
+    }
+
+    /// The Portal refused a join for a reason that holds node-wide: nothing
+    /// else this cycle.
+    pub fn close(&mut self, code: &str) {
+        self.mode = BudgetMode::Closed(SkipReason::RecentlyRefused(code.to_string()));
+    }
+
+    /// One line for the cycle's log, if anything was skipped.
+    #[must_use]
+    pub fn summary(&self) -> Option<String> {
+        if self.skipped.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = self
+            .skipped
+            .iter()
+            .map(|(reason, count)| format!("{count} × {reason}"))
+            .collect();
+        parts.sort();
+        Some(parts.join(", "))
+    }
+}
+
+/// Apply the policy for this cycle: send at most one stake or claim op.
+///
+/// Never fails the cycle. A stake op that does not go out this time is
+/// re-planned from fresh state on the next one.
+pub async fn manage_stake(client: &PortalClient, tracker: &StakeTracker) -> Option<NodeOp> {
+    client.node_id()?;
+    let op = tracker.plan(Instant::now())?;
+    send(client, tracker, op).await
+}
+
+async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Option<NodeOp> {
+    match client.submit_node_op(op).await {
+        Ok(response) => {
+            let nonce = response.nonce.unwrap_or_default();
+            match op.amount() {
+                Some(amount) => info!(nonce, "{}: {amount} KOR queued by the Portal", op.name()),
+                None => info!(nonce, "{} queued by the Portal", op.name()),
+            }
+            tracker.record_sent(op, nonce, Instant::now());
+            Some(op)
+        }
+        Err(err) => {
+            match status_and_code(&err) {
+                Some((status, code)) if (400..500).contains(&status) => {
+                    let code = code.unwrap_or_else(|| status.to_string());
+                    warn!("the Portal refused {} ({code}): {err:#}", op.name());
+                    tracker.record_refused(op, &code, Instant::now());
+                }
+                // Unreachable, or a 5xx: whether it was kept is unknown. The
+                // next cycle's resync says, and the plan is made again.
+                _ => debug!("{} not sent this cycle: {err:#}", op.name()),
+            }
+            None
+        }
+    }
+}
+
+/// Stake what the faucet just funded, before the daemon's first cycle.
+///
+/// The same decision a cycle makes, from a fresh registry read, so a node that
+/// onboards with an empty bond has its first `add-stake` queued before it
+/// looks at any agreement — joins are refused until it lands. Best effort:
+/// failure here only defers the top-up to the first cycle.
+///
+/// # Errors
+/// Only if the progress line cannot be written.
+pub async fn bootstrap_stake(
+    client: &PortalClient,
+    tracker: &Arc<StakeTracker>,
+    writer: &mut impl Write,
+) -> std::io::Result<()> {
+    let entry = match client.resync_from_registry().await {
+        Ok(entry) => entry,
+        Err(err) => {
+            warn!("could not read the stake at startup; the first cycle will retry: {err:#}");
+            return Ok(());
+        }
+    };
+    tracker.observe(Some(&entry), Instant::now());
+
+    let Some(snapshot) = tracker.snapshot() else {
+        writeln!(
+            writer,
+            "Stake: not reported by this Portal (it predates staking); joining as before"
+        )?;
+        return Ok(());
+    };
+    writeln!(
+        writer,
+        "✓ Stake: {} KOR bonded, {} KOR unreserved",
+        snapshot.stake, snapshot.available
+    )?;
+    if snapshot.bond_cleanup_pending {
+        writeln!(
+            writer,
+            "⚠ Bond cleanup pending: the stake was slashed to zero; no joins until it finishes"
+        )?;
+    }
+
+    if let Some(op) = manage_stake(client, tracker).await {
+        if let Some(amount) = op.amount() {
+            writeln!(writer, "✓ Staking {amount} KOR as collateral")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(stake: Option<&str>, available: Option<&str>) -> RegistryEntry {
+        RegistryEntry {
+            signer_id: 42,
+            x_only_pubkey: "ab".into(),
+            bls_pubkey: None,
+            next_nonce: 10,
+            kor_balance: Some("1000".into()),
+            user_id: None,
+            stake: stake.map(Into::into),
+            stake_reserved: None,
+            stake_available: available.map(Into::into),
+            stake_withdrawal_height: None,
+            bond_cleanup_pending: Some(false),
+            reward_balance: Some("0".into()),
+        }
+    }
+
+    fn kor(raw: &str) -> Kor {
+        Kor::parse(raw).unwrap()
+    }
+
+    fn snapshot(balance: &str, stake: &str) -> StakeSnapshot {
+        StakeSnapshot {
+            kor_balance: Some(kor(balance)),
+            stake: kor(stake),
+            reserved: Some(Kor::ZERO),
+            available: kor(stake),
+            withdrawal_height: None,
+            bond_cleanup_pending: false,
+            reward_balance: None,
+            next_nonce: 10,
+        }
+    }
+
+    #[test]
+    fn an_entry_without_a_stake_is_an_old_portal() {
+        assert_eq!(StakeSnapshot::from_entry(&entry(None, None)), None);
+        assert_eq!(
+            StakeSnapshot::from_entry(&entry(Some("x"), Some("1"))),
+            None
+        );
+        // A stake with nothing saying how much of it is free: not enough to
+        // join against.
+        assert_eq!(StakeSnapshot::from_entry(&entry(Some("10"), None)), None);
+    }
+
+    #[test]
+    fn available_falls_back_to_stake_minus_reserved() {
+        let mut e = entry(Some("100"), None);
+        e.stake_reserved = Some("30.5".into());
+        let snapshot = StakeSnapshot::from_entry(&e).unwrap();
+        assert_eq!(snapshot.available, kor("69.5"));
+        assert_eq!(snapshot.reserved, Some(kor("30.5")));
+        assert_eq!(snapshot.kor_balance, Some(kor("1000")));
+    }
+
+    #[test]
+    fn top_up_stakes_everything_above_the_reserve() {
+        let policy = StakePolicy::default();
+        assert_eq!(
+            top_up_amount(&policy, &snapshot("1000", "0")),
+            Some(kor("995"))
+        );
+        assert_eq!(
+            top_up_amount(&policy, &snapshot("6.25", "995")),
+            Some(kor("1.25"))
+        );
+    }
+
+    #[test]
+    fn top_up_waits_for_at_least_one_free_kor() {
+        let policy = StakePolicy::default();
+        assert_eq!(top_up_amount(&policy, &snapshot("5.999", "995")), None);
+        assert_eq!(top_up_amount(&policy, &snapshot("3", "995")), None);
+        let mut unknown = snapshot("1000", "0");
+        unknown.kor_balance = None;
+        assert_eq!(top_up_amount(&policy, &unknown), None);
+    }
+
+    #[test]
+    fn top_up_stops_at_the_target_and_may_close_the_gap_below_one() {
+        let policy = StakePolicy {
+            stake_target: Some(kor("100")),
+            ..StakePolicy::default()
+        };
+        assert_eq!(
+            top_up_amount(&policy, &snapshot("1000", "0")),
+            Some(kor("100"))
+        );
+        assert_eq!(
+            top_up_amount(&policy, &snapshot("1000", "99.5")),
+            Some(kor("0.5"))
+        );
+        assert_eq!(top_up_amount(&policy, &snapshot("1000", "100")), None);
+        assert_eq!(top_up_amount(&policy, &snapshot("1000", "150")), None);
+    }
+
+    #[test]
+    fn top_up_never_fights_a_withdrawal_or_a_cleanup() {
+        let policy = StakePolicy::default();
+        let mut withdrawing = snapshot("1000", "10");
+        withdrawing.withdrawal_height = Some(500);
+        assert_eq!(top_up_amount(&policy, &withdrawing), None);
+
+        let mut cleaning = snapshot("1000", "0");
+        cleaning.bond_cleanup_pending = true;
+        assert_eq!(top_up_amount(&policy, &cleaning), None);
+    }
+
+    fn observed(tracker: &StakeTracker, e: &RegistryEntry, now: Instant) {
+        tracker.observe(Some(e), now);
+    }
+
+    /// The failure the in-flight rule exists for: the same top-up sent again
+    /// every cycle while the first one waits for a block.
+    #[test]
+    fn one_op_at_a_time_until_its_nonce_is_consumed() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+
+        let op = tracker.plan(t0).unwrap();
+        assert_eq!(op, NodeOp::AddStake(kor("995")));
+        tracker.record_sent(op, 10, t0);
+
+        // Next cycle: Kontor has not run it yet, nonce 10 still next.
+        observed(
+            &tracker,
+            &entry(Some("0"), Some("0")),
+            t0 + Duration::from_secs(30),
+        );
+        assert_eq!(tracker.plan(t0 + Duration::from_secs(30)), None);
+
+        // It executed: the nonce moved on, the balance went into the bond.
+        let mut landed = entry(Some("995"), Some("995"));
+        landed.next_nonce = 11;
+        landed.kor_balance = Some("5".into());
+        observed(&tracker, &landed, t0 + Duration::from_secs(60));
+        assert_eq!(tracker.plan(t0 + Duration::from_secs(60)), None);
+    }
+
+    /// An op that consumed its nonce without moving the balance — it failed on
+    /// chain, or lost the nonce to another op — is simply planned again.
+    #[test]
+    fn a_top_up_that_did_not_happen_is_planned_again() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let mut consumed = entry(Some("0"), Some("0"));
+        consumed.next_nonce = 12;
+        observed(&tracker, &consumed, t0 + Duration::from_secs(30));
+        assert_eq!(
+            tracker.plan(t0 + Duration::from_secs(30)),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+    }
+
+    #[test]
+    fn an_op_that_never_lands_expires() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let later = t0 + OP_LANDING_TIMEOUT;
+        observed(&tracker, &entry(Some("0"), Some("0")), later);
+        assert_eq!(tracker.plan(later), Some(NodeOp::AddStake(kor("995"))));
+    }
+
+    #[test]
+    fn auto_stake_off_signs_nothing_on_its_own() {
+        let tracker = StakeTracker::new(StakePolicy {
+            auto_stake: false,
+            ..StakePolicy::default()
+        });
+        let t0 = Instant::now();
+        let mut e = entry(Some("0"), Some("0"));
+        e.reward_balance = Some("50".into());
+        observed(&tracker, &e, t0);
+        assert_eq!(tracker.plan(t0), None);
+
+        // An operator request is still carried out.
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        assert_eq!(tracker.plan(t0), Some(NodeOp::BeginUnstake));
+    }
+
+    #[test]
+    fn rewards_are_claimed_past_the_threshold_at_most_once_an_hour() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut e = entry(Some("995"), Some("995"));
+        e.kor_balance = Some("5".into());
+        e.reward_balance = Some("0.99".into());
+        observed(&tracker, &e, t0);
+        assert_eq!(tracker.plan(t0), None, "below the threshold");
+
+        e.reward_balance = Some("1".into());
+        observed(&tracker, &e, t0);
+        assert_eq!(tracker.plan(t0), Some(NodeOp::ClaimRewards));
+        tracker.record_sent(NodeOp::ClaimRewards, 10, t0);
+
+        // Landed, but the claim is rate-limited even if more is claimable.
+        e.next_nonce = 11;
+        e.reward_balance = Some("2".into());
+        let soon = t0 + Duration::from_secs(60);
+        observed(&tracker, &e, soon);
+        assert_eq!(tracker.plan(soon), None);
+
+        let later = t0 + CLAIM_INTERVAL;
+        observed(&tracker, &e, later);
+        assert_eq!(tracker.plan(later), Some(NodeOp::ClaimRewards));
+    }
+
+    #[test]
+    fn a_top_up_takes_precedence_over_a_claim() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut e = entry(Some("0"), Some("0"));
+        e.reward_balance = Some("50".into());
+        observed(&tracker, &e, t0);
+        assert_eq!(tracker.plan(t0), Some(NodeOp::AddStake(kor("995"))));
+    }
+
+    #[test]
+    fn only_unstake_and_withdraw_can_be_requested_and_one_at_a_time() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        assert!(tracker.request(NodeOp::ClaimRewards).is_err());
+        assert!(tracker.request(NodeOp::AddStake(Kor::ONE)).is_err());
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        assert!(tracker.request(NodeOp::BeginUnstake).is_err());
+
+        // Sent: the request is done, another may follow.
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("10"), Some("10")), t0);
+        assert_eq!(tracker.plan(t0), Some(NodeOp::WithdrawStake));
+        tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
+        assert!(tracker.request(NodeOp::BeginUnstake).is_ok());
+    }
+
+    #[test]
+    fn an_old_portal_gates_nothing_and_a_new_one_never_joins_blind() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+
+        observed(&tracker, &entry(None, None), t0);
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, None),
+            JoinDecision::Join { collateral: None },
+            "old Portal: as before"
+        );
+
+        observed(&tracker, &entry(Some("10"), Some("10")), t0);
+        tracker.observe(None, t0); // the read failed this cycle
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::StakeUnknown)
+        );
+    }
+
+    #[test]
+    fn the_budget_commits_collateral_within_a_cycle() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("50")), t0);
+
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(Some("30"))),
+            JoinDecision::Join {
+                collateral: Some(kor("30"))
+            }
+        );
+        assert_eq!(
+            budget.decide(false, Some(Some("30"))),
+            JoinDecision::Skip(SkipReason::InsufficientCollateral),
+            "only 20 left"
+        );
+        assert_eq!(
+            budget.decide(false, Some(Some("20"))),
+            JoinDecision::Join {
+                collateral: Some(kor("20"))
+            },
+            "exactly what is left is enough: Kontor refuses only reserved > stake"
+        );
+        assert_eq!(
+            budget.decide(false, Some(None)),
+            JoinDecision::Skip(SkipReason::CollateralUnknown)
+        );
+        assert_eq!(
+            budget.decide(false, None),
+            JoinDecision::Skip(SkipReason::NotListed)
+        );
+        assert_eq!(
+            budget.decide(false, Some(Some("0"))),
+            JoinDecision::Skip(SkipReason::NoCollateralRequirement)
+        );
+        assert_eq!(
+            budget.decide(true, Some(Some("1000"))),
+            JoinDecision::Join { collateral: None },
+            "an existing membership is never held back"
+        );
+
+        budget.refund(Some(kor("20")));
+        assert_eq!(
+            budget.decide(false, Some(Some("20"))),
+            JoinDecision::Join {
+                collateral: Some(kor("20"))
+            }
+        );
+        let summary = budget.summary().unwrap();
+        assert!(
+            summary.contains("1 × insufficient unreserved stake"),
+            "{summary}"
+        );
+    }
+
+    /// Joins sent in an earlier cycle hold their collateral until they
+    /// execute, so a second cycle before the next block does not spend it
+    /// again.
+    #[test]
+    fn pending_joins_hold_collateral_across_cycles_until_they_land() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("50")), t0);
+        tracker.record_join("AGR-1", kor("40"), 10, t0);
+
+        observed(&tracker, &entry(Some("100"), Some("50")), t0);
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(Some("20"))),
+            JoinDecision::Skip(SkipReason::InsufficientCollateral)
+        );
+
+        // Executed: the reservation now shows in stake_available instead.
+        let mut landed = entry(Some("100"), Some("10"));
+        landed.next_nonce = 11;
+        observed(&tracker, &landed, t0);
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(Some("10"))),
+            JoinDecision::Join {
+                collateral: Some(kor("10"))
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_withdrawal_no_stake_and_refusals_close_the_budget() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+
+        let mut cleaning = entry(Some("0"), Some("0"));
+        cleaning.bond_cleanup_pending = Some(true);
+        observed(&tracker, &cleaning, t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::BondCleanupPending)
+        );
+
+        let mut withdrawing = entry(Some("10"), Some("10"));
+        withdrawing.stake_withdrawal_height = Some(900);
+        observed(&tracker, &withdrawing, t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::WithdrawalRequested)
+        );
+
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::NoStake)
+        );
+
+        observed(&tracker, &entry(Some("10"), Some("10")), t0);
+        tracker.pause_joins("INSUFFICIENT_COLLATERAL", t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::RecentlyRefused(
+                "INSUFFICIENT_COLLATERAL".into()
+            ))
+        );
+        let after = t0 + JOIN_REFUSAL_COOLDOWN;
+        assert_eq!(
+            tracker.join_budget(after).decide(false, Some(Some("1"))),
+            JoinDecision::Join {
+                collateral: Some(kor("1"))
+            },
+            "the pause expires"
+        );
+    }
+
+    #[test]
+    fn a_slash_and_a_cleanup_are_recorded_for_the_operator() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("70")), t0);
+        observed(&tracker, &entry(Some("40"), Some("10")), t0);
+        let status = tracker.status();
+        let message = status["last_event"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("slashed") && message.contains("60"),
+            "{message}"
+        );
+
+        let mut cleaning = entry(Some("0"), Some("0"));
+        cleaning.bond_cleanup_pending = Some(true);
+        observed(&tracker, &cleaning, t0);
+        let status = tracker.status();
+        assert_eq!(status["last_event"]["message"], "bond cleanup pending");
+        assert_eq!(status["bond_cleanup_pending"], true);
+        assert_eq!(status["stake"], "0");
+    }
+
+    /// A withdrawal empties the bond on purpose; that is not a slash.
+    #[test]
+    fn a_withdrawal_is_not_reported_as_a_slash() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut requested = entry(Some("100"), Some("100"));
+        requested.stake_withdrawal_height = Some(5);
+        observed(&tracker, &requested, t0);
+        tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
+
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = 11;
+        observed(&tracker, &withdrawn, t0);
+        let message = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!message.contains("slashed"), "{message}");
+    }
+
+    #[test]
+    fn status_renders_amounts_as_strings() {
+        let tracker = StakeTracker::new(StakePolicy {
+            stake_target: Some(kor("250.5")),
+            ..StakePolicy::default()
+        });
+        let status = tracker.status();
+        assert_eq!(status["reported"], false);
+        assert_eq!(status["policy"]["auto_stake"], true);
+        assert_eq!(status["policy"]["gas_reserve"], "5");
+        assert_eq!(status["policy"]["stake_target"], "250.5");
+        assert_eq!(status["policy"]["claim_threshold"], "1");
+
+        let t0 = Instant::now();
+        let mut e = entry(Some("995"), Some("965"));
+        e.stake_reserved = Some("30".into());
+        observed(&tracker, &e, t0);
+        tracker.record_sent(NodeOp::AddStake(kor("0.25")), 10, t0);
+        let status = tracker.status();
+        assert_eq!(status["stake"], "995");
+        assert_eq!(status["reserved"], "30");
+        assert_eq!(status["available"], "965");
+        assert_eq!(status["in_flight"]["op"], "add_stake");
+        assert_eq!(status["in_flight"]["amount"], "0.25");
+        assert_eq!(status["in_flight"]["nonce"], 10);
+    }
+}

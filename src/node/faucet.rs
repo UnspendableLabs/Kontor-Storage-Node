@@ -5,8 +5,15 @@
 //! Portal faucet endpoint and polls the registry until a balance appears
 //! on-chain. If the faucet is unavailable, it logs a warning and continues to
 //! poll, waiting for a manual transfer.
+//!
+//! The amount is configurable (`KONTOR_STORAGE_FAUCET_AMOUNT_KOR`, 1000 by
+//! default) because staking changed what "funded" means: the KOR is no longer
+//! only gas, it is the collateral every join reserves. The Portal caps the
+//! request; a node asking for more than a given Portal allows is told the cap
+//! and asks again for exactly that, rather than failing onboarding over it.
 
 use crate::clients::http_helpers::HttpStatusError;
+use crate::clients::kor::Kor;
 use crate::clients::PortalClient;
 use anyhow::Result;
 use std::io::Write;
@@ -17,9 +24,6 @@ const KOR_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Shorter interval in unit tests so polling scenarios finish quickly.
 #[cfg(test)]
 const KOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Amount of KOR requested from the faucet (Portal caps at 10.0).
-const FAUCET_AMOUNT: f64 = 10.0;
 
 /// Returns true when the registry entry's `kor_balance` indicates no KOR
 /// (missing, unparsable, or non-positive).
@@ -41,6 +45,7 @@ fn kor_balance_is_empty(balance: &Option<String>) -> bool {
 pub async fn ensure_kor_balance(
     client: &PortalClient,
     signer_id: u64,
+    amount: Kor,
     writer: &mut impl Write,
 ) -> Result<()> {
     let entry = client.get_registry_entry(signer_id).await?;
@@ -51,11 +56,11 @@ pub async fn ensure_kor_balance(
         return Ok(());
     }
 
-    writeln!(writer, "KOR balance: 0 → requesting faucet…")?;
-    match client
-        .request_faucet(&entry.x_only_pubkey, FAUCET_AMOUNT)
-        .await
-    {
+    writeln!(
+        writer,
+        "KOR balance: 0 → requesting {amount} KOR from the faucet…"
+    )?;
+    match request_within_cap(client, &entry.x_only_pubkey, amount, writer).await {
         Ok(resp) => {
             writeln!(
                 writer,
@@ -80,6 +85,49 @@ pub async fn ensure_kor_balance(
     }
 
     poll_until_balance(client, signer_id, writer).await
+}
+
+/// Ask the faucet for `amount`, and once more for the Portal's cap if it says
+/// `amount` is above it.
+///
+/// The Portal answers an oversized request with `400 INVALID_REQUEST` and
+/// `amount must be in (0, <cap>], got …` — both the fixed 10 KOR of older
+/// Portals and the configurable `PORTAL_FAUCET_MAX_AMOUNT_KOR` of newer ones.
+/// Any other 400 is returned as is.
+async fn request_within_cap(
+    client: &PortalClient,
+    recipient: &str,
+    amount: Kor,
+    writer: &mut impl Write,
+) -> Result<crate::clients::portal::FaucetResponse> {
+    let err = match client
+        .request_faucet(recipient, amount.to_f64_lossy())
+        .await
+    {
+        Ok(resp) => return Ok(resp),
+        Err(err) => err,
+    };
+    let cap = err
+        .downcast_ref::<HttpStatusError>()
+        .filter(|status| status.status.as_u16() == 400)
+        .and_then(|status| status.api_message())
+        .and_then(|message| faucet_cap(&message))
+        .filter(|cap| *cap < amount);
+    let Some(cap) = cap else {
+        return Err(err);
+    };
+    writeln!(
+        writer,
+        "⚠ This Portal's faucet gives at most {cap} KOR; requesting that instead"
+    )?;
+    client.request_faucet(recipient, cap.to_f64_lossy()).await
+}
+
+/// The cap out of the Portal's `amount must be in (0, <cap>], got …`.
+fn faucet_cap(message: &str) -> Option<Kor> {
+    let rest = message.split_once("amount must be in (0, ")?.1;
+    let cap = rest.split_once(']')?.0;
+    Kor::parse_positive(cap).ok()
 }
 
 async fn poll_until_balance(
@@ -161,7 +209,9 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, &mut buffer).await.unwrap();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(
@@ -169,7 +219,7 @@ mod tests {
             "expected balance line, got: {output}"
         );
         assert!(
-            !output.contains("requesting faucet"),
+            !output.contains("from the faucet"),
             "should not call faucet when balance present: {output}"
         );
 
@@ -213,10 +263,12 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, &mut buffer).await.unwrap();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
-        assert!(output.contains("requesting faucet"), "got: {output}");
+        assert!(output.contains("from the faucet"), "got: {output}");
         assert!(
             output.contains("commit=c0ffee reveal=decaf0"),
             "got: {output}"
@@ -255,7 +307,9 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, &mut buffer).await.unwrap();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(
@@ -296,7 +350,9 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, &mut buffer).await.unwrap();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(
@@ -328,12 +384,118 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        let err = ensure_kor_balance(&client, 42, &mut buffer)
+        let err = ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
             .await
             .unwrap_err();
         assert!(
             err.to_string().contains("status 400"),
             "expected 400 propagated, got: {err}"
         );
+    }
+
+    #[test]
+    fn faucet_cap_reads_the_portal_message() {
+        assert_eq!(
+            faucet_cap("amount must be in (0, 10], got 1000"),
+            Some(Kor::whole(10))
+        );
+        assert_eq!(
+            faucet_cap("amount must be in (0, 250.5], got 1000"),
+            Some(Kor::parse("250.5").unwrap())
+        );
+        assert_eq!(faucet_cap("recipient must be 64 hex characters"), None);
+        assert_eq!(faucet_cap("amount must be in (0, oops], got 1"), None);
+    }
+
+    /// The configured amount goes out as the request's number.
+    #[tokio::test]
+    async fn ensure_kor_balance_requests_the_configured_amount() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/faucet"))
+            .and(wiremock::matchers::body_json(json!({
+                "recipient": "abc123",
+                "amount": 250.5
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commit_txid": "c", "reveal_txid": "r", "recipient": "abc123", "amount": 250.5,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("250.5"))),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, Kor::parse("250.5").unwrap(), &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("requesting 250.5 KOR"), "{output}");
+    }
+
+    /// A Portal that caps lower than the node asks is asked again for its cap,
+    /// instead of failing onboarding — the old 10 KOR Portal is one.
+    #[tokio::test]
+    async fn ensure_kor_balance_falls_back_to_the_portal_cap() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/faucet"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"amount": 1000.0}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "amount must be in (0, 10], got 1000",
+                    "status": 400
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/faucet"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"amount": 10.0}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commit_txid": "c", "reveal_txid": "r", "recipient": "abc123", "amount": 10.0,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("10"))))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("gives at most 10 KOR"), "{output}");
+        assert!(output.contains("✓ KOR balance: 10"), "{output}");
     }
 }

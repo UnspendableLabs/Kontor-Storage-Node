@@ -115,6 +115,51 @@ pub struct Cli {
     )]
     pub kontor_contract_address: String,
 
+    /// Kontor address of the staking contract this node bonds its collateral
+    /// in. MUST match the Portal's own `KONTOR_STAKING_CONTRACT_ADDRESS`, for
+    /// the same reason as the filestorage address: it is inside every signed
+    /// `add-stake`, `begin-unstake` and `withdraw-stake`.
+    #[arg(
+        long,
+        env = "KONTOR_STAKING_CONTRACT_ADDRESS",
+        default_value = "staking_0_0"
+    )]
+    pub kontor_staking_contract_address: String,
+
+    /// Bond spare KOR as collateral and claim storage rewards automatically.
+    ///
+    /// On by default: Kontor refuses every join without enough unreserved
+    /// stake, so a node that does not stake stores nothing new. Off, the node
+    /// signs no stake or claim op on its own, and joins only what a bond
+    /// funded by hand covers.
+    #[arg(
+        long,
+        env = "KONTOR_STORAGE_AUTO_STAKE",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub auto_stake: bool,
+
+    /// KOR kept liquid to pay gas for joins and proofs; auto-stake never bonds
+    /// it. Decimal, e.g. `5` or `2.5`.
+    #[arg(long, env = "KONTOR_STORAGE_GAS_RESERVE_KOR", default_value = "5")]
+    pub gas_reserve_kor: String,
+
+    /// Cap on the total bonded stake. Unset (the default) bonds everything
+    /// above the gas reserve.
+    #[arg(long, env = "KONTOR_STORAGE_STAKE_TARGET_KOR")]
+    pub stake_target_kor: Option<String>,
+
+    /// KOR requested from the Portal faucet when the node starts with an empty
+    /// balance. The Portal caps it (`PORTAL_FAUCET_MAX_AMOUNT_KOR`).
+    #[arg(long, env = "KONTOR_STORAGE_FAUCET_AMOUNT_KOR", default_value = "1000")]
+    pub faucet_amount_kor: String,
+
+    /// Claim storage rewards once at least this much KOR is claimable.
+    #[arg(long, env = "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR", default_value = "1")]
+    pub claim_threshold_kor: String,
+
     /// Command to run
     #[command(subcommand)]
     pub command: Commands,
@@ -222,5 +267,27 @@ mod tests {
 
         assert!(std::env::var(LEGACY).is_err());
         assert!(std::env::var(CORRECTED).is_err());
+    }
+
+    /// Auto-stake is on unless switched off, and the switch takes the usual
+    /// spellings of a boolean environment variable.
+    #[test]
+    #[serial_test::serial]
+    fn auto_stake_defaults_on_and_accepts_boolish_values() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["kontor-storage-node"];
+            argv.extend_from_slice(args);
+            argv.push("ping");
+            Cli::try_parse_from(argv).unwrap()
+        };
+        if std::env::var("KONTOR_STORAGE_AUTO_STAKE").is_err() {
+            assert!(parse(&[]).auto_stake);
+        }
+        for off in ["false", "0", "no", "off"] {
+            assert!(!parse(&["--auto-stake", off]).auto_stake, "{off}");
+        }
+        for on in ["true", "1", "yes", "on"] {
+            assert!(parse(&["--auto-stake", on]).auto_stake, "{on}");
+        }
     }
 }

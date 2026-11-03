@@ -318,6 +318,8 @@ mod tests {
             blob_size: None,
             file_hash: None,
             ledger_index: None,
+            required_collateral: None,
+            storage_weight: None,
             txid: None,
             block_height: None,
             block_time: None,

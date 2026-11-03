@@ -3,6 +3,7 @@ pub mod downloadagreements;
 pub mod getactivechallenges;
 pub mod getnewagreements;
 pub mod reconcile;
+pub mod stake;
 
 use anyhow::{Context, Result};
 
