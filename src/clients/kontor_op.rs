@@ -16,8 +16,11 @@
 //! variants are only shaped closely enough to keep the derive happy — they are
 //! never serialized.
 //!
-//! Checked against Kontor `core/indexer-types/src/lib.rs` at rev `b8e4026`,
-//! the revision Horizon Portal's `Cargo.lock` pins.
+//! Checked against Kontor `core/indexer-types/src/lib.rs` at rev `80913826`
+//! (the staking upgrade): variant order, the `KONTOR-OP-V1` prefix and the
+//! `(SignerRef, nonce, sponsored, &Inst)` tuple are unchanged from `b8e4026`,
+//! and `ContractAddress` still displays as `name_height_txindex` (the
+//! `contract_address!` macro in `core/macros`).
 
 use anyhow::{Context, Result};
 use serde::Serialize;

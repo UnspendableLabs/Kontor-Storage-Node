@@ -2,7 +2,7 @@
 # Pinned to the same channel as Kontor and the Horizon Portal so the shared
 # dependency set (kontor-crypto and its transitive crypto stack) resolves and
 # builds identically across the three repositories.
-channel = "1.95.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 
