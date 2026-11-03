@@ -244,7 +244,6 @@ struct InFlight {
     op: NodeOp,
     nonce: u64,
     sent: Instant,
-    #[allow(dead_code)] // read by /admin, wired in the next change
     sent_at: DateTime<Utc>,
 }
 
@@ -252,7 +251,6 @@ struct InFlight {
 /// yet, so it is held back from the budget until the nonce says it is.
 #[derive(Clone, Debug)]
 struct PendingJoin {
-    #[allow(dead_code)] // read by /admin, wired in the next change
     agreement_id: String,
     collateral: Kor,
     nonce: u64,
@@ -520,7 +518,6 @@ impl StakeTracker {
     }
 
     /// What `GET /api/admin/status` shows under `staking`.
-    #[allow(dead_code)] // wired into /admin in the next change
     #[must_use]
     pub fn status(&self) -> Value {
         let state = self.lock();
