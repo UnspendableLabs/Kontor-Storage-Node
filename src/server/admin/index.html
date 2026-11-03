@@ -314,6 +314,67 @@
   <div class="msg err" id="ledger-blocked"></div>
   <div class="msg" id="ledger-awaiting"></div>
 
+  <!-- The bond. Kontor refuses joins without enough unreserved stake and
+       slashes a missed challenge at 30x its collateral, and neither shows in
+       the counters above. Amounts arrive as exact decimal strings and are
+       shown as they are: parsing them into numbers would round them. -->
+  <div class="card" id="staking" style="margin-top:14px">
+    <h2>Collateral</h2>
+    <div class="msg err" id="staking-cleanup"></div>
+    <div class="msg warn" id="staking-withdrawal"></div>
+    <div class="msg warn" id="staking-paused"></div>
+    <p class="muted" id="staking-unreported" hidden>
+      The Portal does not report a stake for this node yet — either it predates
+      staking (the node then joins as before), or the daemon has not completed a
+      cycle since it started.
+    </p>
+    <div id="staking-rows">
+      <div class="row"><span class="k">Spendable</span><span class="mono" id="staking-balance">—</span></div>
+      <div class="row"><span class="k">Bonded stake</span><span class="mono" id="staking-stake">—</span></div>
+      <div class="row"><span class="k">Reserved by agreements</span><span class="mono" id="staking-reserved">—</span></div>
+      <div class="row"><span class="k">Available for new joins</span><span class="mono" id="staking-available">—</span></div>
+      <div class="row"><span class="k">Claimable rewards</span><span class="mono" id="staking-rewards">—</span></div>
+      <div class="row"><span class="k">Waiting to land</span><span id="staking-in-flight">—</span></div>
+      <div class="row" id="staking-exit-row" hidden><span class="k">Exit</span><span id="staking-exit">—</span></div>
+    </div>
+    <div class="divider"></div>
+    <div class="row"><span class="k">Auto-stake</span><span id="staking-policy">—</span></div>
+    <div class="row"><span class="k">Last event</span><span id="staking-event" class="trunc">—</span></div>
+  </div>
+
+  <div class="card danger-zone" id="exit">
+    <h2>Withdraw the collateral</h2>
+    <div class="msg err" id="exit-error"></div>
+    <div class="msg ok" id="exit-success"></div>
+    <p>
+      For a node that is leaving. <strong>Begin unstake</strong> is the only
+      step you take: from the moment it is queued this node joins nothing new,
+      and once it executes — starting Kontor's withdrawal delay, about two weeks
+      of blocks — the node leaves its agreements on its own, one per cycle, each
+      once its open challenge has been proved. It keeps proving until then: a
+      missed proof is still slashed.
+    </p>
+    <p class="muted">
+      When nothing is held any more and the delay has passed by the node's
+      count, it withdraws the bond itself, and bonds nothing again. The node
+      cannot see the chain tip, so it times the delay assuming 10-minute blocks;
+      <strong>Withdraw</strong> tries it now, by hand. Kontor refuses a withdrawal
+      while any agreement or open challenge holds part of the bond. Nothing is
+      signed by this page: the request is queued and the daemon signs it on its
+      next cycle.
+    </p>
+    <form id="exit-form" class="stack">
+      <label class="muted" for="exit-action">Action</label>
+      <select id="exit-action">
+        <option value="begin_unstake" data-phrase="UNSTAKE">Begin unstake</option>
+        <option value="withdraw_stake" data-phrase="WITHDRAW">Withdraw the bond</option>
+      </select>
+      <label class="muted" for="exit-confirm">Type <code id="exit-phrase">UNSTAKE</code> to confirm</label>
+      <input type="text" id="exit-confirm" placeholder="UNSTAKE" autocomplete="off">
+      <button class="danger" type="submit" id="exit-submit" disabled>Queue it</button>
+    </form>
+  </div>
+
   <div class="card danger-zone">
     <h2>Reset the database</h2>
     <div class="msg err" id="reset-error"></div>
@@ -606,6 +667,7 @@
       $("storage-directory-row").style.display = "none";
     }
     renderLedger(data.ledger || {});
+    renderStaking(data.staking || {});
     renderPhase(data);
     $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
   }
@@ -657,6 +719,80 @@
           "Portal reconciles their creating transaction. This usually clears on its own."
         : "",
       true);
+  }
+
+  function kor(value) {
+    return value === null || value === undefined ? "—" : value + " KOR";
+  }
+
+  // Standing conditions, so every message is kept (`show(.., true)`) and
+  // cleared again by the next poll that no longer reports it.
+  function renderStaking(staking) {
+    var reported = staking.reported === true;
+    $("staking-unreported").hidden = reported;
+    $("staking-rows").hidden = !reported;
+
+    $("staking-balance").textContent = kor(staking.kor_balance);
+    $("staking-stake").textContent = kor(staking.stake);
+    $("staking-reserved").textContent = kor(staking.reserved);
+    $("staking-available").textContent = kor(staking.available);
+    $("staking-rewards").textContent = kor(staking.reward_balance);
+
+    var flight = staking.in_flight;
+    var pending = (staking.pending_joins || []).length;
+    var waiting = [];
+    if (flight) {
+      waiting.push(flight.op + (flight.amount ? " " + flight.amount + " KOR" : "") +
+        " (nonce " + flight.nonce + ")");
+    }
+    if (pending > 0) { waiting.push(pending + " join(s)"); }
+    if (staking.operator_request) { waiting.push(staking.operator_request + " requested"); }
+    $("staking-in-flight").textContent = waiting.length ? waiting.join(" · ") : "nothing";
+
+    var exit = staking.exit;
+    $("staking-exit-row").hidden = !exit;
+    if (exit) {
+      var steps = [];
+      var held = (exit.memberships_left || []).length;
+      steps.push(held === 0 ? "no agreement held" : held + " agreement(s) still to leave");
+      if ((exit.deferred || []).length) {
+        steps.push(exit.deferred.length + " waiting for an open challenge");
+      }
+      if (exit.unresolved_challenges) {
+        steps.push(exit.unresolved_challenges + " challenge(s) unresolved");
+      }
+      if (exit.withdraw_estimated_from) {
+        steps.push("withdrawal tried from about " +
+          new Date(exit.withdraw_estimated_from).toLocaleString());
+      }
+      $("staking-exit").textContent = steps.join(" · ");
+    }
+
+    var policy = staking.policy || {};
+    $("staking-policy").textContent = policy.auto_stake === false
+      ? "off — this node signs no stake or claim op on its own"
+      : "on — bonds " + (policy.stake_target ? "up to " + policy.stake_target + " KOR" : "everything") +
+        " above a " + policy.gas_reserve + " KOR gas reserve; claims rewards from " +
+        policy.claim_threshold + " KOR";
+
+    var event = staking.last_event;
+    $("staking-event").textContent = event
+      ? new Date(event.at).toLocaleString() + " — " + event.message
+      : "—";
+
+    show($("staking-cleanup"), staking.bond_cleanup_pending === true
+      ? "Bond cleanup pending: the stake was slashed to zero after missed challenges. Kontor is " +
+        "unwinding this node's agreements; it can neither join nor add stake until that finishes. " +
+        "See \"Staking & collateral\" in the README."
+      : "", true);
+    show($("staking-withdrawal"),
+      staking.withdrawal_height !== null && staking.withdrawal_height !== undefined
+        ? "Withdrawal requested: no new joins, no more stake. The bond can be withdrawn from block " +
+          staking.withdrawal_height + " once no agreement holds any of it."
+        : "", true);
+    show($("staking-paused"), staking.joins_paused
+      ? "Joins paused for a few minutes: the Portal refused one (" + staking.joins_paused + ")."
+      : "", true);
   }
 
   function loadStatus() {
@@ -1052,6 +1188,43 @@
 
   /* ---------------- reset ---------------- */
 
+  /* ---------------- unstake / withdraw ---------------- */
+
+  function exitPhrase() {
+    var select = $("exit-action");
+    return select.options[select.selectedIndex].getAttribute("data-phrase");
+  }
+
+  function syncExitPhrase() {
+    var phrase = exitPhrase();
+    $("exit-phrase").textContent = phrase;
+    $("exit-confirm").placeholder = phrase;
+    $("exit-submit").disabled = $("exit-confirm").value !== phrase;
+  }
+
+  function requestStakeAction(event) {
+    event.preventDefault();
+    var action = $("exit-action").value;
+    var warning = action === "begin_unstake"
+      ? "Begin the unstake? This node will stop taking on agreements for good."
+      : "Withdraw the whole bond? Kontor refuses it while any agreement still holds collateral.";
+    if (!window.confirm(warning)) { return; }
+
+    $("exit-submit").disabled = true;
+    api("/api/admin/stake", {
+      method: "POST",
+      body: { action: action, confirm: $("exit-confirm").value }
+    }).then(function (result) {
+      show($("exit-success"), result.message || "Queued", true);
+      $("exit-confirm").value = "";
+      syncExitPhrase();
+      loadStatus();
+    }).catch(function (error) {
+      report($("exit-error"), error);
+      syncExitPhrase();
+    });
+  }
+
   function resetDatabase(event) {
     event.preventDefault();
     var deleteFiles = $("reset-delete-files").checked;
@@ -1435,6 +1608,10 @@
   $("reset-form").addEventListener("submit", resetDatabase);
   $("register-submit").addEventListener("click", registerNode);
   $("whitelist-form").addEventListener("submit", submitWhitelist);
+
+  $("exit-form").addEventListener("submit", requestStakeAction);
+  $("exit-action").addEventListener("change", syncExitPhrase);
+  $("exit-confirm").addEventListener("input", syncExitPhrase);
 
   $("reset-confirm").addEventListener("input", function () {
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;

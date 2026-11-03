@@ -1,8 +1,11 @@
-use crate::app::tasks::computeproofs::compute_and_submit_proofs;
-use crate::app::tasks::downloadagreements::{download_agreements, rebuild_ledger, StorageBackend};
+use crate::app::tasks::computeproofs::{compute_and_submit_proofs, ProofRetries};
+use crate::app::tasks::downloadagreements::{
+    download_agreements_gated, rebuild_ledger, StorageBackend,
+};
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::app::tasks::reconcile;
+use crate::app::tasks::stake::{exit_inputs, manage_stake, JoinBudget, StakeTracker};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
@@ -11,7 +14,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
@@ -26,8 +30,26 @@ pub struct StorageLimits {
     pub max_file_size: Option<u64>,
 }
 
+/// What the daemon carries from one cycle to the next.
+#[derive(Debug, Default)]
+pub(crate) struct DaemonMemory {
+    /// The bond, and the stake ops and joins still waiting to land. Shared
+    /// with `/admin`, and with the onboarding step that queued the first
+    /// top-up before this daemon started.
+    pub staking: Arc<StakeTracker>,
+    /// How often each challenge has been proved, so a proof Kontor keeps
+    /// rejecting is not recomputed every cycle until its deadline.
+    pub proofs: ProofRetries,
+}
+
 /// Starts the portal synchronization daemon that periodically fetches agreements
 /// ready to be signed, stores the new ones locally, and downloads their files.
+///
+/// `staking` is the bond tracker the node's runtime owns, shared with `/admin`
+/// and with the onboarding step that may already have an op in flight.
+// Eight plain inputs, each from a different part of the configuration;
+// bundling them would only move the list into a struct used exactly here.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_portal_daemon(
     portal_client: PortalClient,
     database: DatabaseConnection,
@@ -36,6 +58,7 @@ pub fn spawn_portal_daemon(
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
     storage_dir: PathBuf,
+    staking: Arc<StakeTracker>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = run_portal_daemon(
@@ -46,6 +69,7 @@ pub fn spawn_portal_daemon(
             storage_limits,
             storage_backend,
             storage_dir,
+            staking,
         )
         .await
         {
@@ -54,6 +78,7 @@ pub fn spawn_portal_daemon(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_portal_daemon(
     portal_client: PortalClient,
     database: DatabaseConnection,
@@ -62,7 +87,13 @@ async fn run_portal_daemon(
     storage_limits: StorageLimits,
     storage_backend: StorageBackend,
     storage_dir: PathBuf,
+    staking: Arc<StakeTracker>,
 ) -> Result<()> {
+    let memory = DaemonMemory {
+        staking,
+        proofs: ProofRetries::default(),
+    };
+
     // Ensure only a single daemon instance runs at a time.
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
@@ -90,6 +121,7 @@ async fn run_portal_daemon(
         storage_limits,
         &storage_backend,
         &storage_dir,
+        &memory,
     )
     .await
     .context("initial portal sync failed")?;
@@ -103,6 +135,7 @@ async fn run_portal_daemon(
             storage_limits,
             &storage_backend,
             &storage_dir,
+            &memory,
         )
         .await
         {
@@ -129,53 +162,101 @@ async fn run_portal_daemon(
     }
 }
 
+/// One daemon cycle.
+///
+/// The order is the point: the stake is read first, because every join
+/// decision of the cycle is made against it; agreements are taken on next;
+/// proofs come after, so a full node or a refused join never costs one; and
+/// the stake op goes out last, holding the highest nonce of the cycle — if it
+/// ever collides with another op on a nonce it is the one that loses, and a
+/// lost top-up is retried next cycle where a lost proof is a slash.
 async fn sync_portal_once(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
     storage_backend: &StorageBackend,
     storage_dir: &std::path::Path,
+    memory: &DaemonMemory,
 ) -> Result<()> {
-    if let Some(max_files) = storage_limits.max_files {
-        let downloaded = downloaded_files_count(database).await?;
-        if downloaded >= max_files {
+    // A node at its file limit takes on nothing new, but keeps proving what it
+    // already stores: skipping the whole cycle here used to mean every
+    // challenge on a full node expired, and an expired challenge is now
+    // slashed at 30× the agreement's collateral.
+    let at_file_limit = match storage_limits.max_files {
+        Some(max_files) if downloaded_files_count(database).await? >= max_files => {
             info!(
                 "Max stored files limit ({max_files}) reached; skipping agreement fetch and downloads"
             );
-            return Ok(());
+            true
         }
-    }
+        _ => false,
+    };
 
     // Resync the nonce from Kontor's registry at the start of every cycle so
     // that the local counter always reflects the confirmed on-chain state before
-    // any new signed ops are submitted.
+    // any new signed ops are submitted. The same read carries the bond, so the
+    // cycle's staking decisions share the nonce's snapshot.
     if portal_client.node_id().is_some() {
-        if let Err(e) = portal_client.resync_nonce().await {
-            warn!("failed to resync nonce at start of sync cycle: {e:#}");
-        }
+        let entry = match portal_client.resync_from_registry().await {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                warn!("failed to resync nonce at start of sync cycle: {e:#}");
+                None
+            }
+        };
+        memory.staking.observe(entry.as_ref(), Instant::now());
     }
 
     let mut failed_count: usize = 0;
 
     if let Some(node_id) = portal_client.node_id() {
-        failed_count += reconcile::reconcile_from_portal(
+        failed_count += reconcile::reconcile_from_portal_with(
             portal_client,
             database,
             node_id,
             storage_backend,
             storage_dir,
             false,
+            |agreements| {
+                let now = Instant::now();
+                for agreement in agreements {
+                    memory
+                        .staking
+                        .note_collateral(agreement.required_collateral.as_deref(), now);
+                }
+            },
         )
         .await
         .context("reconciling agreements with Portal")?;
     }
 
-    sync_ready_agreements(portal_client, database)
-        .await
-        .context("fetching new agreements failed")?;
-    download_agreements(portal_client, database, storage_limits, storage_backend)
+    if !at_file_limit {
+        let listing = sync_ready_agreements(portal_client, database)
+            .await
+            .context("fetching new agreements failed")?;
+        let now = Instant::now();
+        for agreement in listing.values() {
+            memory
+                .staking
+                .note_collateral(agreement.required_collateral.as_deref(), now);
+        }
+        let mut budget = if portal_client.node_id().is_some() {
+            memory.staking.join_budget(Instant::now())
+        } else {
+            JoinBudget::unmetered()
+        };
+        download_agreements_gated(
+            portal_client,
+            database,
+            storage_limits,
+            storage_backend,
+            &listing,
+            &mut budget,
+            Some(&memory.staking),
+        )
         .await
         .context("downloading agreements failed")?;
+    }
 
     failed_count += sync_active_challenges(portal_client, database)
         .await
@@ -194,9 +275,15 @@ async fn sync_portal_once(
         warn!("rebuilding the file ledger failed, proofs may be skipped this cycle: {err:#}");
     }
 
-    compute_and_submit_proofs(portal_client, database, storage_backend, storage_dir)
-        .await
-        .context("computing and submitting proofs failed")?;
+    compute_and_submit_proofs(
+        portal_client,
+        database,
+        storage_backend,
+        storage_dir,
+        &memory.proofs,
+    )
+    .await
+    .context("computing and submitting proofs failed")?;
 
     if failed_count > 0 {
         if let Err(e) = portal_client.resync_nonce().await {
@@ -205,6 +292,21 @@ async fn sync_portal_once(
             );
         }
     }
+
+    // The exit, once the operator's unstake has executed, is worked out from
+    // the node's own rows: which memberships it holds and which challenges
+    // are still open. A read failure only postpones the next exit step.
+    let exit = match portal_client.node_id() {
+        Some(node_id) if memory.staking.exiting() => match exit_inputs(database, node_id).await {
+            Ok(exit) => Some(exit),
+            Err(err) => {
+                warn!("could not read memberships for the exit this cycle: {err:#}");
+                None
+            }
+        },
+        _ => None,
+    };
+    manage_stake(portal_client, &memory.staking, exit.as_ref()).await;
 
     Ok(())
 }
@@ -568,7 +670,7 @@ mod tests {
 
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
-    use crate::testutils::{setup_in_memory_db, unique_test_path};
+    use crate::testutils::{setup_in_memory_db, unique_test_path, AgreementFixture};
     use chrono::DateTime;
     use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
@@ -643,6 +745,7 @@ mod tests {
             StorageLimits::default(),
             StorageBackend::local(),
             storage_dir,
+            Arc::new(StakeTracker::default()),
         )
         .await
         .unwrap_err();
@@ -706,6 +809,7 @@ mod tests {
             },
             StorageBackend::local(),
             storage_dir.clone(),
+            Arc::new(StakeTracker::default()),
         );
 
         time::sleep(Duration::from_millis(30)).await;
@@ -749,6 +853,7 @@ mod tests {
             StorageLimits::default(),
             StorageBackend::local(),
             storage_dir,
+            Arc::new(StakeTracker::default()),
         );
 
         // Wait for the daemon to fail and exit on its own. The spawned task
@@ -865,6 +970,7 @@ mod tests {
             StorageLimits::default(),
             StorageBackend::local(),
             storage_dir.clone(),
+            Arc::new(StakeTracker::default()),
         );
 
         // Wait long enough for the daemon to: 1) initial sync (success),
@@ -955,6 +1061,7 @@ mod tests {
             StorageLimits::default(),
             StorageBackend::local(),
             storage_dir.clone(),
+            Arc::new(StakeTracker::default()),
         );
 
         // Wait for the daemon to download the agreement at least once. Give it
@@ -1130,6 +1237,7 @@ mod tests {
             StorageLimits::default(),
             &StorageBackend::local(),
             &storage_dir,
+            &DaemonMemory::default(),
         )
         .await
         .expect("sync_portal_once should succeed");
@@ -1186,6 +1294,7 @@ mod tests {
             StorageLimits::default(),
             &StorageBackend::local(),
             &storage_dir,
+            &DaemonMemory::default(),
         )
         .await
         .expect("sync_portal_once should succeed");
@@ -1195,5 +1304,272 @@ mod tests {
             Some(99),
             "nonce should be resynced from registry at the start of each sync cycle"
         );
+    }
+
+    async fn mount_no_node_agreements(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0, "limit": 20, "total": 0, "agreements": []
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// A full node used to skip its whole cycle, proofs included — and every
+    /// challenge it then missed is now slashed at 30× the collateral. At the
+    /// limit it stops taking on agreements and keeps proving.
+    #[tokio::test]
+    async fn a_node_at_its_file_limit_still_syncs_its_challenges() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42, "x_only_pubkey": "abcd", "bls_pubkey": null, "next_nonce": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        AgreementFixture {
+            downloaded: true,
+            ..AgreementFixture::new("AGR-full", "FILE-full")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let storage_dir = unique_test_path("daemon_full_node");
+        fs::create_dir_all(&storage_dir).ok();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits {
+                max_files: Some(1),
+                ..StorageLimits::default()
+            },
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path() == "/api/nodes/NODE-test/challenges"),
+            "challenges must still be synced at the file limit"
+        );
+    }
+
+    /// The registry entry of a new node the faucet just funded.
+    fn funded_entry(next_nonce: u64) -> serde_json::Value {
+        json!({
+            "signer_id": 42,
+            "x_only_pubkey": "abcd",
+            "bls_pubkey": null,
+            "next_nonce": next_nonce,
+            "kor_balance": "1000",
+            "stake": "0",
+            "stake_reserved": "0",
+            "stake_available": "0",
+            "stake_withdrawal_height": null,
+            "bond_cleanup_pending": false,
+            "reward_balance": "0"
+        })
+    }
+
+    /// The top-up goes out at the end of the cycle — after every join and
+    /// proof, holding the cycle's highest nonce — and is not sent again while
+    /// Kontor has not executed it.
+    #[tokio::test]
+    async fn the_stake_top_up_goes_out_last_and_once_until_it_lands() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(funded_entry(3)))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "op": "add_stake",
+                "amount": "995",
+                "nonce": 3
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": "add_stake", "status": "queued", "nonce": 3
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_stake_last");
+        fs::create_dir_all(&storage_dir).ok();
+        let client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0);
+        let memory = DaemonMemory::default();
+
+        for _ in 0..2 {
+            sync_portal_once(
+                &client,
+                &database,
+                StorageLimits::default(),
+                &StorageBackend::local(),
+                &storage_dir,
+                &memory,
+            )
+            .await
+            .unwrap();
+        }
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let first_cycle_end = requests
+            .iter()
+            .position(|r| r.url.path() == "/api/nodes/NODE-test/ops")
+            .expect("the top-up was sent");
+        assert!(
+            requests[..first_cycle_end]
+                .iter()
+                .any(|r| r.url.path() == "/api/nodes/NODE-test/challenges"),
+            "the cycle's other work came before the top-up"
+        );
+        assert_eq!(memory.staking.status()["in_flight"]["nonce"], 3);
+    }
+
+    /// Joins are gated on the bond the cycle just read: an agreement whose
+    /// collateral the stake cannot cover is not even downloaded.
+    #[tokio::test]
+    async fn a_cycle_does_not_download_what_its_stake_cannot_cover() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        let mut ready = agreement_payload("AGR-costly", "FILE-costly", "ready");
+        ready["nodes"] = json!([]);
+        ready["required_collateral"] = json!("500");
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0, "limit": 20, "total": 1, "agreements": [ready]
+            })))
+            .mount(&mock_server)
+            .await;
+        let mut entry = funded_entry(3);
+        entry["kor_balance"] = json!("5");
+        entry["stake"] = json!("100");
+        entry["stake_available"] = json!("100");
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-costly/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_gate");
+        fs::create_dir_all(&storage_dir).ok();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .unwrap();
+
+        let stored = Agreements::find_by_id("AGR-costly")
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("still recorded as ready, for a later cycle");
+        assert!(!stored.downloaded);
+    }
+
+    /// Once the operator's unstake has executed, the cycle's op is the exit:
+    /// a `leave_agreement` for a membership the node's own rows hold.
+    #[tokio::test]
+    async fn an_executed_unstake_turns_the_cycle_s_op_into_a_leave() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        let mut entry = funded_entry(4);
+        entry["kor_balance"] = json!("5");
+        entry["stake"] = json!("100");
+        entry["stake_available"] = json!("70");
+        entry["stake_withdrawal_height"] = json!(9000);
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "op": "leave_agreement",
+                "agreement_id": "AGR-held",
+                "nonce": 4
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": "leave_agreement", "status": "queued", "nonce": 4
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        AgreementFixture {
+            status: "confirmed".into(),
+            downloaded: true,
+            nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+            ..AgreementFixture::new("AGR-held", "FILE-held")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let storage_dir = unique_test_path("daemon_exit");
+        fs::create_dir_all(&storage_dir).ok();
+        let memory = DaemonMemory::default();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+            &memory,
+        )
+        .await
+        .unwrap();
+
+        let status = memory.staking.status();
+        assert_eq!(status["in_flight"]["op"], "leave_agreement");
+        assert_eq!(status["exit"]["memberships_left"], json!(["AGR-held"]));
     }
 }

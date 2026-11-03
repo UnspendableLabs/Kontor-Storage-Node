@@ -3,6 +3,12 @@
 //! Deliberately small: the public dashboard at `/` already lists the files, so
 //! this only answers the question the danger zone raises — how much state is
 //! there, and where does it live.
+//!
+//! Plus the bond, under `staking`: since the staking upgrade a node with no
+//! unreserved stake silently stops taking on agreements, and one that misses a
+//! challenge loses 30× its collateral. Neither shows up in the counts, so the
+//! daemon's own view of the stake is echoed here — admin-only, unlike the
+//! public `/api/info`, because it is the operator's money.
 
 use axum::http::StatusCode;
 use sea_orm::sea_query::Expr;
@@ -81,6 +87,7 @@ pub async fn node_status(
             "total": challenges_total,
         },
         "ledger": ledger,
+        "staking": state.runtime.staking().status(),
         "restart_available": state.runtime.can_restart(),
         "session_expires_at": session_expires_at,
     }))
@@ -573,5 +580,49 @@ mod tests {
             assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(err.code, error_codes::DATABASE_ERROR);
         }
+    }
+
+    /// The bond as the daemon last read it, with the policy it acts on. A node
+    /// whose daemon has not read anything yet says so rather than showing
+    /// zeros an operator could mistake for an empty stake.
+    #[tokio::test]
+    async fn status_reports_the_bond_the_daemon_last_read() {
+        use crate::clients::portal::RegistryEntry;
+
+        let (state, _dir) = state_with(&[]).await;
+        let before = node_status(&state, SESSION_EXPIRY).await.unwrap();
+        assert_eq!(before["staking"]["reported"], false);
+        assert_eq!(before["staking"]["stake"], Value::Null);
+        assert_eq!(before["staking"]["policy"]["auto_stake"], true);
+
+        let entry: RegistryEntry = serde_json::from_value(json!({
+            "signer_id": 42,
+            "x_only_pubkey": "ab",
+            "bls_pubkey": null,
+            "next_nonce": 1,
+            "kor_balance": "5",
+            "stake": "995",
+            "stake_reserved": "30",
+            "stake_available": "965",
+            "stake_withdrawal_height": null,
+            "bond_cleanup_pending": false,
+            "reward_balance": "2.5"
+        }))
+        .unwrap();
+        state
+            .runtime
+            .staking()
+            .observe(Some(&entry), std::time::Instant::now());
+
+        let after = node_status(&state, SESSION_EXPIRY).await.unwrap();
+        let staking = &after["staking"];
+        assert_eq!(staking["reported"], true);
+        assert_eq!(staking["kor_balance"], "5");
+        assert_eq!(staking["stake"], "995");
+        assert_eq!(staking["reserved"], "30");
+        assert_eq!(staking["available"], "965");
+        assert_eq!(staking["reward_balance"], "2.5");
+        assert_eq!(staking["withdrawal_height"], Value::Null);
+        assert_eq!(staking["bond_cleanup_pending"], false);
     }
 }

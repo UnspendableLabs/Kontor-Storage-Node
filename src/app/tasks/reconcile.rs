@@ -36,10 +36,37 @@ pub(crate) async fn reconcile_from_portal(
     storage_dir: &Path,
     redownload_from_gcs: bool,
 ) -> Result<usize> {
+    reconcile_from_portal_with(
+        portal_client,
+        database,
+        node_id,
+        storage_backend,
+        storage_dir,
+        redownload_from_gcs,
+        |_| {},
+    )
+    .await
+}
+
+/// [`reconcile_from_portal`], also handing the fetched list to `inspect`.
+///
+/// The daemon learns from it what this node's confirmed agreements actually
+/// cost to join — the only place a `required_collateral` reliably appears, since
+/// the ready listing is joined before the agreement exists on chain.
+pub(crate) async fn reconcile_from_portal_with(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    node_id: &str,
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    redownload_from_gcs: bool,
+    inspect: impl FnOnce(&[Agreement]),
+) -> Result<usize> {
     let remote_agreements = portal_client
         .get_node_agreements(node_id)
         .await
         .context("fetching all node agreements for reconciliation")?;
+    inspect(&remote_agreements);
 
     if remote_agreements.is_empty() {
         info!("Reconciliation: no agreements found on Portal for node {node_id}");
@@ -318,6 +345,8 @@ mod tests {
             blob_size: None,
             file_hash: None,
             ledger_index: None,
+            required_collateral: None,
+            storage_weight: None,
             txid: None,
             block_height: None,
             block_time: None,

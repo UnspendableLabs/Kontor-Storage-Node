@@ -2,6 +2,7 @@ pub mod gcs;
 pub mod http_helpers;
 pub mod http_signature;
 pub mod kontor_op;
+pub mod kor;
 pub mod portal;
 
 pub use gcs::GcsClient;

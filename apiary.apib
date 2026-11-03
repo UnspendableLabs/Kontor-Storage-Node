@@ -327,6 +327,36 @@ Counts of everything a reset would erase, plus where it is stored.
                     "highest_slot": 613,
                     "rebuild_blocked": false
                 },
+                "staking": {
+                    "reported": true,
+                    "portal_reports_stake": true,
+                    "observed_at": "2026-11-03T10:15:00+00:00",
+                    "kor_balance": "5.25",
+                    "stake": "995",
+                    "reserved": "30",
+                    "available": "965",
+                    "withdrawal_height": null,
+                    "bond_cleanup_pending": false,
+                    "reward_balance": "0.5",
+                    "policy": {
+                        "auto_stake": true,
+                        "gas_reserve": "5",
+                        "stake_target": null,
+                        "claim_threshold": "1"
+                    },
+                    "in_flight": null,
+                    "pending_joins": [
+                        { "agreement_id": "agr_7f3c", "collateral": "12.5", "nonce": 18 }
+                    ],
+                    "joins_paused": null,
+                    "operator_request": null,
+                    "exit": null,
+                    "exited": false,
+                    "last_event": {
+                        "at": "2026-11-03T09:40:00+00:00",
+                        "message": "add_stake 995 KOR sent (nonce 3)"
+                    }
+                },
                 "restart_available": true,
                 "session_expires_at": 1798761600
             }
@@ -336,6 +366,8 @@ Counts of everything a reset would erase, plus where it is stored.
     `registration` says whether the Portal knows this node's BLS key. `registered: false` means onboarding stopped at the lookup and no daemon is running — the node serves this page and nothing else until the key is registered. `node_id` and `signer_id` are then `null`, and `signer_id` is also `null` on a node whose `RegisterBlsKey` transaction has not confirmed yet. `supported: false` means no BLS key was loaded at all, so there is nothing to register.
 
     `registration.derived` is present on a node that knows its own Taproot account — one set up from a seed phrase, through the wizard or an older release — and is `null` on a node whose BLS key was imported without one. Such a node registers itself during onboarding and has no use for the wallet flow, so what the page shows instead is the account it derived and the Taproot address a Portal admin has to whitelist. `derived.account` is the wallet's own account number, counting from 1, not the child index in the derivation path. `derived.network` is one of `mainnet`, `testnet`, `signet`, `regtest`, and decides the address prefix as well as the coin type. Its `node_id` is the identifier derived from the xpub, which equals the outer `node_id` once the Portal has the row. While `registered` is `false` such a node re-offers its registration every 30 seconds, so `derived.taproot_address` being whitelisted is the only action left — this endpoint starts reporting `registered: true` on its own once it is. The exception is a registration the Portal read and rejected outright (`400`, `401`, `409`, `422`): replaying identical bytes cannot change that answer, so the node logs it and stops, and `registered` then only turns `true` if somebody registers the key elsewhere.
+
+    `staking` is the bond as the daemon last read it from the Portal's signer entry, once per cycle. Every amount is an exact decimal string in KOR. `reported: false` means the last read carried no stake — a Portal predating staking (`portal_reports_stake: false`, and the node then joins without gating) or a read that failed this cycle — and the amount fields are then `null`. `available` is what new joins can still reserve; the node holds back the collateral of `pending_joins` (accepted but not yet executed) on top of that. `in_flight` is the one stake or claim op the node has sent and Kontor has not executed yet (`op`, `amount`, `nonce`, `sent_at`). `withdrawal_height` is non-null once an unstake has executed; `bond_cleanup_pending` means the stake was slashed to zero and the node can neither join nor add stake until Kontor finishes cleaning up. `joins_paused` names the Portal error code that paused joins after a refused join, for ten minutes. `operator_request` is an unstake or withdrawal queued from `POST /api/admin/stake` and not yet signed. `exit` is `null` until an unstake has executed; then it reports the exit in progress: `memberships_left` (agreements still to leave), `deferred` (of those, the ones waiting for an open challenge), `left` (leaves executed in this process), `unresolved_challenges`, and `withdraw_estimated_from` (when the node will first try `withdraw-stake` on its own, assuming 10-minute blocks). `exited` is `true` once the bond has been withdrawn; the node then bonds nothing on its own. `last_event` is the last thing worth telling the operator: an op sent or refused, a slash, cleanup starting or ending, a withdrawal.
 
     `ledger` reports whether the node can still prove. `placed` is how many stored files carry a contract-assigned slot and would enter the rebuilt ledger; `awaiting_ledger_index` is how many are stored and served but not yet provable, because the Portal has not reconciled their creating transaction. `rebuild_blocked` is `true` once `highest_slot + 1` exceeds `placed` by more than kontor-crypto's sparsity gap (1024), at which point the ledger cannot be rebuilt and every proof is skipped — see the README.
 
@@ -404,6 +436,46 @@ With `restart`, the node answers this request and then exits with code `75` so i
 + Response 500 (application/json)
 
     The transaction could not be opened or committed (`DATABASE_ERROR`). The wipe is rolled back.
+
+### Stake Action [POST /api/admin/stake]
+
+Queues an unstake or a withdrawal of the node's bond. Nothing is signed here: the daemon signs the op on its next cycle, ahead of any automatic stake or claim op, and relays it through the Portal like every other op. Progress shows on `GET /api/admin/status` — `staking.operator_request` while it waits, `staking.in_flight` once it is sent, `staking.withdrawal_height` once an unstake has executed.
+
+`begin_unstake` is the start of the exit, and the only step an operator has to take. Joins stop as soon as it is queued. Once it executes — starting Kontor's withdrawal delay — the daemon leaves each held agreement (`leave_agreement` through the Portal's relay, one per cycle, each once its open challenge is proved) and then sends `withdraw-stake` itself when nothing is held and the delay has passed by its count. `withdraw_stake` here tries that withdrawal now, by hand: Kontor refuses it while the delay runs or while any agreement or open challenge holds part of the bond, and the refusal shows as an op that executed without the stake changing.
+
++ Request (application/json)
+
+    + Headers
+
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+
+    + Attributes
+        + action: `begin_unstake` (enum, required)
+            + Members
+                + `begin_unstake`
+                + `withdraw_stake`
+        + confirm: `UNSTAKE` (string, required) - `UNSTAKE` for `begin_unstake`, `WITHDRAW` for `withdraw_stake`
+
++ Response 202 (application/json)
+
+    + Body
+
+            {
+                "queued": "begin_unstake",
+                "message": "queued: the daemon signs it on its next cycle"
+            }
+
++ Response 400 (application/json)
+
+    Unknown `action`, or `confirm` is not that action's phrase (`CONFIRMATION_REQUIRED`).
+
++ Response 401 (application/json)
+
+    Missing, malformed or expired session (`UNAUTHORIZED`).
+
++ Response 409 (application/json)
+
+    `STAKE_UNAVAILABLE`: the node is not `running` (no daemon to sign), the Portal has not reported a stake yet, there is no stake to unstake, a withdrawal is already requested (for `begin_unstake`) or none is (for `withdraw_stake`), or another request is already waiting.
 
 ### Register Node [POST /api/admin/register-node]
 

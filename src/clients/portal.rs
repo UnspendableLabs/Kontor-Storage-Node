@@ -1,6 +1,7 @@
 use super::http_helpers::{build_http_client, check_response_status};
 use super::http_signature;
 use super::kontor_op::{build_signing_message, Inst, InstKind, SignerRef, DEFAULT_GAS_LIMIT};
+use super::kor::Kor;
 use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -18,6 +19,14 @@ use tokio::fs;
 /// filestorage instance must point the node at the same one — see
 /// [`PortalClient::with_contract_address`].
 pub const DEFAULT_FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
+
+/// Staking contract address in Kontor (native contract at genesis).
+///
+/// Mirrors the Portal's `KONTOR_STAKING_CONTRACT_ADDRESS` default. Like the
+/// filestorage address it is inside the signed `Inst` of every stake op, so the
+/// two sides must name the same instance — see
+/// [`PortalClient::with_staking_contract_address`].
+pub const DEFAULT_STAKING_CONTRACT: &str = "staking_0_0";
 
 /// Encode `s` as a Wave string literal, validating it contains only safe
 /// characters.
@@ -79,6 +88,93 @@ fn verify_proof_expr(proof_bytes: &[u8], challenge_ids: &[&str]) -> Result<Strin
     Ok(format!("verify-proof([{}], [{}])", items.join(", "), ids))
 }
 
+/// A staking or rewards operation the node signs itself and the Portal relays
+/// through `POST /api/nodes/{node_id}/ops` (contract §2).
+///
+/// The Portal never trusts an expression from the client: it rebuilds the
+/// `Inst` from `op` (and `amount`) and verifies this node's signature over the
+/// result. So [`NodeOp::contract_and_expr`] must produce exactly what the Portal
+/// builds — the contract each op targets, and the WAVE expression with the
+/// amount encoded by [`Kor::wave_literal`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeOp {
+    /// `staking::add-stake(amount)`: bond more collateral.
+    AddStake(Kor),
+    /// `staking::begin-unstake()`: start the withdrawal delay. The node can no
+    /// longer join agreements, nor add stake, until it has withdrawn.
+    BeginUnstake,
+    /// `staking::withdraw-stake()`: take the whole bond back once the delay has
+    /// elapsed and no storage obligation is left.
+    WithdrawStake,
+    /// `filestorage::claim-rewards()`: move accrued storage rewards into the
+    /// node's spendable balance, where auto-stake can pick them up.
+    ClaimRewards,
+    /// `filestorage::leave-agreement(id)`: give up one membership. Part of
+    /// leaving the network: `withdraw-stake` is refused while any membership
+    /// remains.
+    LeaveAgreement(String),
+}
+
+/// Which contract an op is a call on. The addresses themselves are
+/// configuration and live on the client.
+enum OpContract {
+    Staking,
+    Filestorage,
+}
+
+impl NodeOp {
+    /// The `op` field of the relay request.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            NodeOp::AddStake(_) => "add_stake",
+            NodeOp::BeginUnstake => "begin_unstake",
+            NodeOp::WithdrawStake => "withdraw_stake",
+            NodeOp::ClaimRewards => "claim_rewards",
+            NodeOp::LeaveAgreement(_) => "leave_agreement",
+        }
+    }
+
+    /// The amount, for the one op that carries one.
+    #[must_use]
+    pub fn amount(&self) -> Option<Kor> {
+        match self {
+            NodeOp::AddStake(amount) => Some(*amount),
+            _ => None,
+        }
+    }
+
+    /// The agreement, for the one op that names one.
+    #[must_use]
+    pub fn agreement_id(&self) -> Option<&str> {
+        match self {
+            NodeOp::LeaveAgreement(agreement_id) => Some(agreement_id),
+            _ => None,
+        }
+    }
+
+    /// The contract the op calls and its WAVE expression (contract §2 table).
+    ///
+    /// `leave-agreement("<id>")` is quoted exactly like `join-agreement`, with
+    /// the same `[A-Za-z0-9_-]` allowlist — the Portal rebuilds it from the
+    /// `agreement_id` field and verifies the signature over it.
+    fn contract_and_expr(&self) -> Result<(OpContract, String)> {
+        Ok(match self {
+            NodeOp::AddStake(amount) => (
+                OpContract::Staking,
+                format!("add-stake({})", amount.wave_literal()),
+            ),
+            NodeOp::BeginUnstake => (OpContract::Staking, "begin-unstake()".to_string()),
+            NodeOp::WithdrawStake => (OpContract::Staking, "withdraw-stake()".to_string()),
+            NodeOp::ClaimRewards => (OpContract::Filestorage, "claim-rewards()".to_string()),
+            NodeOp::LeaveAgreement(agreement_id) => (
+                OpContract::Filestorage,
+                format!("leave-agreement({})", wave_string_literal(agreement_id)?),
+            ),
+        })
+    }
+}
+
 /// Authentication credentials for Portal API requests.
 #[derive(Clone)]
 pub struct PortalAuth {
@@ -110,6 +206,8 @@ pub struct PortalClient {
     auth: Option<PortalAuth>,
     /// Filestorage contract every signed Kontor op targets.
     contract_address: String,
+    /// Staking contract the stake ops target.
+    staking_contract_address: String,
 }
 
 impl std::fmt::Debug for PortalClient {
@@ -119,6 +217,7 @@ impl std::fmt::Debug for PortalClient {
             .field("storage_dir", &self.storage_dir)
             .field("auth", &self.auth)
             .field("contract_address", &self.contract_address)
+            .field("staking_contract_address", &self.staking_contract_address)
             .finish()
     }
 }
@@ -145,6 +244,7 @@ impl PortalClient {
             http,
             auth: None,
             contract_address: DEFAULT_FILESTORAGE_CONTRACT.to_string(),
+            staking_contract_address: DEFAULT_STAKING_CONTRACT.to_string(),
         })
     }
 
@@ -157,6 +257,18 @@ impl PortalClient {
     #[must_use]
     pub fn with_contract_address(mut self, contract_address: impl Into<String>) -> Self {
         self.contract_address = contract_address.into();
+        self
+    }
+
+    /// Point this client at a specific staking contract instance.
+    ///
+    /// Defaults to [`DEFAULT_STAKING_CONTRACT`]. Same reasoning as
+    /// [`Self::with_contract_address`]: `add-stake`, `begin-unstake` and
+    /// `withdraw-stake` are signed against this address, and the Portal rebuilds
+    /// them from its own `KONTOR_STAKING_CONTRACT_ADDRESS`.
+    #[must_use]
+    pub fn with_staking_contract_address(mut self, address: impl Into<String>) -> Self {
+        self.staking_contract_address = address.into();
         self
     }
 
@@ -212,6 +324,7 @@ impl PortalClient {
                 next_nonce: Arc::new(AtomicU64::new(initial_nonce)),
             }),
             contract_address: DEFAULT_FILESTORAGE_CONTRACT.to_string(),
+            staking_contract_address: DEFAULT_STAKING_CONTRACT.to_string(),
         })
     }
 
@@ -235,6 +348,16 @@ impl PortalClient {
     ///
     /// Returns the new nonce value.
     pub async fn resync_nonce(&self) -> Result<u64> {
+        Ok(self.resync_from_registry().await?.next_nonce)
+    }
+
+    /// [`Self::resync_nonce`], keeping the registry entry it read.
+    ///
+    /// The daemon reads the entry once per cycle and makes every staking
+    /// decision of that cycle from it: the balance and stake it reports are the
+    /// same snapshot as the nonce the cycle signs from, which is what lets an
+    /// op's nonce later say whether that op has landed.
+    pub async fn resync_from_registry(&self) -> Result<RegistryEntry> {
         let auth = self
             .auth
             .as_ref()
@@ -244,7 +367,52 @@ impl PortalClient {
         if old != entry.next_nonce {
             tracing::warn!(old, new = entry.next_nonce, "resynced registry nonce");
         }
-        Ok(entry.next_nonce)
+        Ok(entry)
+    }
+
+    /// Give back the nonce of an op the Portal refused outright.
+    ///
+    /// [`Self::sign_kontor_op`] takes the nonce before the request goes out. A
+    /// 4xx means the Portal stored nothing, so that nonce will never be used on
+    /// chain — and keeping it consumed would leave a gap that makes the Portal
+    /// drop every later op of this cycle as out of sequence. A proof dropped
+    /// that way is a missed challenge, which now costs collateral.
+    ///
+    /// Only rolls back if nothing was signed since, so it can never hand out a
+    /// nonce twice. Network errors and 5xx do not come here: whether the Portal
+    /// kept the op is unknown, and the next cycle's resync settles it. Nor does
+    /// `409 CONFLICT`, the one 4xx after which something *is* stored: the
+    /// Portal already holds a different op of this node at that nonce, so the
+    /// nonce is taken and handing it out again would only collide a second
+    /// time.
+    fn release_nonce(&self, nonce: u64) {
+        if let Some(auth) = &self.auth {
+            let _ = auth.next_nonce.compare_exchange(
+                nonce.wrapping_add(1),
+                nonce,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Send a signed op and release its nonce if the Portal refuses it
+    /// without storing anything — every 4xx except `409`, see
+    /// [`Self::release_nonce`].
+    async fn send_signed_op(
+        &self,
+        request: reqwest::RequestBuilder,
+        nonce: u64,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let resp = request.send().await?;
+        let status = resp.status();
+        let nothing_stored = status.is_client_error() && status != reqwest::StatusCode::CONFLICT;
+        let result = check_response_status(resp, what).await;
+        if result.is_err() && nothing_stored {
+            self.release_nonce(nonce);
+        }
+        result
     }
 
     /// Read the current local nonce counter (test-only helper).
@@ -622,6 +790,11 @@ impl PortalClient {
     ///
     /// Returns `(hex_signature, nonce_used)`.
     fn sign_kontor_op(&self, expr: String) -> Result<(String, u64)> {
+        self.sign_kontor_call(self.contract_address.clone(), expr)
+    }
+
+    /// [`Self::sign_kontor_op`] against an explicit contract.
+    fn sign_kontor_call(&self, contract: String, expr: String) -> Result<(String, u64)> {
         let auth = self
             .auth
             .as_ref()
@@ -632,10 +805,7 @@ impl PortalClient {
         let claim = SignerRef::SignerId(auth.signer_id);
         let inst = Inst {
             gas_limit: DEFAULT_GAS_LIMIT,
-            kind: InstKind::Call {
-                contract: self.contract_address.clone(),
-                expr,
-            },
+            kind: InstKind::Call { contract, expr },
         };
 
         // `sponsored = false`: a node self-pays gas for its own calls. Only
@@ -671,12 +841,18 @@ impl PortalClient {
         let request =
             self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
 
-        let resp = request.body(body_bytes).send().await?;
-        let resp = check_response_status(resp, &format!("join agreement {agreement_id}")).await?;
-        let body = resp
+        let resp = self
+            .send_signed_op(
+                request.body(body_bytes),
+                nonce,
+                &format!("join agreement {agreement_id}"),
+            )
+            .await?;
+        let mut body = resp
             .json::<JoinAgreementResponse>()
             .await
             .context("failed to deserialize join response")?;
+        body.nonce = Some(nonce);
         Ok(body)
     }
 
@@ -844,14 +1020,84 @@ impl PortalClient {
         let request =
             self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
 
-        let resp = request.body(body_bytes).send().await?;
-        let resp =
-            check_response_status(resp, &format!("submit proof for challenge {challenge_id}"))
-                .await?;
+        let resp = self
+            .send_signed_op(
+                request.body(body_bytes),
+                nonce,
+                &format!("submit proof for challenge {challenge_id}"),
+            )
+            .await?;
         let body = resp
             .json::<SubmitProofResponse>()
             .await
             .context("failed to deserialize submit proof response")?;
+        Ok(body)
+    }
+}
+
+impl PortalClient {
+    /// Sign a staking or rewards op and hand it to the Portal's relay.
+    ///
+    /// `POST /api/nodes/{node_id}/ops` (contract §2), authenticated like a join.
+    /// Self-paid (`sponsored = false`) at [`DEFAULT_GAS_LIMIT`], exactly like
+    /// the node's other calls. A `202` only means the op is queued: whether it
+    /// executed is read back later from the registry entry — its nonce becomes
+    /// consumed, and the balance or stake it moved changes.
+    ///
+    /// # Errors
+    /// If the client is unauthenticated, the request fails, or the Portal
+    /// refuses the op (the [`HttpStatusError`](super::http_helpers::HttpStatusError)
+    /// carries the code, e.g. `BOND_CLEANUP_PENDING`).
+    pub async fn submit_node_op(&self, op: &NodeOp) -> Result<NodeOpResponse> {
+        let node_id = self
+            .node_id()
+            .ok_or_else(|| anyhow!("authentication required to submit a node op"))?
+            .to_string();
+
+        let (contract, expr) = op.contract_and_expr()?;
+        let contract = match contract {
+            OpContract::Staking => self.staking_contract_address.clone(),
+            OpContract::Filestorage => self.contract_address.clone(),
+        };
+        let (bls_signature, nonce) = self.sign_kontor_call(contract, expr)?;
+
+        let payload = NodeOpRequest {
+            op: op.name(),
+            amount: op.amount().map(|amount| amount.to_string()),
+            agreement_id: op.agreement_id().map(str::to_string),
+            bls_signature,
+            nonce,
+        };
+        let body_bytes =
+            serde_json::to_vec(&payload).context("failed to serialize node op request")?;
+
+        let url = self.api_path(&format!("/api/nodes/{}/ops", urlencoding::encode(&node_id)));
+        let request =
+            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
+
+        let resp = self
+            .send_signed_op(
+                request.body(body_bytes),
+                nonce,
+                &format!("submit {}", op.name()),
+            )
+            .await?;
+        let mut body = resp
+            .json::<NodeOpResponse>()
+            .await
+            .context("failed to deserialize node op response")?;
+        // What the node signed is the authority on which nonce the op holds; an
+        // echo that disagrees would be a Portal bug, not a reason to track the
+        // wrong one.
+        if body.nonce != Some(nonce) {
+            tracing::warn!(
+                op = op.name(),
+                signed = nonce,
+                echoed = ?body.nonce,
+                "the Portal echoed a different nonce for a node op"
+            );
+        }
+        body.nonce = Some(nonce);
         Ok(body)
     }
 }
@@ -980,6 +1226,20 @@ pub struct Agreement {
     /// the field omits it entirely: such agreements are still downloaded and
     /// served, only proof computation refuses to proceed without a slot.
     pub ledger_index: Option<u64>,
+    /// `agreement-data.required-collateral`: how much of the node's bonded
+    /// stake joining this agreement reserves, as a decimal string (contract
+    /// §4). Kontor refuses the join unless the unreserved stake covers it, and
+    /// a missed challenge on the agreement is slashed at 30× this amount.
+    ///
+    /// `None` until the Portal has reconciled the creating transaction — the
+    /// same lifecycle as `ledger_index` — and on a Portal predating staking.
+    #[serde(default)]
+    pub required_collateral: Option<String>,
+    /// `agreement-data.storage-weight`, the agreement's share of storage
+    /// rewards. Carried for the operator's benefit; nothing decides on it.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub storage_weight: Option<String>,
     #[allow(dead_code)]
     pub txid: Option<String>,
     #[allow(dead_code)]
@@ -998,6 +1258,11 @@ pub struct JoinAgreementResponse {
     pub agreement_id: Option<String>,
     #[allow(dead_code)]
     pub joined_at: Option<String>,
+    /// The nonce this node signed the join with. Filled in by the client, not
+    /// read from the Portal: it is what tells the daemon when the join has
+    /// executed and its collateral reservation shows up in the stake.
+    #[serde(skip)]
+    pub nonce: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1149,6 +1414,57 @@ pub struct RegistryEntry {
     pub next_nonce: u64,
     pub kor_balance: Option<String>,
     pub user_id: Option<String>,
+    /// Bonded stake in the staking contract, `"0"` when there is none.
+    ///
+    /// This and every field below are contract §3 additions, all optional: a
+    /// Portal predating staking omits them, and one that could not reach Kontor
+    /// may send `null`. Either way they read as "unknown", which the daemon
+    /// treats as "keep the pre-staking behaviour", never as zero. They stay
+    /// strings here so that a value the node cannot parse costs the staking
+    /// decision of one cycle rather than the nonce resync that rides on the
+    /// same request.
+    #[serde(default)]
+    pub stake: Option<String>,
+    /// `filestorage::get-node-reservation`: stake held by joined agreements.
+    #[serde(default)]
+    pub stake_reserved: Option<String>,
+    /// `max(stake − reserved, 0)`: what new joins can still reserve.
+    #[serde(default)]
+    pub stake_available: Option<String>,
+    /// Set once `begin-unstake` has executed: the height from which
+    /// `withdraw-stake` is allowed. Non-null means no more joins and no more
+    /// stake.
+    #[serde(default)]
+    pub stake_withdrawal_height: Option<u64>,
+    /// The stake was slashed to zero and Kontor is unwinding this node's
+    /// memberships; it can neither join nor add stake until that finishes.
+    #[serde(default)]
+    pub bond_cleanup_pending: Option<bool>,
+    /// Storage rewards claimable with `claim-rewards`.
+    #[serde(default)]
+    pub reward_balance: Option<String>,
+}
+
+/// Body of `POST /api/nodes/{node_id}/ops`.
+#[derive(Debug, Serialize)]
+struct NodeOpRequest {
+    op: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agreement_id: Option<String>,
+    bls_signature: String,
+    nonce: u64,
+}
+
+/// The relay's `202`: the op is queued, not executed.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeOpResponse {
+    pub op: String,
+    pub status: String,
+    #[serde(default)]
+    pub nonce: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1170,9 +1486,11 @@ pub struct FaucetResponse {
 mod tests {
     #![allow(deprecated)]
     use super::{
-        join_agreement_expr, verify_proof_expr, wave_string_literal, PortalClient,
-        DEFAULT_FILESTORAGE_CONTRACT,
+        join_agreement_expr, verify_proof_expr, wave_string_literal, NodeOp, OpContract,
+        PortalClient, RegistryEntry, DEFAULT_FILESTORAGE_CONTRACT, DEFAULT_STAKING_CONTRACT,
     };
+    use crate::clients::kontor_op::{build_signing_message, Inst, InstKind, SignerRef};
+    use crate::clients::kor::Kor;
     use crate::crypto::BlsKeyPair;
     use bytes::Bytes;
     use serde_json::json;
@@ -2365,5 +2683,405 @@ mod tests {
             err.to_string().contains("authentication required"),
             "expected auth error, got {err}"
         );
+    }
+
+    /// The relay rebuilds each op from its name alone (contract §2 table), so
+    /// the contract and expression here are what the Portal will verify the
+    /// signature against.
+    #[test]
+    fn node_ops_target_the_contracts_the_relay_rebuilds() {
+        let (contract, expr) = NodeOp::AddStake(Kor::parse("250.5").unwrap())
+            .contract_and_expr()
+            .unwrap();
+        assert!(matches!(contract, OpContract::Staking));
+        assert_eq!(
+            expr,
+            "add-stake({r0: 10692327041775828992, r1: 13, r2: 0, r3: 0, sign: plus})"
+        );
+
+        let (contract, expr) = NodeOp::BeginUnstake.contract_and_expr().unwrap();
+        assert!(matches!(contract, OpContract::Staking));
+        assert_eq!(expr, "begin-unstake()");
+
+        let (contract, expr) = NodeOp::WithdrawStake.contract_and_expr().unwrap();
+        assert!(matches!(contract, OpContract::Staking));
+        assert_eq!(expr, "withdraw-stake()");
+
+        let (contract, expr) = NodeOp::ClaimRewards.contract_and_expr().unwrap();
+        assert!(matches!(contract, OpContract::Filestorage));
+        assert_eq!(expr, "claim-rewards()");
+
+        assert_eq!(NodeOp::AddStake(Kor::ONE).name(), "add_stake");
+        assert_eq!(NodeOp::BeginUnstake.name(), "begin_unstake");
+        assert_eq!(NodeOp::WithdrawStake.name(), "withdraw_stake");
+        assert_eq!(NodeOp::ClaimRewards.name(), "claim_rewards");
+
+        let leave = NodeOp::LeaveAgreement("agr_7f-3c".into());
+        let (contract, expr) = leave.contract_and_expr().unwrap();
+        assert!(matches!(contract, OpContract::Filestorage));
+        assert_eq!(expr, "leave-agreement(\"agr_7f-3c\")");
+        assert_eq!(leave.name(), "leave_agreement");
+        assert_eq!(leave.agreement_id(), Some("agr_7f-3c"));
+        assert!(
+            NodeOp::LeaveAgreement("agr\", \"x".into())
+                .contract_and_expr()
+                .is_err(),
+            "an id that could break out of the literal is refused"
+        );
+    }
+
+    fn node_op_client(uri: &str, keypair: Arc<BlsKeyPair>, name: &str) -> PortalClient {
+        PortalClient::with_auth(
+            uri,
+            storage_dir(name),
+            keypair,
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            7,
+        )
+    }
+
+    /// The signature a correct client must produce for `expr` on `contract`:
+    /// the same bytes join and proofs are signed over, self-paid.
+    fn expected_signature(keypair: &BlsKeyPair, contract: &str, expr: &str, nonce: u64) -> String {
+        let inst = Inst {
+            gas_limit: 100_000,
+            kind: InstKind::Call {
+                contract: contract.to_string(),
+                expr: expr.to_string(),
+            },
+        };
+        let msg = build_signing_message(&SignerRef::SignerId(42), nonce, false, &inst).unwrap();
+        keypair.sign_kontor_op_message(&msg).unwrap()
+    }
+
+    async fn mount_ops_accepting(mock_server: &MockServer, op: &str) {
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(header_exists("Authorization"))
+            .and(header_exists("Content-Digest"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": op,
+                "status": "queued",
+                "nonce": 7
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn sent_body(mock_server: &MockServer) -> serde_json::Value {
+        let requests = mock_server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|r| r.url.path() == "/api/nodes/NODE-test/ops")
+            .expect("the op was posted");
+        serde_json::from_slice(&request.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn add_stake_is_signed_against_the_staking_contract_with_an_exact_amount() {
+        let mock_server = MockServer::start().await;
+        mount_ops_accepting(&mock_server, "add_stake").await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "add_stake");
+        let response = client
+            .submit_node_op(&NodeOp::AddStake(Kor::parse("250.50").unwrap()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, "queued");
+        assert_eq!(response.nonce, Some(7));
+        assert_eq!(client.current_nonce(), Some(8), "the op consumed nonce 7");
+
+        let body = sent_body(&mock_server).await;
+        assert_eq!(body["op"], "add_stake");
+        assert_eq!(
+            body["amount"], "250.5",
+            "canonical decimal string, never a float"
+        );
+        assert_eq!(body["nonce"], 7);
+        assert_eq!(
+            body["bls_signature"],
+            expected_signature(
+                &keypair,
+                DEFAULT_STAKING_CONTRACT,
+                "add-stake({r0: 10692327041775828992, r1: 13, r2: 0, r3: 0, sign: plus})",
+                7
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_rewards_is_a_filestorage_call_with_no_amount() {
+        let mock_server = MockServer::start().await;
+        mount_ops_accepting(&mock_server, "claim_rewards").await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "claim")
+            .with_contract_address("filestorage_9_1");
+        client.submit_node_op(&NodeOp::ClaimRewards).await.unwrap();
+
+        let body = sent_body(&mock_server).await;
+        assert_eq!(body["op"], "claim_rewards");
+        assert!(body.get("amount").is_none(), "{body}");
+        assert_eq!(
+            body["bls_signature"],
+            expected_signature(&keypair, "filestorage_9_1", "claim-rewards()", 7)
+        );
+    }
+
+    /// The staking address is configuration on both sides and part of the
+    /// signed bytes, so overriding it must change what is signed.
+    #[tokio::test]
+    async fn the_staking_address_override_is_what_gets_signed() {
+        let mock_server = MockServer::start().await;
+        mount_ops_accepting(&mock_server, "begin_unstake").await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "unstake")
+            .with_staking_contract_address("staking_4_2");
+        client.submit_node_op(&NodeOp::BeginUnstake).await.unwrap();
+
+        let body = sent_body(&mock_server).await;
+        assert_eq!(
+            body["bls_signature"],
+            expected_signature(&keypair, "staking_4_2", "begin-unstake()", 7)
+        );
+    }
+
+    /// A 4xx means the Portal kept nothing, so the nonce goes back: otherwise
+    /// every later op of the cycle would be one ahead and dropped. A 5xx is
+    /// ambiguous and keeps it consumed until the next resync.
+    #[tokio::test]
+    async fn a_refused_op_gives_its_nonce_back_and_an_ambiguous_one_does_not() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"op": "add_stake"}),
+            ))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": {"code": "BOND_CLEANUP_PENDING", "message": "cleanup", "status": 422}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"op": "claim_rewards"}),
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "refused");
+
+        let err = client
+            .submit_node_op(&NodeOp::AddStake(Kor::ONE))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::clients::http_helpers::status_and_code(&err),
+            Some((422, Some("BOND_CLEANUP_PENDING".to_string())))
+        );
+        assert_eq!(client.current_nonce(), Some(7), "refused: nonce released");
+
+        client
+            .submit_node_op(&NodeOp::ClaimRewards)
+            .await
+            .unwrap_err();
+        assert_eq!(client.current_nonce(), Some(8), "5xx: nonce stays consumed");
+    }
+
+    #[tokio::test]
+    async fn submit_node_op_requires_authentication() {
+        let client = PortalClient::new("http://localhost:1234", storage_dir("op_no_auth"));
+        let err = client
+            .submit_node_op(&NodeOp::ClaimRewards)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("authentication required"), "{err}");
+    }
+
+    /// Same release for a join the Portal turns down at its pre-check (§5),
+    /// which the daemon now survives instead of aborting the cycle.
+    #[tokio::test]
+    async fn a_join_refused_for_collateral_releases_its_nonce() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": {"code": "INSUFFICIENT_COLLATERAL", "message": "no", "status": 422}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "join_refused");
+        client.join_agreement("AGR-1").await.unwrap_err();
+        assert_eq!(client.current_nonce(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_created_join_reports_the_nonce_it_was_signed_with() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "node_id": "NODE-test",
+                "created": true,
+                "nonce": 999
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "join_nonce");
+        let response = client.join_agreement("AGR-1").await.unwrap();
+        assert_eq!(
+            response.nonce,
+            Some(7),
+            "what was signed, not what was echoed"
+        );
+    }
+
+    /// A Portal predating staking sends none of the §3 fields; one that is
+    /// current sends all of them. Both must deserialize, and the new fields stay
+    /// strings so a strange value cannot break the nonce resync.
+    #[test]
+    fn registry_entry_reads_with_and_without_the_stake_fields() {
+        let old: RegistryEntry = serde_json::from_value(json!({
+            "signer_id": 42,
+            "x_only_pubkey": "ab",
+            "bls_pubkey": null,
+            "next_nonce": 3,
+            "kor_balance": "10"
+        }))
+        .unwrap();
+        assert_eq!(old.stake, None);
+        assert_eq!(old.bond_cleanup_pending, None);
+
+        let new: RegistryEntry = serde_json::from_value(json!({
+            "signer_id": 42,
+            "x_only_pubkey": "ab",
+            "bls_pubkey": null,
+            "next_nonce": 3,
+            "kor_balance": "5",
+            "stake": "995",
+            "stake_reserved": "30.5",
+            "stake_available": "964.5",
+            "stake_withdrawal_height": null,
+            "bond_cleanup_pending": false,
+            "reward_balance": "not-a-number"
+        }))
+        .unwrap();
+        assert_eq!(new.stake.as_deref(), Some("995"));
+        assert_eq!(new.stake_reserved.as_deref(), Some("30.5"));
+        assert_eq!(new.stake_available.as_deref(), Some("964.5"));
+        assert_eq!(new.stake_withdrawal_height, None);
+        assert_eq!(new.bond_cleanup_pending, Some(false));
+        assert_eq!(new.reward_balance.as_deref(), Some("not-a-number"));
+    }
+
+    #[tokio::test]
+    async fn agreements_carry_the_collateral_they_require() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 2,
+                "agreements": [
+                    {
+                        "agreement_id": "AGR-known", "user_id": "u", "file_id": "F1",
+                        "filename": "a", "mime_type": "x", "original_size": 1,
+                        "nodes": [], "transaction_id": null, "status": "ready",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "required_collateral": "12.5", "storage_weight": "1"
+                    },
+                    {
+                        "agreement_id": "AGR-legacy", "user_id": "u", "file_id": "F2",
+                        "filename": "b", "mime_type": "x", "original_size": 1,
+                        "nodes": [], "transaction_id": null, "status": "ready",
+                        "created_at": "2024-01-01T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::new(mock_server.uri(), storage_dir("collateral"));
+        let agreements = client.get_new_agreements().await.unwrap();
+        assert_eq!(agreements[0].required_collateral.as_deref(), Some("12.5"));
+        assert_eq!(agreements[0].storage_weight.as_deref(), Some("1"));
+        assert_eq!(agreements[1].required_collateral, None);
+    }
+
+    #[tokio::test]
+    async fn leave_agreement_names_the_agreement_and_signs_the_filestorage_call() {
+        let mock_server = MockServer::start().await;
+        mount_ops_accepting(&mock_server, "leave_agreement").await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), Arc::clone(&keypair), "leave");
+        client
+            .submit_node_op(&NodeOp::LeaveAgreement("agr_1".into()))
+            .await
+            .unwrap();
+
+        let body = sent_body(&mock_server).await;
+        assert_eq!(body["op"], "leave_agreement");
+        assert_eq!(body["agreement_id"], "agr_1");
+        assert!(body.get("amount").is_none(), "{body}");
+        assert_eq!(
+            body["bls_signature"],
+            expected_signature(
+                &keypair,
+                DEFAULT_FILESTORAGE_CONTRACT,
+                "leave-agreement(\"agr_1\")",
+                7
+            )
+        );
+    }
+
+    /// `409 CONFLICT` is the one 4xx after which the Portal holds something:
+    /// another op of this node already has that nonce. Releasing it would sign
+    /// the next op at the same, taken, nonce.
+    #[tokio::test]
+    async fn a_conflict_keeps_the_nonce_consumed() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "CONFLICT", "message": "nonce 7 is taken", "status": 409}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "CONFLICT", "message": "taken", "status": 409}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "conflict");
+
+        let err = client
+            .submit_node_op(&NodeOp::ClaimRewards)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::clients::http_helpers::status_and_code(&err),
+            Some((409, Some("CONFLICT".to_string())))
+        );
+        assert_eq!(client.current_nonce(), Some(8), "409: the nonce is taken");
+
+        client.join_agreement("AGR-1").await.unwrap_err();
+        assert_eq!(client.current_nonce(), Some(9), "same rule for a join");
     }
 }
