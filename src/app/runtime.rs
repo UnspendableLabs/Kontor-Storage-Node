@@ -1694,6 +1694,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Migrate { action },
         }
     }
