@@ -102,11 +102,9 @@ pub enum NodeOp {
     AddStake(Kor),
     /// `staking::begin-unstake()`: start the withdrawal delay. The node can no
     /// longer join agreements, nor add stake, until it has withdrawn.
-    #[allow(dead_code)] // requested from /admin, wired later
     BeginUnstake,
     /// `staking::withdraw-stake()`: take the whole bond back once the delay has
     /// elapsed and no storage obligation is left.
-    #[allow(dead_code)] // requested from /admin, wired later
     WithdrawStake,
     /// `filestorage::claim-rewards()`: move accrued storage rewards into the
     /// node's spendable balance, where auto-stake can pick them up.

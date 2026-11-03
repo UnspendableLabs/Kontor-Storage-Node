@@ -341,6 +341,35 @@
     <div class="row"><span class="k">Last event</span><span id="staking-event" class="trunc">—</span></div>
   </div>
 
+  <div class="card danger-zone" id="exit">
+    <h2>Withdraw the collateral</h2>
+    <div class="msg err" id="exit-error"></div>
+    <div class="msg ok" id="exit-success"></div>
+    <p>
+      For a node that is leaving. <strong>Begin unstake</strong> starts Kontor's
+      withdrawal delay (about two weeks of blocks): from the moment it executes
+      this node joins no new agreement and bonds no more stake. The agreements it
+      already holds still have to be proved until they end, and a missed proof is
+      still slashed.
+    </p>
+    <p class="muted">
+      <strong>Withdraw</strong> returns the whole bond once the delay has passed
+      and no agreement or open challenge holds any of it; Kontor refuses it before
+      then. Neither is signed by this page: the request is queued and the daemon
+      signs it on its next cycle.
+    </p>
+    <form id="exit-form" class="stack">
+      <label class="muted" for="exit-action">Action</label>
+      <select id="exit-action">
+        <option value="begin_unstake" data-phrase="UNSTAKE">Begin unstake</option>
+        <option value="withdraw_stake" data-phrase="WITHDRAW">Withdraw the bond</option>
+      </select>
+      <label class="muted" for="exit-confirm">Type <code id="exit-phrase">UNSTAKE</code> to confirm</label>
+      <input type="text" id="exit-confirm" placeholder="UNSTAKE" autocomplete="off">
+      <button class="danger" type="submit" id="exit-submit" disabled>Queue it</button>
+    </form>
+  </div>
+
   <div class="card danger-zone">
     <h2>Reset the database</h2>
     <div class="msg err" id="reset-error"></div>
@@ -1135,6 +1164,43 @@
 
   /* ---------------- reset ---------------- */
 
+  /* ---------------- unstake / withdraw ---------------- */
+
+  function exitPhrase() {
+    var select = $("exit-action");
+    return select.options[select.selectedIndex].getAttribute("data-phrase");
+  }
+
+  function syncExitPhrase() {
+    var phrase = exitPhrase();
+    $("exit-phrase").textContent = phrase;
+    $("exit-confirm").placeholder = phrase;
+    $("exit-submit").disabled = $("exit-confirm").value !== phrase;
+  }
+
+  function requestStakeAction(event) {
+    event.preventDefault();
+    var action = $("exit-action").value;
+    var warning = action === "begin_unstake"
+      ? "Begin the unstake? This node will stop taking on agreements for good."
+      : "Withdraw the whole bond? Kontor refuses it while any agreement still holds collateral.";
+    if (!window.confirm(warning)) { return; }
+
+    $("exit-submit").disabled = true;
+    api("/api/admin/stake", {
+      method: "POST",
+      body: { action: action, confirm: $("exit-confirm").value }
+    }).then(function (result) {
+      show($("exit-success"), result.message || "Queued", true);
+      $("exit-confirm").value = "";
+      syncExitPhrase();
+      loadStatus();
+    }).catch(function (error) {
+      report($("exit-error"), error);
+      syncExitPhrase();
+    });
+  }
+
   function resetDatabase(event) {
     event.preventDefault();
     var deleteFiles = $("reset-delete-files").checked;
@@ -1518,6 +1584,10 @@
   $("reset-form").addEventListener("submit", resetDatabase);
   $("register-submit").addEventListener("click", registerNode);
   $("whitelist-form").addEventListener("submit", submitWhitelist);
+
+  $("exit-form").addEventListener("submit", requestStakeAction);
+  $("exit-action").addEventListener("change", syncExitPhrase);
+  $("exit-confirm").addEventListener("input", syncExitPhrase);
 
   $("reset-confirm").addEventListener("input", function () {
     $("reset-submit").disabled = this.value !== CONFIRMATION_PHRASE;

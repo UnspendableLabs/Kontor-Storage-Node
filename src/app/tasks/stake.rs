@@ -446,7 +446,6 @@ impl StakeTracker {
     /// # Errors
     /// If `op` is not one an operator may request, or another request is
     /// already waiting.
-    #[allow(dead_code)] // the /admin actions that call it come later
     pub fn request(&self, op: NodeOp) -> Result<(), &'static str> {
         if !matches!(op, NodeOp::BeginUnstake | NodeOp::WithdrawStake) {
             return Err("only an unstake or a withdrawal can be requested");
