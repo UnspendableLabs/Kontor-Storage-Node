@@ -1,4 +1,4 @@
-use crate::app::tasks::computeproofs::compute_and_submit_proofs;
+use crate::app::tasks::computeproofs::{compute_and_submit_proofs, ProofRetries};
 use crate::app::tasks::downloadagreements::{
     download_agreements_gated, rebuild_ledger, StorageBackend,
 };
@@ -37,6 +37,9 @@ pub(crate) struct DaemonMemory {
     /// with `/admin`, and with the onboarding step that queued the first
     /// top-up before this daemon started.
     pub staking: Arc<StakeTracker>,
+    /// How often each challenge has been proved, so a proof Kontor keeps
+    /// rejecting is not recomputed every cycle until its deadline.
+    pub proofs: ProofRetries,
 }
 
 /// Starts the portal synchronization daemon that periodically fetches agreements
@@ -86,7 +89,10 @@ async fn run_portal_daemon(
     storage_dir: PathBuf,
     staking: Arc<StakeTracker>,
 ) -> Result<()> {
-    let memory = DaemonMemory { staking };
+    let memory = DaemonMemory {
+        staking,
+        proofs: ProofRetries::default(),
+    };
 
     // Ensure only a single daemon instance runs at a time.
     let _lock =
@@ -160,8 +166,8 @@ async fn run_portal_daemon(
 ///
 /// The order is the point: the stake is read first, because every join
 /// decision of the cycle is made against it; agreements are taken on next;
-/// proofs come after, so a refused join never costs one; and the stake op
-/// goes out last, holding the highest nonce of the cycle — if it
+/// proofs come after, so a full node or a refused join never costs one; and
+/// the stake op goes out last, holding the highest nonce of the cycle — if it
 /// ever collides with another op on a nonce it is the one that loses, and a
 /// lost top-up is retried next cycle where a lost proof is a slash.
 async fn sync_portal_once(
@@ -172,15 +178,19 @@ async fn sync_portal_once(
     storage_dir: &std::path::Path,
     memory: &DaemonMemory,
 ) -> Result<()> {
-    if let Some(max_files) = storage_limits.max_files {
-        let downloaded = downloaded_files_count(database).await?;
-        if downloaded >= max_files {
+    // A node at its file limit takes on nothing new, but keeps proving what it
+    // already stores: skipping the whole cycle here used to mean every
+    // challenge on a full node expired, and an expired challenge is now
+    // slashed at 30× the agreement's collateral.
+    let at_file_limit = match storage_limits.max_files {
+        Some(max_files) if downloaded_files_count(database).await? >= max_files => {
             info!(
                 "Max stored files limit ({max_files}) reached; skipping agreement fetch and downloads"
             );
-            return Ok(());
+            true
         }
-    }
+        _ => false,
+    };
 
     // Resync the nonce from Kontor's registry at the start of every cycle so
     // that the local counter always reflects the confirmed on-chain state before
@@ -212,25 +222,27 @@ async fn sync_portal_once(
         .context("reconciling agreements with Portal")?;
     }
 
-    let listing = sync_ready_agreements(portal_client, database)
+    if !at_file_limit {
+        let listing = sync_ready_agreements(portal_client, database)
+            .await
+            .context("fetching new agreements failed")?;
+        let mut budget = if portal_client.node_id().is_some() {
+            memory.staking.join_budget(Instant::now())
+        } else {
+            JoinBudget::unmetered()
+        };
+        download_agreements_gated(
+            portal_client,
+            database,
+            storage_limits,
+            storage_backend,
+            &listing,
+            &mut budget,
+            Some(&memory.staking),
+        )
         .await
-        .context("fetching new agreements failed")?;
-    let mut budget = if portal_client.node_id().is_some() {
-        memory.staking.join_budget(Instant::now())
-    } else {
-        JoinBudget::unmetered()
-    };
-    download_agreements_gated(
-        portal_client,
-        database,
-        storage_limits,
-        storage_backend,
-        &listing,
-        &mut budget,
-        Some(&memory.staking),
-    )
-    .await
-    .context("downloading agreements failed")?;
+        .context("downloading agreements failed")?;
+    }
 
     failed_count += sync_active_challenges(portal_client, database)
         .await
@@ -249,9 +261,15 @@ async fn sync_portal_once(
         warn!("rebuilding the file ledger failed, proofs may be skipped this cycle: {err:#}");
     }
 
-    compute_and_submit_proofs(portal_client, database, storage_backend, storage_dir)
-        .await
-        .context("computing and submitting proofs failed")?;
+    compute_and_submit_proofs(
+        portal_client,
+        database,
+        storage_backend,
+        storage_dir,
+        &memory.proofs,
+    )
+    .await
+    .context("computing and submitting proofs failed")?;
 
     if failed_count > 0 {
         if let Err(e) = portal_client.resync_nonce().await {
@@ -625,7 +643,7 @@ mod tests {
 
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
-    use crate::testutils::{setup_in_memory_db, unique_test_path};
+    use crate::testutils::{setup_in_memory_db, unique_test_path, AgreementFixture};
     use chrono::DateTime;
     use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
     use serde_json::json;
@@ -1270,6 +1288,64 @@ mod tests {
             })))
             .mount(mock_server)
             .await;
+    }
+
+    /// A full node used to skip its whole cycle, proofs included — and every
+    /// challenge it then missed is now slashed at 30× the collateral. At the
+    /// limit it stops taking on agreements and keeps proving.
+    #[tokio::test]
+    async fn a_node_at_its_file_limit_still_syncs_its_challenges() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42, "x_only_pubkey": "abcd", "bls_pubkey": null, "next_nonce": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        AgreementFixture {
+            downloaded: true,
+            ..AgreementFixture::new("AGR-full", "FILE-full")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let storage_dir = unique_test_path("daemon_full_node");
+        fs::create_dir_all(&storage_dir).ok();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits {
+                max_files: Some(1),
+                ..StorageLimits::default()
+            },
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path() == "/api/nodes/NODE-test/challenges"),
+            "challenges must still be synced at the file limit"
+        );
     }
 
     /// The registry entry of a new node the faucet just funded.
