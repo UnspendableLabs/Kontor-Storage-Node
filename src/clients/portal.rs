@@ -358,7 +358,11 @@ impl PortalClient {
     ///
     /// Only rolls back if nothing was signed since, so it can never hand out a
     /// nonce twice. Network errors and 5xx do not come here: whether the Portal
-    /// kept the op is unknown, and the next cycle's resync settles it.
+    /// kept the op is unknown, and the next cycle's resync settles it. Nor does
+    /// `409 CONFLICT`, the one 4xx after which something *is* stored: the
+    /// Portal already holds a different op of this node at that nonce, so the
+    /// nonce is taken and handing it out again would only collide a second
+    /// time.
     fn release_nonce(&self, nonce: u64) {
         if let Some(auth) = &self.auth {
             let _ = auth.next_nonce.compare_exchange(
@@ -370,7 +374,9 @@ impl PortalClient {
         }
     }
 
-    /// Send a signed op and release its nonce if the Portal refuses it.
+    /// Send a signed op and release its nonce if the Portal refuses it
+    /// without storing anything — every 4xx except `409`, see
+    /// [`Self::release_nonce`].
     async fn send_signed_op(
         &self,
         request: reqwest::RequestBuilder,
@@ -378,9 +384,10 @@ impl PortalClient {
         what: &str,
     ) -> Result<reqwest::Response> {
         let resp = request.send().await?;
-        let client_error = resp.status().is_client_error();
+        let status = resp.status();
+        let nothing_stored = status.is_client_error() && status != reqwest::StatusCode::CONFLICT;
         let result = check_response_status(resp, what).await;
-        if result.is_err() && client_error {
+        if result.is_err() && nothing_stored {
             self.release_nonce(nonce);
         }
         result
@@ -2971,5 +2978,43 @@ mod tests {
         assert_eq!(agreements[0].required_collateral.as_deref(), Some("12.5"));
         assert_eq!(agreements[0].storage_weight.as_deref(), Some("1"));
         assert_eq!(agreements[1].required_collateral, None);
+    }
+
+    /// `409 CONFLICT` is the one 4xx after which the Portal holds something:
+    /// another op of this node already has that nonce. Releasing it would sign
+    /// the next op at the same, taken, nonce.
+    #[tokio::test]
+    async fn a_conflict_keeps_the_nonce_consumed() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "CONFLICT", "message": "nonce 7 is taken", "status": 409}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "CONFLICT", "message": "taken", "status": 409}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "conflict");
+
+        let err = client
+            .submit_node_op(NodeOp::ClaimRewards)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::clients::http_helpers::status_and_code(&err),
+            Some((409, Some("CONFLICT".to_string())))
+        );
+        assert_eq!(client.current_nonce(), Some(8), "409: the nonce is taken");
+
+        client.join_agreement("AGR-1").await.unwrap_err();
+        assert_eq!(client.current_nonce(), Some(9), "same rule for a join");
     }
 }
