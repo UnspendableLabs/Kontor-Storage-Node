@@ -63,6 +63,15 @@ The node can be configured via command-line arguments or environment variables:
 | _(env only, deprecated)_ | `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT` | `0` | Only consulted on the `KONTOR_STORAGE_MNEMONIC` path. A node set up through the wizard needs no such override: it commits to one account once, having shown you the address it derived. |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset_ | Overrides the password chosen through `/admin`, and is the recovery path if it is forgotten. At least 16 characters. Leaving it unset is the normal case: the node mints a setup token instead. See [First-run setup](#first-run-setup). |
 | `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
+| `--kontor-staking-contract-address` | `KONTOR_STAKING_CONTRACT_ADDRESS` | `staking_0_0` | Kontor address of the staking contract the node bonds its collateral in. **Must match the Portal's own `KONTOR_STAKING_CONTRACT_ADDRESS`**, for the same reason: it is part of every signed stake op. |
+| `--auto-stake` | `KONTOR_STORAGE_AUTO_STAKE` | `true` | Bond spare KOR as collateral and claim storage rewards automatically. `false` (also `0`, `no`, `off`) makes the node sign no stake or claim op on its own. See [Staking & collateral](#staking--collateral). |
+| `--gas-reserve-kor` | `KONTOR_STORAGE_GAS_RESERVE_KOR` | `5` | KOR kept liquid to pay the fees of the node's own joins and proofs. Never bonded. `0` bonds everything. |
+| `--stake-target-kor` | `KONTOR_STORAGE_STAKE_TARGET_KOR` | _unset_ | Cap on the total bonded stake. Unset bonds everything above the gas reserve. |
+| `--faucet-amount-kor` | `KONTOR_STORAGE_FAUCET_AMOUNT_KOR` | `1000` | KOR requested from the Portal faucet when the node starts with an empty balance. The Portal caps it (`PORTAL_FAUCET_MAX_AMOUNT_KOR`); a node asking for more is told the cap and asks again for exactly that. |
+| `--claim-threshold-kor` | `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` | `1` | Claim storage rewards once at least this much is claimable (at most once an hour). |
+
+All KOR amounts are exact decimals with up to 18 fractional digits (`2.5`,
+`0.000000000000000001`); exponents and signs are refused rather than rounded.
 
 
 You can also create a `.env.local` file in the project root; it is loaded automatically if present and provides the same environment variables as the table above. Example:
@@ -92,7 +101,7 @@ STORAGE_GCS_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
 
 The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits apply in both `local` and `gcs` modes to respect quotas (for example, free tiers) even when files are stored remotely (uploaded to GCS).
 
-When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit.
+When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit — and keeps proving the ones it holds: a missed challenge is slashed.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
 
 ### First-run setup
@@ -466,6 +475,90 @@ Each node also records the identity it came up with in
 "the Portal forgot me" rather than "this account was never right", which is what
 lets every node of a multi-node deployment recover unattended from a Portal reset
 rather than only the one that restarted first.
+
+### Staking & collateral
+
+Kontor will not let a node store anything it has not put money behind. Joining
+an agreement requires a **bonded stake** in the `staking` contract whose
+*unreserved* part covers the agreement's `required_collateral`; the join then
+reserves that amount until the membership ends. Every challenge the node fails
+to answer before its deadline is settled by **slashing 30 × the agreement's
+collateral** from the stake.
+
+#### What the node does on its own
+
+Each sync cycle the node reads its bond from the Portal (`GET
+/api/signers/{signer_id}` — the same request that resyncs its nonce) and:
+
+1. **Bonds spare KOR.** If at least 1 KOR sits above the gas reserve
+   (`KONTOR_STORAGE_GAS_RESERVE_KOR`, 5 by default) it signs
+   `add-stake(min(free, target − stake))` and hands it to the Portal, which
+   publishes it like a join. A fresh node does this right after the faucet funds
+   it — 1000 KOR by default, so 995 bonded — before it looks at any agreement.
+2. **Joins only what the bond covers.** Before downloading a ready agreement it
+   checks the agreement's collateral against the unreserved stake, less what
+   this cycle and still-unexecuted earlier joins have already committed. An
+   agreement whose collateral the Portal does not know yet is left for a later
+   cycle. Nothing it cannot join is downloaded.
+3. **Claims rewards** once `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` (1 KOR) is
+   claimable, at most hourly, so the next cycle bonds them.
+
+The node sends **one** stake or claim op at a time. The Portal only answers
+"queued", so the node learns that an op ran from its nonce: once Kontor's
+`next_nonce` moves past it, the op has executed, and the next decision is made
+from the balance and stake the Portal then reports. An op that is never
+reflected is given up after 30 minutes and decided again. The stake op is the
+last thing a cycle signs, so it never takes a nonce a proof needed.
+
+The gas reserve is not optional in spirit: the node pays its own fees, and a
+node with nothing liquid cannot submit proofs — which is the expensive way to
+run out of money. Set `KONTOR_STORAGE_AUTO_STAKE=false` to manage the bond by
+hand; joins are still gated on whatever stake there is.
+
+Against a Portal that predates staking (its signer entry reports no stake) the
+node behaves as it always did: no stake ops, no gating. Once a Portal *has*
+reported a stake, a cycle in which it cannot be read joins nothing.
+
+#### Slashing risk
+
+A miss costs 30 × the agreement's collateral, so a node holding many agreements
+can lose its whole bond to a short outage. The node defends what it can:
+
+- proofs run every cycle, including on a node at `STORAGE_MAX_FILES` or one
+  whose join was just refused, nearest deadline first;
+- a proof Kontor rejects leaves the challenge open, and the node proves it again
+  — up to 5 times, 1 to 16 minutes apart — before giving up loudly on a proof
+  that is evidently wrong;
+- a refused join (`422` from the Portal) no longer fails the cycle; joins pause
+  for 10 minutes instead.
+
+It cannot defend against being down, against a file it lost, or against the
+[ledger limitation](#the-aggregated-ledger) below, which stops every proof at
+once. `GET /api/admin/status` and the **Collateral** card in `/admin` show the
+bond as the daemon last read it; a drop in stake is logged at `ERROR` as a
+slash.
+
+#### Bond cleanup, and coming back from it
+
+If slashing takes the stake to zero, Kontor puts the node in **bond cleanup**:
+it stops its rewards, settles its open challenges and removes it from its
+agreements, a bounded amount of work per block. Until that finishes the node
+can **neither join nor add stake** — Kontor refuses both, so the node does not
+try. `/admin` says so, and the log says so once when it starts.
+
+Nothing needs doing while it runs. When cleanup clears, the next cycle sees an
+empty bond with KOR above the reserve (fund the node again if the faucet will
+not), stakes it, and starts joining as a new node would. Before that, find out
+why challenges were missed — a node slashed into cleanup once will be again.
+
+#### Leaving
+
+`/admin` → **Withdraw the collateral** queues `begin-unstake` or
+`withdraw-stake` for the daemon to sign (type `UNSTAKE` / `WITHDRAW` to
+confirm). An unstake starts Kontor's withdrawal delay (about two weeks of
+blocks) and stops every new join and top-up for good, but the node must keep
+proving what it holds. The withdrawal succeeds only once the delay has passed
+and no agreement or open challenge holds any of the bond.
 
 ### Download and preparation pipeline
 
