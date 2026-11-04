@@ -37,9 +37,12 @@
 //! that executed and failed, or that lost its nonce to another op, also
 //! consumes it. That is fine because every decision here is recomputed from the
 //! state the Portal reports — if a top-up did not happen, the balance is still
-//! there next cycle and a new one is sent. What the in-flight rule prevents is
-//! the other failure: re-sending the same 995 KOR every 30 seconds while the
-//! first one waits for a block.
+//! there next cycle and a new one is sent, after the same hour's pause a
+//! refusal earns: a top-up Kontor refused for a reason neither the snapshot
+//! nor the Portal's pre-check saw would otherwise be signed again every cycle,
+//! burning gas each block. What the in-flight rule prevents is the other
+//! failure: re-sending the same 995 KOR every 30 seconds while the first one
+//! waits for a block.
 //!
 //! An op the Portal accepted and then dropped would never consume its nonce,
 //! so an op that has waited [`OP_LANDING_CHECK_INTERVAL`] is looked up in the
@@ -669,6 +672,28 @@ impl StakeTracker {
             Some(NodeOp::LeaveAgreement(agreement_id)) => {
                 info!("left agreement {agreement_id}");
                 state.left.insert(agreement_id.clone());
+            }
+            Some(op @ NodeOp::AddStake(amount))
+                if state
+                    .last_known
+                    .as_ref()
+                    .is_some_and(|previous| snapshot.stake <= previous.stake) =>
+            {
+                // Its nonce went, its KOR did not: Kontor refused it for a
+                // reason the snapshot and the Portal's pre-check did not see,
+                // or another op took the nonce. The same op signed again next
+                // cycle meets the same answer, and each attempt costs gas, so
+                // it waits as long as one the Portal refused.
+                warn!(
+                    "add-stake of {amount} KOR executed without raising the bond; not signing \
+                     it again for {} hour",
+                    REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
+                );
+                state.refused.insert(refused_key(op), now);
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("add_stake {amount} KOR executed without raising the bond"),
+                ));
             }
             Some(NodeOp::WithdrawStake) if !snapshot.stake.is_zero() => {
                 // Executed, and the bond is still there: too early, or an
@@ -1947,10 +1972,12 @@ mod tests {
         assert_eq!(tracker.plan(t0 + Duration::from_secs(60), None), None);
     }
 
-    /// An op that consumed its nonce without moving the balance — it failed on
-    /// chain, or lost the nonce to another op — is simply planned again.
+    /// An op that consumed its nonce without raising the bond — it failed on
+    /// chain, or lost the nonce to another op — is planned again, but only
+    /// after the hour a refusal earns: re-planned every cycle, it would burn
+    /// gas each block for as long as Kontor keeps refusing it.
     #[test]
-    fn a_top_up_that_did_not_happen_is_planned_again() {
+    fn a_top_up_that_landed_without_raising_the_bond_waits_an_hour() {
         let tracker = StakeTracker::new(StakePolicy::default());
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
@@ -1958,11 +1985,32 @@ mod tests {
 
         let mut consumed = entry(Some("0"), Some("0"));
         consumed.next_nonce = 12;
-        observed(&tracker, &consumed, t0 + Duration::from_secs(30));
+        let soon = t0 + Duration::from_secs(30);
+        observed(&tracker, &consumed, soon);
+        assert_eq!(tracker.plan(soon, None), None, "not re-signed next cycle");
+        let message = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("without raising the bond"), "{message}");
+
+        let later = soon + REFUSED_OP_RETRY_INTERVAL;
+        observed(&tracker, &consumed, later);
         assert_eq!(
-            tracker.plan(t0 + Duration::from_secs(30), None),
+            tracker.plan(later, None),
             Some(NodeOp::AddStake(kor("995")))
         );
+
+        // One that did raise the bond, even by less than it asked, is not a
+        // refusal: the rest is planned again at once.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+        let mut partial = entry(Some("500"), Some("500"));
+        partial.next_nonce = 11;
+        partial.kor_balance = Some("500".into());
+        observed(&tracker, &partial, soon);
+        assert_eq!(tracker.plan(soon, None), Some(NodeOp::AddStake(kor("495"))));
     }
 
     fn listed_op(op: &str, nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
