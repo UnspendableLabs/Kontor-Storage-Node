@@ -221,9 +221,10 @@ fn check_storage_limits(
 /// staking upgrade a missed proof is slashed. The cost of this order is a
 /// download wasted when the join is refused, which the join budget keeps rare.
 ///
-/// Idempotent — the Portal answers `created: false` for a membership it already
-/// has. Returns `None` for an unauthenticated client (legacy tests), which has
-/// nothing to sign with.
+/// Only for an agreement the node has no row in: the Portal answers
+/// `created: false` for one it has, storing nothing, so signing that join would
+/// only spend a nonce. Returns `None` for an unauthenticated client (legacy
+/// tests), which has nothing to sign with.
 async fn join_downloaded_agreement(
     portal_client: &PortalClient,
     agreement: &agreements::Model,
@@ -255,35 +256,75 @@ async fn join_downloaded_agreement(
     Ok(Some(join_response))
 }
 
-/// Whether this node already holds a membership in `agreement`, by the local
-/// row or by this cycle's listing.
+/// What this node's row in an agreement says, by the local row or by this
+/// cycle's listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    /// No row: the agreement is still to be joined.
+    None,
+    /// A membership the node holds, or whose join is on its way: an obligation
+    /// to store the file, which a challenge will slash it for not having.
+    Held,
+    /// A row that is over — the join failed or was invalidated, or the node
+    /// left. Nothing is owed, and the Portal answers a second join with
+    /// `created: false` without storing it, so none is signed.
+    Ended,
+}
+
+/// Statuses of a node's row in an agreement that are not a membership.
+const ENDED_MEMBERSHIP: [&str; 3] = ["failed", "invalid", "left"];
+
+/// Whether this node has a row in `agreement`, and whether it is still live.
 ///
-/// Both are looked at because each lags in its own way: the local `nodes` is
-/// refreshed by reconciliation, which only lists agreements the node is in,
-/// and the listing is current but only covers agreements still ready. Old rows
-/// store bare node-id strings rather than `{node_id, status}` objects, so both
-/// shapes count.
-fn holds_membership(
+/// Both the local row and the listing are looked at because each lags in its
+/// own way: the local `nodes` is refreshed by reconciliation, which only lists
+/// agreements the node is in, and the listing is current but only covers
+/// agreements still ready. Old rows store bare node-id strings rather than
+/// `{node_id, status}` objects; those count as held.
+fn membership(
     agreement: &agreements::Model,
     listed: Option<&crate::clients::portal::Agreement>,
     node_id: Option<&str>,
-) -> bool {
+) -> Membership {
     let Some(node_id) = node_id else {
-        return false;
+        return Membership::None;
     };
-    let in_local = agreement.nodes.as_array().is_some_and(|nodes| {
-        nodes.iter().any(|node| {
-            node.as_str() == Some(node_id)
-                || node.get("node_id").and_then(|id| id.as_str()) == Some(node_id)
+    let mut statuses: Vec<Option<&str>> = agreement
+        .nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            if node.as_str() == Some(node_id) {
+                Some(None)
+            } else if node.get("node_id").and_then(|id| id.as_str()) == Some(node_id) {
+                Some(Some(
+                    node.get("status").and_then(|s| s.as_str()).unwrap_or(""),
+                ))
+            } else {
+                None
+            }
         })
-    });
-    let in_listing = listed.is_some_and(|listed| {
-        listed
-            .nodes
-            .iter()
-            .any(|node: &AgreementNode| node.node_id == node_id)
-    });
-    in_local || in_listing
+        .collect();
+    if let Some(listed) = listed {
+        statuses.extend(
+            listed
+                .nodes
+                .iter()
+                .filter(|node: &&AgreementNode| node.node_id == node_id)
+                .map(|node| Some(node.status.as_str())),
+        );
+    }
+    if statuses.is_empty() {
+        Membership::None
+    } else if statuses
+        .iter()
+        .any(|status| status.is_none_or(|status| !ENDED_MEMBERSHIP.contains(&status)))
+    {
+        Membership::Held
+    } else {
+        Membership::Ended
+    }
 }
 
 /// Store an agreement file to the configured storage backend and update the database.
@@ -416,12 +457,19 @@ pub async fn download_agreements(
 /// Download agreement files that are not yet stored locally.
 ///
 /// This function orchestrates the download workflow:
-/// 1. Queries for pending agreements respecting storage limits
-/// 2. For each agreement, checks storage limits, then whether the stake can
-///    cover joining it (`budget`, from this cycle's `listing`)
-/// 3. Downloads the file and joins the agreement on Portal
+/// 1. Queries for pending agreements, memberships the node already holds first
+/// 2. For each agreement it does not hold yet, checks storage limits, then
+///    whether the stake can cover joining it (`budget`, from this cycle's
+///    `listing`)
+/// 3. Downloads the file and, for an agreement not held yet, joins it on Portal
 /// 4. Stores the file to the configured backend (local or GCS)
 /// 5. Updates the database to mark the agreement as downloaded
+///
+/// A membership the node holds is downloaded whatever the limits say: the
+/// limits decide what the node takes on, and a held agreement whose file is
+/// missing is slashed at its first challenge. Nor is it joined again — the
+/// Portal would answer `created: false` and store nothing, and the nonce the
+/// join was signed at would go unused.
 ///
 /// A join the Portal refuses with a `422` (no stake, not enough unreserved
 /// collateral, cleanup pending, withdrawal requested) costs the downloaded
@@ -457,45 +505,63 @@ pub async fn download_agreements_gated(
         None => 0,
     };
 
-    let mut query = Agreements::find().filter(agreements::Column::Downloaded.eq(false));
-    if let Some(max_file_size) = storage_limits.max_file_size {
-        let max_file_size: i64 = max_file_size
-            .try_into()
-            .map_err(|_| anyhow!("max file size exceeds trackable range"))?;
-        query = query.filter(agreements::Column::OriginalSize.lte(max_file_size));
-    }
-
-    let pending = query
+    let pending = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(false))
         .all(database)
         .await
         .context("failed to load agreements to download")?;
 
+    // Held memberships first, so the files the node already owes are fetched
+    // before new agreements use up the limits. The sort is stable: within
+    // each group the order is the database's, as before.
+    let mut pending: Vec<(agreements::Model, Membership)> = pending
+        .into_iter()
+        .map(|agreement| {
+            let membership = membership(
+                &agreement,
+                listing.get(&agreement.agreement_id),
+                portal_client.node_id(),
+            );
+            (agreement, membership)
+        })
+        .collect();
+    pending.sort_by_key(|(_, membership)| *membership != Membership::Held);
+
     let mut downloaded_count = 0usize;
 
-    for agreement in pending {
+    for (agreement, membership) in pending {
         let original_size: u64 = agreement
             .original_size
             .try_into()
             .context("original_size does not fit into u64")?;
 
-        // Check storage limits before downloading
-        match check_storage_limits(
-            &agreement,
-            &storage_limits,
-            used_bytes,
-            downloaded_files,
-            original_size,
-        ) {
-            StorageLimitCheck::Allowed => {}
-            StorageLimitCheck::MaxFilesReached | StorageLimitCheck::CapacityExceeded => continue,
+        // Storage limits gate what the node takes on, never what it owes.
+        if membership != Membership::Held {
+            if storage_limits
+                .max_file_size
+                .is_some_and(|max_file_size| original_size > max_file_size)
+            {
+                continue;
+            }
+            match check_storage_limits(
+                &agreement,
+                &storage_limits,
+                used_bytes,
+                downloaded_files,
+                original_size,
+            ) {
+                StorageLimitCheck::Allowed => {}
+                StorageLimitCheck::MaxFilesReached | StorageLimitCheck::CapacityExceeded => {
+                    continue
+                }
+            }
         }
 
         // Collateral last among the checks: it is the one that sets something
         // aside, and an agreement skipped for size must not hold any.
         let listed = listing.get(&agreement.agreement_id);
-        let member = holds_membership(&agreement, listed, portal_client.node_id());
         let collateral = match budget.decide(
-            member,
+            membership != Membership::None,
             listed.map(|listed| listed.required_collateral.as_deref()),
         ) {
             JoinDecision::Join { collateral } => collateral,
@@ -515,7 +581,11 @@ pub async fn download_agreements_gated(
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
 
-        match join_downloaded_agreement(portal_client, &agreement).await {
+        let join = match membership {
+            Membership::None => join_downloaded_agreement(portal_client, &agreement).await,
+            Membership::Held | Membership::Ended => Ok(None),
+        };
+        match join {
             Ok(Some(joined)) => {
                 record_reservation(tracker, &agreement, collateral, &joined);
             }
@@ -3010,12 +3080,15 @@ mod tests {
     async fn an_existing_membership_is_downloaded_even_with_joins_closed() {
         let mock_server = MockServer::start().await;
         mount_download(&mock_server, "AGR-mine").await;
+        // Nor joined again: the Portal would store nothing, and the join's
+        // nonce would be spent for nothing.
         Mock::given(method("POST"))
             .and(path("/api/agreements/AGR-mine/join"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "node_id": "NODE-test",
                 "created": false
             })))
+            .expect(0)
             .mount(&mock_server)
             .await;
 
@@ -3049,8 +3122,71 @@ mod tests {
         assert_eq!(
             tracker.status()["pending_joins"],
             json!([]),
-            "an idempotent re-join reserves nothing new"
+            "a held membership reserves nothing new"
         );
+        assert_eq!(client.current_nonce(), Some(0), "nothing was signed");
+    }
+
+    /// A held membership with its file missing is what gets slashed, so it is
+    /// downloaded first — before a new agreement takes the last slot — and past
+    /// every storage limit, which only gate what the node takes on.
+    #[tokio::test]
+    async fn held_memberships_are_downloaded_first_and_past_the_limits() {
+        let mock_server = MockServer::start().await;
+        for id in ["AGR-new", "AGR-mine", "AGR-mine-too"] {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        // Inserted first, so the database would hand it out first, and within
+        // every limit on its own.
+        let mut new = AgreementFixture::new("AGR-new", "FILE-AGR-new");
+        new.nodes = json!([]);
+        new.original_size = 10;
+        new.into_active_model().insert(&database).await.unwrap();
+        AgreementFixture::new("AGR-mine", "FILE-AGR-mine")
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
+        let mut too = AgreementFixture::new("AGR-mine-too", "FILE-AGR-mine-too");
+        too.nodes = json!([{"node_id": "NODE-test", "status": "valid"}]);
+        too.original_size = 10_000;
+        too.into_active_model().insert(&database).await.unwrap();
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("held_first")).await;
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits {
+                capacity: Some(100),
+                max_file_size: Some(50),
+                max_files: Some(1),
+            },
+            &StorageBackend::local(),
+            &listing(vec![listed("AGR-new", Some("1"), &[])]),
+            &mut JoinBudget::unmetered(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (id, downloaded) in [
+            ("AGR-mine", true),
+            ("AGR-mine-too", true),
+            ("AGR-new", false),
+        ] {
+            let row = Agreements::find_by_id(id)
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.downloaded, downloaded, "{id}");
+        }
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "/join"), 0, "nothing joined");
     }
 
     /// A §5 refusal is survived: the cycle goes on, the file it downloaded is
@@ -3221,45 +3357,53 @@ mod tests {
 
     #[test]
     fn membership_is_read_from_both_row_shapes_and_the_listing() {
-        let mut fx = AgreementFixture::new("AGR-1", "F");
-        fx.nodes = json!(["NODE-test"]);
-        let bare = fx.into_active_model();
-        let model = |active: agreements::ActiveModel| agreements::Model {
-            agreement_id: active.agreement_id.unwrap(),
-            user_id: active.user_id.unwrap(),
-            file_id: active.file_id.unwrap(),
-            filename: active.filename.unwrap(),
-            mime_type: active.mime_type.unwrap(),
-            original_size: active.original_size.unwrap(),
-            nodes: active.nodes.unwrap(),
-            root: None,
-            padded_len: None,
-            object_id: None,
-            ledger_index: None,
-            downloaded: false,
-            transaction_id: None,
-            curation: json!({}),
-            status: "ready".into(),
-            created_at: active.created_at.unwrap(),
+        let model = |nodes: serde_json::Value| {
+            let mut fx = AgreementFixture::new("AGR-1", "F");
+            fx.nodes = nodes;
+            let active = fx.into_active_model();
+            agreements::Model {
+                agreement_id: active.agreement_id.unwrap(),
+                user_id: active.user_id.unwrap(),
+                file_id: active.file_id.unwrap(),
+                filename: active.filename.unwrap(),
+                mime_type: active.mime_type.unwrap(),
+                original_size: active.original_size.unwrap(),
+                nodes: active.nodes.unwrap(),
+                root: None,
+                padded_len: None,
+                object_id: None,
+                ledger_index: None,
+                downloaded: false,
+                transaction_id: None,
+                curation: json!({}),
+                status: "ready".into(),
+                created_at: active.created_at.unwrap(),
+            }
         };
-        let bare = model(bare);
-        assert!(holds_membership(&bare, None, Some("NODE-test")));
-        assert!(!holds_membership(&bare, None, Some("NODE-other")));
-        assert!(!holds_membership(&bare, None, None));
+        let me = Some("NODE-test");
 
-        let mut fx = AgreementFixture::new("AGR-2", "F");
-        fx.nodes = json!([{"node_id": "NODE-test", "status": "valid"}]);
-        assert!(holds_membership(
-            &model(fx.into_active_model()),
-            None,
-            Some("NODE-test")
-        ));
+        let bare = model(json!(["NODE-test"]));
+        assert_eq!(membership(&bare, None, me), Membership::Held);
+        assert_eq!(
+            membership(&bare, None, Some("NODE-other")),
+            Membership::None
+        );
+        assert_eq!(membership(&bare, None, None), Membership::None);
 
-        let mut fx = AgreementFixture::new("AGR-3", "F");
-        fx.nodes = json!([]);
-        let none = model(fx.into_active_model());
-        let listed = listed("AGR-3", Some("1"), &["NODE-test"]);
-        assert!(holds_membership(&none, Some(&listed), Some("NODE-test")));
-        assert!(!holds_membership(&none, None, Some("NODE-test")));
+        let valid = model(json!([{"node_id": "NODE-test", "status": "valid"}]));
+        assert_eq!(membership(&valid, None, me), Membership::Held);
+
+        let none = model(json!([]));
+        let pending = listed("AGR-1", Some("1"), &["NODE-test"]);
+        assert_eq!(membership(&none, Some(&pending), me), Membership::Held);
+        assert_eq!(membership(&none, None, me), Membership::None);
+
+        for status in ["failed", "invalid", "left"] {
+            let ended = model(json!([{"node_id": "NODE-test", "status": status}]));
+            assert_eq!(membership(&ended, None, me), Membership::Ended, "{status}");
+        }
+        // Either source saying the membership is live is enough.
+        let left = model(json!([{"node_id": "NODE-test", "status": "left"}]));
+        assert_eq!(membership(&left, Some(&pending), me), Membership::Held);
     }
 }

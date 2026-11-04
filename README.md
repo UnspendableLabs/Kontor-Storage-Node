@@ -45,7 +45,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--database-url` | `DATABASE_URL` | Local SQLite file under user data dir | Database connection string (SQLite/PostgreSQL/MySQL) |
 | `--storage-dir` | `STORAGE_DIR` | `<data_dir>/Kontor-Storage-Node/files` | Directory where downloaded files are stored |
 | `--storage-capacity` | `STORAGE_CAPACITY` | _unlimited_ | Max storage for downloads (bytes, supports M/G/T suffix) |
-| `--storage-max-files` | `STORAGE_MAX_FILES` | _unlimited_ | Max number of files to keep locally; when reached, new agreements are not fetched |
+| `--storage-max-files` | `STORAGE_MAX_FILES` | _unlimited_ | Max number of files to keep locally; when reached, new agreements are not fetched (the files of agreements the node is already a member of still are) |
 | `--storage-max-file-size` | `STORAGE_MAX_FILE_SIZE` | _unlimited_ | Max size for a single downloaded file (bytes, supports M/G/T suffix) |
 | `--storage-method` | `STORAGE_METHOD` | `local` | Storage backend: `local` for local filesystem or `gcs` for Google Cloud Storage |
 | `--storage-gcs-bucket-name` | `STORAGE_GCS_BUCKET_NAME` | _required if gcs_ | GCS bucket name (required when `STORAGE_METHOD=gcs`) |
@@ -102,8 +102,10 @@ STORAGE_GCS_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
 
 The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits apply in both `local` and `gcs` modes to respect quotas (for example, free tiers) even when files are stored remotely (uploaded to GCS).
 
-When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching new agreements and downloading files once the stored file count reaches the limit — and keeps proving the ones it holds: a missed challenge is slashed.
+When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching and joining new agreements once the stored file count reaches the limit — and keeps proving the ones it holds: a missed challenge is slashed.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
+
+The three limits decide what the node takes on, not what it already owes. The file of an agreement the node is already a member of — after a database reset, a restart between a join and storing its file, or a limit lowered since — is downloaded whatever the limits say, before any new agreement, because a missing file is slashed at the first challenge on it. Such an agreement is not joined again.
 
 ### First-run setup
 

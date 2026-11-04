@@ -3,7 +3,7 @@ use crate::app::tasks::downloadagreements::{
     download_agreements_gated, rebuild_ledger, StorageBackend,
 };
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
-use crate::app::tasks::getnewagreements::sync_ready_agreements;
+use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{exit_inputs, manage_stake, JoinBudget, StakeTracker};
 use crate::clients::PortalClient;
@@ -179,13 +179,15 @@ async fn sync_portal_once(
     memory: &DaemonMemory,
 ) -> Result<()> {
     // A node at its file limit takes on nothing new, but keeps proving what it
-    // already stores: skipping the whole cycle here used to mean every
-    // challenge on a full node expired, and an expired challenge is now
-    // slashed at 30× the agreement's collateral.
+    // already stores, and still downloads the files of memberships it holds:
+    // skipping the whole cycle here used to mean every challenge on a full node
+    // expired, and an expired challenge — like one on a file the node never
+    // fetched — is slashed at 30× the agreement's collateral.
     let at_file_limit = match storage_limits.max_files {
         Some(max_files) if downloaded_files_count(database).await? >= max_files => {
             info!(
-                "Max stored files limit ({max_files}) reached; skipping agreement fetch and downloads"
+                "Max stored files limit ({max_files}) reached; not fetching new agreements, \
+                 only the files of memberships this node holds"
             );
             true
         }
@@ -229,7 +231,11 @@ async fn sync_portal_once(
         .context("reconciling agreements with Portal")?;
     }
 
-    if !at_file_limit {
+    // At the limit the listing stays empty, and the download step's own limit
+    // check keeps any agreement not held yet from being fetched or joined.
+    let listing = if at_file_limit {
+        ReadyListing::new()
+    } else {
         let listing = sync_ready_agreements(portal_client, database)
             .await
             .context("fetching new agreements failed")?;
@@ -239,23 +245,24 @@ async fn sync_portal_once(
                 .staking
                 .note_collateral(agreement.required_collateral.as_deref(), now);
         }
-        let mut budget = if portal_client.node_id().is_some() {
-            memory.staking.join_budget(Instant::now())
-        } else {
-            JoinBudget::unmetered()
-        };
-        download_agreements_gated(
-            portal_client,
-            database,
-            storage_limits,
-            storage_backend,
-            &listing,
-            &mut budget,
-            Some(&memory.staking),
-        )
-        .await
-        .context("downloading agreements failed")?;
-    }
+        listing
+    };
+    let mut budget = if portal_client.node_id().is_some() {
+        memory.staking.join_budget(Instant::now())
+    } else {
+        JoinBudget::unmetered()
+    };
+    download_agreements_gated(
+        portal_client,
+        database,
+        storage_limits,
+        storage_backend,
+        &listing,
+        &mut budget,
+        Some(&memory.staking),
+    )
+    .await
+    .context("downloading agreements failed")?;
 
     sync_active_challenges(portal_client, database)
         .await
@@ -1370,6 +1377,101 @@ mod tests {
                 .iter()
                 .any(|r| r.url.path() == "/api/nodes/NODE-test/challenges"),
             "challenges must still be synced at the file limit"
+        );
+    }
+
+    /// At the limit, a membership the node holds but has no file for is still
+    /// downloaded — that file is what its next challenge is slashed for — and
+    /// nothing new is fetched or joined.
+    #[tokio::test]
+    async fn a_node_at_its_file_limit_still_downloads_what_it_holds() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42, "x_only_pubkey": "abcd", "bls_pubkey": null, "next_nonce": 0
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-held/download"))
+            .and(query_param("no_redirect", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": format!("{}/files/held", mock_server.uri())
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/held"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("held-body"))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-other/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        AgreementFixture {
+            downloaded: true,
+            ..AgreementFixture::new("AGR-full", "FILE-full")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        AgreementFixture::new("AGR-held", "FILE-held")
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
+        AgreementFixture {
+            nodes: json!([]),
+            ..AgreementFixture::new("AGR-other", "FILE-other")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let storage_dir = unique_test_path("daemon_full_node_held");
+        fs::create_dir_all(&storage_dir).ok();
+
+        sync_portal_once(
+            &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+            &database,
+            StorageLimits {
+                max_files: Some(1),
+                ..StorageLimits::default()
+            },
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .unwrap();
+
+        let held = Agreements::find_by_id("AGR-held")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(held.downloaded, "the held membership's file was fetched");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            !requests.iter().any(|r| r.url.path().ends_with("/join")),
+            "nothing joined at the limit"
         );
     }
 
