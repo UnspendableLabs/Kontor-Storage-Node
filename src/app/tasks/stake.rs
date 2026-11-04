@@ -738,7 +738,10 @@ impl StakeTracker {
         // tracked in flight — one given up as lost has been forgotten by then
         // (see `verify_in_flight`), and auto-stake would re-bond
         // the whole bond it just returned. An exit under way at the last read,
-        // and now no bond and no withdrawal pending: the bond came back.
+        // and now no bond and no withdrawal pending: the bond came back — or
+        // was slashed to the last KOR, which Kontor clears the withdrawal
+        // height for as well. The exit is over either way, and nothing is
+        // bonded again; `describe_transition` says which it was.
         let was_exiting = state.withdrawal.is_some()
             || state
                 .last_known
@@ -747,7 +750,7 @@ impl StakeTracker {
         if was_exiting && snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
             state.exited = true;
         }
-        if state.exited && !exited_before {
+        if state.exited && !exited_before && !snapshot.bond_cleanup_pending {
             warn!(
                 "the bond has been withdrawn: this node bonds nothing more on its own. Set \
                  KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
@@ -1315,9 +1318,15 @@ fn describe_transition(
 
     // A bond that went to zero while a withdrawal was pending is the
     // withdrawal completing — whether or not its op is still tracked in
-    // flight, which one that landed after the in-flight expiry is not.
+    // flight, which one that landed after the in-flight expiry is not —
+    // unless the node is in bond cleanup. A withdrawal returns the bond and
+    // leaves nothing to clean up; a slash to zero leaves the memberships to
+    // unwind, and Kontor clears the withdrawal height with the stake, so the
+    // registry otherwise looks the same.
     let withdrawn = landed == Some(NodeOp::WithdrawStake)
-        || (current.stake.is_zero() && previous.withdrawal_height.is_some());
+        || (current.stake.is_zero()
+            && previous.withdrawal_height.is_some()
+            && !current.bond_cleanup_pending);
     if current.stake < previous.stake && !withdrawn {
         let lost = previous.stake.saturating_sub(current.stake);
         error!(
@@ -1346,6 +1355,15 @@ fn describe_transition(
         (None, Some(height)) => {
             warn!("withdrawal requested: joins stop, and the stake can be withdrawn from height {height} once no agreement holds it");
             event = Some(format!("withdrawal requested, unlocks at height {height}"));
+        }
+        (Some(_), None) if current.bond_cleanup_pending => {
+            warn!(
+                "the exit ended in a slash: the stake went to zero before it was withdrawn, \
+                 and Kontor cleared the withdrawal with it. This node bonds nothing more on \
+                 its own; set KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will \
+                 stake again once bond cleanup is done"
+            );
+            event = Some("slashed to zero during the exit: nothing left to withdraw".to_string());
         }
         (Some(_), None) => {
             info!("the withdrawal has completed");
@@ -3453,6 +3471,43 @@ mod tests {
             tracker.plan(late + Duration::from_secs(60), None),
             None,
             "the returned bond is not staked again"
+        );
+        assert_eq!(tracker.status()["exited"], true);
+    }
+
+    /// An exiting node slashed to its last KOR looks, from the registry, like
+    /// one whose withdrawal completed: no stake, no withdrawal height — Kontor
+    /// clears the height when nothing is left to withdraw. Bond cleanup tells
+    /// them apart, a withdrawal leaving nothing to clean up. The slash is
+    /// reported as one, and the exit is over either way.
+    #[test]
+    fn a_slash_to_zero_during_the_exit_is_not_a_completed_withdrawal() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let mut slashed = entry(Some("0"), Some("0"));
+        slashed.bond_cleanup_pending = Some(true);
+        observed(&tracker, &slashed, t0);
+        let event = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(event.contains("slashed"), "{event}");
+        assert!(!event.contains("withdrawal completed"), "{event}");
+        assert_eq!(
+            tracker.status()["exited"],
+            true,
+            "nothing is left to withdraw, and nothing is bonded again"
+        );
+        assert_eq!(tracker.plan(t0, None), None);
+
+        // The real thing, for contrast.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(
+            tracker.status()["last_event"]["message"],
+            "withdrawal completed"
         );
         assert_eq!(tracker.status()["exited"], true);
     }
