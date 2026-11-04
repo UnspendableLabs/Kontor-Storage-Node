@@ -518,7 +518,9 @@ The node sends **one** stake or claim op at a time. The Portal only answers
 "queued", so the node learns that an op ran from its nonce: once Kontor's
 `next_nonce` moves past it, the op has executed, and the next decision is made
 from the balance and stake the Portal then reports. An op that is never
-reflected is given up after 30 minutes and decided again. The stake op is the
+reflected is given up after 30 minutes and decided again. One the Portal
+refuses is not signed again every cycle: a top-up, a claim or a leave (for that
+agreement only) waits an hour, a withdrawal six. The stake op is the
 last thing a cycle signs, so it never takes a nonce a proof needed.
 
 The node's own nonce counter only moves forward. Each cycle raises it to

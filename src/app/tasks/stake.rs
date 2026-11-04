@@ -85,6 +85,12 @@ pub const OP_LANDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// gas, and rewards accrue per block, so claiming more often only buys dust.
 pub const CLAIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How long an `add-stake`, or a `leave-agreement` for one agreement, waits
+/// after the Portal refused it. A refusal is the Portal saying no to that op,
+/// and it says the same thing to the same op signed again the next cycle; an
+/// hour, like a claim, lets whatever it disagreed with change.
+pub const REFUSED_OP_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// How long joins stay paused after the Portal refuses one with a §5 code.
 ///
 /// The refusal means the node's own view of its stake disagreed with the
@@ -319,6 +325,9 @@ struct TrackerState {
     in_flight: Option<InFlight>,
     pending_joins: Vec<PendingJoin>,
     last_claim: Option<Instant>,
+    /// When the Portal last refused an `add-stake` (`None` key) or a
+    /// `leave-agreement` (its agreement).
+    refused: HashMap<RefusedOp, Instant>,
     joins_paused: Option<(Instant, String)>,
     /// An unstake or withdrawal the operator asked for from `/admin`, waiting
     /// for the daemon's next cycle — the daemon is the only thing that signs,
@@ -340,6 +349,21 @@ struct TrackerState {
     exited: bool,
     /// The exit as of the last plan, for `/admin`.
     exit: Option<ExitInputs>,
+}
+
+/// An op kind, and the agreement it names, that the Portal refused.
+type RefusedOp = (&'static str, Option<String>);
+
+fn refused_key(op: &NodeOp) -> RefusedOp {
+    (op.name(), op.agreement_id().map(str::to_string))
+}
+
+/// Whether `op` was refused less than [`REFUSED_OP_RETRY_INTERVAL`] ago.
+fn refused_recently(state: &TrackerState, op: &NodeOp, now: Instant) -> bool {
+    state
+        .refused
+        .get(&refused_key(op))
+        .is_some_and(|at| now.duration_since(*at) < REFUSED_OP_RETRY_INTERVAL)
 }
 
 /// Where the node's exit stands, worked out by the daemon from its own rows.
@@ -571,7 +595,10 @@ impl StakeTracker {
 
         if !state.exited {
             if let Some(amount) = top_up_amount(&state.policy, snapshot) {
-                return Some(NodeOp::AddStake(amount));
+                let op = NodeOp::AddStake(amount);
+                if !refused_recently(state, &op, now) {
+                    return Some(op);
+                }
             }
         }
 
@@ -605,14 +632,22 @@ impl StakeTracker {
     }
 
     /// The relay refused `op`. A refusal is not retried until something
-    /// changes: a claim waits its interval, an operator request is dropped (the
+    /// changes: a claim waits its interval, a withdrawal its retry interval,
+    /// an `add-stake` — and a leave, for its agreement only —
+    /// [`REFUSED_OP_RETRY_INTERVAL`], and an operator request is dropped (the
     /// operator sees why and can ask again).
     pub fn record_refused(&self, op: &NodeOp, reason: &str, now: Instant) {
         let mut state = self.lock();
         match op {
             NodeOp::ClaimRewards => state.last_claim = Some(now),
             NodeOp::WithdrawStake => state.last_withdraw = Some(now),
-            _ => {}
+            NodeOp::AddStake(_) | NodeOp::LeaveAgreement(_) => {
+                state
+                    .refused
+                    .retain(|_, at| now.duration_since(*at) < REFUSED_OP_RETRY_INTERVAL);
+                state.refused.insert(refused_key(op), now);
+            }
+            NodeOp::BeginUnstake => {}
         }
         if state.operator_request.as_ref() == Some(op) {
             state.operator_request = None;
@@ -791,11 +826,11 @@ fn describe_sent(op: &NodeOp, nonce: u64) -> String {
 
 /// The next step of the exit, if one is due.
 fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
-    if let Some(agreement_id) = exit
-        .memberships
-        .iter()
-        .find(|id| !state.left.contains(*id) && !exit.deferred.contains(id))
-    {
+    if let Some(agreement_id) = exit.memberships.iter().find(|id| {
+        !state.left.contains(*id)
+            && !exit.deferred.contains(id)
+            && !refused_recently(state, &NodeOp::LeaveAgreement((*id).clone()), now)
+    }) {
         return Some(NodeOp::LeaveAgreement(agreement_id.clone()));
     }
     let all_left = exit.memberships.iter().all(|id| state.left.contains(id));
@@ -1105,6 +1140,12 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
         }
         Err(err) => {
             match status_and_code(&err) {
+                // Not a refusal of the op: another op of this node holds the
+                // nonce, which stays consumed, and the next cycle signs a
+                // fresh one.
+                Some((409, _)) => {
+                    warn!("{} lost its nonce to another op: {err:#}", op.name());
+                }
                 Some((status, code)) if (400..500).contains(&status) => {
                     let code = code.unwrap_or_else(|| status.to_string());
                     warn!("the Portal refused {} ({code}): {err:#}", op.name());
@@ -1841,6 +1882,82 @@ mod tests {
             tracker.plan(later + WITHDRAW_RETRY_INTERVAL, Some(&exit)),
             Some(NodeOp::WithdrawStake)
         );
+    }
+
+    /// A refused `add-stake` used to be signed again every cycle. It now waits
+    /// [`REFUSED_OP_RETRY_INTERVAL`]; a refused leave holds back that agreement
+    /// only, and the exit goes on with the next one.
+    #[test]
+    fn refused_stake_and_leave_ops_back_off() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        let op = tracker.plan(t0, None).unwrap();
+        assert_eq!(op, NodeOp::AddStake(kor("995")));
+        tracker.record_refused(&op, "INVALID_REQUEST", t0);
+        let soon = t0 + Duration::from_secs(30);
+        assert_eq!(tracker.plan(soon, None), None, "not re-signed next cycle");
+        assert_eq!(
+            tracker.plan(t0 + REFUSED_OP_RETRY_INTERVAL, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into(), "AGR-b".into()],
+            ..ExitInputs::default()
+        };
+        let leave_a = NodeOp::LeaveAgreement("AGR-a".into());
+        assert_eq!(tracker.plan(t0, Some(&exit)), Some(leave_a.clone()));
+        tracker.record_refused(&leave_a, "INVALID_REQUEST", t0);
+        assert_eq!(
+            tracker.plan(soon, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-b".into())),
+            "the next agreement, not the refused one again"
+        );
+        assert_eq!(
+            tracker.plan(t0 + REFUSED_OP_RETRY_INTERVAL, Some(&exit)),
+            Some(leave_a)
+        );
+    }
+
+    /// Through the relay: a 4xx backs the top-up off, a `409` — the nonce was
+    /// taken, not the op refused — does not.
+    #[tokio::test]
+    async fn the_relay_s_refusal_backs_off_and_a_lost_nonce_does_not() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, backs_off) in [(400u16, true), (422, true), (409, false)] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/nodes/NODE-test/ops"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": {"code": "NOPE", "message": "no", "status": status}
+                })))
+                .mount(&mock_server)
+                .await;
+            let client = PortalClient::try_with_auth(
+                mock_server.uri(),
+                std::env::temp_dir(),
+                Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+                "NODE-test",
+                42,
+                "token",
+                10,
+            )
+            .unwrap();
+            let tracker = StakeTracker::new(StakePolicy::default());
+            observed(&tracker, &entry(Some("0"), Some("0")), Instant::now());
+
+            assert_eq!(manage_stake(&client, &tracker, None).await, None);
+            assert_eq!(
+                tracker.plan(Instant::now(), None).is_none(),
+                backs_off,
+                "{status}"
+            );
+        }
     }
 
     /// A withdrawal that takes longer than [`OP_LANDING_TIMEOUT`] to execute is
