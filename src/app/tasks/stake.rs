@@ -443,6 +443,7 @@ impl StakeTracker {
         };
         state.portal_reports_stake = true;
 
+        let exited_before = state.exited;
         let mut landed = None;
         if let Some(op) = state.in_flight.take() {
             if snapshot.next_nonce > op.nonce {
@@ -484,14 +485,27 @@ impl StakeTracker {
                 );
                 state.left.clear();
             }
-            Some(NodeOp::WithdrawStake) => {
-                warn!(
-                    "the bond has been withdrawn: this node bonds nothing more on its own. Set \
-                     KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
-                );
-                state.exited = true;
-            }
+            Some(NodeOp::WithdrawStake) => state.exited = true,
             _ => {}
+        }
+        // The snapshot says so too, whether or not the withdrawal is still
+        // tracked in flight — one that took longer than OP_LANDING_TIMEOUT to
+        // execute has been forgotten by then, and auto-stake would re-bond
+        // the whole bond it just returned. An exit under way at the last read,
+        // and now no bond and no withdrawal pending: the bond came back.
+        let was_exiting = state.unstake_seen.is_some()
+            || state
+                .last_known
+                .as_ref()
+                .is_some_and(|previous| previous.withdrawal_height.is_some());
+        if was_exiting && snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
+            state.exited = true;
+        }
+        if state.exited && !exited_before {
+            warn!(
+                "the bond has been withdrawn: this node bonds nothing more on its own. Set \
+                 KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
+            );
         }
         if snapshot.withdrawal_height.is_some() {
             state.unstake_seen.get_or_insert(now);
@@ -1827,6 +1841,46 @@ mod tests {
             tracker.plan(later + WITHDRAW_RETRY_INTERVAL, Some(&exit)),
             Some(NodeOp::WithdrawStake)
         );
+    }
+
+    /// A withdrawal that takes longer than [`OP_LANDING_TIMEOUT`] to execute is
+    /// no longer tracked when it lands. The snapshot still shows it — an exit
+    /// under way, then no bond and no withdrawal pending — and the balance it
+    /// returned is not bonded again.
+    #[test]
+    fn a_withdrawal_that_lands_late_still_ends_the_auto_stake() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(12, "100"), t0);
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::WithdrawStake));
+        tracker.record_sent(NodeOp::WithdrawStake, 12, t0);
+
+        let late = t0 + OP_LANDING_TIMEOUT + Duration::from_secs(60);
+        observed(&tracker, &exiting_entry(12, "100"), late);
+        assert_eq!(tracker.status()["in_flight"], Value::Null, "forgotten");
+
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = 13;
+        withdrawn.kor_balance = Some("105".into());
+        observed(&tracker, &withdrawn, late + Duration::from_secs(60));
+        assert_eq!(
+            tracker.plan(late + Duration::from_secs(60), None),
+            None,
+            "the returned bond is not staked again"
+        );
+        assert_eq!(tracker.status()["exited"], true);
+    }
+
+    /// An empty bond on a node that was never exiting is a new node: it stakes.
+    #[test]
+    fn an_empty_bond_without_an_exit_is_not_a_withdrawal() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+        assert_eq!(tracker.status()["exited"], false);
     }
 
     /// Without the operator's unstake there is no exit, whatever the rows say.
