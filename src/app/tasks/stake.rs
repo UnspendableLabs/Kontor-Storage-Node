@@ -54,7 +54,10 @@
 //! `failed`. A listing that cannot be read leaves it in flight, up to
 //! [`OP_LANDING_HARD_TIMEOUT`]. Giving an op up too early is the expensive
 //! mistake here: the same `add-stake` signed again with a fresh nonce makes
-//! both execute, and the bond overshoots its target.
+//! both execute, and the bond overshoots its target. The same listing settles
+//! an op whose answer never came — the request timed out, or the Portal
+//! answered with a 5xx: the Portal may well hold it, so it is kept in flight
+//! like one it accepted, not signed again.
 //!
 //! # Why the op goes out last
 //!
@@ -76,7 +79,7 @@ use crate::app::tasks::getnewagreements::ReadyListing;
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
 use crate::clients::kor::Kor;
-use crate::clients::portal::{NodeOp, NodeOpRecord, RegistryEntry};
+use crate::clients::portal::{NodeOp, NodeOpRecord, RegistryEntry, UnsettledOp};
 use crate::clients::PortalClient;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -952,6 +955,22 @@ impl StakeTracker {
 
     /// The relay accepted `op` at `nonce`.
     pub fn record_sent(&self, op: NodeOp, nonce: u64, now: Instant) {
+        let event = describe_sent(&op, nonce);
+        self.track(op, nonce, now, event);
+    }
+
+    /// `op` was signed at `nonce` and sent, and no answer came back that says
+    /// whether the Portal kept it (see [`UnsettledOp`]). It is tracked exactly
+    /// like one the relay accepted: its nonce is consumed either way, and if
+    /// the Portal did store it, signing it again would execute it twice. The
+    /// Portal's listing settles it after [`OP_LANDING_CHECK_INTERVAL`] (see
+    /// [`Self::verify_in_flight`]) — gone, the plan is made again.
+    pub fn record_unsettled(&self, op: NodeOp, nonce: u64, now: Instant) {
+        let event = format!("{}; the Portal gave no answer", describe_sent(&op, nonce));
+        self.track(op, nonce, now, event);
+    }
+
+    fn track(&self, op: NodeOp, nonce: u64, now: Instant, event: String) {
         let mut state = self.lock();
         match op {
             NodeOp::ClaimRewards => state.last_claim = Some(now),
@@ -961,7 +980,7 @@ impl StakeTracker {
         if state.operator_request.as_ref() == Some(&op) {
             state.operator_request = None;
         }
-        state.last_event = Some((Utc::now(), describe_sent(&op, nonce)));
+        state.last_event = Some((Utc::now(), event));
         state.in_flight = Some(InFlight {
             op,
             nonce,
@@ -1734,9 +1753,26 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
                     warn!("the Portal refused {} ({code}): {err:#}", op.name());
                     tracker.record_refused(&op, &code, Instant::now());
                 }
-                // Unreachable, or a 5xx: whether it was kept is unknown. The
-                // next cycle's resync says, and the plan is made again.
-                _ => debug!("{} not sent this cycle: {err:#}", op.name()),
+                // Unreachable, timed out, or a 5xx: whether the Portal kept
+                // it is unknown, and the nonce it was signed at is consumed
+                // either way. Planning again from an unchanged snapshot would
+                // sign the same op at the next nonce, and a Portal that did
+                // store the first — it answers only after several Kontor
+                // reads, so a timeout after the row is written is routine —
+                // would relay both. So it is kept in flight, and the Portal's
+                // listing says what became of it (see `verify_in_flight`).
+                _ => match err.downcast_ref::<UnsettledOp>() {
+                    Some(unsettled) => {
+                        let nonce = unsettled.nonce;
+                        warn!(
+                            nonce,
+                            "{} may or may not have reached the Portal; keeping it in flight                              until the Portal's listing says: {err:#}",
+                            op.name()
+                        );
+                        tracker.record_unsettled(op.clone(), nonce, Instant::now());
+                    }
+                    None => debug!("{} not sent this cycle: {err:#}", op.name()),
+                },
             }
             None
         }
@@ -3041,6 +3077,92 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// Through the relay: an answer that says nothing about whether the op
+    /// was stored — a 5xx, or no answer at all — leaves it in flight at the
+    /// nonce it was signed with, where a refusal or a lost nonce does not.
+    /// Planned again from the same snapshot, the top-up would otherwise go out
+    /// a second time at the next nonce, and a Portal that had stored the first
+    /// would relay both.
+    #[tokio::test]
+    async fn an_op_the_portal_gave_no_answer_to_stays_in_flight() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let client_for = |uri: String| {
+            PortalClient::try_with_auth(
+                uri,
+                std::env::temp_dir(),
+                Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+                "NODE-test",
+                42,
+                "token",
+                10,
+            )
+            .unwrap()
+        };
+        let tracked = |tracker: &StakeTracker| tracker.status()["in_flight"]["nonce"].clone();
+
+        // A 400 backs the op off, a 409 leaves it to be signed again at once.
+        for (status, in_flight, plans_again) in [
+            (500u16, true, false),
+            (503, true, false),
+            (400, false, false),
+            (409, false, true),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/nodes/NODE-test/ops"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": {"code": "NOPE", "message": "no", "status": status}
+                })))
+                .mount(&mock_server)
+                .await;
+            let client = client_for(mock_server.uri());
+            let tracker = StakeTracker::new(StakePolicy::default());
+            observed(&tracker, &entry(Some("0"), Some("0")), Instant::now());
+
+            assert_eq!(manage_stake(&client, &tracker, None).await, None);
+            assert_eq!(
+                tracked(&tracker),
+                if in_flight { json!(10) } else { Value::Null },
+                "{status}"
+            );
+            assert_eq!(
+                tracker.plan(Instant::now(), None).is_some(),
+                plans_again,
+                "{status}"
+            );
+        }
+
+        // No Portal at all: the same open question, settled the same way.
+        let client = client_for("http://127.0.0.1:1".to_string());
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        assert_eq!(tracked(&tracker), json!(10));
+        assert_eq!(tracker.plan(t0, None), None);
+        assert!(
+            tracker.status()["last_event"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no answer"),
+            "{}",
+            tracker.status()["last_event"]
+        );
+
+        // The listing, asked after the usual wait, settles it: gone, the
+        // plan is made again (a listed op is covered by
+        // `the_portal_s_listing_decides_whether_an_overdue_op_is_dropped`).
+        let check = Instant::now() + OP_LANDING_CHECK_INTERVAL;
+        assert_eq!(tracker.op_to_verify(check), Some(10));
+        tracker.verify_in_flight(10, Ok(vec![]), check);
+        assert_eq!(
+            tracker.plan(check, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
     }
 
     /// A withdrawal that takes longer than [`OP_LANDING_HARD_TIMEOUT`] to

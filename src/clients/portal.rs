@@ -1,4 +1,4 @@
-use super::http_helpers::{build_http_client, check_response_status};
+use super::http_helpers::{build_http_client, check_response_status, status_and_code};
 use super::http_signature;
 use super::kontor_op::{build_signing_message, Inst, InstKind, SignerRef, DEFAULT_GAS_LIMIT};
 use super::kor::Kor;
@@ -1151,17 +1151,28 @@ impl PortalClient {
         let request =
             self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
 
+        // Every 4xx is the Portal saying what became of the op: refused and
+        // not stored (the nonce came back, see `send_signed_op`), or `409`,
+        // another op of this node at that nonce. Anything else — no answer, a
+        // 5xx, a `202` that cannot be read — leaves the question open, and the
+        // caller must assume the op may be queued.
+        let unsettled = |err: anyhow::Error| match status_and_code(&err) {
+            Some((status, _)) if (400..500).contains(&status) => err,
+            _ => err.context(UnsettledOp { nonce }),
+        };
         let resp = self
             .send_signed_op(
                 request.body(body_bytes),
                 nonce,
                 &format!("submit {}", op.name()),
             )
-            .await?;
+            .await
+            .map_err(unsettled)?;
         let mut body = resp
             .json::<NodeOpResponse>()
             .await
-            .context("failed to deserialize node op response")?;
+            .context("failed to deserialize node op response")
+            .map_err(unsettled)?;
         // What the node signed is the authority on which nonce the op holds; an
         // echo that disagrees would be a Portal bug, not a reason to track the
         // wrong one.
@@ -1603,6 +1614,29 @@ pub struct NodeOpResponse {
     pub nonce: Option<u64>,
 }
 
+/// Attached to a [`PortalClient::submit_node_op`] error when the Portal may
+/// hold the op all the same: the request failed in transit or timed out, the
+/// Portal answered with a 5xx, or its `202` could not be read. The Portal
+/// stores the op only after several Kontor reads, so a client timeout after
+/// the row is written is routine. The op was signed at `nonce`, which stays
+/// consumed (see `release_nonce`); the caller keeps it in flight until the
+/// Portal's listing says what became of it, rather than signing it again and
+/// having both execute. Read it with `err.downcast_ref::<UnsettledOp>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsettledOp {
+    pub nonce: u64,
+}
+
+impl std::fmt::Display for UnsettledOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the op signed at nonce {} may have been stored by the Portal",
+            self.nonce
+        )
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FaucetRequest {
     recipient: String,
@@ -1623,7 +1657,7 @@ mod tests {
     #![allow(deprecated)]
     use super::{
         join_agreement_expr, resynced_nonce, verify_proof_expr, wave_string_literal, NodeOp,
-        OpContract, PortalClient, RegistryEntry, DEFAULT_FILESTORAGE_CONTRACT,
+        OpContract, PortalClient, RegistryEntry, UnsettledOp, DEFAULT_FILESTORAGE_CONTRACT,
         DEFAULT_STAKING_CONTRACT, KONTOR_MAX_NONCE_GAP,
     };
     use crate::clients::kontor_op::{build_signing_message, Inst, InstKind, SignerRef};
@@ -3073,12 +3107,46 @@ mod tests {
             Some((422, Some("BOND_CLEANUP_PENDING".to_string())))
         );
         assert_eq!(client.current_nonce(), Some(7), "refused: nonce released");
+        assert_eq!(
+            err.downcast_ref::<UnsettledOp>(),
+            None,
+            "a refusal is a settled outcome: nothing was stored"
+        );
 
-        client
+        let err = client
             .submit_node_op(&NodeOp::ClaimRewards)
             .await
             .unwrap_err();
         assert_eq!(client.current_nonce(), Some(8), "5xx: nonce stays consumed");
+        assert_eq!(
+            err.downcast_ref::<UnsettledOp>(),
+            Some(&UnsettledOp { nonce: 7 }),
+            "and the caller learns which nonce may be queued: {err:#}"
+        );
+        assert_eq!(
+            crate::clients::http_helpers::status_and_code(&err),
+            Some((503, None)),
+            "the status is still readable through the marker"
+        );
+    }
+
+    /// A Portal that cannot be reached at all is the same open question as a
+    /// 5xx: the op never left, but the client cannot tell that from a request
+    /// that timed out after the Portal stored it.
+    #[tokio::test]
+    async fn an_unreachable_portal_leaves_the_op_unsettled() {
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client("http://127.0.0.1:1", keypair, "unreachable");
+        let err = client
+            .submit_node_op(&NodeOp::ClaimRewards)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<UnsettledOp>(),
+            Some(&UnsettledOp { nonce: 7 }),
+            "{err:#}"
+        );
+        assert_eq!(client.current_nonce(), Some(8), "nonce stays consumed");
     }
 
     /// The listing the node consults before giving an accepted op up for
