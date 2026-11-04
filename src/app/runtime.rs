@@ -806,6 +806,8 @@ impl Supervisor {
             )?;
         }
 
+        // Only a node with neither a balance nor a bond is funded and waited
+        // for; a staked node restarting goes straight on to its daemon.
         node::ensure_kor_balance(
             &authenticated,
             signer_id,

@@ -1,10 +1,18 @@
 //! KOR balance check and faucet request at startup.
 //!
-//! After onboarding completes, ensures the node's signer has a positive KOR
-//! balance. If the registry shows no balance, this module calls the public
-//! Portal faucet endpoint and polls the registry until a balance appears
-//! on-chain. If the faucet is unavailable, it logs a warning and continues to
-//! poll, waiting for a manual transfer.
+//! After onboarding completes, ensures a node that has never been funded gets
+//! some KOR. If the registry shows no liquid balance *and* no bonded stake,
+//! this module calls the public Portal faucet endpoint and polls the registry
+//! until a balance appears on-chain. If the faucet is unavailable, it logs a
+//! warning and continues to poll, waiting for a manual transfer.
+//!
+//! An empty liquid balance alone does not mean unfunded: once auto-stake has
+//! bonded everything above the gas reserve and the reserve has gone on fees,
+//! liquid `0` is a staked node's normal state. Asking the faucet then, on every
+//! restart, would be one request per restart — and on a `502`/`503` the poll
+//! would keep the daemon from starting while the node's challenges expire. So
+//! a node with a bonded stake is not funded again, and one whose stake the
+//! Portal does not report asks the faucet once but never waits for it.
 //!
 //! The amount is configurable (`KONTOR_STORAGE_FAUCET_AMOUNT_KOR`, 1000 by
 //! default) because staking changed what "funded" means: the KOR is no longer
@@ -14,6 +22,7 @@
 
 use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::kor::Kor;
+use crate::clients::portal::RegistryEntry;
 use crate::clients::PortalClient;
 use anyhow::Result;
 use std::io::Write;
@@ -34,11 +43,41 @@ fn kor_balance_is_empty(balance: &Option<String>) -> bool {
     }
 }
 
-/// Ensure the node's signer has a positive KOR balance before continuing.
+/// What the registry entry says about whether this node was ever funded,
+/// once its liquid balance is known to be empty.
+#[derive(Debug, PartialEq, Eq)]
+enum Funding {
+    /// No stake either, and no exit or cleanup under way: a new node.
+    Unfunded,
+    /// A bonded stake: funded, its KOR is in the bond.
+    Staked(Kor),
+    /// The Portal does not report the stake (absent, `null`, unreadable), or
+    /// the node is in bond cleanup: it may well be an onboarded node, so its
+    /// startup must not wait on the faucet.
+    Unknown,
+}
+
+fn funding(entry: &RegistryEntry) -> Funding {
+    let Some(stake) = entry.stake.as_deref().and_then(|raw| Kor::parse(raw).ok()) else {
+        return Funding::Unknown;
+    };
+    if !stake.is_zero() {
+        Funding::Staked(stake)
+    } else if entry.bond_cleanup_pending == Some(true) || entry.stake_withdrawal_height.is_some() {
+        Funding::Unknown
+    } else {
+        Funding::Unfunded
+    }
+}
+
+/// Ensure a node that was never funded has KOR before continuing.
 ///
 /// 1. Fetches the registry entry for `signer_id`.
-/// 2. If `kor_balance` is already positive, returns immediately.
-/// 3. Otherwise calls the Portal faucet:
+/// 2. If `kor_balance` is already positive, or the node has a bonded stake,
+///    returns immediately.
+/// 3. If the stake is unknown (see [`Funding::Unknown`]), asks the faucet once
+///    and returns without waiting; a faucet error is only a warning.
+/// 4. Otherwise — no balance, no stake: a new node — calls the Portal faucet:
 ///    - Success: logs the broadcast txids and polls until the balance appears.
 ///    - 502/503: warns and polls anyway (e.g. waiting for a manual transfer).
 ///    - Other errors: propagated.
@@ -54,6 +93,36 @@ pub async fn ensure_kor_balance(
         let balance = entry.kor_balance.as_deref().unwrap_or("0");
         writeln!(writer, "✓ KOR balance: {balance}")?;
         return Ok(());
+    }
+
+    match funding(&entry) {
+        Funding::Staked(stake) => {
+            writeln!(
+                writer,
+                "✓ KOR balance: 0 liquid, {stake} KOR bonded; not asking the faucet"
+            )?;
+            return Ok(());
+        }
+        Funding::Unknown => {
+            writeln!(
+                writer,
+                "KOR balance: 0, stake not known → requesting {amount} KOR from the faucet, \
+                 without waiting for it…"
+            )?;
+            match request_within_cap(client, &entry.x_only_pubkey, amount, writer).await {
+                Ok(resp) => writeln!(
+                    writer,
+                    "✓ Faucet broadcast: commit={} reveal={}",
+                    resp.commit_txid, resp.reveal_txid
+                )?,
+                Err(e) => {
+                    tracing::warn!("faucet request failed; starting without it: {e:#}");
+                    writeln!(writer, "⚠ Faucet request failed; starting without it")?;
+                }
+            }
+            return Ok(());
+        }
+        Funding::Unfunded => {}
     }
 
     writeln!(
@@ -170,6 +239,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// The entry of a node that holds no stake: what a new node looks like.
     fn registry_entry_json(kor_balance: Option<&str>) -> serde_json::Value {
         json!({
             "signer_id": 42,
@@ -178,7 +248,78 @@ mod tests {
             "next_nonce": 7,
             "kor_balance": kor_balance,
             "user_id": null,
+            "stake": "0",
+            "stake_available": "0",
         })
+    }
+
+    async fn mount_faucet(mock_server: &MockServer, status: u16, times: u64) {
+        Mock::given(method("POST"))
+            .and(path("/api/faucet"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "commit_txid": "c", "reveal_txid": "r", "recipient": "abc123", "amount": 10.0,
+                "code": "FAUCET_UNAVAILABLE", "message": "down",
+            })))
+            .expect(times)
+            .mount(mock_server)
+            .await;
+    }
+
+    /// After staking, liquid 0 is normal. A restart used to ask the faucet
+    /// again — and on a 503 wait for it forever, the daemon not started.
+    #[tokio::test]
+    async fn ensure_kor_balance_does_not_fund_a_staked_node() {
+        let mock_server = MockServer::start().await;
+        let mut entry = registry_entry_json(Some("0"));
+        entry["stake"] = json!("995");
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_faucet(&mock_server, 503, 0).await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("995 KOR bonded"), "{output}");
+    }
+
+    /// A stake the Portal does not report — an old Portal, an unreadable value,
+    /// a node in bond cleanup — may hide an onboarded node: the faucet is asked
+    /// once, and startup does not wait for it, even when it is down.
+    #[tokio::test]
+    async fn ensure_kor_balance_never_waits_when_the_stake_is_unknown() {
+        for (stake, cleanup, faucet) in [
+            (json!(null), false, 503u16),
+            (json!("garbage"), false, 200),
+            (json!("0"), true, 502),
+        ] {
+            let mock_server = MockServer::start().await;
+            let mut entry = registry_entry_json(None);
+            entry["stake"] = stake.clone();
+            entry["bond_cleanup_pending"] = json!(cleanup);
+            Mock::given(method("GET"))
+                .and(path("/api/signers/42"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            mount_faucet(&mock_server, faucet, 1).await;
+
+            let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+            let mut buffer = Vec::new();
+            ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+                .await
+                .unwrap_or_else(|e| panic!("{stake} {cleanup}: {e:#}"));
+            let output = String::from_utf8(buffer).unwrap();
+            assert!(output.contains("without waiting"), "{output}");
+            assert!(!output.contains("Waiting for KOR balance"), "{output}");
+        }
     }
 
     #[test]
