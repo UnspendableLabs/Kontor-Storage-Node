@@ -595,9 +595,18 @@ impl StakeTracker {
 
     /// The start of the withdrawal delay the database should hold, if it does
     /// not hold it already: `Some(None)` to clear a record whose delay is over.
+    ///
+    /// Nothing, until the record has been read (see
+    /// [`Self::restore_withdrawal_start`]): before that there is nothing to
+    /// compare with, and a start this process witnessed itself would be
+    /// written over the earlier one a previous process recorded — restarting
+    /// the two weeks the record exists to keep.
     #[must_use]
     pub fn withdrawal_start_to_persist(&self) -> Option<Option<DateTime<Utc>>> {
         let state = self.lock();
+        if !state.withdrawal_restored {
+            return None;
+        }
         let wanted = state.withdrawal.map(|timer| timer.started_at);
         (wanted != state.persisted_withdrawal_start).then_some(wanted)
     }
@@ -2892,6 +2901,49 @@ mod tests {
             Some(NodeOp::WithdrawStake),
             "the delay had run out before this process started"
         );
+    }
+
+    /// A record that could not be read is not written over. The daemon reads
+    /// the record before it acts on its own reads, but a read that fails
+    /// leaves the tracker counting from this process's first sight of the
+    /// height — and writing that start would replace the earlier one, which
+    /// is exactly what the record exists to keep. Nothing is written until
+    /// the read has gone through.
+    #[test]
+    fn nothing_is_written_until_the_recorded_start_has_been_read() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert!(!tracker.withdrawal_start_restored());
+        assert_eq!(
+            tracker.withdrawal_start_to_persist(),
+            None,
+            "the record has not been read; it may hold an earlier start"
+        );
+
+        // Read at last, and earlier than this process's start: it stands,
+        // and there is nothing to write.
+        let started_at = Utc::now() - chrono::Duration::hours(48);
+        tracker.restore_withdrawal_start(Some(started_at), t0);
+        assert_eq!(tracker.withdrawal_start_to_persist(), None);
+        assert_eq!(tracker.plan(t0, Some(&ExitInputs::default())), None);
+        let estimated = tracker.status()["exit"]["withdraw_estimated_from"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let estimated = DateTime::parse_from_rfc3339(&estimated).unwrap();
+        let delay = chrono::Duration::from_std(withdrawal_delay()).unwrap();
+        assert_eq!(estimated.with_timezone(&Utc), started_at + delay);
+
+        // No record after all: this process's start is the one to write.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert_eq!(tracker.withdrawal_start_to_persist(), None);
+        tracker.restore_withdrawal_start(None, t0);
+        assert!(matches!(
+            tracker.withdrawal_start_to_persist(),
+            Some(Some(_))
+        ));
     }
 
     /// The start is written when first seen, left alone while nothing changed,
