@@ -37,6 +37,12 @@ impl Kor {
         Kor(kor as u128 * SCALE)
     }
 
+    /// An amount in indivisible units of 10⁻¹⁸ KOR.
+    #[must_use]
+    pub const fn from_units(units: u128) -> Kor {
+        Kor(units)
+    }
+
     #[must_use]
     pub fn is_zero(self) -> bool {
         self.0 == 0

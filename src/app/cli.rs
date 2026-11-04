@@ -142,7 +142,7 @@ pub struct Cli {
     pub auto_stake: bool,
 
     /// KOR kept liquid to pay gas for joins and proofs; auto-stake never bonds
-    /// it. Decimal, e.g. `5` or `2.5`.
+    /// it. Decimal, e.g. `5` or `2.5`; at least `0.0001`, one op's gas hold.
     #[arg(long, env = "KONTOR_STORAGE_GAS_RESERVE_KOR", default_value = "5")]
     pub gas_reserve_kor: String,
 

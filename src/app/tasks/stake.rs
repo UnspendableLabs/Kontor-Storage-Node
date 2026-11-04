@@ -59,6 +59,7 @@
 //! entry cannot be read joins nothing rather than joining blind.
 
 use crate::clients::http_helpers::status_and_code;
+use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
 use crate::clients::kor::Kor;
 use crate::clients::portal::{NodeOp, RegistryEntry};
 use crate::clients::PortalClient;
@@ -75,6 +76,22 @@ use tracing::{debug, error, info, warn};
 
 /// The smallest free balance worth a top-up (contract stake policy).
 pub const MIN_TOP_UP: Kor = Kor::ONE;
+
+/// Kontor's price of one gas unit, in 10⁻¹⁸ KOR: `max(execution price,
+/// collateral unit price)`, both 10⁻⁹ KOR at 80913826 (`Pricing::gas_hold`,
+/// `core/indexer/src/protocol/v1/pricing.rs`).
+const GAS_PRICE_UNITS: u128 = 1_000_000_000;
+
+/// The smallest gas reserve with which an `add-stake` can run at all.
+///
+/// Before it runs a call, Kontor holds `gas_limit × gas price` from the payer
+/// (`with_payment`, `core/indexer/src/protocol/v1/fees.rs`), and refuses the
+/// call if the balance does not cover it. An `add-stake` of the whole balance
+/// therefore always fails: once the hold is taken, the amount is no longer
+/// there. The reserve must cover at least one op's hold — [`DEFAULT_GAS_LIMIT`]
+/// gas, 0.0001 KOR. That is a floor, not a recommendation: it pays for the
+/// top-up and nothing after it.
+pub const MIN_GAS_RESERVE: Kor = Kor::from_units(DEFAULT_GAS_LIMIT as u128 * GAS_PRICE_UNITS);
 
 /// How long an accepted op may stay unreflected before the node assumes the
 /// Portal dropped it and decides again. Long enough for a compose round and a
@@ -133,7 +150,8 @@ pub struct StakePolicy {
     /// Sign `add-stake` and `claim-rewards` automatically. Off, the node signs
     /// no money-moving op on its own; joins are still gated on the stake.
     pub auto_stake: bool,
-    /// KOR kept liquid to pay gas for joins and proofs. Never staked.
+    /// KOR kept liquid to pay gas for joins and proofs. Never staked. At
+    /// least [`MIN_GAS_RESERVE`].
     pub gas_reserve: Kor,
     /// Cap on the total bond. `None` stakes everything above the reserve.
     pub stake_target: Option<Kor>,

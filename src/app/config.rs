@@ -1,5 +1,5 @@
 use crate::app::cli::Cli;
-use crate::app::tasks::stake::StakePolicy;
+use crate::app::tasks::stake::{StakePolicy, MIN_GAS_RESERVE};
 use crate::clients::kor::Kor;
 use crate::database::{default_app_dir, default_storage_dir};
 use anyhow::{anyhow, Result};
@@ -147,7 +147,7 @@ impl Config {
 
         let stake_policy = StakePolicy {
             auto_stake: cli.auto_stake,
-            gas_reserve: parse_kor(&cli.gas_reserve_kor, "KONTOR_STORAGE_GAS_RESERVE_KOR")?,
+            gas_reserve: parse_gas_reserve(&cli.gas_reserve_kor)?,
             stake_target: cli
                 .stake_target_kor
                 .as_deref()
@@ -241,6 +241,22 @@ impl TryFrom<&Cli> for Config {
 /// A KOR amount from the environment: an exact decimal, so `0.1` is `0.1`.
 fn parse_kor(raw: &str, field_name: &str) -> Result<Kor> {
     Kor::parse(raw).map_err(|err| anyhow!("invalid {field_name}: {err}"))
+}
+
+/// [`parse_kor`], refusing a reserve below [`MIN_GAS_RESERVE`]: Kontor holds an
+/// op's gas from the balance before running it, so with less kept back every
+/// `add-stake` of "everything above the reserve" fails on chain.
+fn parse_gas_reserve(raw: &str) -> Result<Kor> {
+    let reserve = parse_kor(raw, "KONTOR_STORAGE_GAS_RESERVE_KOR")?;
+    if reserve < MIN_GAS_RESERVE {
+        return Err(anyhow!(
+            "invalid KONTOR_STORAGE_GAS_RESERVE_KOR: {reserve} KOR is below the minimum of \
+             {MIN_GAS_RESERVE} KOR. Kontor holds an op's gas from the balance before running \
+             it, so a smaller reserve makes every add-stake of the rest fail; and the node \
+             pays its own proofs out of it (5 KOR by default)"
+        ));
+    }
+    Ok(reserve)
 }
 
 /// [`parse_kor`] for amounts where zero makes no sense: a zero claim threshold
@@ -649,20 +665,38 @@ mod tests {
         assert_eq!(config.kontor_staking_contract_address, "staking_3_1");
     }
 
-    /// A reserve of zero is a choice (stake everything); the other three
-    /// amounts at zero are mistakes, and say which variable holds them.
+    /// Bad amounts are refused, and say which variable holds them. A reserve
+    /// below one op's gas hold is one: Kontor takes the hold before running an
+    /// `add-stake`, so staking everything above a zero reserve always fails.
     #[test]
     fn config_from_cli_rejects_bad_stake_amounts_by_name() {
-        let zero_reserve = Cli {
-            gas_reserve_kor: "0".to_string(),
+        let minimum = Cli {
+            gas_reserve_kor: "0.0001".to_string(),
             ..make_cli()
         };
-        assert!(Config::from_cli(&zero_reserve).is_ok());
+        assert_eq!(
+            Config::from_cli(&minimum).unwrap().stake_policy.gas_reserve,
+            MIN_GAS_RESERVE
+        );
 
         for (cli, name) in [
             (
                 Cli {
                     gas_reserve_kor: "1e3".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_GAS_RESERVE_KOR",
+            ),
+            (
+                Cli {
+                    gas_reserve_kor: "0".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_GAS_RESERVE_KOR",
+            ),
+            (
+                Cli {
+                    gas_reserve_kor: "0.000099999999999999".to_string(),
                     ..make_cli()
                 },
                 "KONTOR_STORAGE_GAS_RESERVE_KOR",
