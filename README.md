@@ -519,6 +519,13 @@ from the balance and stake the Portal then reports. An op that is never
 reflected is given up after 30 minutes and decided again. The stake op is the
 last thing a cycle signs, so it never takes a nonce a proof needed.
 
+The node's own nonce counter only moves forward. Each cycle raises it to
+Kontor's `next_nonce` when that is ahead, but never lowers it: between two
+blocks the ops it signed are still queued at the Portal under those nonces,
+and signing at them again would collide. An op that never runs leaves a gap,
+which the Portal and Kontor both accept (up to 10,000 nonces ahead; a counter
+further ahead falls back to Kontor's value).
+
 The gas reserve is not optional in spirit: the node pays its own fees, and a
 node with nothing liquid cannot submit proofs — which is the expensive way to
 run out of money. Set `KONTOR_STORAGE_AUTO_STAKE=false` to manage the bond by

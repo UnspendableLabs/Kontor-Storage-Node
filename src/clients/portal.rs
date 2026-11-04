@@ -28,6 +28,11 @@ pub const DEFAULT_FILESTORAGE_CONTRACT: &str = "filestorage_0_0";
 /// [`PortalClient::with_staking_contract_address`].
 pub const DEFAULT_STAKING_CONTRACT: &str = "staking_0_0";
 
+/// How far past a signer's `next_nonce` Kontor accepts an op's nonce
+/// (`MAX_NONCE_GAP` in `advance_nonce`, `core/indexer/src/protocol/v1/storage_identity.rs`).
+/// A counter further ahead than this would have every op it signs refused.
+pub const KONTOR_MAX_NONCE_GAP: u64 = 10_000;
+
 /// Encode `s` as a Wave string literal, validating it contains only safe
 /// characters.
 ///
@@ -172,6 +177,33 @@ impl NodeOp {
                 format!("leave-agreement({})", wave_string_literal(agreement_id)?),
             ),
         })
+    }
+}
+
+/// The local nonce counter after a resync against Kontor's `next_nonce`:
+/// `max(local, kontor)`, unless that is further ahead than Kontor accepts.
+///
+/// Kontor only moves `next_nonce` once an op has executed, and the Portal
+/// relays ops a block (~10 minutes) at a time, so for most of a block the
+/// counter is rightly ahead: every op signed since the last block is still
+/// queued at the Portal under its nonce. Rewinding to Kontor's value — what
+/// the node used to do every cycle — signed the next cycle's ops at nonces
+/// those queued ops already held, and they collided. So the counter never
+/// moves back, not after an op that failed on chain, nor across startup: an
+/// op that never ran just leaves a gap, and gaps are fine — the Portal takes
+/// strictly ascending nonces at or above `next_nonce`, and Kontor accepts any
+/// nonce up to [`KONTOR_MAX_NONCE_GAP`] past it (Portal
+/// `docs/node-portal-contract.md` §2).
+///
+/// Past that gap every op would be refused, so the counter falls back to
+/// Kontor's value instead: a collision or two is recoverable, a node that can
+/// sign nothing Kontor accepts is not.
+#[must_use]
+pub fn resynced_nonce(local: u64, kontor: u64) -> u64 {
+    if local.saturating_sub(kontor) > KONTOR_MAX_NONCE_GAP {
+        kontor
+    } else {
+        local.max(kontor)
     }
 }
 
@@ -342,30 +374,46 @@ impl PortalClient {
         self.auth.as_ref().map(|a| a.signer_id)
     }
 
-    /// Resynchronize the local nonce counter with the Portal's view of the
-    /// registry. Useful after observing on-chain failures that may have left
-    /// gaps in the local nonce sequence.
-    ///
-    /// Returns the new nonce value.
-    pub async fn resync_nonce(&self) -> Result<u64> {
-        Ok(self.resync_from_registry().await?.next_nonce)
-    }
-
-    /// [`Self::resync_nonce`], keeping the registry entry it read.
+    /// Bring the local nonce counter up to Kontor's `next_nonce` — never down —
+    /// keeping the registry entry it read.
     ///
     /// The daemon reads the entry once per cycle and makes every staking
     /// decision of that cycle from it: the balance and stake it reports are the
     /// same snapshot as the nonce the cycle signs from, which is what lets an
     /// op's nonce later say whether that op has landed.
+    ///
+    /// See [`resynced_nonce`] for why the counter only ever moves forward.
     pub async fn resync_from_registry(&self) -> Result<RegistryEntry> {
         let auth = self
             .auth
             .as_ref()
             .ok_or_else(|| anyhow!("authentication required to resync nonce"))?;
         let entry = self.get_registry_entry(auth.signer_id).await?;
-        let old = auth.next_nonce.swap(entry.next_nonce, Ordering::Relaxed);
-        if old != entry.next_nonce {
-            tracing::warn!(old, new = entry.next_nonce, "resynced registry nonce");
+        let kontor = entry.next_nonce;
+        // A compare-exchange loop rather than `fetch_update`, which the pinned
+        // toolchain deprecates and the declared MSRV has no replacement for.
+        let mut old = auth.next_nonce.load(Ordering::Relaxed);
+        let new = loop {
+            let new = resynced_nonce(old, kontor);
+            match auth.next_nonce.compare_exchange_weak(
+                old,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        if new < old {
+            tracing::warn!(
+                old,
+                new,
+                "the local nonce ran more than {KONTOR_MAX_NONCE_GAP} past Kontor's, which \
+                 Kontor would refuse; falling back to Kontor's next_nonce"
+            );
+        } else if new > old {
+            tracing::info!(old, new, "advanced the local nonce to Kontor's next_nonce");
         }
         Ok(entry)
     }
@@ -374,13 +422,15 @@ impl PortalClient {
     ///
     /// [`Self::sign_kontor_op`] takes the nonce before the request goes out. A
     /// 4xx means the Portal stored nothing, so that nonce will never be used on
-    /// chain — and keeping it consumed would leave a gap that makes the Portal
-    /// drop every later op of this cycle as out of sequence. A proof dropped
-    /// that way is a missed challenge, which now costs collateral.
+    /// chain, and giving it back keeps the sequence without a hole. A hole is no
+    /// longer fatal — the Portal and Kontor both accept one — but a Portal that
+    /// predates that drops every later op of the cycle as out of sequence, and a
+    /// proof dropped that way is a missed challenge, which costs collateral.
     ///
     /// Only rolls back if nothing was signed since, so it can never hand out a
     /// nonce twice. Network errors and 5xx do not come here: whether the Portal
-    /// kept the op is unknown, and the next cycle's resync settles it. Nor does
+    /// kept the op is unknown, so the nonce stays consumed — at worst a gap,
+    /// which Kontor skips over (see [`resynced_nonce`]). Nor does
     /// `409 CONFLICT`, the one 4xx after which something *is* stored: the
     /// Portal already holds a different op of this node at that nonce, so the
     /// nonce is taken and handing it out again would only collide a second
@@ -1486,8 +1536,9 @@ pub struct FaucetResponse {
 mod tests {
     #![allow(deprecated)]
     use super::{
-        join_agreement_expr, verify_proof_expr, wave_string_literal, NodeOp, OpContract,
-        PortalClient, RegistryEntry, DEFAULT_FILESTORAGE_CONTRACT, DEFAULT_STAKING_CONTRACT,
+        join_agreement_expr, resynced_nonce, verify_proof_expr, wave_string_literal, NodeOp,
+        OpContract, PortalClient, RegistryEntry, DEFAULT_FILESTORAGE_CONTRACT,
+        DEFAULT_STAKING_CONTRACT, KONTOR_MAX_NONCE_GAP,
     };
     use crate::clients::kontor_op::{build_signing_message, Inst, InstKind, SignerRef};
     use crate::clients::kor::Kor;
@@ -2641,44 +2692,92 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resync_nonce_updates_local_counter_from_registry() {
-        let mock_server = MockServer::start().await;
+    fn client_with_nonce(uri: String, dir: &str, nonce: u64) -> PortalClient {
+        PortalClient::with_auth(
+            uri,
+            storage_dir(dir),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            nonce,
+        )
+    }
 
+    async fn mount_registry_nonce(mock_server: &MockServer, next_nonce: u64) {
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signer_id": 42,
                 "x_only_pubkey": "abcd",
                 "bls_pubkey": null,
-                "next_nonce": 99
+                "next_nonce": next_nonce
             })))
-            .expect(1)
-            .mount(&mock_server)
+            .mount(mock_server)
             .await;
+    }
 
-        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
-        let client = PortalClient::with_auth(
-            mock_server.uri(),
-            storage_dir("resync_nonce"),
-            keypair,
-            "NODE-test",
-            42,
-            "test-jwt-token",
-            5,
-        );
+    /// Kontor ahead of the counter — a first start, or ops signed elsewhere —
+    /// moves it forward.
+    #[tokio::test]
+    async fn resync_moves_the_local_nonce_up_to_kontors() {
+        let mock_server = MockServer::start().await;
+        mount_registry_nonce(&mock_server, 99).await;
+        let client = client_with_nonce(mock_server.uri(), "resync_nonce", 5);
 
-        assert_eq!(client.current_nonce(), Some(5));
-
-        let new_nonce = client.resync_nonce().await.unwrap();
-        assert_eq!(new_nonce, 99);
+        let entry = client.resync_from_registry().await.unwrap();
+        assert_eq!(entry.next_nonce, 99);
         assert_eq!(client.current_nonce(), Some(99));
     }
 
+    /// The counter ahead of Kontor is the normal state between two blocks: the
+    /// ops signed since are queued at the Portal under those nonces, and
+    /// re-signing them is what collided.
     #[tokio::test]
-    async fn resync_nonce_requires_authentication() {
+    async fn resync_never_moves_the_local_nonce_back() {
+        let mock_server = MockServer::start().await;
+        mount_registry_nonce(&mock_server, 99).await;
+        let client = client_with_nonce(mock_server.uri(), "resync_nonce_ahead", 120);
+
+        client.resync_from_registry().await.unwrap();
+        assert_eq!(client.current_nonce(), Some(120));
+        client.resync_from_registry().await.unwrap();
+        assert_eq!(client.current_nonce(), Some(120), "and not on the next one");
+    }
+
+    /// Further ahead than Kontor accepts, every op would be refused: fall back.
+    #[tokio::test]
+    async fn resync_falls_back_to_kontor_past_the_max_gap() {
+        let mock_server = MockServer::start().await;
+        mount_registry_nonce(&mock_server, 99).await;
+        let client = client_with_nonce(
+            mock_server.uri(),
+            "resync_nonce_runaway",
+            99 + KONTOR_MAX_NONCE_GAP + 1,
+        );
+
+        client.resync_from_registry().await.unwrap();
+        assert_eq!(client.current_nonce(), Some(99));
+    }
+
+    #[test]
+    fn resynced_nonce_is_monotonic_within_the_gap() {
+        assert_eq!(resynced_nonce(5, 99), 99);
+        assert_eq!(resynced_nonce(99, 99), 99);
+        assert_eq!(resynced_nonce(120, 99), 120);
+        assert_eq!(
+            resynced_nonce(99 + KONTOR_MAX_NONCE_GAP, 99),
+            99 + KONTOR_MAX_NONCE_GAP,
+            "exactly the gap Kontor still accepts"
+        );
+        assert_eq!(resynced_nonce(100 + KONTOR_MAX_NONCE_GAP, 99), 99);
+        assert_eq!(resynced_nonce(u64::MAX, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn resync_requires_authentication() {
         let client = PortalClient::new("http://localhost:1234", storage_dir("resync_no_auth"));
-        let err = client.resync_nonce().await.unwrap_err();
+        let err = client.resync_from_registry().await.unwrap_err();
         assert!(
             err.to_string().contains("authentication required"),
             "expected auth error, got {err}"

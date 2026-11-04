@@ -192,10 +192,11 @@ async fn sync_portal_once(
         _ => false,
     };
 
-    // Resync the nonce from Kontor's registry at the start of every cycle so
-    // that the local counter always reflects the confirmed on-chain state before
-    // any new signed ops are submitted. The same read carries the bond, so the
-    // cycle's staking decisions share the nonce's snapshot.
+    // Read Kontor's registry entry at the start of every cycle. The local nonce
+    // counter is only ever moved *up* to its `next_nonce` (see
+    // `resynced_nonce`): ops signed last cycle are usually still queued at the
+    // Portal, and signing at their nonces again is what collided. The same read
+    // carries the bond, so the cycle's staking decisions share its snapshot.
     if portal_client.node_id().is_some() {
         let entry = match portal_client.resync_from_registry().await {
             Ok(entry) => Some(entry),
@@ -207,10 +208,8 @@ async fn sync_portal_once(
         memory.staking.observe(entry.as_ref(), Instant::now());
     }
 
-    let mut failed_count: usize = 0;
-
     if let Some(node_id) = portal_client.node_id() {
-        failed_count += reconcile::reconcile_from_portal_with(
+        reconcile::reconcile_from_portal_with(
             portal_client,
             database,
             node_id,
@@ -258,7 +257,7 @@ async fn sync_portal_once(
         .context("downloading agreements failed")?;
     }
 
-    failed_count += sync_active_challenges(portal_client, database)
+    sync_active_challenges(portal_client, database)
         .await
         .context("syncing active challenges failed")?;
 
@@ -284,14 +283,6 @@ async fn sync_portal_once(
     )
     .await
     .context("computing and submitting proofs failed")?;
-
-    if failed_count > 0 {
-        if let Err(e) = portal_client.resync_nonce().await {
-            warn!(
-                "failed to resync nonce after observing {failed_count} on-chain failure(s): {e:#}"
-            );
-        }
-    }
 
     // The exit, once the operator's unstake has executed, is worked out from
     // the node's own rows: which memberships it holds and which challenges
@@ -1166,8 +1157,11 @@ mod tests {
         })
     }
 
+    /// An op that failed on chain used to rewind the counter to Kontor's
+    /// `next_nonce` — onto the nonces of ops still queued at the Portal. It now
+    /// leaves the counter where it is.
     #[tokio::test]
-    async fn sync_portal_once_resyncs_nonce_after_failed_transition() {
+    async fn an_on_chain_failure_does_not_rewind_the_nonce() {
         let mock_server = MockServer::start().await;
         let agreement_id = "AGR-failed-nonce";
         let file_id = "FILE-AGR-failed-nonce";
@@ -1188,8 +1182,7 @@ mod tests {
         mount_empty_ready_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
 
-        // Registry endpoint is hit twice: once at startup resync, once after
-        // observing the failed transition.
+        // Read once, at the start of the cycle; the failure costs no second read.
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1198,7 +1191,7 @@ mod tests {
                 "bls_pubkey": null,
                 "next_nonce": 99
             })))
-            .expect(2)
+            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -1228,8 +1221,8 @@ mod tests {
         };
         seeded.insert(&database).await.unwrap();
 
-        let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
-        assert_eq!(portal_client.current_nonce(), Some(5));
+        // Ahead of Kontor: ops signed since its last block, still queued.
+        let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 120);
 
         sync_portal_once(
             &portal_client,
@@ -1244,13 +1237,15 @@ mod tests {
 
         assert_eq!(
             portal_client.current_nonce(),
-            Some(99),
-            "nonce should be resynced from registry after observing failed transition"
+            Some(120),
+            "a failure on chain must not move the nonce back onto queued ops"
         );
     }
 
+    /// Every cycle reads Kontor's `next_nonce` and moves the counter up to it
+    /// — but never back down onto ops the Portal still has queued.
     #[tokio::test]
-    async fn sync_portal_once_resyncs_nonce_at_start_of_every_cycle() {
+    async fn every_cycle_moves_the_nonce_up_to_kontors_and_never_down() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -1268,8 +1263,7 @@ mod tests {
         mount_empty_ready_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
 
-        // Registry endpoint is now hit once per cycle (startup resync), even
-        // without any failed transitions.
+        // Hit once per cycle, even without any failed transitions.
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1278,31 +1272,35 @@ mod tests {
                 "bls_pubkey": null,
                 "next_nonce": 99
             })))
-            .expect(1)
+            .expect(3)
             .mount(&mock_server)
             .await;
 
         let database = setup_in_memory_db().await;
         let storage_dir = unique_test_path("daemon_resync_each_cycle");
         fs::create_dir_all(&storage_dir).ok();
+        let memory = DaemonMemory::default();
 
-        let portal_client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
+        let behind = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 5);
+        let ahead = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 120);
+        for client in [&behind, &ahead, &ahead] {
+            sync_portal_once(
+                client,
+                &database,
+                StorageLimits::default(),
+                &StorageBackend::local(),
+                &storage_dir,
+                &memory,
+            )
+            .await
+            .expect("sync_portal_once should succeed");
+        }
 
-        sync_portal_once(
-            &portal_client,
-            &database,
-            StorageLimits::default(),
-            &StorageBackend::local(),
-            &storage_dir,
-            &DaemonMemory::default(),
-        )
-        .await
-        .expect("sync_portal_once should succeed");
-
+        assert_eq!(behind.current_nonce(), Some(99), "moved up to Kontor's");
         assert_eq!(
-            portal_client.current_nonce(),
-            Some(99),
-            "nonce should be resynced from registry at the start of each sync cycle"
+            ahead.current_nonce(),
+            Some(120),
+            "kept ahead of Kontor's, cycle after cycle"
         );
     }
 
@@ -1451,6 +1449,57 @@ mod tests {
             "the cycle's other work came before the top-up"
         );
         assert_eq!(memory.staking.status()["in_flight"]["nonce"], 3);
+    }
+
+    /// Onboarding queues the first top-up at Kontor's `next_nonce`, N. The
+    /// first cycle reads the same N — the top-up waits for a block — and used to
+    /// rewind the counter to it, signing that cycle's first op at N again.
+    #[tokio::test]
+    async fn the_first_cycle_does_not_re_sign_the_bootstrap_nonce() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(funded_entry(3)))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": "add_stake", "status": "queued", "nonce": 3
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_bootstrap_nonce");
+        fs::create_dir_all(&storage_dir).ok();
+        let client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 3);
+        let memory = DaemonMemory::default();
+
+        crate::app::tasks::stake::bootstrap_stake(&client, &memory.staking, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(client.current_nonce(), Some(4), "the top-up took nonce 3");
+
+        sync_portal_once(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+            &memory,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.current_nonce(),
+            Some(4),
+            "Kontor still says 3, and the next op must not be signed at it"
+        );
     }
 
     /// Joins are gated on the bond the cycle just read: an agreement whose
