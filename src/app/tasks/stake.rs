@@ -1160,7 +1160,12 @@ fn describe_transition(
 ) -> Option<String> {
     let mut event = None;
 
-    if current.stake < previous.stake && landed != Some(NodeOp::WithdrawStake) {
+    // A bond that went to zero while a withdrawal was pending is the
+    // withdrawal completing — whether or not its op is still tracked in
+    // flight, which one that landed after the in-flight expiry is not.
+    let withdrawn = landed == Some(NodeOp::WithdrawStake)
+        || (current.stake.is_zero() && previous.withdrawal_height.is_some());
+    if current.stake < previous.stake && !withdrawn {
         let lost = previous.stake.saturating_sub(current.stake);
         error!(
             "stake dropped from {} to {} KOR (−{lost}): a missed challenge was slashed at 30× \
@@ -2439,7 +2444,11 @@ mod tests {
         assert_eq!(status["stake"], "0");
     }
 
-    /// A withdrawal empties the bond on purpose; that is not a slash.
+    /// A withdrawal empties the bond on purpose; that is not a slash — not
+    /// even when its op is no longer tracked in flight (one requested from
+    /// /admin and given up as lost, say, or sent by an earlier process). A
+    /// slash while the withdrawal is pending still is one: it does not take
+    /// the bond to zero.
     #[test]
     fn a_withdrawal_is_not_reported_as_a_slash() {
         let tracker = StakeTracker::new(StakePolicy::default());
@@ -2457,6 +2466,26 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!message.contains("slashed"), "{message}");
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &requested, t0);
+        observed(&tracker, &withdrawn, t0);
+        assert_eq!(
+            tracker.status()["last_event"]["message"],
+            "withdrawal completed",
+            "no op in flight, same withdrawal"
+        );
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &requested, t0);
+        let mut slashed = entry(Some("40"), Some("40"));
+        slashed.stake_withdrawal_height = Some(5);
+        observed(&tracker, &slashed, t0);
+        let message = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("slashed"), "{message}");
     }
 
     #[test]
