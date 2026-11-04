@@ -145,7 +145,7 @@ pub async fn ensure_kor_balance(
                 Some(502) | Some(503) => {
                     writeln!(
                         writer,
-                        "⚠ Faucet indisponible, en attente d'un transfert KOR manuel…"
+                        "⚠ Faucet unavailable; waiting for a manual KOR transfer…"
                     )?;
                 }
                 _ => return Err(e),
@@ -454,7 +454,7 @@ mod tests {
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(
-            output.contains("Faucet indisponible"),
+            output.contains("Faucet unavailable"),
             "expected warning, got: {output}"
         );
         assert!(output.contains("✓ KOR balance: 3.0"), "got: {output}");
@@ -497,7 +497,7 @@ mod tests {
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(
-            output.contains("Faucet indisponible"),
+            output.contains("Faucet unavailable"),
             "expected warning, got: {output}"
         );
         assert!(output.contains("✓ KOR balance: 7.0"), "got: {output}");

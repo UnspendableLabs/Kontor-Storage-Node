@@ -44,7 +44,7 @@ jobs:
 
   # `rust-version` in Cargo.toml is a promise to whoever runs `cargo install`,
   # and nothing here was keeping it. Every other job resolves its toolchain
-  # through rust-toolchain.toml, which pins 1.95.0 and silently overrides the
+  # through rust-toolchain.toml, which pins 1.99.1 and silently overrides the
   # `@stable` above — so the declared minimum had never once been compiled.
   # Removing the file is what lets the requested toolchain actually be used.
   msrv:
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # First, so the reading below does not itself pull down 1.95.0.
+      # First, so the reading below does not itself pull down 1.99.1.
       - run: rm rust-toolchain.toml
       - name: Read rust-version from the manifest
         id: msrv

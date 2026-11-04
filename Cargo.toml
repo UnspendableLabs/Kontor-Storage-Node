@@ -28,7 +28,7 @@ exclude = [
     "/tests",
     # Kept out deliberately. `cargo install` never reads it — rustup picks a
     # toolchain from the working directory, not from the crate it is building —
-    # but anyone who unpacks the tarball and builds it would have 1.95.0 forced
+    # but anyone who unpacks the tarball and builds it would have 1.99.1 forced
     # on them by a file they did not write, which is the opposite of what
     # `rust-version` above promises.
     "/rust-toolchain.toml",

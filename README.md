@@ -556,8 +556,8 @@ can lose its whole bond to a short outage. The node defends what it can:
 - proofs run every cycle, including on a node at `STORAGE_MAX_FILES` or one
   whose join was just refused, nearest deadline first;
 - a proof Kontor rejects leaves the challenge open, and the node proves it again
-  — up to 5 times, 1 to 16 minutes apart — before giving up loudly on a proof
-  that is evidently wrong;
+  — up to 5 times, waiting 1, 2, 4 and 8 minutes between attempts — before
+  giving up loudly on a proof that is evidently wrong;
 - a refused join (`422` from the Portal) no longer fails the cycle; joins pause
   for 10 minutes instead.
 
