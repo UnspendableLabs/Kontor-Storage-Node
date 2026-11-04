@@ -157,8 +157,9 @@ pub const WITHDRAWAL_DELAY_BLOCKS: u64 = 2028;
 
 /// Block interval assumed to turn that delay into a time. The node has no
 /// view of the chain tip, so it times the delay from when it first saw the
-/// withdrawal height; faster blocks only make it wait longer than it had to,
-/// and the operator can always withdraw by hand from `/admin`.
+/// withdrawal height — a moment it records in its database, so a restart does
+/// not start the two weeks over; faster blocks only make it wait longer than
+/// it had to, and the operator can always withdraw by hand from `/admin`.
 pub const ASSUMED_BLOCK_TIME: Duration = Duration::from_secs(600);
 
 /// How often an automatic `withdraw-stake` is retried after one that executed
@@ -334,6 +335,48 @@ impl fmt::Display for SkipReason {
     }
 }
 
+/// Kontor's withdrawal delay as the node counts it. The node cannot see the
+/// chain tip, so it counts [`WITHDRAWAL_DELAY_BLOCKS`] of
+/// [`ASSUMED_BLOCK_TIME`] from the first read that showed the withdrawal
+/// height; faster blocks only make it wait longer than it had to, and the
+/// operator can always withdraw by hand from `/admin`.
+#[derive(Clone, Copy, Debug)]
+struct WithdrawalTimer {
+    /// When the delay started: the first read that showed the height, in this
+    /// process or — restored from the database — in an earlier one.
+    started_at: DateTime<Utc>,
+    /// When this process started counting.
+    seen: Instant,
+    /// How much of the delay had already run by `seen`: zero for a start this
+    /// process witnessed itself.
+    head_start: Duration,
+}
+
+impl WithdrawalTimer {
+    fn starting_now(now: Instant) -> Self {
+        Self {
+            started_at: Utc::now(),
+            seen: now,
+            head_start: Duration::ZERO,
+        }
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        now.duration_since(self.seen)
+            .saturating_add(self.head_start)
+    }
+
+    /// When the node first tries `withdraw-stake` on its own.
+    fn due_at(&self) -> DateTime<Utc> {
+        self.started_at + chrono::Duration::from_std(withdrawal_delay()).unwrap_or_default()
+    }
+}
+
+/// [`WITHDRAWAL_DELAY_BLOCKS`] at [`ASSUMED_BLOCK_TIME`].
+fn withdrawal_delay() -> Duration {
+    ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32)
+}
+
 /// An op the relay accepted and Kontor has not executed yet.
 #[derive(Clone, Debug)]
 struct InFlight {
@@ -388,9 +431,16 @@ struct TrackerState {
     /// date with the Portal since this process started — or since the last
     /// time the exit had to resend its leaves.
     memberships_refreshed: bool,
-    /// When this process first saw the withdrawal height: the start of the
-    /// withdrawal delay as far as the node can tell.
-    unstake_seen: Option<Instant>,
+    /// The withdrawal delay, counted from when the node first saw the
+    /// withdrawal height — in this process, or in an earlier one by the record
+    /// it left in the database.
+    withdrawal: Option<WithdrawalTimer>,
+    /// What the database holds as the start of the delay, as far as this
+    /// process knows: `None` for no row. Compared with `withdrawal` to decide
+    /// what to write (see [`persist_withdrawal_start`]).
+    persisted_withdrawal_start: Option<DateTime<Utc>>,
+    /// The database has been read for an earlier process's record.
+    withdrawal_restored: bool,
     last_withdraw: Option<Instant>,
     /// The bond came back: the operator left the network. Nothing more is
     /// bonded automatically, whatever auto-stake says.
@@ -498,6 +548,59 @@ impl StakeTracker {
         self.lock().memberships_refreshed = true;
     }
 
+    /// Whether the database has been read for the start of a withdrawal delay
+    /// an earlier process recorded (see [`restore_withdrawal_start`]).
+    #[must_use]
+    pub fn withdrawal_start_restored(&self) -> bool {
+        self.lock().withdrawal_restored
+    }
+
+    /// Count the withdrawal delay from `started_at`, the moment an earlier
+    /// process first saw the withdrawal height; `None` when it recorded none.
+    ///
+    /// Overrides a start this process witnessed itself if the record is
+    /// earlier — onboarding reads the registry before the daemon reads the
+    /// database — and never a later one.
+    pub fn restore_withdrawal_start(&self, started_at: Option<DateTime<Utc>>, now: Instant) {
+        let mut state = self.lock();
+        state.withdrawal_restored = true;
+        state.persisted_withdrawal_start = started_at;
+        let Some(started_at) = started_at else {
+            return;
+        };
+        if state
+            .withdrawal
+            .is_some_and(|timer| timer.started_at <= started_at)
+        {
+            return;
+        }
+        let head_start = (Utc::now() - started_at).to_std().unwrap_or_default();
+        info!(
+            "the withdrawal delay has been running since {}; {} hours of it are already behind",
+            started_at.to_rfc3339(),
+            head_start.as_secs() / 3600
+        );
+        state.withdrawal = Some(WithdrawalTimer {
+            started_at,
+            seen: now,
+            head_start,
+        });
+    }
+
+    /// The start of the withdrawal delay the database should hold, if it does
+    /// not hold it already: `Some(None)` to clear a record whose delay is over.
+    #[must_use]
+    pub fn withdrawal_start_to_persist(&self) -> Option<Option<DateTime<Utc>>> {
+        let state = self.lock();
+        let wanted = state.withdrawal.map(|timer| timer.started_at);
+        (wanted != state.persisted_withdrawal_start).then_some(wanted)
+    }
+
+    /// The database now holds `started_at` as the start of the delay.
+    pub fn withdrawal_start_persisted(&self, started_at: Option<DateTime<Utc>>) {
+        self.lock().persisted_withdrawal_start = started_at;
+    }
+
     /// Whether the node is in its exit: the operator's unstake has executed.
     #[must_use]
     pub fn exiting(&self) -> bool {
@@ -577,7 +680,7 @@ impl StakeTracker {
         // (see `verify_in_flight`), and auto-stake would re-bond
         // the whole bond it just returned. An exit under way at the last read,
         // and now no bond and no withdrawal pending: the bond came back.
-        let was_exiting = state.unstake_seen.is_some()
+        let was_exiting = state.withdrawal.is_some()
             || state
                 .last_known
                 .as_ref()
@@ -592,9 +695,11 @@ impl StakeTracker {
             );
         }
         if snapshot.withdrawal_height.is_some() {
-            state.unstake_seen.get_or_insert(now);
+            state
+                .withdrawal
+                .get_or_insert_with(|| WithdrawalTimer::starting_now(now));
         } else {
-            state.unstake_seen = None;
+            state.withdrawal = None;
         }
 
         // A join's collateral is held until its nonce says it has executed —
@@ -990,12 +1095,9 @@ impl StakeTracker {
                     .iter()
                     .filter(|id| !state.left.contains(*id))
                     .collect();
-                let delay = ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32);
-                let withdraw_from = state.unstake_seen.map(|seen| {
-                    let left = delay.saturating_sub(seen.elapsed());
-                    (Utc::now() + chrono::Duration::from_std(left).unwrap_or_default())
-                        .to_rfc3339()
-                });
+                let withdraw_from = state
+                    .withdrawal
+                    .map(|timer| timer.due_at().to_rfc3339());
                 json!({
                     "memberships_left": remaining,
                     "deferred": exit.deferred,
@@ -1040,11 +1142,10 @@ fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option
 /// The delay has passed by the node's reckoning, and the last automatic
 /// attempt is far enough back.
 fn withdraw_due(state: &TrackerState, now: Instant) -> bool {
-    let Some(seen) = state.unstake_seen else {
+    let Some(timer) = state.withdrawal else {
         return false;
     };
-    let delay = ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32);
-    now.duration_since(seen) >= delay
+    timer.elapsed(now) >= withdrawal_delay()
         && state
             .last_withdraw
             .is_none_or(|last| now.duration_since(last) >= WITHDRAW_RETRY_INTERVAL)
@@ -1274,6 +1375,86 @@ pub fn is_membership_status(status: Option<&str>) -> bool {
 /// Challenge statuses that are not resolved yet: still to prove, or proved
 /// and waiting for the verdict.
 const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
+
+/// The `node_state` key under which the start of the withdrawal delay is kept,
+/// as an RFC 3339 timestamp.
+pub const WITHDRAWAL_STARTED_AT: &str = "stake_withdrawal_started_at";
+
+/// Read the start of the withdrawal delay an earlier process recorded, if any,
+/// into the tracker. Once per process, before the first cycle's read is acted
+/// on.
+///
+/// # Errors
+/// If the row cannot be read; the tracker then still counts from this process
+/// and the next cycle tries again.
+pub async fn restore_withdrawal_start(
+    database: &DatabaseConnection,
+    tracker: &StakeTracker,
+    now: Instant,
+) -> anyhow::Result<()> {
+    use crate::entities::prelude::NodeState;
+    use sea_orm::EntityTrait;
+
+    let row = NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+        .one(database)
+        .await
+        .context("reading the start of the withdrawal delay")?;
+    let started_at = match row {
+        Some(row) => Some(
+            DateTime::parse_from_rfc3339(&row.value)
+                .with_context(|| format!("unreadable {WITHDRAWAL_STARTED_AT}: {}", row.value))?
+                .with_timezone(&Utc),
+        ),
+        None => None,
+    };
+    tracker.restore_withdrawal_start(started_at, now);
+    Ok(())
+}
+
+/// Record the start of the withdrawal delay as the tracker counts it, or clear
+/// the record once the withdrawal is over. A no-op while the database already
+/// says the same.
+///
+/// # Errors
+/// If the row cannot be written; the next cycle tries again.
+pub async fn persist_withdrawal_start(
+    database: &DatabaseConnection,
+    tracker: &StakeTracker,
+) -> anyhow::Result<()> {
+    use crate::entities::node_state;
+    use crate::entities::prelude::NodeState;
+    use sea_orm::{ActiveValue, EntityTrait};
+
+    let Some(started_at) = tracker.withdrawal_start_to_persist() else {
+        return Ok(());
+    };
+    match started_at {
+        Some(started_at) => {
+            let row = node_state::ActiveModel {
+                key: ActiveValue::Set(WITHDRAWAL_STARTED_AT.to_string()),
+                value: ActiveValue::Set(started_at.to_rfc3339()),
+                updated_at: ActiveValue::Set(Utc::now().fixed_offset()),
+            };
+            NodeState::insert(row)
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::column(node_state::Column::Key)
+                        .update_columns([node_state::Column::Value, node_state::Column::UpdatedAt])
+                        .to_owned(),
+                )
+                .exec(database)
+                .await
+                .context("recording the start of the withdrawal delay")?;
+        }
+        None => {
+            NodeState::delete_by_id(WITHDRAWAL_STARTED_AT)
+                .exec(database)
+                .await
+                .context("clearing the start of the withdrawal delay")?;
+        }
+    }
+    tracker.withdrawal_start_persisted(started_at);
+    Ok(())
+}
 
 /// Release the collateral of pending joins that will never execute, from what
 /// this cycle learned about their agreements.
@@ -2480,6 +2661,131 @@ mod tests {
             "no re-bonding after an exit"
         );
         assert_eq!(tracker.status()["exited"], true);
+    }
+
+    /// The delay is counted from when the withdrawal height was first seen,
+    /// which a restart must not move: a start an earlier process recorded is
+    /// honoured, and the hours already behind are not waited for again.
+    #[test]
+    fn the_withdrawal_delay_is_counted_from_the_recorded_start() {
+        let exit = ExitInputs::default();
+        let hour = Duration::from_secs(60 * 60);
+        let delay = ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+
+        // An earlier process saw the height all but an hour ago.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let started_at = Utc::now() - chrono::Duration::from_std(delay - hour).unwrap();
+        tracker.restore_withdrawal_start(Some(started_at), t0);
+        assert!(tracker.withdrawal_start_restored());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert_eq!(tracker.plan(t0, Some(&exit)), None, "an hour still to go");
+        assert_eq!(
+            tracker.plan(t0 + hour, Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+        let estimated = tracker.status()["exit"]["withdraw_estimated_from"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let estimated = DateTime::parse_from_rfc3339(&estimated).unwrap();
+        assert!(
+            (estimated.with_timezone(&Utc)
+                - (started_at + chrono::Duration::from_std(delay).unwrap()))
+            .num_seconds()
+            .abs()
+                < 2,
+            "{estimated}"
+        );
+
+        // No record: the delay runs from this process's first sight of it.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        tracker.restore_withdrawal_start(None, t0);
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert_eq!(
+            tracker.plan(t0 + delay - Duration::from_secs(1), Some(&exit)),
+            None
+        );
+        assert_eq!(
+            tracker.plan(t0 + delay, Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+
+        // Onboarding reads the registry before the daemon reads the database:
+        // an earlier record overrides the start this process just witnessed,
+        // a later one never does.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        tracker.restore_withdrawal_start(Some(Utc::now() + chrono::Duration::hours(1)), t0);
+        assert_eq!(tracker.plan(t0 + delay - hour, Some(&exit)), None);
+        tracker.restore_withdrawal_start(
+            Some(Utc::now() - chrono::Duration::from_std(delay).unwrap()),
+            t0,
+        );
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::WithdrawStake),
+            "the delay had run out before this process started"
+        );
+    }
+
+    /// The start is written when first seen, left alone while nothing changed,
+    /// read back by the next process, and cleared once the withdrawal is over.
+    #[tokio::test]
+    async fn the_withdrawal_start_is_kept_in_the_database_across_restarts() {
+        use crate::entities::prelude::NodeState;
+        use crate::testutils::setup_in_memory_db;
+        use sea_orm::EntityTrait;
+
+        let db = setup_in_memory_db().await;
+        let t0 = Instant::now();
+        let first = StakeTracker::new(StakePolicy::default());
+        restore_withdrawal_start(&db, &first, t0).await.unwrap();
+        assert!(first.withdrawal_start_restored());
+        assert_eq!(
+            first.withdrawal_start_to_persist(),
+            None,
+            "nothing to write yet"
+        );
+
+        observed(&first, &exiting_entry(10, "100"), t0);
+        assert!(matches!(first.withdrawal_start_to_persist(), Some(Some(_))));
+        persist_withdrawal_start(&db, &first).await.unwrap();
+        let row = NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("recorded");
+        DateTime::parse_from_rfc3339(&row.value).expect("an RFC 3339 timestamp");
+        assert_eq!(first.withdrawal_start_to_persist(), None, "already written");
+        persist_withdrawal_start(&db, &first).await.unwrap();
+
+        // The next process picks it up and counts from the same moment.
+        let second = StakeTracker::new(StakePolicy::default());
+        let t1 = t0 + Duration::from_secs(3600);
+        restore_withdrawal_start(&db, &second, t1).await.unwrap();
+        observed(&second, &exiting_entry(10, "100"), t1);
+        assert_eq!(
+            second.status()["exit"]["withdraw_estimated_from"],
+            first.status()["exit"]["withdraw_estimated_from"]
+        );
+        assert_eq!(
+            second.withdrawal_start_to_persist(),
+            None,
+            "the record is the one it restored"
+        );
+        // Withdrawn: no delay to count, and no record to mislead a later exit.
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = 11;
+        observed(&second, &withdrawn, t1);
+        assert_eq!(second.withdrawal_start_to_persist(), Some(None));
+        persist_withdrawal_start(&db, &second).await.unwrap();
+        assert!(NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(second.withdrawal_start_to_persist(), None);
     }
 
     /// A withdrawal that executed without returning the bond means a leave

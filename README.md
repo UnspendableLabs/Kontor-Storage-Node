@@ -598,9 +598,11 @@ unstake** (type `UNSTAKE`). The rest is the daemon's, one op per cycle:
    node's balance. After that it bonds nothing again in this process.
 
 The node cannot see the chain tip, so it times the delay from when it first saw
-the withdrawal height, assuming 10-minute blocks; **Withdraw** (type
-`WITHDRAW`) tries it by hand at any time. A withdrawal that executes without
-returning the bond is retried every 6 hours, re-sending the leaves first.
+the withdrawal height, assuming 10-minute blocks. That moment is recorded in
+its database (`node_state`), so a restart does not put the two weeks back on
+the clock; **Withdraw** (type `WITHDRAW`) tries it by hand at any time. A
+withdrawal that executes without returning the bond is retried every 6 hours,
+re-sending the leaves first.
 
 A restart does not lose the leaves already made. The Portal marks a membership
 `left` once its `leave-agreement` is confirmed, and before the exit's first

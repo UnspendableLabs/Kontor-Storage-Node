@@ -2,3 +2,4 @@
 
 pub use super::agreements::Entity as Agreements;
 pub use super::challenges::Entity as Challenges;
+pub use super::node_state::Entity as NodeState;

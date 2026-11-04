@@ -6,7 +6,8 @@ use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{
-    exit_inputs, manage_stake, refresh_memberships, settle_pending_joins, JoinBudget, StakeTracker,
+    exit_inputs, manage_stake, persist_withdrawal_start, refresh_memberships,
+    restore_withdrawal_start, settle_pending_joins, JoinBudget, StakeTracker,
 };
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
@@ -202,6 +203,16 @@ async fn sync_portal_once(
     // Portal, and signing at their nonces again is what collided. The same read
     // carries the bond, so the cycle's staking decisions share its snapshot.
     if portal_client.node_id().is_some() {
+        // The start of a withdrawal delay an earlier process recorded, read
+        // once before this process acts on its own reads; and after each read,
+        // the start as this process counts it, written for the next one.
+        if !memory.staking.withdrawal_start_restored() {
+            if let Err(err) =
+                restore_withdrawal_start(database, &memory.staking, Instant::now()).await
+            {
+                warn!("could not read when the withdrawal delay started: {err:#}");
+            }
+        }
         let entry = match portal_client.resync_from_registry().await {
             Ok(entry) => Some(entry),
             Err(e) => {
@@ -210,6 +221,9 @@ async fn sync_portal_once(
             }
         };
         memory.staking.observe(entry.as_ref(), Instant::now());
+        if let Err(err) = persist_withdrawal_start(database, &memory.staking).await {
+            warn!("could not record when the withdrawal delay started: {err:#}");
+        }
     }
 
     if let Some(node_id) = portal_client.node_id() {
