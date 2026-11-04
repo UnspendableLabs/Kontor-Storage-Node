@@ -1681,6 +1681,13 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
                 Some((409, _)) => {
                     warn!("{} lost its nonce to another op: {err:#}", op.name());
                 }
+                // Nor these, which say nothing about the op — the same rule
+                // as for proofs (`computeproofs::refused_by_portal`): the
+                // session expired (401), or the Portal asks to come back
+                // later (408, 429). The next cycle signs it again.
+                Some((status @ (401 | 408 | 429), _)) => {
+                    warn!("{} not taken this cycle ({status}): {err:#}", op.name());
+                }
                 Some((status, code)) if (400..500).contains(&status) => {
                     let code = code.unwrap_or_else(|| status.to_string());
                     warn!("the Portal refused {} ({code}): {err:#}", op.name());
@@ -2866,14 +2873,24 @@ mod tests {
         );
     }
 
-    /// Through the relay: a 4xx backs the top-up off, a `409` — the nonce was
-    /// taken, not the op refused — does not.
+    /// Through the relay: a 4xx backs the top-up off, except the ones that
+    /// say nothing about the op — a `409` (the nonce was taken), a `401` (the
+    /// session expired), a `408` or `429` (come back later) — the same four
+    /// the proofs do not count as refusals.
     #[tokio::test]
     async fn the_relay_s_refusal_backs_off_and_a_lost_nonce_does_not() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        for (status, backs_off) in [(400u16, true), (422, true), (409, false)] {
+        for (status, backs_off) in [
+            (400u16, true),
+            (403, true),
+            (422, true),
+            (409, false),
+            (401, false),
+            (408, false),
+            (429, false),
+        ] {
             let mock_server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/api/nodes/NODE-test/ops"))
