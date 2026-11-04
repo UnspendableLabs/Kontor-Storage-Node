@@ -525,12 +525,14 @@ after 30 minutes is looked up in the Portal's listing of the node's ops (`GET
 unconfirmed batch, so half an hour is routine, and signing the same top-up
 again would bond it twice — and it is only given up, and decided again, once
 the Portal no longer lists it or lists it as `failed`, or after 6 hours
-whatever the Portal says. The collateral set aside for a join is held the same
-way: until the join's nonce is consumed, until the Portal shows the join
-invalidated or the agreement closed to joins, or 6 hours at most. One the
-Portal refuses is not signed again every cycle: a top-up, a claim or a leave
-(for that agreement only) waits an hour, a withdrawal six. The stake op is the
-last thing a cycle signs, so it never takes a nonce a proof needed.
+without the Portal saying it holds it (a Portal that keeps answering `queued`
+or `submitted` is believed for as long as it does: the op is not lost, and a
+batch signed late routinely takes longer). The collateral set aside for a join
+is held the same way: until the join's nonce is consumed, until the Portal
+shows the join invalidated or the agreement closed to joins, or 6 hours at
+most. One the Portal refuses is not signed again every cycle: a top-up, a claim
+or a leave (for that agreement only) waits an hour, a withdrawal six. The stake
+op is the last thing a cycle signs, so it never takes a nonce a proof needed.
 
 The node's own nonce counter only moves forward. Each cycle raises it to
 Kontor's `next_nonce` when that is ahead, but never lowers it: between two
@@ -553,13 +555,17 @@ reported a stake, a cycle in which it cannot be read joins nothing.
 A miss costs 30 × the agreement's collateral, so a node holding many agreements
 can lose its whole bond to a short outage. The node defends what it can:
 
-- proofs run every cycle, including on a node at `STORAGE_MAX_FILES` or one
-  whose join was just refused, nearest deadline first;
+- proofs run every cycle, before any agreement is downloaded or joined,
+  including on a node at `STORAGE_MAX_FILES`, nearest deadline first: nothing
+  that happens to a join or a download can cost a proof, and a proof signed
+  before the cycle's joins never has a join's nonce passed over it;
 - a proof Kontor rejects leaves the challenge open, and the node proves it again
   — up to 5 times, waiting 1, 2, 4 and 8 minutes between attempts — before
   giving up loudly on a proof that is evidently wrong;
-- a refused join (`422` from the Portal) no longer fails the cycle; joins pause
-  for 10 minutes instead.
+- a refused join (`422` from the Portal) pauses joins for 10 minutes; any other
+  failure of one agreement — a download the Portal cannot serve, a join it
+  answers with anything else, a file that cannot be stored — costs that
+  agreement this cycle and nothing more. Neither fails the cycle.
 
 It cannot defend against being down, against a file it lost, or against the
 [ledger limitation](#the-aggregated-ledger) below, which stops every proof at
@@ -583,7 +589,9 @@ why challenges were missed — a node slashed into cleanup once will be again.
 #### Leaving
 
 Leaving takes one action: `/admin` → **Withdraw the collateral** → **Begin
-unstake** (type `UNSTAKE`). The rest is the daemon's, one op per cycle:
+unstake** (type `UNSTAKE`). Asked for again while the first is still in flight,
+it is refused (`409`): both would execute. The rest is the daemon's, one op
+per cycle:
 
 1. **No new joins** from the moment the request is queued.
 2. Once `begin-unstake` has executed — starting Kontor's withdrawal delay of
@@ -592,7 +600,9 @@ unstake** (type `UNSTAKE`). The rest is the daemon's, one op per cycle:
    after the challenge is proved. Kontor would allow leaving earlier, and does
    not penalise it, but it changes nothing: the challenge must still be proved
    or it is slashed, and its collateral stays reserved until it resolves. The
-   node keeps proving throughout.
+   node keeps proving throughout. An agreement only counts as left once the
+   Portal lists the leave as `confirmed`; one Kontor refused is tried again
+   an hour later, one that never ran at once.
 3. When no agreement is held, no challenge is unresolved, and the delay has
    passed, it sends **`withdraw-stake`**, which returns the whole bond to the
    node's balance. After that it bonds nothing again in this process.

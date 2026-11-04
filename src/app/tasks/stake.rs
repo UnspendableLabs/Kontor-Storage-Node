@@ -55,7 +55,10 @@
 //! ones sit in an unconfirmed batch, so half an hour is routine — and is
 //! declared dropped only when the Portal no longer lists it, or lists it as
 //! `failed`. A listing that cannot be read leaves it in flight, up to
-//! [`OP_LANDING_HARD_TIMEOUT`]. Giving an op up too early is the expensive
+//! [`OP_LANDING_HARD_TIMEOUT`] after the Portal's last word; a Portal that
+//! keeps listing the op is believed for as long as it does (§2: an op still
+//! `queued` or `submitted` has not been lost and must not be signed again).
+//! Giving an op up too early is the expensive
 //! mistake here: the same `add-stake` signed again with a fresh nonce makes
 //! both execute, and the bond overshoots its target. The same listing settles
 //! an op whose answer never came — the request timed out, or the Portal
@@ -121,11 +124,17 @@ pub const MIN_GAS_RESERVE: Kor = Kor::from_units(DEFAULT_GAS_LIMIT as u128 * GAS
 /// blocks, so most ops never prompt the question.
 pub const OP_LANDING_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// How long an accepted op stays in flight at the outside, whatever the Portal
-/// says or fails to say about it. A Portal that lists an op as queued for this
-/// long, or cannot be asked for this long, has lost it for all the node can
-/// tell; it is then decided again. A join's committed collateral is held for
-/// the same length at most (see [`settle_pending_joins`]).
+/// How long an accepted op stays in flight without the Portal vouching for
+/// it. The clock runs from when the op was sent, and is restarted each time
+/// the Portal's listing says it still holds the op (`queued`, `submitted` or
+/// `confirmed`); an op the Portal cannot be asked about for this long, or
+/// stopped listing without saying `failed`, has been lost for all the node can
+/// tell, and is decided again. One the Portal keeps listing is waited for
+/// however long that takes (Portal `docs/node-portal-contract.md` §2: an op
+/// still `queued` or `submitted` has not been lost and must not be signed
+/// again) — a batch the operator signs late, or that the Portal cancels and
+/// re-queues, routinely takes longer than this. A join's committed collateral
+/// is held for the same length at most (see [`settle_pending_joins`]).
 pub const OP_LANDING_HARD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// At most one automatic `claim-rewards` per this interval. Each claim costs
@@ -220,7 +229,11 @@ pub struct StakeSnapshot {
     pub available: Kor,
     /// Non-null once `begin-unstake` has executed.
     pub withdrawal_height: Option<u64>,
-    pub bond_cleanup_pending: bool,
+    /// Whether the stake was slashed to zero and Kontor is still unwinding
+    /// the node's memberships; `None` when the Portal could not read it
+    /// (Portal `docs/node-portal-contract.md` §3: null is unknown, not
+    /// false).
+    pub bond_cleanup_pending: Option<bool>,
     pub reward_balance: Option<Kor>,
     /// Kontor's next nonce for this signer at the time of the read.
     pub next_nonce: u64,
@@ -248,15 +261,17 @@ impl StakeSnapshot {
             reserved,
             available,
             withdrawal_height: entry.stake_withdrawal_height,
-            bond_cleanup_pending: entry.bond_cleanup_pending.unwrap_or(false),
+            bond_cleanup_pending: entry.bond_cleanup_pending,
             reward_balance: parse_field("reward_balance", entry.reward_balance.as_deref()),
-            next_nonce: entry.next_nonce,
+            // Not known until the signer's first op: nothing has landed yet,
+            // which is what 0 says about every op in flight.
+            next_nonce: entry.next_nonce.unwrap_or(0),
         })
     }
 
     /// Why this bond cannot take on a new agreement at all, if it cannot.
     fn join_blocker(&self) -> Option<SkipReason> {
-        if self.bond_cleanup_pending {
+        if self.bond_cleanup_pending == Some(true) {
             Some(SkipReason::BondCleanupPending)
         } else if self.withdrawal_height.is_some() {
             Some(SkipReason::WithdrawalRequested)
@@ -287,7 +302,7 @@ fn parse_field(name: &str, raw: Option<&str>) -> Option<Kor> {
 /// op, then nothing more to do.
 #[must_use]
 pub fn top_up_amount(policy: &StakePolicy, snapshot: &StakeSnapshot) -> Option<Kor> {
-    if snapshot.bond_cleanup_pending || snapshot.withdrawal_height.is_some() {
+    if snapshot.bond_cleanup_pending == Some(true) || snapshot.withdrawal_height.is_some() {
         return None;
     }
     let free = snapshot.kor_balance?.saturating_sub(policy.gas_reserve);
@@ -386,6 +401,16 @@ fn withdrawal_delay() -> Duration {
     ASSUMED_BLOCK_TIME.saturating_mul(WITHDRAWAL_DELAY_BLOCKS as u32)
 }
 
+/// An op whose nonce Kontor has consumed, waiting for the Portal to say how
+/// it ended (see [`StakeTracker::classify_landed`]).
+#[derive(Clone, Debug)]
+struct LandedOp {
+    op: NodeOp,
+    nonce: u64,
+    /// When the nonce was seen consumed.
+    landed: Instant,
+}
+
 /// An op the relay accepted and Kontor has not executed yet.
 #[derive(Clone, Debug)]
 struct InFlight {
@@ -395,6 +420,18 @@ struct InFlight {
     sent_at: DateTime<Utc>,
     /// When the Portal's listing was last asked about it.
     checked: Option<Instant>,
+    /// When the Portal's listing last said it still holds the op. The hard
+    /// timeout counts from here, or from `sent` while the Portal has not
+    /// been heard.
+    vouched: Option<Instant>,
+}
+
+impl InFlight {
+    /// Whether the op has gone [`OP_LANDING_HARD_TIMEOUT`] without the Portal
+    /// vouching for it.
+    fn given_up_at(&self, now: Instant) -> bool {
+        now.duration_since(self.vouched.unwrap_or(self.sent)) >= OP_LANDING_HARD_TIMEOUT
+    }
 }
 
 /// A join sent but not yet executed: its collateral is not in `stake_reserved`
@@ -424,11 +461,13 @@ struct TrackerState {
     /// When the Portal last refused an `add-stake` (`None` key) or a
     /// `leave-agreement` (its agreement).
     refused: HashMap<RefusedOp, Instant>,
-    /// An `add-stake` whose nonce Kontor consumed while the bond did not move,
-    /// backed off for an hour and waiting for the Portal's listing to say
-    /// whether Kontor refused it or the Portal retired it unexecuted (see
-    /// [`StakeTracker::classify_landed`]).
-    unexplained: Option<(NodeOp, u64)>,
+    /// An op whose nonce Kontor consumed and whose outcome the registry read
+    /// does not settle, waiting for the Portal's listing to say what became
+    /// of it (see [`StakeTracker::classify_landed`]): an `add-stake` that did
+    /// not raise the bond — Kontor refused it, or the Portal retired it
+    /// unexecuted — or a `leave-agreement`, which the registry says nothing
+    /// about at all.
+    unexplained: Option<LandedOp>,
     joins_paused: Option<(Instant, String)>,
     /// An unstake or withdrawal the operator asked for from `/admin`, waiting
     /// for the daemon's next cycle — the daemon is the only thing that signs,
@@ -674,12 +713,12 @@ impl StakeTracker {
                     op.op.name()
                 );
                 landed = Some((op.op, op.nonce));
-            } else if now.duration_since(op.sent) >= OP_LANDING_HARD_TIMEOUT {
+            } else if op.given_up_at(now) {
                 warn!(
                     op = op.op.name(),
                     nonce = op.nonce,
-                    "the {} op is still not reflected after {} hours; giving it up for lost \
-                     and deciding again",
+                    "the {} op is still not reflected after {} hours without the Portal saying \
+                     it holds it; giving it up for lost and deciding again",
                     op.op.name(),
                     OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
                 );
@@ -689,9 +728,20 @@ impl StakeTracker {
         }
 
         match &landed {
-            Some((NodeOp::LeaveAgreement(agreement_id), _)) => {
-                info!("left agreement {agreement_id}");
-                state.left.insert(agreement_id.clone());
+            Some((op @ NodeOp::LeaveAgreement(agreement_id), nonce)) => {
+                // Its nonce went; whether Kontor accepted the leave is not in
+                // the registry. The Portal's listing says, and until it does
+                // the agreement is neither left nor left again (see
+                // `classify_landed` and `next_exit_op`).
+                info!(
+                    "the leave of agreement {agreement_id} has executed; asking the Portal \
+                     whether Kontor accepted it"
+                );
+                state.unexplained = Some(LandedOp {
+                    op: op.clone(),
+                    nonce: *nonce,
+                    landed: now,
+                });
             }
             Some((op @ NodeOp::AddStake(amount), nonce))
                 if state
@@ -712,7 +762,11 @@ impl StakeTracker {
                     REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
                 );
                 state.refused.insert(refused_key(op), now);
-                state.unexplained = Some((op.clone(), *nonce));
+                state.unexplained = Some(LandedOp {
+                    op: op.clone(),
+                    nonce: *nonce,
+                    landed: now,
+                });
                 state.last_event = Some((
                     Utc::now(),
                     format!("add_stake {amount} KOR executed without raising the bond"),
@@ -750,7 +804,7 @@ impl StakeTracker {
         if was_exiting && snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
             state.exited = true;
         }
-        if state.exited && !exited_before && !snapshot.bond_cleanup_pending {
+        if state.exited && !exited_before && snapshot.bond_cleanup_pending == Some(false) {
             warn!(
                 "the bond has been withdrawn: this node bonds nothing more on its own. Set \
                  KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
@@ -778,7 +832,7 @@ impl StakeTracker {
             if let Some(event) = event {
                 state.last_event = Some((Utc::now(), event));
             }
-        } else if snapshot.bond_cleanup_pending {
+        } else if snapshot.bond_cleanup_pending == Some(true) {
             error!(
                 "bond cleanup is pending: this node's stake was slashed to zero. It cannot join \
                  or add stake until Kontor finishes unwinding its memberships"
@@ -850,16 +904,29 @@ impl StakeTracker {
             return;
         }
         let dropped = match listed.as_ref().map(|listed| listed.status.as_str()) {
-            Some("queued" | "submitted") => {
-                info!(
-                    "the {name} op at nonce {nonce} is still {} at the Portal after {} minutes; \
-                     waiting",
-                    listed.as_ref().map_or("", |listed| listed.status.as_str()),
-                    now.duration_since(op.sent).as_secs() / 60
-                );
+            Some(status @ ("queued" | "submitted")) => {
+                // Held by the Portal: waited for, however long — a `submitted`
+                // op whose batch the Portal gave up on comes back as `queued`
+                // and is batched again, still under this nonce.
+                op.vouched = Some(now);
+                let waited = now.duration_since(op.sent);
+                if waited >= OP_LANDING_HARD_TIMEOUT {
+                    warn!(
+                        "the {name} op at nonce {nonce} has been {status} at the Portal for {} \
+                         hours; it is not lost, and is not signed again while the Portal holds it",
+                        waited.as_secs() / 3600
+                    );
+                } else {
+                    info!(
+                        "the {name} op at nonce {nonce} is still {status} at the Portal after {} \
+                         minutes; waiting",
+                        waited.as_secs() / 60
+                    );
+                }
                 return;
             }
             Some("confirmed") => {
+                op.vouched = Some(now);
                 debug!(
                     "the {name} op at nonce {nonce} is confirmed at the Portal; waiting for the \
                      registry to reflect it"
@@ -896,54 +963,130 @@ impl StakeTracker {
         state.last_event = Some((Utc::now(), dropped));
     }
 
-    /// The nonce of a landed `add-stake` the Portal's listing should be asked
-    /// about: one that executed without raising the bond (see
+    /// The nonce of a landed op the Portal's listing should be asked about:
+    /// an `add-stake` that executed without raising the bond, or a leave (see
     /// [`Self::classify_landed`]).
     #[must_use]
     pub fn op_to_classify(&self) -> Option<u64> {
-        self.lock().unexplained.as_ref().map(|(_, nonce)| *nonce)
+        self.lock().unexplained.as_ref().map(|landed| landed.nonce)
     }
 
-    /// What the Portal's listing of this node's failed ops says about the
-    /// `add-stake` at `nonce` whose nonce went while the bond did not move
-    /// (see [`Self::op_to_classify`]).
+    /// What the Portal's listing of this node's ops says about the op at
+    /// `nonce` whose nonce Kontor consumed (see [`Self::op_to_classify`]).
     ///
-    /// Its nonce goes one of two ways. Kontor executed and refused it: the
-    /// Portal lists it `failed` with Kontor's error, and the hour's backoff
-    /// `observe` put on it stands — the same op meets the same answer. Or the
-    /// Portal retired it without Kontor seeing it: a proof batched ahead of it
-    /// took the nonce, and the Portal lists it `failed` with "no receipt"; or
-    /// its nonce was stale by compose time, and the listing says so. Nothing
-    /// was refused then, and the backoff is lifted so the op is signed again.
-    /// A listing that cannot be read, or says anything else, leaves the
-    /// backoff in place: an hour's wait is the cheap mistake here.
-    pub fn classify_landed(&self, nonce: u64, listing: anyhow::Result<Vec<NodeOpRecord>>) {
+    /// For an `add-stake` whose nonce went while the bond did not move, it
+    /// went one of two ways. Kontor executed and refused it: the Portal lists
+    /// it `failed` with Kontor's error, and the hour's backoff `observe` put
+    /// on it stands — the same op meets the same answer. Or the Portal retired
+    /// it without Kontor seeing it: a proof batched ahead of it took the nonce,
+    /// and the Portal lists it `failed` with "no receipt"; or its nonce was
+    /// stale by compose time, and the listing says so. Nothing was refused
+    /// then, and the backoff is lifted so the op is signed again.
+    ///
+    /// For a `leave-agreement` the registry says nothing at all, so the
+    /// listing is the only word: `confirmed` and the agreement is left;
+    /// `failed` by Kontor and it is tried again after the hour a refusal
+    /// earns; retired by the Portal, or no longer listed, and it is tried
+    /// again at once. Until then the exit neither counts the agreement as
+    /// left nor leaves it again.
+    ///
+    /// A listing that still shows the op `queued` or `submitted` — the Portal
+    /// has not reconciled the block yet — or that cannot be read, settles
+    /// nothing: the op is asked about again next cycle, up to
+    /// [`OP_LANDING_HARD_TIMEOUT`] after it landed, then forgotten: the next
+    /// plan decides again from the rows and the bond as they stand.
+    pub fn classify_landed(
+        &self,
+        nonce: u64,
+        listing: anyhow::Result<Vec<NodeOpRecord>>,
+        now: Instant,
+    ) {
         let mut state = self.lock();
-        let Some((op, _)) = state.unexplained.take_if(|(_, n)| *n == nonce) else {
+        let Some(landed) = state.unexplained.take_if(|landed| landed.nonce == nonce) else {
             return;
         };
+        let op = landed.op.clone();
         let name = op.name();
+        let keep_asking = |state: &mut TrackerState, landed: LandedOp| {
+            if now.duration_since(landed.landed) < OP_LANDING_HARD_TIMEOUT {
+                state.unexplained = Some(landed);
+            } else {
+                warn!(
+                    "the Portal has not said how the {name} op at nonce {nonce} ended in {} \
+                     hours; deciding again from the rows as they stand",
+                    OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
+                );
+            }
+        };
         let listed = match listing {
             Ok(ops) => ops
                 .into_iter()
                 .find(|listed| listed.nonce == nonce && listed.op == name),
             Err(err) => {
                 warn!(
-                    "could not ask the Portal why the {name} op at nonce {nonce} did not take; \
-                     the backoff stands: {err:#}"
+                    "could not ask the Portal how the {name} op at nonce {nonce} ended; asking \
+                     again next cycle: {err:#}"
                 );
+                keep_asking(&mut state, landed);
                 return;
             }
         };
-        match listed {
-            Some(listed)
-                if listed.status == "failed"
-                    && listed.error.as_deref().is_some_and(retired_by_portal) =>
-            {
+        let status = listed.as_ref().map(|listed| listed.status.as_str());
+        let error = listed
+            .as_ref()
+            .and_then(|listed| listed.error.as_deref())
+            .unwrap_or("no error given");
+        if matches!(status, Some("queued" | "submitted")) {
+            debug!(
+                "the Portal still lists the {name} op at nonce {nonce} as {}; asking again next \
+                 cycle",
+                status.unwrap_or_default()
+            );
+            keep_asking(&mut state, landed);
+            return;
+        }
+        let retired = status == Some("failed") && retired_by_portal(error);
+        match &op {
+            NodeOp::LeaveAgreement(agreement_id) => match status {
+                Some("confirmed") => {
+                    info!("left agreement {agreement_id}");
+                    state.left.insert(agreement_id.clone());
+                    state.last_event = Some((Utc::now(), format!("left agreement {agreement_id}")));
+                }
+                Some("failed") if !retired => {
+                    warn!(
+                        "Kontor refused the leave of agreement {agreement_id} ({error}); trying \
+                         again in {} hour",
+                        REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
+                    );
+                    state.refused.insert(refused_key(&op), now);
+                    state.last_event = Some((
+                        Utc::now(),
+                        format!("leave_agreement {agreement_id} failed on Kontor: {error}"),
+                    ));
+                }
+                _ => {
+                    // Retired unexecuted, or not held by the Portal at all:
+                    // the membership stands and the leave is signed again.
+                    warn!(
+                        "the leave of agreement {agreement_id} at nonce {nonce} never ran ({}); \
+                         signing it again",
+                        if listed.is_some() {
+                            error
+                        } else {
+                            "the Portal does not list it"
+                        }
+                    );
+                    state.last_event = Some((
+                        Utc::now(),
+                        format!("leave_agreement {agreement_id} never ran (nonce {nonce}); signing again"),
+                    ));
+                }
+            },
+            _ if retired => {
                 info!(
-                    "the Portal retired the {name} op at nonce {nonce} before Kontor ran it ({}); \
-                     signing it again",
-                    listed.error.as_deref().unwrap_or_default()
+                    "the Portal retired the {name} op at nonce {nonce} before Kontor ran it \
+                     ({error}); signing it again"
                 );
                 state.refused.remove(&refused_key(&op));
                 state.last_event = Some((
@@ -953,15 +1096,16 @@ impl StakeTracker {
                     ),
                 ));
             }
-            Some(listed) => debug!(
-                "the Portal lists the {name} op at nonce {nonce} as {} ({}); the backoff stands",
-                listed.status,
-                listed.error.as_deref().unwrap_or("no error given")
-            ),
-            None => debug!(
-                "the Portal does not list the {name} op at nonce {nonce} among its failed ops: \
-                 Kontor ran it, and the backoff stands"
-            ),
+            _ => match status {
+                Some(status) => debug!(
+                    "the Portal lists the {name} op at nonce {nonce} as {status} ({error}); the \
+                     backoff stands"
+                ),
+                None => debug!(
+                    "the Portal does not list the {name} op at nonce {nonce}: Kontor ran it, and \
+                     the backoff stands"
+                ),
+            },
         }
     }
 
@@ -1079,6 +1223,7 @@ impl StakeTracker {
             sent: now,
             sent_at: Utc::now(),
             checked: None,
+            vouched: None,
         });
     }
 
@@ -1109,8 +1254,9 @@ impl StakeTracker {
     /// Queue an unstake or withdrawal for the daemon's next cycle.
     ///
     /// # Errors
-    /// If `op` is not one an operator may request, or another request is
-    /// already waiting.
+    /// If `op` is not one an operator may request, another request is
+    /// already waiting, or the same op is already in flight — signed and not
+    /// executed yet; asked for again it would run twice.
     pub fn request(&self, op: NodeOp) -> Result<(), &'static str> {
         if !matches!(op, NodeOp::BeginUnstake | NodeOp::WithdrawStake) {
             return Err("only an unstake or a withdrawal can be requested");
@@ -1118,6 +1264,14 @@ impl StakeTracker {
         let mut state = self.lock();
         if state.operator_request.is_some() {
             return Err("another request is already waiting for the next cycle");
+        }
+        if state.in_flight.as_ref().is_some_and(|sent| sent.op == op) {
+            return Err(match op {
+                NodeOp::BeginUnstake => {
+                    "an unstake is already in flight: signed, and not executed yet"
+                }
+                _ => "a withdrawal is already in flight: signed, and not executed yet",
+            });
         }
         state.last_event = Some((Utc::now(), format!("{} requested from /admin", op.name())));
         state.operator_request = Some(op);
@@ -1213,7 +1367,7 @@ impl StakeTracker {
             "reserved": state.snapshot.as_ref().and_then(|s| s.reserved),
             "available": state.snapshot.as_ref().map(|s| s.available),
             "withdrawal_height": state.snapshot.as_ref().and_then(|s| s.withdrawal_height),
-            "bond_cleanup_pending": state.snapshot.as_ref().map(|s| s.bond_cleanup_pending),
+            "bond_cleanup_pending": state.snapshot.as_ref().and_then(|s| s.bond_cleanup_pending),
             "reward_balance": state.snapshot.as_ref().and_then(|s| s.reward_balance),
             "policy": {
                 "auto_stake": policy.auto_stake,
@@ -1283,15 +1437,26 @@ fn describe_sent(op: &NodeOp, nonce: u64) -> String {
 
 /// The next step of the exit, if one is due.
 fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
+    // A leave that has executed but whose outcome the Portal has not given
+    // yet (see `classify_landed`): not left, not left again, and nothing to
+    // withdraw behind it.
+    let undecided = match &state.unexplained {
+        Some(LandedOp {
+            op: NodeOp::LeaveAgreement(agreement_id),
+            ..
+        }) => Some(agreement_id.as_str()),
+        _ => None,
+    };
     if let Some(agreement_id) = exit.memberships.iter().find(|id| {
         !state.left.contains(*id)
+            && undecided != Some(id.as_str())
             && !exit.deferred.contains(id)
             && !refused_recently(state, &NodeOp::LeaveAgreement((*id).clone()), now)
     }) {
         return Some(NodeOp::LeaveAgreement(agreement_id.clone()));
     }
     let all_left = exit.memberships.iter().all(|id| state.left.contains(id));
-    (all_left && exit.unresolved_challenges == 0 && withdraw_due(state, now))
+    (all_left && undecided.is_none() && exit.unresolved_challenges == 0 && withdraw_due(state, now))
         .then_some(NodeOp::WithdrawStake)
 }
 
@@ -1322,12 +1487,13 @@ fn describe_transition(
     // unless the node is in bond cleanup. A withdrawal returns the bond and
     // leaves nothing to clean up; a slash to zero leaves the memberships to
     // unwind, and Kontor clears the withdrawal height with the stake, so the
-    // registry otherwise looks the same.
+    // registry otherwise looks the same. Whether cleanup is pending has to be
+    // known for that: unread, the drop is reported as what it may be.
+    let exit_over = current.stake.is_zero() && previous.withdrawal_height.is_some();
     let withdrawn = landed == Some(NodeOp::WithdrawStake)
-        || (current.stake.is_zero()
-            && previous.withdrawal_height.is_some()
-            && !current.bond_cleanup_pending);
-    if current.stake < previous.stake && !withdrawn {
+        || (exit_over && current.bond_cleanup_pending == Some(false));
+    let undecided = exit_over && current.bond_cleanup_pending.is_none();
+    if current.stake < previous.stake && !withdrawn && !undecided {
         let lost = previous.stake.saturating_sub(current.stake);
         error!(
             "stake dropped from {} to {} KOR (−{lost}): a missed challenge was slashed at 30× \
@@ -1340,15 +1506,19 @@ fn describe_transition(
         ));
     }
 
-    if current.bond_cleanup_pending && !previous.bond_cleanup_pending {
-        error!(
-            "bond cleanup is pending: this node's stake was slashed to zero. It cannot join or \
-             add stake until Kontor finishes unwinding its memberships"
-        );
-        event = Some("bond cleanup pending".to_string());
-    } else if previous.bond_cleanup_pending && !current.bond_cleanup_pending {
-        info!("bond cleanup has finished; the node can add stake and join again");
-        event = Some("bond cleanup finished".to_string());
+    match (previous.bond_cleanup_pending, current.bond_cleanup_pending) {
+        (Some(false) | None, Some(true)) => {
+            error!(
+                "bond cleanup is pending: this node's stake was slashed to zero. It cannot join \
+                 or add stake until Kontor finishes unwinding its memberships"
+            );
+            event = Some("bond cleanup pending".to_string());
+        }
+        (Some(true), Some(false)) => {
+            info!("bond cleanup has finished; the node can add stake and join again");
+            event = Some("bond cleanup finished".to_string());
+        }
+        _ => {}
     }
 
     match (previous.withdrawal_height, current.withdrawal_height) {
@@ -1356,7 +1526,17 @@ fn describe_transition(
             warn!("withdrawal requested: joins stop, and the stake can be withdrawn from height {height} once no agreement holds it");
             event = Some(format!("withdrawal requested, unlocks at height {height}"));
         }
-        (Some(_), None) if current.bond_cleanup_pending => {
+        (Some(_), None) if current.bond_cleanup_pending.is_none() => {
+            warn!(
+                "the exit is over: no stake is bonded and no withdrawal is pending, but the \
+                 Portal could not say whether bond cleanup is pending, so whether the bond was \
+                 withdrawn or slashed to zero is not known. This node bonds nothing more on its \
+                 own; check the balance before restarting it with auto-stake on"
+            );
+            event =
+                Some("exit over: withdrawn or slashed, the Portal could not say which".to_string());
+        }
+        (Some(_), None) if current.bond_cleanup_pending == Some(true) => {
             warn!(
                 "the exit ended in a slash: the stake went to zero before it was withdrawn, \
                  and Kontor cleared the withdrawal with it. This node bonds nothing more on \
@@ -1714,6 +1894,24 @@ pub async fn refresh_memberships(
     database: &DatabaseConnection,
     node_id: &str,
 ) -> anyhow::Result<()> {
+    refresh_memberships_except(client, database, node_id, &[]).await
+}
+
+/// [`refresh_memberships`] for the rows not among `current`: the agreements
+/// the Portal's filtered listing has just returned, which reconciliation has
+/// already rewritten from it. What is left are the rows that claim a live
+/// membership the Portal no longer lists for this node — the stale `valid`
+/// rows of memberships that went `left`, `invalid` or `failed` — each re-read
+/// from its detail, which carries every row whatever its status.
+///
+/// # Errors
+/// As [`refresh_memberships`].
+pub async fn refresh_memberships_except(
+    client: &PortalClient,
+    database: &DatabaseConnection,
+    node_id: &str,
+    current: &[String],
+) -> anyhow::Result<()> {
     use crate::entities::agreements;
     use crate::entities::prelude::Agreements;
     use sea_orm::{ActiveValue, EntityTrait};
@@ -1721,6 +1919,7 @@ pub async fn refresh_memberships(
     let rows = Agreements::find().all(database).await?;
     for row in rows
         .into_iter()
+        .filter(|agreement| !current.contains(&agreement.agreement_id))
         .filter(|agreement| !NOT_ON_CHAIN.contains(&agreement.status.as_str()))
         .filter(|agreement| is_live_member(&agreement.nodes, node_id))
     {
@@ -1830,12 +2029,13 @@ pub async fn manage_stake(
     send(client, tracker, op).await
 }
 
-/// Ask the Portal why an `add-stake` that just landed did not raise the bond
-/// (see [`StakeTracker::classify_landed`]), before this cycle's plan.
+/// Ask the Portal how an op that just landed ended — an `add-stake` that did
+/// not raise the bond, a leave (see [`StakeTracker::classify_landed`]) —
+/// before this cycle's plan.
 async fn classify_landed_op(client: &PortalClient, tracker: &StakeTracker) {
     if let Some(nonce) = tracker.op_to_classify() {
-        let listing = client.list_node_ops(&["failed"]).await;
-        tracker.classify_landed(nonce, listing);
+        let listing = client.list_node_ops(&[]).await;
+        tracker.classify_landed(nonce, listing, Instant::now());
     }
 }
 
@@ -1948,7 +2148,7 @@ pub async fn bootstrap_stake(
         "✓ Stake: {} KOR bonded, {} KOR unreserved",
         snapshot.stake, snapshot.available
     )?;
-    if snapshot.bond_cleanup_pending {
+    if snapshot.bond_cleanup_pending == Some(true) {
         writeln!(
             writer,
             "⚠ Bond cleanup pending: the stake was slashed to zero; no joins until it finishes"
@@ -1970,9 +2170,9 @@ mod tests {
     fn entry(stake: Option<&str>, available: Option<&str>) -> RegistryEntry {
         RegistryEntry {
             signer_id: 42,
-            x_only_pubkey: "ab".into(),
+            x_only_pubkey: Some("ab".into()),
             bls_pubkey: None,
-            next_nonce: 10,
+            next_nonce: Some(10),
             kor_balance: Some("1000".into()),
             user_id: None,
             stake: stake.map(Into::into),
@@ -1995,7 +2195,7 @@ mod tests {
             reserved: Some(Kor::ZERO),
             available: kor(stake),
             withdrawal_height: None,
-            bond_cleanup_pending: false,
+            bond_cleanup_pending: Some(false),
             reward_balance: None,
             next_nonce: 10,
         }
@@ -2098,7 +2298,7 @@ mod tests {
         assert_eq!(top_up_amount(&policy, &withdrawing), None);
 
         let mut cleaning = snapshot("1000", "0");
-        cleaning.bond_cleanup_pending = true;
+        cleaning.bond_cleanup_pending = Some(true);
         assert_eq!(top_up_amount(&policy, &cleaning), None);
     }
 
@@ -2128,7 +2328,7 @@ mod tests {
 
         // It executed: the nonce moved on, the balance went into the bond.
         let mut landed = entry(Some("995"), Some("995"));
-        landed.next_nonce = 11;
+        landed.next_nonce = Some(11);
         landed.kor_balance = Some("5".into());
         observed(&tracker, &landed, t0 + Duration::from_secs(60));
         assert_eq!(tracker.plan(t0 + Duration::from_secs(60), None), None);
@@ -2146,7 +2346,7 @@ mod tests {
         tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
 
         let mut consumed = entry(Some("0"), Some("0"));
-        consumed.next_nonce = 12;
+        consumed.next_nonce = Some(12);
         let soon = t0 + Duration::from_secs(30);
         observed(&tracker, &consumed, soon);
         assert_eq!(tracker.plan(soon, None), None, "not re-signed next cycle");
@@ -2169,7 +2369,7 @@ mod tests {
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
         tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
         let mut partial = entry(Some("500"), Some("500"));
-        partial.next_nonce = 11;
+        partial.next_nonce = Some(11);
         partial.kor_balance = Some("500".into());
         observed(&tracker, &partial, soon);
         assert_eq!(tracker.plan(soon, None), Some(NodeOp::AddStake(kor("495"))));
@@ -2409,7 +2609,7 @@ mod tests {
         tracker.record_sent(NodeOp::ClaimRewards, 10, t0);
 
         // Landed, but the claim is rate-limited even if more is claimable.
-        e.next_nonce = 11;
+        e.next_nonce = Some(11);
         e.reward_balance = Some("2".into());
         let soon = t0 + Duration::from_secs(60);
         observed(&tracker, &e, soon);
@@ -2545,7 +2745,7 @@ mod tests {
 
         // Executed: the reservation now shows in stake_available instead.
         let mut landed = entry(Some("100"), Some("10"));
-        landed.next_nonce = 11;
+        landed.next_nonce = Some(11);
         observed(&tracker, &landed, t0);
         let mut budget = tracker.join_budget(t0);
         assert_eq!(
@@ -2714,7 +2914,7 @@ mod tests {
         tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
 
         let mut withdrawn = entry(Some("0"), Some("0"));
-        withdrawn.next_nonce = 11;
+        withdrawn.next_nonce = Some(11);
         observed(&tracker, &withdrawn, t0);
         let message = tracker.status()["last_event"]["message"]
             .as_str()
@@ -2886,10 +3086,27 @@ mod tests {
 
     fn exiting_entry(next_nonce: u64, stake: &str) -> RegistryEntry {
         let mut e = entry(Some(stake), Some("0"));
-        e.next_nonce = next_nonce;
+        e.next_nonce = Some(next_nonce);
         e.kor_balance = Some("5".into());
         e.stake_withdrawal_height = Some(5000);
         e
+    }
+
+    /// The Portal's listing of a `leave_agreement` op at `nonce`.
+    fn leave_record(nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
+        NodeOpRecord {
+            op: "leave_agreement".into(),
+            nonce,
+            status: status.into(),
+            error: error.map(Into::into),
+            txid: None,
+        }
+    }
+
+    /// The leave at `nonce` has landed, and the Portal confirms it.
+    fn leave_confirmed(tracker: &StakeTracker, nonce: u64, now: Instant) {
+        assert_eq!(tracker.op_to_classify(), Some(nonce), "asked about");
+        tracker.classify_landed(nonce, Ok(vec![leave_record(nonce, "confirmed", None)]), now);
     }
 
     /// The exit: leave each membership one op at a time, skipping one whose
@@ -2916,6 +3133,7 @@ mod tests {
         assert_eq!(tracker.plan(t0, Some(&exit)), None, "one op at a time");
 
         observed(&tracker, &exiting_entry(11, "100"), t0);
+        leave_confirmed(&tracker, 10, t0);
         assert_eq!(tracker.plan(t0, Some(&exit)), None, "AGR-a still deferred");
 
         exit.deferred.clear();
@@ -2926,6 +3144,7 @@ mod tests {
         );
         tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 11, t0);
         observed(&tracker, &exiting_entry(12, "100"), t0);
+        leave_confirmed(&tracker, 11, t0);
 
         // Nothing held; but the delay has not run by the node's reckoning.
         assert_eq!(tracker.plan(t0, Some(&exit)), None);
@@ -2942,7 +3161,7 @@ mod tests {
 
         // Withdrawn: the bond is back in the balance, and stays there.
         let mut withdrawn = entry(Some("0"), Some("0"));
-        withdrawn.next_nonce = 13;
+        withdrawn.next_nonce = Some(13);
         withdrawn.kor_balance = Some("105".into());
         observed(&tracker, &withdrawn, later);
         assert!(!tracker.exiting());
@@ -3110,7 +3329,7 @@ mod tests {
         );
         // Withdrawn: no delay to count, and no record to mislead a later exit.
         let mut withdrawn = entry(Some("0"), Some("0"));
-        withdrawn.next_nonce = 11;
+        withdrawn.next_nonce = Some(11);
         observed(&second, &withdrawn, t1);
         assert_eq!(second.withdrawal_start_to_persist(), Some(None));
         persist_withdrawal_start(&db, &second).await.unwrap();
@@ -3135,6 +3354,7 @@ mod tests {
         };
         tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
         observed(&tracker, &exiting_entry(11, "100"), t0);
+        leave_confirmed(&tracker, 10, t0);
 
         let later = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
         assert_eq!(
@@ -3155,6 +3375,7 @@ mod tests {
         );
         tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 12, later);
         observed(&tracker, &exiting_entry(13, "100"), later);
+        leave_confirmed(&tracker, 12, later);
         assert_eq!(tracker.plan(later, Some(&exit)), None, "retry interval");
         assert_eq!(
             tracker.plan(later + WITHDRAW_RETRY_INTERVAL, Some(&exit)),
@@ -3262,12 +3483,22 @@ mod tests {
             error: Some(error.into()),
             txid: None,
         };
-        let cases: [(anyhow::Result<Vec<NodeOpRecord>>, bool); 5] = [
+        let submitted = || NodeOpRecord {
+            op: "add_stake".into(),
+            nonce: 10,
+            status: "submitted".into(),
+            error: None,
+            txid: Some("ff".into()),
+        };
+        // The listing, whether the op is signed again, and whether the
+        // Portal is asked again next cycle because it has not said yet.
+        let cases: [(anyhow::Result<Vec<NodeOpRecord>>, bool, bool); 6] = [
             (
                 Ok(vec![failed(
                     "no receipt recorded by Kontor (op never executed)",
                 )]),
                 true,
+                false,
             ),
             (
                 Ok(vec![failed(
@@ -3275,19 +3506,25 @@ mod tests {
                      never execute; sign it again with a fresh nonce",
                 )]),
                 true,
+                false,
             ),
-            (Ok(vec![failed("ContractErr: insufficient balance")]), false),
-            (Ok(vec![]), false),
-            (Err(anyhow::anyhow!("portal down")), false),
+            (
+                Ok(vec![failed("ContractErr: insufficient balance")]),
+                false,
+                false,
+            ),
+            (Ok(vec![]), false, false),
+            (Ok(vec![submitted()]), false, true),
+            (Err(anyhow::anyhow!("portal down")), false, true),
         ];
-        for (listing, signs_again) in cases {
+        for (listing, signs_again, asked_again) in cases {
             let tracker = StakeTracker::new(StakePolicy::default());
             let t0 = Instant::now();
             observed(&tracker, &entry(Some("0"), Some("0")), t0);
             assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
             tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
             let mut unchanged = entry(Some("0"), Some("0"));
-            unchanged.next_nonce = 11;
+            unchanged.next_nonce = Some(11);
             observed(&tracker, &unchanged, t0);
             assert_eq!(
                 tracker.plan(t0, None),
@@ -3296,23 +3533,220 @@ mod tests {
             );
             assert_eq!(tracker.op_to_classify(), Some(10));
 
-            tracker.classify_landed(10, listing);
-            assert_eq!(tracker.op_to_classify(), None, "asked once");
+            tracker.classify_landed(10, listing, t0);
+            assert_eq!(tracker.op_to_classify().is_some(), asked_again);
             assert_eq!(tracker.plan(t0, None).is_some(), signs_again);
         }
+    }
+
+    /// A leave is only counted as left once the Portal lists it `confirmed`.
+    /// Until the Portal has said, the agreement is neither left again nor the
+    /// bond withdrawn; one Kontor refused waits an hour, one that never ran is
+    /// signed again at once.
+    #[test]
+    fn a_leave_counts_as_left_only_once_the_portal_confirms_it() {
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        let leave = NodeOp::LeaveAgreement("AGR-a".into());
+        let landed = || {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            observed(&tracker, &exiting_entry(10, "100"), t0);
+            assert_eq!(tracker.plan(t0, Some(&exit)), Some(leave.clone()));
+            tracker.record_sent(leave.clone(), 10, t0);
+            observed(&tracker, &exiting_entry(11, "100"), t0);
+            assert_eq!(tracker.op_to_classify(), Some(10));
+            (tracker, t0)
+        };
+        let due = |t0: Instant| t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+
+        // Not decided yet: nothing is sent, not even the withdrawal.
+        let (tracker, t0) = landed();
+        tracker.classify_landed(10, Ok(vec![leave_record(10, "submitted", None)]), t0);
+        assert_eq!(tracker.op_to_classify(), Some(10), "asked again next cycle");
+        assert_eq!(tracker.plan(due(t0), Some(&exit)), None);
+        assert_eq!(tracker.status()["exit"]["left"], 0);
+
+        // Confirmed: left, and the exit goes on.
+        tracker.classify_landed(10, Ok(vec![leave_record(10, "confirmed", None)]), t0);
+        assert_eq!(tracker.status()["exit"]["left"], 1);
+        assert_eq!(
+            tracker.plan(due(t0), Some(&exit)),
+            Some(NodeOp::WithdrawStake)
+        );
+
+        // Kontor refused it: not left, and tried again after the hour.
+        let (tracker, t0) = landed();
+        tracker.classify_landed(
+            10,
+            Ok(vec![leave_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"not a member\"))"),
+            )]),
+            t0,
+        );
+        assert_eq!(tracker.status()["exit"]["left"], 0);
+        assert_eq!(tracker.plan(t0, Some(&exit)), None, "backed off");
+        assert_eq!(
+            tracker.plan(t0 + REFUSED_OP_RETRY_INTERVAL, Some(&exit)),
+            Some(leave.clone())
+        );
+
+        // Retired by the Portal before it ran, or not listed at all: signed
+        // again at once.
+        for listing in [
+            vec![leave_record(
+                10,
+                "failed",
+                Some("no receipt recorded by Kontor (op never executed)"),
+            )],
+            vec![],
+        ] {
+            let (tracker, t0) = landed();
+            tracker.classify_landed(10, Ok(listing), t0);
+            assert_eq!(tracker.plan(t0, Some(&exit)), Some(leave.clone()));
+        }
+
+        // The Portal never says: after the hard timeout the rows decide, and
+        // the leave is sent again rather than the exit stalling.
+        let (tracker, t0) = landed();
+        tracker.classify_landed(10, Err(anyhow::anyhow!("down")), t0);
+        assert_eq!(tracker.op_to_classify(), Some(10));
+        tracker.classify_landed(
+            10,
+            Err(anyhow::anyhow!("down")),
+            t0 + OP_LANDING_HARD_TIMEOUT,
+        );
+        assert_eq!(tracker.op_to_classify(), None);
+        assert_eq!(
+            tracker.plan(t0 + OP_LANDING_HARD_TIMEOUT, Some(&exit)),
+            Some(leave)
+        );
+    }
+
+    /// An op the Portal keeps listing as `queued` or `submitted` is waited
+    /// for past the hard timeout — Portal `docs/node-portal-contract.md` §2:
+    /// it has not been lost and must not be signed again — including one
+    /// that goes back from `submitted` to `queued` when the Portal gives up
+    /// on its batch. The timeout runs from the Portal's last word.
+    #[test]
+    fn an_op_the_portal_still_holds_is_waited_for_past_the_hard_timeout() {
+        let listed = |status: &str| {
+            Ok(vec![NodeOpRecord {
+                op: "add_stake".into(),
+                nonce: 10,
+                status: status.into(),
+                error: None,
+                txid: None,
+            }])
+        };
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let mut at = t0;
+        for status in ["queued", "submitted", "submitted", "queued", "queued"] {
+            at += OP_LANDING_CHECK_INTERVAL;
+            assert_eq!(tracker.op_to_verify(at), Some(10));
+            tracker.verify_in_flight(10, listed(status), at);
+            observed(&tracker, &entry(Some("0"), Some("0")), at);
+            assert_eq!(tracker.plan(at, None), None, "{status} at +{:?}", at - t0);
+        }
+        let vouched = at;
+        let past = t0 + OP_LANDING_HARD_TIMEOUT + Duration::from_secs(1);
+        observed(&tracker, &entry(Some("0"), Some("0")), past);
+        assert_eq!(
+            tracker.plan(past, None),
+            None,
+            "the Portal said it holds the op; the hard timeout does not apply"
+        );
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
+
+        // No word from the Portal for the whole timeout after its last one:
+        // given up, and decided again.
+        observed(
+            &tracker,
+            &entry(Some("0"), Some("0")),
+            vouched + OP_LANDING_HARD_TIMEOUT,
+        );
+        assert_eq!(
+            tracker.plan(vouched + OP_LANDING_HARD_TIMEOUT, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+    }
+
+    /// The same op asked for from `/admin` while the daemon's copy is still
+    /// in flight is refused: both would execute.
+    #[test]
+    fn an_operator_request_is_refused_while_the_same_op_is_in_flight() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::BeginUnstake));
+        tracker.record_sent(NodeOp::BeginUnstake, 10, t0);
+
+        let err = tracker.request(NodeOp::BeginUnstake).unwrap_err();
+        assert!(err.contains("in flight"), "{err}");
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
+
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        tracker.record_sent(NodeOp::WithdrawStake, 11, t0);
+        let err = tracker.request(NodeOp::WithdrawStake).unwrap_err();
+        assert!(err.contains("in flight"), "{err}");
+    }
+
+    /// A Portal that could not read whether bond cleanup is pending leaves
+    /// the end of an exit undecided: the drop to zero is reported as neither
+    /// a withdrawal nor a slash, and `/admin` shows the field as unknown.
+    #[test]
+    fn an_unknown_bond_cleanup_decides_nothing() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let mut over = entry(Some("0"), Some("0"));
+        over.bond_cleanup_pending = None;
+        observed(&tracker, &over, t0);
+        let event = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(event.contains("could not say"), "{event}");
+        assert!(!event.contains("withdrawal completed"), "{event}");
+        assert_eq!(tracker.status()["bond_cleanup_pending"], Value::Null);
+        assert_eq!(tracker.status()["exited"], true);
+        assert_eq!(tracker.plan(t0, None), None, "nothing bonded again");
+
+        // Unknown is not "cleanup finished" either.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let mut cleaning = entry(Some("0"), Some("0"));
+        cleaning.bond_cleanup_pending = Some(true);
+        observed(&tracker, &cleaning, t0);
+        let mut unknown = entry(Some("0"), Some("0"));
+        unknown.bond_cleanup_pending = None;
+        observed(&tracker, &unknown, t0);
+        assert_eq!(
+            tracker.status()["last_event"]["message"],
+            "bond cleanup pending",
+            "no event for a field that was not read"
+        );
     }
 
     /// Through the client: the failed-ops listing is consulted before the
     /// plan, and an op the Portal retired goes out again in the same cycle.
     #[tokio::test]
     async fn a_retired_add_stake_is_signed_again_through_the_relay() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/ops"))
-            .and(query_param("status", "failed"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0, "limit": 100, "total": 1, "node_id": "NODE-test",
                 "ops": [{
@@ -3350,7 +3784,7 @@ mod tests {
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
         tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
         let mut unchanged = entry(Some("0"), Some("0"));
-        unchanged.next_nonce = 11;
+        unchanged.next_nonce = Some(11);
         observed(&tracker, &unchanged, t0);
 
         assert_eq!(
@@ -3464,7 +3898,7 @@ mod tests {
         assert_eq!(tracker.status()["in_flight"], Value::Null, "forgotten");
 
         let mut withdrawn = entry(Some("0"), Some("0"));
-        withdrawn.next_nonce = 13;
+        withdrawn.next_nonce = Some(13);
         withdrawn.kor_balance = Some("105".into());
         observed(&tracker, &withdrawn, late + Duration::from_secs(60));
         assert_eq!(

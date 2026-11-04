@@ -391,7 +391,12 @@ impl PortalClient {
             .as_ref()
             .ok_or_else(|| anyhow!("authentication required to resync nonce"))?;
         let entry = self.get_registry_entry(auth.signer_id).await?;
-        let kontor = entry.next_nonce;
+        let Some(kontor) = entry.next_nonce else {
+            tracing::debug!(
+                "Kontor reports no next_nonce for this signer yet; the local counter stands"
+            );
+            return Ok(entry);
+        };
         // A compare-exchange loop rather than `fetch_update`, which the pinned
         // toolchain deprecates and the declared MSRV has no replacement for.
         let mut old = auth.next_nonce.load(Ordering::Relaxed);
@@ -1533,9 +1538,14 @@ pub struct LoginResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistryEntry {
     pub signer_id: u64,
-    pub x_only_pubkey: String,
+    /// `None` for a signer registered with a BLS key only — Kontor's
+    /// `SignerResponse` has it optional, and the Portal forwards it as is.
+    pub x_only_pubkey: Option<String>,
     pub bls_pubkey: Option<String>,
-    pub next_nonce: u64,
+    /// `None` until Kontor has processed the signer's first op: the next
+    /// nonce is then 0, but the field is read as "not known" wherever a wrong
+    /// guess would cost something.
+    pub next_nonce: Option<u64>,
     pub kor_balance: Option<String>,
     pub user_id: Option<String>,
     /// Bonded stake in the staking contract, `"0"` when there is none.
@@ -2846,7 +2856,7 @@ mod tests {
         let client = client_with_nonce(mock_server.uri(), "resync_nonce", 5);
 
         let entry = client.resync_from_registry().await.unwrap();
-        assert_eq!(entry.next_nonce, 99);
+        assert_eq!(entry.next_nonce, Some(99));
         assert_eq!(client.current_nonce(), Some(99));
     }
 

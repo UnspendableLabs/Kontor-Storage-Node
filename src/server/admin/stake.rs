@@ -185,6 +185,25 @@ mod tests {
         );
     }
 
+    /// The same op asked for again while the daemon's copy is still in flight
+    /// — signed, not executed — is a conflict: both would execute.
+    #[tokio::test]
+    async fn the_same_op_is_refused_while_it_is_in_flight() {
+        let (state, _dir) = state().await;
+        observe(&state, "100", None);
+        request_stake_action(&request("begin_unstake", "UNSTAKE"), &state).unwrap();
+        let tracker = state.runtime.staking();
+        let now = std::time::Instant::now();
+        assert_eq!(tracker.plan(now, None), Some(NodeOp::BeginUnstake));
+        tracker.record_sent(NodeOp::BeginUnstake, 1, now);
+
+        let err = request_stake_action(&request("begin_unstake", "UNSTAKE"), &state).unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, error_codes::STAKE_UNAVAILABLE);
+        assert!(err.message.contains("in flight"), "{}", err.message);
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
+    }
+
     #[tokio::test]
     async fn each_action_needs_its_own_phrase() {
         let (state, _dir) = state().await;

@@ -1,5 +1,6 @@
 use super::downloadagreements::StorageBackend;
 use super::getnewagreements::agreement_to_active_model;
+use super::stake::refresh_memberships_except;
 use super::{load_existing_ids, sync_new_items, ITEM_TYPE_AGREEMENTS, STATUS_FAILED};
 use crate::app::config::StorageMethod;
 use crate::clients::portal::Agreement;
@@ -68,15 +69,29 @@ pub(crate) async fn reconcile_from_portal_with(
         .context("fetching all node agreements for reconciliation")?;
     inspect(&remote_agreements);
 
-    if remote_agreements.is_empty() {
-        info!("Reconciliation: no agreements found on Portal for node {node_id}");
-        return Ok(0);
-    }
-
     let requested_ids: Vec<String> = remote_agreements
         .iter()
         .map(|a| a.agreement_id.clone())
         .collect();
+
+    // The listing is filtered to the memberships the node *validly* holds, so
+    // a local row still saying `valid` for an agreement the listing no longer
+    // carries is stale: the Portal has marked the membership `left`,
+    // `invalid` or `failed`. Each such row is re-read from the agreement's
+    // detail, which carries every row. A failure here only leaves the row
+    // stale for another cycle.
+    if let Err(err) =
+        refresh_memberships_except(portal_client, database, node_id, &requested_ids).await
+    {
+        warn!(
+            "Reconciliation: could not re-read the memberships the Portal no longer lists: {err:#}"
+        );
+    }
+
+    if remote_agreements.is_empty() {
+        info!("Reconciliation: no agreements found on Portal for node {node_id}");
+        return Ok(0);
+    }
 
     let existing_ids = load_existing_ids::<Agreements, _>(
         database,
@@ -784,6 +799,76 @@ mod tests {
         assert_eq!(
             failed_count, 0,
             "no transition to failed should yield a zero count"
+        );
+    }
+
+    /// A local row still saying `valid` for an agreement the filtered listing
+    /// no longer carries is stale — the Portal marked the membership `left`
+    /// (or `invalid`, or `failed`) — and is re-read from the agreement's
+    /// detail, which carries every row. Rows the listing does carry are not
+    /// re-read: they were just rewritten from it.
+    #[tokio::test]
+    async fn stale_valid_rows_are_corrected_from_the_agreement_detail() {
+        let mock_server = MockServer::start().await;
+        mount_node_agreements(&mock_server, &[sample_agreement("AGR-live", "confirmed")]).await;
+        let mut gone = sample_agreement("AGR-gone", "confirmed");
+        gone.nodes[0].status = "left".to_string();
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-gone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(agreement_json(&gone)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-live"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_agreements_db().await;
+        for id in ["AGR-live", "AGR-gone"] {
+            AgreementFixture {
+                status: "confirmed".into(),
+                nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+                ..AgreementFixture::new(id, format!("FILE-{id}"))
+            }
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
+        }
+
+        let storage_dir = unique_storage_dir("reconcile_stale_rows");
+        reconcile_from_portal(
+            &mock_portal_client(&mock_server.uri(), storage_dir.clone()),
+            &database,
+            "NODE-test",
+            &StorageBackend::local(),
+            &storage_dir,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let gone = Agreements::find_by_id("AGR-gone")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            gone.nodes,
+            json!([{"node_id": "NODE-test", "status": "left"}]),
+            "the row now says what the Portal says"
+        );
+        let live = Agreements::find_by_id("AGR-live")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.nodes,
+            json!([{"node_id": "NODE-test", "status": "valid"}])
         );
     }
 }

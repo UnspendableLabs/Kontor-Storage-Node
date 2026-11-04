@@ -73,11 +73,14 @@ fn funding(entry: &RegistryEntry) -> Funding {
 /// Ensure a node that was never funded has KOR before continuing.
 ///
 /// 1. Fetches the registry entry for `signer_id`.
-/// 2. If `kor_balance` is already positive, or the node has a bonded stake,
+/// 2. If `kor_balance` is `null` — the Portal could not read it (Portal
+///    `docs/node-portal-contract.md` §3: unknown, not zero) — returns without
+///    asking the faucet: a node that may well be funded is not funded again.
+/// 3. If `kor_balance` is already positive, or the node has a bonded stake,
 ///    returns immediately.
-/// 3. If the stake is unknown (see [`Funding::Unknown`]), asks the faucet once
+/// 4. If the stake is unknown (see [`Funding::Unknown`]), asks the faucet once
 ///    and returns without waiting; a faucet error is only a warning.
-/// 4. Otherwise — no balance, no stake: a new node — calls the Portal faucet:
+/// 5. Otherwise — no balance, no stake: a new node — calls the Portal faucet:
 ///    - Success: logs the broadcast txids and polls until the balance appears.
 ///    - 502/503: warns and polls anyway (e.g. waiting for a manual transfer).
 ///    - Other errors: propagated.
@@ -89,11 +92,29 @@ pub async fn ensure_kor_balance(
 ) -> Result<()> {
     let entry = client.get_registry_entry(signer_id).await?;
 
+    if entry.kor_balance.is_none() {
+        writeln!(
+            writer,
+            "⚠ KOR balance: not reported by the Portal this time; not asking the faucet. The \
+             daemon reads it again each cycle"
+        )?;
+        return Ok(());
+    }
+
     if !kor_balance_is_empty(&entry.kor_balance) {
         let balance = entry.kor_balance.as_deref().unwrap_or("0");
         writeln!(writer, "✓ KOR balance: {balance}")?;
         return Ok(());
     }
+
+    let Some(recipient) = entry.x_only_pubkey.as_deref() else {
+        writeln!(
+            writer,
+            "⚠ KOR balance: 0, and the registry entry carries no x-only key to fund; not asking \
+             the faucet"
+        )?;
+        return Ok(());
+    };
 
     match funding(&entry) {
         Funding::Staked(stake) => {
@@ -109,7 +130,7 @@ pub async fn ensure_kor_balance(
                 "KOR balance: 0, stake not known → requesting {amount} KOR from the faucet, \
                  without waiting for it…"
             )?;
-            match request_within_cap(client, &entry.x_only_pubkey, amount, writer).await {
+            match request_within_cap(client, recipient, amount, writer).await {
                 Ok(resp) => writeln!(
                     writer,
                     "✓ Faucet broadcast: commit={} reveal={}",
@@ -129,7 +150,7 @@ pub async fn ensure_kor_balance(
         writer,
         "KOR balance: 0 → requesting {amount} KOR from the faucet…"
     )?;
-    match request_within_cap(client, &entry.x_only_pubkey, amount, writer).await {
+    match request_within_cap(client, recipient, amount, writer).await {
         Ok(resp) => {
             writeln!(
                 writer,
@@ -300,7 +321,7 @@ mod tests {
             (json!("0"), true, 502),
         ] {
             let mock_server = MockServer::start().await;
-            let mut entry = registry_entry_json(None);
+            let mut entry = registry_entry_json(Some("0"));
             entry["stake"] = stake.clone();
             entry["bond_cleanup_pending"] = json!(cleanup);
             Mock::given(method("GET"))
@@ -320,6 +341,30 @@ mod tests {
             assert!(output.contains("without waiting"), "{output}");
             assert!(!output.contains("Waiting for KOR balance"), "{output}");
         }
+    }
+
+    /// A `kor_balance` the Portal could not read is not an empty one: the
+    /// faucet is not asked, and startup does not wait.
+    #[tokio::test]
+    async fn ensure_kor_balance_does_not_fund_a_node_whose_balance_is_unknown() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        mount_faucet(&mock_server, 200, 0).await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("not reported"), "{output}");
+        assert!(!output.contains("faucet…"), "{output}");
+        assert!(!output.contains("Waiting for KOR balance"), "{output}");
     }
 
     #[test]
@@ -377,7 +422,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
@@ -423,7 +468,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .up_to_n_times(2)
             .mount(&mock_server)
             .await;
@@ -466,7 +511,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
@@ -509,7 +554,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .mount(&mock_server)
             .await;
 
@@ -554,7 +599,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
@@ -594,7 +639,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
