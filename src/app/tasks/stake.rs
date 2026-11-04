@@ -65,6 +65,7 @@ use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
 use crate::clients::kor::Kor;
 use crate::clients::portal::{NodeOp, RegistryEntry};
 use crate::clients::PortalClient;
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
@@ -363,6 +364,10 @@ struct TrackerState {
     recent_collateral: Vec<(Instant, Kor)>,
     /// Agreements a `leave-agreement` has executed for, this process.
     left: HashSet<String>,
+    /// The rows the exit reads its memberships from have been brought up to
+    /// date with the Portal since this process started — or since the last
+    /// time the exit had to resend its leaves.
+    memberships_refreshed: bool,
     /// When this process first saw the withdrawal height: the start of the
     /// withdrawal delay as far as the node can tell.
     unstake_seen: Option<Instant>,
@@ -391,11 +396,10 @@ fn refused_recently(state: &TrackerState, op: &NodeOp, now: Instant) -> bool {
 
 /// Where the node's exit stands, worked out by the daemon from its own rows.
 ///
-/// The Portal keeps a membership row after a leave, so which memberships are
-/// gone is only known to the node — from the `leave-agreement` ops it has seen
-/// execute in this process. After a restart those are sent again; Kontor
-/// refuses a leave for a membership that is gone, which costs a fee and
-/// nothing else.
+/// A leave the node has seen execute in this process is remembered in the
+/// tracker; one from an earlier process shows in the rows, as the `left`
+/// status the Portal gives the membership once the leave is confirmed —
+/// provided the rows are current, which [`refresh_memberships`] sees to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExitInputs {
     /// Agreements this node holds a membership in, by its own rows.
@@ -460,6 +464,18 @@ impl StakeTracker {
                 .sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
             state.recent_collateral.truncate(64);
         }
+    }
+
+    /// Whether the exit has to re-read its memberships from the Portal before
+    /// its next step (see [`refresh_memberships`]).
+    #[must_use]
+    pub fn memberships_need_refresh(&self) -> bool {
+        !self.lock().memberships_refreshed
+    }
+
+    /// The memberships have been re-read; the rows are current.
+    pub fn memberships_refreshed(&self) {
+        self.lock().memberships_refreshed = true;
     }
 
     /// Whether the node is in its exit: the operator's unstake has executed.
@@ -531,6 +547,7 @@ impl StakeTracker {
                     WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
                 );
                 state.left.clear();
+                state.memberships_refreshed = false;
             }
             Some(NodeOp::WithdrawStake) => state.exited = true,
             _ => {}
@@ -1099,10 +1116,68 @@ pub fn is_membership_status(status: Option<&str>) -> bool {
 /// and waiting for the verdict.
 const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
 
+/// Bring the rows of the memberships the exit acts on up to date with the
+/// Portal.
+///
+/// Reconciliation lists the agreements this node *validly* belongs to
+/// (`GET /api/agreements?nodes=`), so once the Portal marks a membership
+/// `left` — a confirmed leave — or `invalid` or `failed`, the agreement drops
+/// out of that listing and the local row keeps saying `valid`. Before the
+/// exit's first step in a process, and again whenever it has to resend its
+/// leaves, each membership the rows still show is re-read one by one, and its
+/// `nodes` and `status` rewritten. A leave is then never paid for a membership
+/// that is already gone.
+///
+/// # Errors
+/// If the rows cannot be read or written, or any agreement cannot be fetched;
+/// the exit then waits a cycle rather than act on stale rows.
+pub async fn refresh_memberships(
+    client: &PortalClient,
+    database: &DatabaseConnection,
+    node_id: &str,
+) -> anyhow::Result<()> {
+    use crate::entities::agreements;
+    use crate::entities::prelude::Agreements;
+    use sea_orm::{ActiveValue, EntityTrait};
+
+    let rows = Agreements::find().all(database).await?;
+    for row in rows
+        .into_iter()
+        .filter(|agreement| !NOT_ON_CHAIN.contains(&agreement.status.as_str()))
+        .filter(|agreement| is_live_member(&agreement.nodes, node_id))
+    {
+        let remote = client
+            .get_agreement(&row.agreement_id)
+            .await
+            .with_context(|| format!("re-reading membership {}", row.agreement_id))?;
+        let nodes = serde_json::to_value(&remote.nodes).context("serializing agreement nodes")?;
+        if nodes == row.nodes && remote.status == row.status {
+            continue;
+        }
+        if !is_live_member(&nodes, node_id) {
+            info!(
+                "membership {} is over according to the Portal; no leave will be sent for it",
+                row.agreement_id
+            );
+        }
+        Agreements::update(agreements::ActiveModel {
+            agreement_id: ActiveValue::Unchanged(row.agreement_id),
+            nodes: ActiveValue::Set(nodes),
+            status: ActiveValue::Set(remote.status),
+            ..Default::default()
+        })
+        .exec(database)
+        .await
+        .context("updating a membership's row")?;
+    }
+    Ok(())
+}
+
 /// Read the node's memberships and open challenges from its own rows.
 ///
-/// A membership is an agreement on chain whose `nodes` lists this node with
-/// any status but `failed` (old rows store bare node-id strings, which count).
+/// A membership is an agreement on chain whose `nodes` lists this node with a
+/// status outside [`NO_MEMBERSHIP`] (old rows store bare node-id strings, which
+/// count).
 ///
 /// # Errors
 /// If the rows cannot be read.
@@ -1144,12 +1219,16 @@ pub async fn exit_inputs(
     })
 }
 
+/// Whether `nodes` (an agreement row's `nodes` JSON) lists `node_id` with a
+/// membership it still holds.
 fn is_live_member(nodes: &Value, node_id: &str) -> bool {
     nodes.as_array().is_some_and(|nodes| {
         nodes.iter().any(|node| {
             node.as_str() == Some(node_id)
                 || (node.get("node_id").and_then(Value::as_str) == Some(node_id)
-                    && node.get("status").and_then(Value::as_str) != Some("failed"))
+                    && is_membership_status(Some(
+                        node.get("status").and_then(Value::as_str).unwrap_or(""),
+                    )))
         })
     })
 }
@@ -1930,8 +2009,13 @@ mod tests {
             Some(NodeOp::WithdrawStake)
         );
         tracker.record_sent(NodeOp::WithdrawStake, 11, later);
+        tracker.memberships_refreshed();
         observed(&tracker, &exiting_entry(12, "100"), later);
 
+        assert!(
+            tracker.memberships_need_refresh(),
+            "the rows are re-read before the leaves are resent"
+        );
         assert_eq!(
             tracker.plan(later, Some(&exit)),
             Some(NodeOp::LeaveAgreement("AGR-a".into()))
@@ -2102,6 +2186,16 @@ mod tests {
                 json!([{"node_id": "NODE-me", "status": "failed"}]),
             ),
             (
+                "AGR-left",
+                "confirmed",
+                json!([{"node_id": "NODE-me", "status": "left"}]),
+            ),
+            (
+                "AGR-invalidated",
+                "confirmed",
+                json!([{"node_id": "NODE-me", "status": "invalid"}]),
+            ),
+            (
                 "AGR-not-yet",
                 "ready",
                 json!([{"node_id": "NODE-me", "status": "valid"}]),
@@ -2153,11 +2247,112 @@ mod tests {
         }
 
         let exit = exit_inputs(&db, "NODE-me").await.unwrap();
-        assert_eq!(exit.memberships, vec!["AGR-bare", "AGR-live", "AGR-open"]);
+        assert_eq!(
+            exit.memberships,
+            vec!["AGR-bare", "AGR-live", "AGR-open"],
+            "a failed, invalidated or left row is not a membership to leave"
+        );
         assert_eq!(exit.deferred, vec!["AGR-open"]);
         assert_eq!(
             exit.unresolved_challenges, 2,
             "active and proved-but-unsettled"
         );
+    }
+
+    /// The rows only learn that a membership is over from the Portal's detail
+    /// endpoint: the node-filtered listing reconciliation uses drops a
+    /// membership once it is no longer `valid`. Re-reading them before the
+    /// exit acts is what keeps a restarted node from paying for a leave an
+    /// earlier process already made.
+    #[tokio::test]
+    async fn refreshing_memberships_learns_which_ones_the_portal_has_closed() {
+        use crate::testutils::{setup_in_memory_db, AgreementFixture};
+        use sea_orm::ActiveModelTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let detail = |id: &str, status: &str, membership: &str| {
+            json!({
+                "agreement_id": id,
+                "user_id": "user_1",
+                "file_id": format!("F-{id}"),
+                "filename": "test.bin",
+                "mime_type": "application/octet-stream",
+                "original_size": 123,
+                "nodes": [{"node_id": "NODE-test", "status": membership}],
+                "transaction_id": null,
+                "status": status,
+                "created_at": "2024-01-01T00:00:00Z"
+            })
+        };
+        for (id, membership) in [("AGR-gone", "left"), ("AGR-kept", "valid")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/agreements/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(detail(
+                    id,
+                    "confirmed",
+                    membership,
+                )))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+        }
+        // Not on chain yet, and not asked about: there is nothing to leave.
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail(
+                "AGR-ready",
+                "ready",
+                "valid",
+            )))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let db = setup_in_memory_db().await;
+        for (id, status) in [
+            ("AGR-gone", "confirmed"),
+            ("AGR-kept", "confirmed"),
+            ("AGR-ready", "ready"),
+        ] {
+            AgreementFixture {
+                status: status.into(),
+                nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+                ..AgreementFixture::new(id, format!("F-{id}"))
+            }
+            .into_active_model()
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            std::env::temp_dir(),
+            Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "token",
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            exit_inputs(&db, "NODE-test").await.unwrap().memberships,
+            vec!["AGR-gone", "AGR-kept"],
+            "stale rows: the leave of AGR-gone would be paid for again"
+        );
+        refresh_memberships(&client, &db, "NODE-test")
+            .await
+            .unwrap();
+        assert_eq!(
+            exit_inputs(&db, "NODE-test").await.unwrap().memberships,
+            vec!["AGR-kept"]
+        );
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        assert!(tracker.memberships_need_refresh(), "once per process");
+        tracker.memberships_refreshed();
+        assert!(!tracker.memberships_need_refresh());
     }
 }

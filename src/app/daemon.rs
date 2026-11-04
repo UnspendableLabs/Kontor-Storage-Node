@@ -5,7 +5,9 @@ use crate::app::tasks::downloadagreements::{
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
 use crate::app::tasks::reconcile;
-use crate::app::tasks::stake::{exit_inputs, manage_stake, JoinBudget, StakeTracker};
+use crate::app::tasks::stake::{
+    exit_inputs, manage_stake, refresh_memberships, JoinBudget, StakeTracker,
+};
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
@@ -293,15 +295,35 @@ async fn sync_portal_once(
 
     // The exit, once the operator's unstake has executed, is worked out from
     // the node's own rows: which memberships it holds and which challenges
-    // are still open. A read failure only postpones the next exit step.
+    // are still open. Those rows are first brought up to date with the Portal
+    // — once per process, and again after a withdrawal that did not take —
+    // so a leave is not paid for a membership an earlier process already
+    // left. A failure of either only postpones the next exit step.
     let exit = match portal_client.node_id() {
-        Some(node_id) if memory.staking.exiting() => match exit_inputs(database, node_id).await {
-            Ok(exit) => Some(exit),
-            Err(err) => {
-                warn!("could not read memberships for the exit this cycle: {err:#}");
-                None
+        Some(node_id) if memory.staking.exiting() => {
+            let current = if memory.staking.memberships_need_refresh() {
+                match refresh_memberships(portal_client, database, node_id).await {
+                    Ok(()) => {
+                        memory.staking.memberships_refreshed();
+                        true
+                    }
+                    Err(err) => {
+                        warn!("could not re-read the memberships for the exit this cycle: {err:#}");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            match exit_inputs(database, node_id).await {
+                Ok(exit) if current => Some(exit),
+                Ok(_) => None,
+                Err(err) => {
+                    warn!("could not read memberships for the exit this cycle: {err:#}");
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
     manage_stake(portal_client, &memory.staking, exit.as_ref()).await;
@@ -1677,6 +1699,26 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(entry))
+            .mount(&mock_server)
+            .await;
+        // The exit's first step in a process re-reads each membership from
+        // the Portal, which is the only place a leave made by an earlier
+        // process shows (as `left`).
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-held"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agreement_id": "AGR-held",
+                "user_id": "user_1",
+                "file_id": "FILE-held",
+                "filename": "test.bin",
+                "mime_type": "application/octet-stream",
+                "original_size": 123,
+                "nodes": [{"node_id": "NODE-test", "status": "valid"}],
+                "transaction_id": null,
+                "status": "confirmed",
+                "created_at": "2024-01-01T00:00:00Z"
+            })))
+            .expect(1)
             .mount(&mock_server)
             .await;
         Mock::given(method("POST"))

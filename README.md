@@ -594,12 +594,16 @@ the withdrawal height, assuming 10-minute blocks; **Withdraw** (type
 `WITHDRAW`) tries it by hand at any time. A withdrawal that executes without
 returning the bond is retried every 6 hours, re-sending the leaves first.
 
-Two things this does not survive. The Portal keeps a membership row after a
-leave, so which agreements the node has left lives only in the running process:
-after a restart it sends those leaves again, and Kontor refuses each one for a
-fee. And a node restarted after its withdrawal with auto-stake still on bonds
-its balance again — set `KONTOR_STORAGE_AUTO_STAKE=false` first; the log says
-so when the bond comes back.
+A restart does not lose the leaves already made. The Portal marks a membership
+`left` once its `leave-agreement` is confirmed, and before the exit's first
+step in a new process — and again before resending leaves after a withdrawal
+that did not take — the node re-reads each membership it still has a row for
+(`GET /api/agreements/{id}`; the node-filtered listing it reconciles from only
+shows memberships still `valid`), so no leave is paid for a membership that is
+gone. What a restart does not survive: a node restarted after its withdrawal
+with auto-stake still on bonds its balance again — set
+`KONTOR_STORAGE_AUTO_STAKE=false` first; the log says so when the bond comes
+back.
 
 ### Download and preparation pipeline
 

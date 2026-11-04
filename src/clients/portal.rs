@@ -832,6 +832,29 @@ impl PortalClient {
         Ok(page)
     }
 
+    /// Fetch one agreement, with this node's membership row whatever its
+    /// status.
+    ///
+    /// The listings filtered by node (`GET /api/agreements?nodes=`) only cover
+    /// agreements the node *validly* belongs to, so a membership the Portal
+    /// has marked `left`, `invalid` or `failed` drops out of them; this is how
+    /// the node finds out.
+    ///
+    /// # Errors
+    /// If the request fails, or the Portal has no such agreement.
+    pub async fn get_agreement(&self, agreement_id: &str) -> Result<Agreement> {
+        let url = self.api_path(&format!(
+            "/api/agreements/{}",
+            urlencoding::encode(agreement_id)
+        ));
+        let request = self.build_signed_request(Method::GET, &url, None)?;
+        let resp = request.send().await?;
+        let resp = check_response_status(resp, &format!("fetch agreement {agreement_id}")).await?;
+        resp.json::<Agreement>()
+            .await
+            .context("failed to deserialize agreement")
+    }
+
     /// Sign a Kontor operation with BLS.
     ///
     /// This method:
@@ -3027,6 +3050,51 @@ mod tests {
         let client = node_op_client(&mock_server.uri(), keypair, "join_refused");
         client.join_agreement("AGR-1").await.unwrap_err();
         assert_eq!(client.current_nonce(), Some(7));
+    }
+
+    /// The detail endpoint carries this node's row whatever its status — the
+    /// node-filtered listings only show memberships still `valid`.
+    #[tokio::test]
+    async fn get_agreement_reads_one_agreement_with_every_membership_status() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-1"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agreement_id": "AGR-1",
+                "user_id": "user_1",
+                "file_id": "FILE-1",
+                "filename": "test.bin",
+                "mime_type": "application/octet-stream",
+                "original_size": 123,
+                "nodes": [
+                    {"node_id": "NODE-test", "status": "left"},
+                    {"node_id": "NODE-other", "status": "valid"}
+                ],
+                "transaction_id": null,
+                "status": "confirmed",
+                "created_at": "2024-01-01T00:00:00Z",
+                "required_collateral": "12.5"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "get_agreement");
+        let agreement = client.get_agreement("AGR-1").await.unwrap();
+        assert_eq!(agreement.status, "confirmed");
+        assert_eq!(agreement.nodes[0].node_id, "NODE-test");
+        assert_eq!(agreement.nodes[0].status, "left");
+        assert_eq!(agreement.required_collateral.as_deref(), Some("12.5"));
+
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-gone"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": {"code": "AGREEMENT_NOT_FOUND", "message": "no", "status": 404}
+            })))
+            .mount(&mock_server)
+            .await;
+        assert!(client.get_agreement("AGR-gone").await.is_err());
     }
 
     #[tokio::test]
