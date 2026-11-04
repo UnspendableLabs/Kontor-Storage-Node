@@ -134,16 +134,12 @@ impl Config {
 
         let storage_method = StorageMethod::from_str(&cli.storage_method)?;
 
-        let kontor_contract_address = cli.kontor_contract_address.trim().to_string();
-        if kontor_contract_address.is_empty() {
-            return Err(anyhow!("KONTOR_CONTRACT_ADDRESS cannot be empty"));
-        }
-
-        let kontor_staking_contract_address =
-            cli.kontor_staking_contract_address.trim().to_string();
-        if kontor_staking_contract_address.is_empty() {
-            return Err(anyhow!("KONTOR_STAKING_CONTRACT_ADDRESS cannot be empty"));
-        }
+        let kontor_contract_address =
+            parse_contract_address(&cli.kontor_contract_address, "KONTOR_CONTRACT_ADDRESS")?;
+        let kontor_staking_contract_address = parse_contract_address(
+            &cli.kontor_staking_contract_address,
+            "KONTOR_STAKING_CONTRACT_ADDRESS",
+        )?;
 
         let stake_policy = StakePolicy {
             auto_stake: cli.auto_stake,
@@ -228,6 +224,61 @@ impl Config {
             faucet_amount,
         })
     }
+}
+
+/// Check that `raw` is a Kontor contract address in its canonical spelling,
+/// `name_height_txindex`, and return it trimmed.
+///
+/// The address is signed into every op. The Portal parses it as Kontor's
+/// `ContractAddress` (`core/macros/src/contract_address.rs` at 80913826) and
+/// renders it back as `{name}_{height}_{tx_index}` before rebuilding the
+/// message it verifies the signature against; a spelling that parses but
+/// renders differently — `staking_00_0`, `staking_+1_0` — signs a different
+/// message, and every op fails `BLS_VERIFY_FAILED`. So the value must be what
+/// Kontor would render: exactly three `_`-separated parts, a name of lowercase
+/// letters, digits and hyphens starting with a letter, and a height (`u64`) and
+/// tx index (`u32`) written as plain decimals.
+///
+/// # Errors
+/// With a message naming `variable`, if the value is not such an address.
+pub fn parse_contract_address(raw: &str, variable: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{variable} cannot be empty"));
+    }
+    let invalid = |why: &str| {
+        anyhow!(
+            "{variable} must be a Kontor contract address spelt as name_height_txindex, \
+             like staking_0_0 (got {value:?}): {why}"
+        )
+    };
+    let parts: Vec<&str> = value.split('_').collect();
+    let [name, height, tx_index] = parts[..] else {
+        return Err(invalid("expected 3 parts separated by '_'"));
+    };
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(invalid(
+            "the name must be lowercase letters, digits and hyphens, starting with a letter",
+        ));
+    }
+    if height.parse::<u64>().ok().map(|h| h.to_string()).as_deref() != Some(height) {
+        return Err(invalid("the height must be a plain decimal that fits u64"));
+    }
+    if tx_index
+        .parse::<u32>()
+        .ok()
+        .map(|i| i.to_string())
+        .as_deref()
+        != Some(tx_index)
+    {
+        return Err(invalid(
+            "the tx index must be a plain decimal that fits u32",
+        ));
+    }
+    Ok(value.to_string())
 }
 
 impl TryFrom<&Cli> for Config {
@@ -549,6 +600,62 @@ mod tests {
 
         let err = Config::from_cli(&cli).unwrap_err();
         assert!(err.to_string().contains("KONTOR_CONTRACT_ADDRESS"));
+    }
+
+    /// The Portal re-renders the address it parses before verifying the
+    /// signature, so only the canonical spelling signs the right message. A
+    /// non-canonical one fails every op with BLS_VERIFY_FAILED, which is a
+    /// worse place to find out than startup.
+    #[test]
+    fn contract_addresses_must_be_canonical() {
+        for good in [
+            "staking_0_0",
+            "filestorage_1_0",
+            "my-contract2_80913826_3",
+            "a_18446744073709551615_4294967295",
+        ] {
+            assert_eq!(
+                parse_contract_address(&format!(" {good} "), "X").unwrap(),
+                good
+            );
+        }
+        for (bad, why) in [
+            ("Staking_0_0", "name"),
+            ("staking_00_0", "height"),
+            ("staking_0_01", "tx index"),
+            ("staking_+1_0", "height"),
+            ("staking_1_x", "tx index"),
+            ("staking_0", "3 parts"),
+            ("staking_0_0_0", "3 parts"),
+            ("_1_0", "name"),
+            ("1staking_1_0", "name"),
+            ("staking_18446744073709551616_0", "height"),
+            ("staking_1_4294967296", "tx index"),
+            ("staking_1_-1", "tx index"),
+            ("stak ing_1_0", "name"),
+        ] {
+            let err = parse_contract_address(bad, "KONTOR_STAKING_CONTRACT_ADDRESS")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("KONTOR_STAKING_CONTRACT_ADDRESS"),
+                "{bad}: {err}"
+            );
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+
+        let cli = Cli {
+            kontor_staking_contract_address: "staking_00_0".to_string(),
+            ..make_cli()
+        };
+        let err = Config::from_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("KONTOR_STAKING_CONTRACT_ADDRESS"), "{err}");
+        let cli = Cli {
+            kontor_contract_address: "Filestorage_0_0".to_string(),
+            ..make_cli()
+        };
+        let err = Config::from_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("KONTOR_CONTRACT_ADDRESS"), "{err}");
     }
 
     #[test]
