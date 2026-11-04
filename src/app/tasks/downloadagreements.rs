@@ -3189,9 +3189,10 @@ mod tests {
         assert_eq!(requests_to(&requests, "/join"), 0, "nothing joined");
     }
 
-    /// A §5 refusal is survived: the cycle goes on, the file it downloaded is
-    /// thrown away, nothing else is joined this cycle, and joins stay paused
-    /// rather than being retried every 30 seconds.
+    /// A Portal `docs/node-portal-contract.md` §5 refusal is survived: the
+    /// cycle goes on, the file it downloaded is thrown away, nothing else is
+    /// joined this cycle, and joins stay paused rather than being retried every
+    /// 30 seconds.
     #[tokio::test]
     async fn a_join_refused_for_collateral_does_not_fail_the_cycle() {
         let mock_server = MockServer::start().await;

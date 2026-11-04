@@ -94,7 +94,8 @@ fn verify_proof_expr(proof_bytes: &[u8], challenge_ids: &[&str]) -> Result<Strin
 }
 
 /// A staking or rewards operation the node signs itself and the Portal relays
-/// through `POST /api/nodes/{node_id}/ops` (contract §2).
+/// through `POST /api/nodes/{node_id}/ops` (Portal
+/// `docs/node-portal-contract.md` §2).
 ///
 /// The Portal never trusts an expression from the client: it rebuilds the
 /// `Inst` from `op` (and `amount`) and verifies this node's signature over the
@@ -158,7 +159,8 @@ impl NodeOp {
         }
     }
 
-    /// The contract the op calls and its WAVE expression (contract §2 table).
+    /// The contract the op calls and its WAVE expression (Portal
+    /// `docs/node-portal-contract.md` §2).
     ///
     /// `leave-agreement("<id>")` is quoted exactly like `join-agreement`, with
     /// the same `[A-Za-z0-9_-]` allowlist — the Portal rebuilds it from the
@@ -1088,11 +1090,12 @@ impl PortalClient {
 impl PortalClient {
     /// Sign a staking or rewards op and hand it to the Portal's relay.
     ///
-    /// `POST /api/nodes/{node_id}/ops` (contract §2), authenticated like a join.
-    /// Self-paid (`sponsored = false`) at [`DEFAULT_GAS_LIMIT`], exactly like
-    /// the node's other calls. A `202` only means the op is queued: whether it
-    /// executed is read back later from the registry entry — its nonce becomes
-    /// consumed, and the balance or stake it moved changes.
+    /// `POST /api/nodes/{node_id}/ops` (Portal `docs/node-portal-contract.md`
+    /// §2), authenticated like a join. Self-paid (`sponsored = false`) at
+    /// [`DEFAULT_GAS_LIMIT`], exactly like the node's other calls. A `202` only
+    /// means the op is queued: whether it executed is read back later from the
+    /// registry entry — its nonce becomes consumed, and the balance or stake it
+    /// moved changes.
     ///
     /// # Errors
     /// If the client is unauthenticated, the request fails, or the Portal
@@ -1277,9 +1280,10 @@ pub struct Agreement {
     /// served, only proof computation refuses to proceed without a slot.
     pub ledger_index: Option<u64>,
     /// `agreement-data.required-collateral`: how much of the node's bonded
-    /// stake joining this agreement reserves, as a decimal string (contract
-    /// §4). Kontor refuses the join unless the unreserved stake covers it, and
-    /// a missed challenge on the agreement is slashed at 30× this amount.
+    /// stake joining this agreement reserves, as a decimal string (Portal
+    /// `docs/node-portal-contract.md` §4). Kontor refuses the join unless the
+    /// unreserved stake covers it, and a missed challenge on the agreement is
+    /// slashed at 30× this amount.
     ///
     /// `None` until the Portal has reconciled the creating transaction — the
     /// same lifecycle as `ledger_index` — and on a Portal predating staking.
@@ -1466,13 +1470,13 @@ pub struct RegistryEntry {
     pub user_id: Option<String>,
     /// Bonded stake in the staking contract, `"0"` when there is none.
     ///
-    /// This and every field below are contract §3 additions, all optional: a
-    /// Portal predating staking omits them, and one that could not reach Kontor
-    /// may send `null`. Either way they read as "unknown", which the daemon
-    /// treats as "keep the pre-staking behaviour", never as zero. They stay
-    /// strings here so that a value the node cannot parse costs the staking
-    /// decision of one cycle rather than the nonce resync that rides on the
-    /// same request.
+    /// This and every field below are Portal `docs/node-portal-contract.md` §3
+    /// additions, all optional: a Portal predating staking omits them, and one
+    /// that could not reach Kontor may send `null`. Either way they read as
+    /// "unknown", which the daemon treats as "keep the pre-staking behaviour",
+    /// never as zero. They stay strings here so that a value the node cannot
+    /// parse costs the staking decision of one cycle rather than the nonce
+    /// resync that rides on the same request.
     #[serde(default)]
     pub stake: Option<String>,
     /// `filestorage::get-node-reservation`: stake held by joined agreements.
@@ -2784,9 +2788,9 @@ mod tests {
         );
     }
 
-    /// The relay rebuilds each op from its name alone (contract §2 table), so
-    /// the contract and expression here are what the Portal will verify the
-    /// signature against.
+    /// The relay rebuilds each op from its name alone (Portal
+    /// `docs/node-portal-contract.md` §2), so the contract and expression here
+    /// are what the Portal will verify the signature against.
     #[test]
     fn node_ops_target_the_contracts_the_relay_rebuilds() {
         let (contract, expr) = NodeOp::AddStake(Kor::parse("250.5").unwrap())
@@ -3005,7 +3009,8 @@ mod tests {
         assert!(err.to_string().contains("authentication required"), "{err}");
     }
 
-    /// Same release for a join the Portal turns down at its pre-check (§5),
+    /// Same release for a join the Portal turns down at its pre-check
+    /// (Portal `docs/node-portal-contract.md` §5),
     /// which the daemon now survives instead of aborting the cycle.
     #[tokio::test]
     async fn a_join_refused_for_collateral_releases_its_nonce() {
@@ -3047,9 +3052,10 @@ mod tests {
         );
     }
 
-    /// A Portal predating staking sends none of the §3 fields; one that is
-    /// current sends all of them. Both must deserialize, and the new fields stay
-    /// strings so a strange value cannot break the nonce resync.
+    /// A Portal predating staking sends none of the signer stake fields
+    /// (Portal `docs/node-portal-contract.md` §3); one that is current sends
+    /// all of them. Both must deserialize, and the new fields stay strings so a
+    /// strange value cannot break the nonce resync.
     #[test]
     fn registry_entry_reads_with_and_without_the_stake_fields() {
         let old: RegistryEntry = serde_json::from_value(json!({

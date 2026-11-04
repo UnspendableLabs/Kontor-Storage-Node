@@ -129,9 +129,10 @@ impl Kor {
     ///
     /// `{r0: <low 64 bits>, r1: <high 64 bits>, r2: 0, r3: 0, sign: plus}` —
     /// exactly this spacing, base-10 limbs, `r0` least significant. The Portal
-    /// rebuilds the `add-stake(...)` expression from the decimal string the node
-    /// sends and verifies the node's BLS signature over it, so this must stay
-    /// byte-identical to the Portal's encoder (contract §1).
+    /// rebuilds the `add-stake(...)` expression from the decimal string the
+    /// node sends and verifies the node's BLS signature over it, so this must
+    /// stay byte-identical to the Portal's encoder (Portal
+    /// `docs/node-portal-contract.md` §1).
     #[must_use]
     pub fn wave_literal(self) -> String {
         let low = self.0 & u128::from(u64::MAX);
@@ -140,7 +141,8 @@ impl Kor {
     }
 
     /// A lossy `f64` for the one wire field that is still a JSON number: the
-    /// faucet request (contract §6). Never compared or encoded from.
+    /// faucet request (Portal `docs/node-portal-contract.md` §6). Never
+    /// compared or encoded from.
     #[must_use]
     pub fn to_f64_lossy(self) -> f64 {
         // Through the canonical string, so an amount configured as "0.1" goes
@@ -150,8 +152,8 @@ impl Kor {
 }
 
 /// The canonical rendering: no leading zeros, no trailing fractional zeros, no
-/// point for a whole amount — `^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$`, the form the
-/// contract requires on the wire.
+/// point for a whole amount — `^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$`, the form
+/// Portal `docs/node-portal-contract.md` §1 requires on the wire.
 impl fmt::Display for Kor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let whole = self.0 / SCALE;

@@ -9,9 +9,10 @@
 //! neither join nor add stake.
 //!
 //! The node never talks to Kontor. It reads its bond from the Portal's signer
-//! entry (contract §3) once per cycle — the same request the nonce resync
-//! already makes — signs `add-stake` / `claim-rewards` itself, and hands them to
-//! the Portal's relay (§2). This module decides *what* to sign:
+//! entry (Portal `docs/node-portal-contract.md` §3) once per cycle — the same
+//! request the nonce resync already makes — signs `add-stake` / `claim-rewards`
+//! itself, and hands them to the Portal's relay (§2 of the same document). This
+//! module decides *what* to sign:
 //!
 //! - **Auto-stake.** Everything above a gas reserve goes into the bond, up to an
 //!   optional target, in one `add-stake` per cycle at most.
@@ -53,10 +54,11 @@
 //!
 //! # Old Portals
 //!
-//! A Portal predating staking sends none of the §3 fields. That is not "zero
-//! stake": the node then keeps its pre-staking behaviour — joins everything,
-//! signs no stake op. Once a Portal *has* reported a stake, a cycle where the
-//! entry cannot be read joins nothing rather than joining blind.
+//! A Portal predating staking sends none of the signer stake fields (Portal
+//! `docs/node-portal-contract.md` §3). That is not "zero stake": the node then
+//! keeps its pre-staking behaviour — joins everything, signs no stake op. Once
+//! a Portal *has* reported a stake, a cycle where the entry cannot be read
+//! joins nothing rather than joining blind.
 
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
@@ -74,7 +76,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// The smallest free balance worth a top-up (contract stake policy).
+/// The smallest free balance worth a top-up.
 pub const MIN_TOP_UP: Kor = Kor::ONE;
 
 /// Kontor's price of one gas unit, in 10⁻¹⁸ KOR: `max(execution price,
@@ -108,7 +110,8 @@ pub const CLAIM_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// hour, like a claim, lets whatever it disagreed with change.
 pub const REFUSED_OP_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// How long joins stay paused after the Portal refuses one with a §5 code.
+/// How long joins stay paused after the Portal refuses one with a join
+/// pre-check code (Portal `docs/node-portal-contract.md` §5).
 ///
 /// The refusal means the node's own view of its stake disagreed with the
 /// Portal's. Retrying every cycle would download a file and be refused again
@@ -144,7 +147,8 @@ pub const ASSUMED_BLOCK_TIME: Duration = Duration::from_secs(600);
 /// know about).
 pub const WITHDRAW_RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// How the node manages its bond (contract "Storage-node stake policy").
+/// How the node manages its bond. The policy is the node's own: the Portal
+/// relays the ops it signs and imposes none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StakePolicy {
     /// Sign `add-stake` and `claim-rewards` automatically. Off, the node signs
@@ -194,7 +198,8 @@ pub struct StakeSnapshot {
 }
 
 impl StakeSnapshot {
-    /// Parse the §3 fields of a signer entry.
+    /// Parse the Portal `docs/node-portal-contract.md` §3 fields of a signer
+    /// entry.
     ///
     /// `None` when the Portal does not report a stake — absent, `null`, or
     /// unreadable — which is what an old Portal looks like. `stake_available`
