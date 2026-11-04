@@ -620,14 +620,25 @@ impl StakeTracker {
         let snapshot = entry.and_then(StakeSnapshot::from_entry);
         let mut state = self.lock();
 
+        // A `stake` field, readable or not, is a Portal that knows about
+        // staking: an entry with the stake but not what is free of it must
+        // close this cycle's joins, not pass for an old Portal.
+        let reports_stake = entry.is_some_and(|entry| entry.stake.is_some());
+        if reports_stake {
+            state.portal_reports_stake = true;
+        }
         let Some(snapshot) = snapshot else {
-            if entry.is_some() && state.portal_reports_stake {
+            if reports_stake {
+                warn!(
+                    "the Portal's signer entry reports a stake but not how much of it is \
+                     unreserved; joins are paused this cycle"
+                );
+            } else if entry.is_some() && state.portal_reports_stake {
                 warn!("the Portal's signer entry no longer reports a stake; joins are paused");
             }
             state.snapshot = None;
             return;
         };
-        state.portal_reports_stake = true;
 
         let exited_before = state.exited;
         let mut landed = None;
@@ -1731,10 +1742,18 @@ pub async fn bootstrap_stake(
     tracker.observe(Some(&entry), Instant::now());
 
     let Some(snapshot) = tracker.snapshot() else {
-        writeln!(
-            writer,
-            "Stake: not reported by this Portal (it predates staking); joining as before"
-        )?;
+        if tracker.status()["portal_reports_stake"] == true {
+            writeln!(
+                writer,
+                "⚠ Stake: reported by the Portal but not readable this time; joins wait for \
+                 the first cycle's read"
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "Stake: not reported by this Portal (it predates staking); joining as before"
+            )?;
+        }
         return Ok(());
     };
     writeln!(
@@ -1805,6 +1824,32 @@ mod tests {
         // A stake with nothing saying how much of it is free: not enough to
         // join against.
         assert_eq!(StakeSnapshot::from_entry(&entry(Some("10"), None)), None);
+    }
+
+    /// A stake reported without its unreserved part is not an old Portal: on
+    /// a first read it used to pass for one, and the cycle joined unmetered.
+    /// It closes the cycle's joins instead, and the Portal counts as
+    /// reporting stake from then on.
+    #[test]
+    fn a_stake_without_its_free_part_closes_joins_even_on_the_first_read() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("10"), None), t0);
+        assert_eq!(tracker.status()["portal_reports_stake"], true);
+        assert_eq!(tracker.status()["reported"], false);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::StakeUnknown)
+        );
+        assert_eq!(tracker.plan(t0, None), None, "nothing to decide from");
+
+        // An unreadable stake says the same: this Portal has the field.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &entry(Some("x"), Some("1")), t0);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::StakeUnknown)
+        );
     }
 
     #[test]
