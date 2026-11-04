@@ -28,6 +28,7 @@
 use crate::app::config::StorageMethod;
 use crate::app::tasks::downloadagreements::{StorageBackend, PORTAL_FILE_NONCE};
 use crate::app::tasks::{field_from_hex, STATUS_ACTIVE, STATUS_PROVED};
+use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, challenges, prelude::Agreements, prelude::Challenges};
 use anyhow::{anyhow, Context, Result};
@@ -343,8 +344,9 @@ async fn prove_active_challenges<G: ProofGenerator>(
                 );
             }
             Err(ProcessError::NotSubmitted(err)) => {
-                // Nothing reached the Portal (missing file, slot not yet
-                // reconciled…): free to try again next cycle.
+                // Nothing the Portal judged (missing file, slot not yet
+                // reconciled, Portal unreachable or failing…): free to try
+                // again next cycle.
                 warn!(
                     "Failed to process challenge {}: {err}",
                     challenge.challenge_id
@@ -363,10 +365,30 @@ async fn prove_active_challenges<G: ProofGenerator>(
 /// Why a challenge was not proved, split by whether the Portal saw a proof.
 #[derive(Debug)]
 enum ProcessError {
-    /// Failed before anything was submitted.
+    /// Failed before anything was submitted, or the submission never got an
+    /// answer about the proof (see [`refused_by_portal`]).
     NotSubmitted(anyhow::Error),
     /// A proof was submitted and refused, or accepted and then not recorded.
     Submitted(anyhow::Error),
+}
+
+/// Whether a failed `submit_proof` means the Portal read this proof and turned
+/// it down — the only failure that counts toward [`MAX_PROOF_SUBMISSIONS`].
+///
+/// That is a 4xx, except the ones that say nothing about the proof: `401` (the
+/// session expired), `408` and `429` (come back later), and `409` (the nonce it
+/// was signed at is held by another op of this node; the next attempt is signed
+/// at a fresh one). A `2xx` whose body cannot be read counts too: the Portal
+/// took the proof. A connection error, a timeout or a 5xx does not — whether the
+/// Portal even looked at the proof is unknown — so an outage spends none of a
+/// challenge's submissions, and the next cycle tries again.
+fn refused_by_portal(err: &anyhow::Error) -> bool {
+    if let Some(status) = err.downcast_ref::<HttpStatusError>() {
+        let status = status.status.as_u16();
+        return (400..500).contains(&status) && !matches!(status, 401 | 408 | 409 | 429);
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_decode)
 }
 
 /// Process a single challenge: load file, generate proof, submit to Portal.
@@ -391,9 +413,7 @@ async fn process_single_challenge<G: ProofGenerator>(
     .await
     .map_err(ProcessError::NotSubmitted)?;
 
-    submit_and_record(portal_client, database, challenge, proof_hex)
-        .await
-        .map_err(ProcessError::Submitted)
+    submit_and_record(portal_client, database, challenge, proof_hex).await
 }
 
 /// Load the file and generate the proof for one challenge.
@@ -500,19 +520,26 @@ async fn submit_and_record(
     database: &DatabaseConnection,
     challenge: &challenges::Model,
     proof_hex: String,
-) -> Result<()> {
+) -> Result<(), ProcessError> {
     // Submit to Portal (BLS signature is computed internally by submit_proof)
     let response = portal_client
         .submit_proof(&challenge.challenge_id, &proof_hex)
         .await
-        .with_context(|| format!("submitting proof for challenge {}", challenge.challenge_id))?;
+        .with_context(|| format!("submitting proof for challenge {}", challenge.challenge_id))
+        .map_err(|err| {
+            if refused_by_portal(&err) {
+                ProcessError::Submitted(err)
+            } else {
+                ProcessError::NotSubmitted(err)
+            }
+        })?;
 
     // Check response status - Portal may reject proof
     if response.status != STATUS_PROVED {
-        return Err(anyhow!(
+        return Err(ProcessError::Submitted(anyhow!(
             "proof rejected by Portal with status: {}",
             response.status
-        ));
+        )));
     }
 
     // Update challenge status in DB.
@@ -534,7 +561,8 @@ async fn submit_and_record(
     active_model
         .update(database)
         .await
-        .context("updating challenge status")?;
+        .context("updating challenge status")
+        .map_err(ProcessError::Submitted)?;
 
     info!(
         "Submitted proof for challenge {} (agreement {})",
@@ -2339,6 +2367,80 @@ mod tests {
         .unwrap();
         assert_eq!(
             fresh.check("chal_refused", Instant::now()),
+            RetryCheck::Prove
+        );
+    }
+
+    /// An outage is not a verdict on the proof. A connection refused or a 5xx
+    /// spends none of the challenge's submissions — five of those used to mean
+    /// giving up on a proof the Portal never looked at — nor does a `409`,
+    /// which is about the nonce, not the proof.
+    #[tokio::test]
+    async fn transient_failures_spend_no_submission() {
+        for status in [500u16, 502, 503, 409, 429, 401] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/challenges/chal_outage"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("try later"))
+                .mount(&mock_server)
+                .await;
+            let db = setup_in_memory_db().await;
+            let storage_dir = unique_storage_dir("outage");
+            stdfs::create_dir_all(&storage_dir).ok();
+            setup_challenges(&db, &storage_dir, &[("chal_outage", 800, "active")]).await;
+
+            let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+            let retries = ProofRetries::default();
+            prove_active_challenges(
+                &client,
+                &db,
+                &StorageBackend::local(),
+                &storage_dir,
+                &MockProofGenerator,
+                &retries,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                retries.check("chal_outage", Instant::now()),
+                RetryCheck::Prove,
+                "{status}"
+            );
+        }
+
+        // Nobody listening at all.
+        // (A dropped `MockServer` goes back to wiremock's pool and keeps
+        // answering, so take a port and let it go instead.)
+        let unreachable = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("outage_unreachable");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(&db, &storage_dir, &[("chal_outage", 800, "active")]).await;
+        let client = PortalClient::with_auth(
+            unreachable,
+            storage_dir.clone(),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+        let retries = ProofRetries::default();
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retries.check("chal_outage", Instant::now()),
             RetryCheck::Prove
         );
     }
