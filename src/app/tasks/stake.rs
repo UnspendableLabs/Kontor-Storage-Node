@@ -955,11 +955,13 @@ impl JoinBudget {
     ///
     /// A known collateral is checked exactly. An unknown one — the usual case,
     /// since the Portal joins in the same batch that creates the agreement — is
-    /// a guess: allowed while any unreserved stake is left, at most
-    /// [`MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE`] per cycle, and charged the
-    /// estimate (or whatever is left, if less) so a few of them use the budget
-    /// up. A guess that turns out short costs a refused join on chain, which is
-    /// not slashable: only the download is wasted.
+    /// a guess: allowed only while the unreserved stake left covers the
+    /// estimate, at most [`MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE`] per cycle,
+    /// and charged the estimate, so a few of them use the budget up. A stake
+    /// that cannot cover even the estimate would most likely be refused the
+    /// join on chain, so the download is not made. A guess that still turns out
+    /// short costs a refused join on chain, which is not slashable: only the
+    /// download is wasted.
     pub fn decide(&mut self, already_member: bool, listed: Option<Option<&str>>) -> JoinDecision {
         if already_member {
             return JoinDecision::Join { collateral: None };
@@ -975,18 +977,17 @@ impl JoinBudget {
                 guesses_left,
             } => match listed {
                 None => JoinDecision::Skip(SkipReason::NotListed),
-                Some(None) if remaining.is_zero() => {
+                Some(None) if *remaining < *estimate => {
                     JoinDecision::Skip(SkipReason::InsufficientCollateral)
                 }
                 Some(None) if *guesses_left == 0 => {
                     JoinDecision::Skip(SkipReason::CollateralUnknown)
                 }
                 Some(None) => {
-                    let charged = (*estimate).min(*remaining);
-                    *remaining = remaining.saturating_sub(charged);
+                    *remaining = remaining.saturating_sub(*estimate);
                     *guesses_left -= 1;
                     JoinDecision::Join {
-                        collateral: Some(charged),
+                        collateral: Some(*estimate),
                     }
                 }
                 Some(Some(raw)) => match Kor::parse(raw) {
@@ -1683,8 +1684,9 @@ mod tests {
     }
 
     /// The usual case: the Portal joins in the batch that creates the
-    /// agreement, so the collateral is not known yet. Joined anyway while
-    /// stake is free, charged the estimate, at most a few per cycle.
+    /// agreement, so the collateral is not known yet. Joined anyway while the
+    /// free stake covers the estimate, charged the estimate, at most a few per
+    /// cycle.
     #[test]
     fn unknown_collateral_is_budgeted_at_the_estimate_and_capped_per_cycle() {
         let tracker = StakeTracker::new(StakePolicy::default());
@@ -1714,24 +1716,40 @@ mod tests {
         );
     }
 
-    /// A small bond still gets to try one: the guess is charged at most what
-    /// is left, which then closes the budget.
+    /// What is left must cover the estimate. A bond with less used to be
+    /// charged "the rest" and download and join anyway — with 0.01 KOR free,
+    /// a join Kontor was all but certain to refuse.
     #[test]
-    fn an_estimate_above_what_is_left_takes_the_rest() {
+    fn an_estimate_above_what_is_left_is_not_joined() {
         let tracker = StakeTracker::new(StakePolicy::default());
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("4"), Some("4")), t0);
+        let mut budget = tracker.join_budget(t0);
+        assert_eq!(
+            budget.decide(false, Some(None)),
+            JoinDecision::Skip(SkipReason::InsufficientCollateral)
+        );
 
+        observed(&tracker, &entry(Some("15"), Some("15")), t0);
         let mut budget = tracker.join_budget(t0);
         assert_eq!(
             budget.decide(false, Some(None)),
             JoinDecision::Join {
-                collateral: Some(kor("4"))
-            }
+                collateral: Some(kor("10"))
+            },
+            "15 covers one estimate of 10"
         );
         assert_eq!(
             budget.decide(false, Some(None)),
-            JoinDecision::Skip(SkipReason::InsufficientCollateral)
+            JoinDecision::Skip(SkipReason::InsufficientCollateral),
+            "the 5 left does not cover a second"
+        );
+        assert_eq!(
+            budget.decide(false, Some(Some("5"))),
+            JoinDecision::Join {
+                collateral: Some(kor("5"))
+            },
+            "a known collateral still uses what is left"
         );
     }
 
