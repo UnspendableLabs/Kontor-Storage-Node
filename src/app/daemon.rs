@@ -3,7 +3,7 @@ use crate::app::tasks::downloadagreements::{
     download_agreements_gated, rebuild_ledger, StorageBackend,
 };
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
-use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
+use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{
     exit_inputs, manage_stake, persist_withdrawal_start, refresh_memberships,
@@ -167,12 +167,16 @@ async fn run_portal_daemon(
 
 /// One daemon cycle.
 ///
-/// The order is the point: the stake is read first, because every join
-/// decision of the cycle is made against it; agreements are taken on next;
-/// proofs come after, so a full node or a refused join never costs one; and
-/// the stake op goes out last, holding the highest nonce of the cycle — if it
-/// ever collides with another op on a nonce it is the one that loses, and a
-/// lost top-up is retried next cycle where a lost proof is a slash.
+/// The order is the point: the stake is read first, because every decision of
+/// the cycle is made against it; the rows are reconciled with the Portal;
+/// proofs come next, before anything that could fail or wait — a missed
+/// challenge is slashed at 30× the agreement's collateral, so no join, no
+/// download, no full node and no Portal error on either may cost one, and a
+/// proof signed before the cycle's joins never has a join's nonce passed over
+/// it; agreements are taken on after; and the stake op goes out last, holding
+/// the highest nonce of the cycle — if it ever collides with another op on a
+/// nonce it is the one that loses, and a lost top-up is retried next cycle
+/// where a lost proof is a slash.
 async fn sync_portal_once(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
@@ -182,20 +186,22 @@ async fn sync_portal_once(
     memory: &DaemonMemory,
 ) -> Result<()> {
     // A node at its file limit takes on nothing new, but keeps proving what it
-    // already stores, and still downloads the files of memberships it holds:
-    // skipping the whole cycle here used to mean every challenge on a full node
-    // expired, and an expired challenge — like one on a file the node never
-    // fetched — is slashed at 30× the agreement's collateral.
-    let at_file_limit = match storage_limits.max_files {
-        Some(max_files) if downloaded_files_count(database).await? >= max_files => {
+    // already stores, still downloads the files of memberships it holds, and
+    // still reads the ready listing: it is what settles the joins it has in
+    // flight and shows which of its stored files the Portal wants joined again.
+    // The download step's own limit check keeps any agreement not held yet from
+    // being fetched or joined. Skipping the whole cycle here used to mean every
+    // challenge on a full node expired, and an expired challenge — like one on
+    // a file the node never fetched — is slashed at 30× the agreement's
+    // collateral.
+    if let Some(max_files) = storage_limits.max_files {
+        if downloaded_files_count(database).await? >= max_files {
             info!(
-                "Max stored files limit ({max_files}) reached; not fetching new agreements, \
+                "Max stored files limit ({max_files}) reached; not taking on new agreements, \
                  only the files of memberships this node holds"
             );
-            true
         }
-        _ => false,
-    };
+    }
 
     // Read Kontor's registry entry at the start of every cycle. The local nonce
     // counter is only ever moved *up* to its `next_nonce` (see
@@ -247,56 +253,16 @@ async fn sync_portal_once(
         .context("reconciling agreements with Portal")?;
     }
 
-    // At the limit the listing stays empty, and the download step's own limit
-    // check keeps any agreement not held yet from being fetched or joined.
-    let listing = if at_file_limit {
-        ReadyListing::new()
-    } else {
-        let listing = sync_ready_agreements(portal_client, database)
-            .await
-            .context("fetching new agreements failed")?;
-        let now = Instant::now();
-        for agreement in listing.values() {
-            memory
-                .staking
-                .note_collateral(agreement.required_collateral.as_deref(), now);
-        }
-        listing
-    };
-    // Joins that will never execute give their collateral back before the
-    // budget is drawn up: the listing just read shows which of this node's
-    // rows the Portal has invalidated, and the rows which agreements are no
-    // longer open to joins.
-    if let Some(node_id) = portal_client.node_id() {
-        if let Err(err) = settle_pending_joins(database, &memory.staking, node_id, &listing).await {
-            warn!("could not settle the pending joins this cycle: {err:#}");
-        }
+    // Proofs before anything the cycle takes on. The challenges are brought up
+    // to date first; if the Portal cannot be asked, the ones already known are
+    // proved against the previous read rather than not at all.
+    if let Err(err) = sync_active_challenges(portal_client, database).await {
+        warn!("syncing active challenges failed; proving the challenges already known: {err:#}");
     }
-    let mut budget = if portal_client.node_id().is_some() {
-        memory.staking.join_budget(Instant::now())
-    } else {
-        JoinBudget::unmetered()
-    };
-    download_agreements_gated(
-        portal_client,
-        database,
-        storage_limits,
-        storage_backend,
-        &listing,
-        &mut budget,
-        Some(&memory.staking),
-    )
-    .await
-    .context("downloading agreements failed")?;
 
-    sync_active_challenges(portal_client, database)
-        .await
-        .context("syncing active challenges failed")?;
-
-    // Refresh the aggregated ledger before proving: this pass may have
-    // downloaded new files or learned the contract-assigned `ledger_index` of
-    // ones stored earlier, and a proof is only verifiable if the file sits at
-    // that exact slot.
+    // Refresh the aggregated ledger before proving: reconciliation may have
+    // learned the contract-assigned `ledger_index` of files stored earlier, and
+    // a proof is only verifiable if the file sits at that exact slot.
     //
     // A failure here is logged rather than propagated: it costs this cycle's
     // proofs (each challenge fails individually against the previous
@@ -315,6 +281,43 @@ async fn sync_portal_once(
     )
     .await
     .context("computing and submitting proofs failed")?;
+
+    let listing = sync_ready_agreements(portal_client, database)
+        .await
+        .context("fetching new agreements failed")?;
+    let now = Instant::now();
+    for agreement in listing.values() {
+        memory
+            .staking
+            .note_collateral(agreement.required_collateral.as_deref(), now);
+    }
+    // Joins that will never execute give their collateral back before the
+    // budget is drawn up: the listing just read shows which of this node's
+    // rows the Portal has invalidated, and the rows which agreements are no
+    // longer open to joins.
+    if let Some(node_id) = portal_client.node_id() {
+        if let Err(err) = settle_pending_joins(database, &memory.staking, node_id, &listing).await {
+            warn!("could not settle the pending joins this cycle: {err:#}");
+        }
+    }
+    let mut budget = if portal_client.node_id().is_some() {
+        memory.staking.join_budget(Instant::now())
+    } else {
+        JoinBudget::unmetered()
+    };
+    // Downloads and joins fail one agreement at a time, never the cycle (see
+    // `download_agreements_gated`); only its own rows failing it does.
+    download_agreements_gated(
+        portal_client,
+        database,
+        storage_limits,
+        storage_backend,
+        &listing,
+        &mut budget,
+        Some(&memory.staking),
+    )
+    .await
+    .context("downloading agreements failed")?;
 
     // The exit, once the operator's unstake has executed, is worked out from
     // the node's own rows: which memberships it holds and which challenges
@@ -803,20 +806,96 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn skips_portal_calls_when_max_files_reached() {
-        let mock_server = MockServer::start().await;
+    /// The page the Portal serves for `agreements` under either listing.
+    fn agreements_page(agreements: Vec<serde_json::Value>) -> serde_json::Value {
+        json!({
+            "offset": 0,
+            "limit": 20,
+            "total": agreements.len(),
+            "agreements": agreements
+        })
+    }
 
+    /// A ready agreement nobody has joined, as the Portal lists it.
+    fn ready_agreement(agreement_id: &str) -> serde_json::Value {
+        json!({
+            "agreement_id": agreement_id,
+            "user_id": "user_1",
+            "file_id": format!("FILE-{agreement_id}"),
+            "filename": "new.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": [],
+            "transaction_id": null,
+            "status": "ready",
+            "created_at": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    /// Everything a cycle of an authenticated node asks the Portal for, apart
+    /// from the ready listing and the downloads the test is about: this node's
+    /// agreements and challenges, both empty, and a registry entry that
+    /// reports no stake (an old Portal), so joins are not metered.
+    async fn mount_empty_node(mock_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(agreements_page(vec![])))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": 0,
+                "challenges": []
+            })))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "signer_id": 42,
+                "x_only_pubkey": "ab",
+                "bls_pubkey": null,
+                "next_nonce": 0,
+                "kor_balance": "10"
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// A node at its file limit still reads the ready listing — it is what
+    /// settles its pending joins and shows which stored files to join again —
+    /// but downloads and joins nothing new.
+    #[tokio::test]
+    async fn a_full_node_reads_the_listing_but_takes_nothing_on() {
+        let mock_server = MockServer::start().await;
+        mount_empty_node(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(agreements_page(vec![ready_agreement("AGREEMENT-new")])),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGREEMENT-new/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGREEMENT-new/join"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(&mock_server)
             .await;
 
         let database = setup_in_memory_db().await;
-        let lock_path = unique_test_path("lock_max_files");
         let storage_dir = unique_test_path("storage_max_files");
         fs::remove_dir_all(&storage_dir).ok();
 
@@ -827,7 +906,7 @@ mod tests {
             filename: Set("downloaded.pdf".into()),
             mime_type: Set("application/pdf".into()),
             original_size: Set(123),
-            nodes: Set(json!(["NODE-1"])),
+            nodes: Set(json!(["NODE-test"])),
             root: Set(None),
             padded_len: Set(None),
             object_id: Set(None),
@@ -840,34 +919,91 @@ mod tests {
         };
         already_downloaded.insert(&database).await.unwrap();
 
-        let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), storage_dir.clone()),
-            database.clone(),
-            Duration::from_millis(10),
-            lock_path.clone(),
+        sync_portal_once(
+            &create_authenticated_portal_client(&mock_server.uri(), storage_dir.clone()),
+            &database,
             StorageLimits {
                 capacity: None,
                 max_file_size: None,
                 max_files: Some(1),
             },
-            StorageBackend::local(),
-            storage_dir.clone(),
-            Arc::new(StakeTracker::default()),
-        );
-
-        time::sleep(Duration::from_millis(30)).await;
-        handle.abort();
-        let _ = handle.await;
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         assert!(
-            requests.is_empty(),
-            "daemon should not call portal when max files limit is reached"
+            requests
+                .iter()
+                .any(|request| request.url.query() == Some("status=ready&offset=0")),
+            "the ready listing is read at the file limit"
         );
+        let stored = Agreements::find_by_id("AGREEMENT-new")
+            .one(&database)
+            .await
+            .unwrap()
+            .expect("the listed agreement is recorded, for when room frees up");
+        assert!(!stored.downloaded, "but not downloaded");
+    }
+
+    /// A download the Portal cannot serve, or a join it refuses for a reason
+    /// other than the stake, fails that agreement, not the cycle — and the
+    /// proofs were already out by then, since they come before any join.
+    #[tokio::test]
+    async fn a_failed_download_neither_fails_the_cycle_nor_delays_the_proofs() {
+        let mock_server = MockServer::start().await;
+        mount_empty_node(&mock_server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("status", "ready"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(agreements_page(vec![ready_agreement("AGREEMENT-broken")])),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGREEMENT-broken/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("storage_broken_download");
+        fs::remove_dir_all(&storage_dir).ok();
+
+        sync_portal_once(
+            &create_authenticated_portal_client(&mock_server.uri(), storage_dir.clone()),
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &storage_dir,
+            &DaemonMemory::default(),
+        )
+        .await
+        .expect("a failed download is that agreement's problem, not the cycle's");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let position = |needle: &str| {
+            requests
+                .iter()
+                .position(|request| request.url.as_str().contains(needle))
+                .unwrap_or_else(|| panic!("{needle} was never requested"))
+        };
         assert!(
-            !lock_is_held(&lock_path),
-            "the lock should be released when the daemon task is dropped"
+            position("/api/nodes/NODE-test/challenges") < position("status=ready"),
+            "the challenges are read, and proved, before the ready listing is looked at"
         );
+        let stored = Agreements::find_by_id("AGREEMENT-broken")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.downloaded, "left for the next cycle");
     }
 
     #[tokio::test]
@@ -1375,13 +1511,8 @@ mod tests {
         let mock_server = MockServer::start().await;
         mount_no_node_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
-        Mock::given(method("GET"))
-            .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&mock_server)
-            .await;
+        // The listing is still read at the limit; nothing in it is taken on.
+        mount_empty_ready_agreements(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1433,13 +1564,8 @@ mod tests {
         let mock_server = MockServer::start().await;
         mount_no_node_agreements(&mock_server).await;
         mount_empty_challenges(&mock_server).await;
-        Mock::given(method("GET"))
-            .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&mock_server)
-            .await;
+        // The listing is still read at the limit; nothing in it is taken on.
+        mount_empty_ready_agreements(&mock_server).await;
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1724,9 +1850,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(entry))
             .mount(&mock_server)
             .await;
-        // The exit's first step in a process re-reads each membership from
-        // the Portal, which is the only place a leave made by an earlier
-        // process shows (as `left`).
+        // The membership is re-read from the Portal twice: by reconciliation,
+        // since the filtered listing above does not carry it, and by the
+        // exit's first step in a process — the detail is the only place a
+        // leave made by an earlier process shows (as `left`).
         Mock::given(method("GET"))
             .and(path("/api/agreements/AGR-held"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1741,7 +1868,7 @@ mod tests {
                 "status": "confirmed",
                 "created_at": "2024-01-01T00:00:00Z"
             })))
-            .expect(1)
+            .expect(2)
             .mount(&mock_server)
             .await;
         Mock::given(method("POST"))
