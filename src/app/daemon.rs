@@ -6,7 +6,7 @@ use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{
-    exit_inputs, manage_stake, refresh_memberships, JoinBudget, StakeTracker,
+    exit_inputs, manage_stake, refresh_memberships, settle_pending_joins, JoinBudget, StakeTracker,
 };
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
@@ -249,6 +249,15 @@ async fn sync_portal_once(
         }
         listing
     };
+    // Joins that will never execute give their collateral back before the
+    // budget is drawn up: the listing just read shows which of this node's
+    // rows the Portal has invalidated, and the rows which agreements are no
+    // longer open to joins.
+    if let Some(node_id) = portal_client.node_id() {
+        if let Err(err) = settle_pending_joins(database, &memory.staking, node_id, &listing).await {
+            warn!("could not settle the pending joins this cycle: {err:#}");
+        }
+    }
     let mut budget = if portal_client.node_id().is_some() {
         memory.staking.join_budget(Instant::now())
     } else {

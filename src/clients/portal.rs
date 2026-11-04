@@ -1176,7 +1176,43 @@ impl PortalClient {
         body.nonce = Some(nonce);
         Ok(body)
     }
+
+    /// List this node's relayed ops as the Portal holds them, newest first
+    /// (Portal `docs/node-portal-contract.md` §2).
+    ///
+    /// `statuses` filters on `queued`, `submitted`, `confirmed`, `failed`;
+    /// empty lists every status. One page of [`NODE_OPS_PAGE`] ops: the node
+    /// sends one op at a time, so the one it is asking about is among the
+    /// newest.
+    ///
+    /// # Errors
+    /// If the client is unauthenticated or the request fails.
+    pub async fn list_node_ops(&self, statuses: &[&str]) -> Result<Vec<NodeOpRecord>> {
+        let node_id = self
+            .node_id()
+            .ok_or_else(|| anyhow!("authentication required to list node ops"))?;
+        let mut url = self.api_path(&format!(
+            "/api/nodes/{}/ops?limit={NODE_OPS_PAGE}",
+            urlencoding::encode(node_id)
+        ));
+        if !statuses.is_empty() {
+            url.push_str("&status=");
+            url.push_str(&urlencoding::encode(&statuses.join("|")));
+        }
+        let request = self.build_signed_request(Method::GET, &url, None)?;
+        let resp = request.send().await?;
+        let resp = check_response_status(resp, "list node ops").await?;
+        let page = resp
+            .json::<NodeOpsPage>()
+            .await
+            .context("failed to deserialize node ops listing")?;
+        Ok(page.ops)
+    }
 }
+
+/// How many relayed ops [`PortalClient::list_node_ops`] asks for: the
+/// Portal's page cap.
+const NODE_OPS_PAGE: u32 = 100;
 
 /// Trait for paginated API responses.
 ///
@@ -1532,6 +1568,29 @@ struct NodeOpRequest {
     agreement_id: Option<String>,
     bls_signature: String,
     nonce: u64,
+}
+
+/// One relayed op as `GET /api/nodes/{node_id}/ops` lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeOpRecord {
+    /// `add_stake`, `begin_unstake`, `withdraw_stake`, `claim_rewards` or
+    /// `leave_agreement`.
+    pub op: String,
+    pub nonce: u64,
+    /// `queued` → `submitted` (batched) → `confirmed` / `failed`.
+    pub status: String,
+    /// Kontor's rendering of the failure, for a `failed` op.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The Bitcoin txid of the carrying batch, once composed.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub txid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeOpsPage {
+    ops: Vec<NodeOpRecord>,
 }
 
 /// The relay's `202`: the op is queued, not executed.
@@ -3020,6 +3079,79 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(client.current_nonce(), Some(8), "5xx: nonce stays consumed");
+    }
+
+    /// The listing the node consults before giving an accepted op up for
+    /// dropped: signed like every node request, one page, newest first, with
+    /// the status filter pipe-separated as the Portal reads it.
+    #[tokio::test]
+    async fn list_node_ops_reads_one_page_with_an_optional_status_filter() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(query_param("limit", "100"))
+            .and(query_param("status", "queued|submitted"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 100,
+                "total": 2,
+                "node_id": "NODE-test",
+                "ops": [
+                    {
+                        "id": "b", "node_id": "NODE-test", "op": "add_stake", "amount": "995",
+                        "agreement_id": null, "nonce": 8, "status": "submitted",
+                        "transaction_id": "t1", "error": null, "txid": "deadbeef",
+                        "created_at": "2026-11-03T10:00:00+00:00",
+                        "updated_at": "2026-11-03T10:05:00+00:00"
+                    },
+                    {
+                        "id": "a", "node_id": "NODE-test", "op": "leave_agreement",
+                        "amount": null, "agreement_id": "agr_1", "nonce": 7,
+                        "status": "failed", "transaction_id": null,
+                        "error": "nonce 7 is below the signer's next nonce", "txid": null,
+                        "created_at": "2026-11-03T09:00:00+00:00",
+                        "updated_at": "2026-11-03T09:30:00+00:00"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(query_param("limit", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0, "limit": 100, "total": 0, "node_id": "NODE-test", "ops": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let keypair = Arc::new(BlsKeyPair::generate().unwrap());
+        let client = node_op_client(&mock_server.uri(), keypair, "list_ops");
+        let ops = client
+            .list_node_ops(&["queued", "submitted"])
+            .await
+            .unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!((ops[0].op.as_str(), ops[0].nonce), ("add_stake", 8));
+        assert_eq!(ops[0].status, "submitted");
+        assert_eq!(ops[0].txid.as_deref(), Some("deadbeef"));
+        assert_eq!(ops[1].status, "failed");
+        assert!(ops[1].error.as_deref().unwrap().contains("nonce 7"));
+
+        assert!(client.list_node_ops(&[]).await.unwrap().is_empty());
+        let requests = mock_server.received_requests().await.unwrap();
+        let unfiltered = requests
+            .iter()
+            .filter(|r| r.url.path() == "/api/nodes/NODE-test/ops")
+            .filter(|r| !r.url.query().unwrap_or("").contains("status="))
+            .count();
+        assert_eq!(unfiltered, 1, "no filter means no status parameter");
+
+        let unauthenticated =
+            PortalClient::new("http://localhost:1234", storage_dir("list_ops_no_auth"));
+        assert!(unauthenticated.list_node_ops(&[]).await.is_err());
     }
 
     #[tokio::test]

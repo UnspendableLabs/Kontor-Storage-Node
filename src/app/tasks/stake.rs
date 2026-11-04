@@ -41,8 +41,17 @@
 //! the other failure: re-sending the same 995 KOR every 30 seconds while the
 //! first one waits for a block.
 //!
-//! An op the Portal accepted and then silently dropped would never consume its
-//! nonce, so in-flight also expires after [`OP_LANDING_TIMEOUT`].
+//! An op the Portal accepted and then dropped would never consume its nonce,
+//! so an op that has waited [`OP_LANDING_CHECK_INTERVAL`] is looked up in the
+//! Portal's own listing of this node's ops (§2, `GET /api/nodes/{node_id}/ops`)
+//! before it is given up: it stays in flight while the Portal still lists it
+//! as `queued` or `submitted` — a signer's newer ops wait while its earlier
+//! ones sit in an unconfirmed batch, so half an hour is routine — and is
+//! declared dropped only when the Portal no longer lists it, or lists it as
+//! `failed`. A listing that cannot be read leaves it in flight, up to
+//! [`OP_LANDING_HARD_TIMEOUT`]. Giving an op up too early is the expensive
+//! mistake here: the same `add-stake` signed again with a fresh nonce makes
+//! both execute, and the bond overshoots its target.
 //!
 //! # Why the op goes out last
 //!
@@ -60,10 +69,11 @@
 //! a Portal *has* reported a stake, a cycle where the entry cannot be read
 //! joins nothing rather than joining blind.
 
+use crate::app::tasks::getnewagreements::ReadyListing;
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
 use crate::clients::kor::Kor;
-use crate::clients::portal::{NodeOp, RegistryEntry};
+use crate::clients::portal::{NodeOp, NodeOpRecord, RegistryEntry};
 use crate::clients::PortalClient;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -96,10 +106,18 @@ const GAS_PRICE_UNITS: u128 = 1_000_000_000;
 /// top-up and nothing after it.
 pub const MIN_GAS_RESERVE: Kor = Kor::from_units(DEFAULT_GAS_LIMIT as u128 * GAS_PRICE_UNITS);
 
-/// How long an accepted op may stay unreflected before the node assumes the
-/// Portal dropped it and decides again. Long enough for a compose round and a
-/// couple of blocks; short enough that a lost top-up is retried the same hour.
-pub const OP_LANDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long an accepted op may stay unreflected before the node asks the
+/// Portal whether it still holds it — and how often it asks again while the
+/// Portal says it does. Long enough for a compose round and a couple of
+/// blocks, so most ops never prompt the question.
+pub const OP_LANDING_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// How long an accepted op stays in flight at the outside, whatever the Portal
+/// says or fails to say about it. A Portal that lists an op as queued for this
+/// long, or cannot be asked for this long, has lost it for all the node can
+/// tell; it is then decided again. A join's committed collateral is held for
+/// the same length at most (see [`settle_pending_joins`]).
+pub const OP_LANDING_HARD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// At most one automatic `claim-rewards` per this interval. Each claim costs
 /// gas, and rewards accrue per block, so claiming more often only buys dust.
@@ -323,6 +341,8 @@ struct InFlight {
     nonce: u64,
     sent: Instant,
     sent_at: DateTime<Utc>,
+    /// When the Portal's listing was last asked about it.
+    checked: Option<Instant>,
 }
 
 /// A join sent but not yet executed: its collateral is not in `stake_reserved`
@@ -490,7 +510,7 @@ impl StakeTracker {
     /// Fold in this cycle's registry read: `None` when it failed outright.
     ///
     /// Retires in-flight work whose nonce Kontor has consumed (or that has
-    /// waited past [`OP_LANDING_TIMEOUT`]), and says out loud when the stake
+    /// waited past [`OP_LANDING_HARD_TIMEOUT`]), and says out loud when the stake
     /// shrank or bond cleanup started — the two things an operator must not
     /// learn from a dashboard a week later.
     pub fn observe(&self, entry: Option<&RegistryEntry>, now: Instant) {
@@ -517,14 +537,14 @@ impl StakeTracker {
                     op.op.name()
                 );
                 landed = Some(op.op);
-            } else if now.duration_since(op.sent) >= OP_LANDING_TIMEOUT {
+            } else if now.duration_since(op.sent) >= OP_LANDING_HARD_TIMEOUT {
                 warn!(
                     op = op.op.name(),
                     nonce = op.nonce,
-                    "the {} op is still not reflected after {} minutes; assuming the Portal \
-                     dropped it and deciding again",
+                    "the {} op is still not reflected after {} hours; giving it up for lost \
+                     and deciding again",
                     op.op.name(),
-                    OP_LANDING_TIMEOUT.as_secs() / 60
+                    OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
                 );
             } else {
                 state.in_flight = Some(op);
@@ -553,8 +573,8 @@ impl StakeTracker {
             _ => {}
         }
         // The snapshot says so too, whether or not the withdrawal is still
-        // tracked in flight — one that took longer than OP_LANDING_TIMEOUT to
-        // execute has been forgotten by then, and auto-stake would re-bond
+        // tracked in flight — one given up as lost has been forgotten by then
+        // (see `verify_in_flight`), and auto-stake would re-bond
         // the whole bond it just returned. An exit under way at the last read,
         // and now no bond and no withdrawal pending: the bond came back.
         let was_exiting = state.unstake_seen.is_some()
@@ -577,8 +597,13 @@ impl StakeTracker {
             state.unstake_seen = None;
         }
 
+        // A join's collateral is held until its nonce says it has executed —
+        // or until its row says it never will (`settle_pending_joins`), with a
+        // long time limit behind both for a join the Portal lost without a
+        // trace.
         state.pending_joins.retain(|join| {
-            snapshot.next_nonce <= join.nonce && now.duration_since(join.sent) < OP_LANDING_TIMEOUT
+            snapshot.next_nonce <= join.nonce
+                && now.duration_since(join.sent) < OP_LANDING_HARD_TIMEOUT
         });
 
         if let Some(previous) = &state.last_known {
@@ -597,6 +622,139 @@ impl StakeTracker {
         state.last_known = Some(snapshot.clone());
         state.snapshot = Some(snapshot);
         state.observed_at = Some(Utc::now());
+    }
+
+    /// The nonce of the in-flight op the Portal should be asked about this
+    /// cycle, if there is one that has waited [`OP_LANDING_CHECK_INTERVAL`]
+    /// since it was sent or last asked about.
+    #[must_use]
+    pub fn op_to_verify(&self, now: Instant) -> Option<u64> {
+        let state = self.lock();
+        let op = state.in_flight.as_ref()?;
+        let since = op.checked.unwrap_or(op.sent);
+        (now.duration_since(since) >= OP_LANDING_CHECK_INTERVAL).then_some(op.nonce)
+    }
+
+    /// What the Portal's listing of this node's ops says about the in-flight
+    /// op at `nonce` (see [`Self::op_to_verify`]).
+    ///
+    /// Still `queued` or `submitted`: it is waiting for a batch, or in one that
+    /// is not confirmed yet, and stays in flight. `confirmed`: it has executed
+    /// and the registry read is behind; it stays in flight for the nonce to
+    /// say so. `failed`, or missing from the listing: the Portal will never
+    /// relay it, so it is given up and the next plan decides again. A listing
+    /// that could not be read says nothing, and nothing changes until the next
+    /// check or [`OP_LANDING_HARD_TIMEOUT`].
+    pub fn verify_in_flight(
+        &self,
+        nonce: u64,
+        listing: anyhow::Result<Vec<NodeOpRecord>>,
+        now: Instant,
+    ) {
+        let mut state = self.lock();
+        let Some(op) = state.in_flight.as_mut().filter(|op| op.nonce == nonce) else {
+            return;
+        };
+        op.checked = Some(now);
+        let name = op.op.name();
+        let listed = match listing {
+            Ok(ops) => ops.into_iter().find(|listed| listed.nonce == nonce),
+            Err(err) => {
+                warn!(
+                    "could not ask the Portal about the {name} op at nonce {nonce}; keeping it in \
+                     flight: {err:#}"
+                );
+                return;
+            }
+        };
+        if let Some(other) = listed.as_ref().filter(|listed| listed.op != name) {
+            // Another op of this node holds the nonce — the relay's `409`
+            // after the fact. Ours was never stored.
+            warn!(
+                "the Portal holds a {} op, not the {name} op, at nonce {nonce}; the {name} op \
+                 was not relayed and is decided again",
+                other.op
+            );
+            state.in_flight = None;
+            state.last_event = Some((
+                Utc::now(),
+                format!("{name} lost nonce {nonce} to a {} op", other.op),
+            ));
+            return;
+        }
+        let dropped = match listed.as_ref().map(|listed| listed.status.as_str()) {
+            Some("queued" | "submitted") => {
+                info!(
+                    "the {name} op at nonce {nonce} is still {} at the Portal after {} minutes; \
+                     waiting",
+                    listed.as_ref().map_or("", |listed| listed.status.as_str()),
+                    now.duration_since(op.sent).as_secs() / 60
+                );
+                return;
+            }
+            Some("confirmed") => {
+                debug!(
+                    "the {name} op at nonce {nonce} is confirmed at the Portal; waiting for the \
+                     registry to reflect it"
+                );
+                return;
+            }
+            Some("failed") => {
+                warn!(
+                    "the Portal reports the {name} op at nonce {nonce} as failed: {}; deciding \
+                     again",
+                    listed
+                        .as_ref()
+                        .and_then(|listed| listed.error.as_deref())
+                        .unwrap_or("no error given")
+                );
+                format!("{name} failed at the Portal (nonce {nonce})")
+            }
+            Some(other) => {
+                warn!(
+                    "the Portal lists the {name} op at nonce {nonce} with an unknown status \
+                     {other:?}; deciding again"
+                );
+                format!("{name} in an unknown state at the Portal (nonce {nonce})")
+            }
+            None => {
+                warn!(
+                    "the Portal no longer lists the {name} op at nonce {nonce}; assuming it \
+                     dropped it and deciding again"
+                );
+                format!("{name} dropped by the Portal (nonce {nonce})")
+            }
+        };
+        state.in_flight = None;
+        state.last_event = Some((Utc::now(), dropped));
+    }
+
+    /// The agreements whose joins still hold collateral in the budget.
+    #[must_use]
+    pub fn pending_join_agreements(&self) -> Vec<String> {
+        self.lock()
+            .pending_joins
+            .iter()
+            .map(|join| join.agreement_id.clone())
+            .collect()
+    }
+
+    /// Give back the collateral of joins that will never reserve anything.
+    pub fn release_joins(&self, agreement_ids: &[String]) {
+        if agreement_ids.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        state.pending_joins.retain(|join| {
+            let settled = agreement_ids.contains(&join.agreement_id);
+            if settled {
+                info!(
+                    "the join of {} will not execute; its {} KOR are back in the budget",
+                    join.agreement_id, join.collateral
+                );
+            }
+            !settled
+        });
     }
 
     /// The op this cycle should send, if any. At most one: the next waits
@@ -668,6 +826,7 @@ impl StakeTracker {
             nonce,
             sent: now,
             sent_at: Utc::now(),
+            checked: None,
         });
     }
 
@@ -1116,6 +1275,68 @@ pub fn is_membership_status(status: Option<&str>) -> bool {
 /// and waiting for the verdict.
 const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
 
+/// Release the collateral of pending joins that will never execute, from what
+/// this cycle learned about their agreements.
+///
+/// A join is held in the budget until its nonce is consumed. It never is when
+/// the Portal retires the join instead — `invalid`, a stale nonce or a
+/// signature that no longer verifies — or when the agreement it was for never
+/// makes it on chain. Both show in what the cycle has just read: this node's
+/// row in `listing` (the ready agreements, with every member's status) is in
+/// [`NO_MEMBERSHIP`], or the agreement is no longer `ready`/`pending` by its
+/// local row. Behind both, [`StakeTracker::observe`] still releases a join
+/// after [`OP_LANDING_HARD_TIMEOUT`].
+///
+/// # Errors
+/// If the rows cannot be read.
+pub async fn settle_pending_joins(
+    database: &DatabaseConnection,
+    tracker: &StakeTracker,
+    node_id: &str,
+    listing: &ReadyListing,
+) -> anyhow::Result<()> {
+    use crate::entities::agreements;
+    use crate::entities::prelude::Agreements;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let pending = tracker.pending_join_agreements();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut settled = Vec::new();
+    let mut unlisted = Vec::new();
+    for agreement_id in pending {
+        match listing.get(&agreement_id) {
+            Some(listed) => {
+                let mine: Vec<&str> = listed
+                    .nodes
+                    .iter()
+                    .filter(|node| node.node_id == node_id)
+                    .map(|node| node.status.as_str())
+                    .collect();
+                if !mine.is_empty() && mine.iter().all(|status| NO_MEMBERSHIP.contains(status)) {
+                    settled.push(agreement_id);
+                }
+            }
+            None => unlisted.push(agreement_id),
+        }
+    }
+    if !unlisted.is_empty() {
+        let rows = Agreements::find()
+            .filter(agreements::Column::AgreementId.is_in(unlisted))
+            .all(database)
+            .await
+            .context("loading the agreements of pending joins")?;
+        settled.extend(
+            rows.into_iter()
+                .filter(|row| !matches!(row.status.as_str(), "ready" | "pending"))
+                .map(|row| row.agreement_id),
+        );
+    }
+    tracker.release_joins(&settled);
+    Ok(())
+}
+
 /// Bring the rows of the memberships the exit acts on up to date with the
 /// Portal.
 ///
@@ -1246,8 +1467,18 @@ pub async fn manage_stake(
     exit: Option<&ExitInputs>,
 ) -> Option<NodeOp> {
     client.node_id()?;
+    verify_overdue_op(client, tracker, Instant::now()).await;
     let op = tracker.plan(Instant::now(), exit)?;
     send(client, tracker, op).await
+}
+
+/// Ask the Portal about an in-flight op that has waited long enough to be
+/// asked about (see [`StakeTracker::verify_in_flight`]).
+async fn verify_overdue_op(client: &PortalClient, tracker: &StakeTracker, now: Instant) {
+    if let Some(nonce) = tracker.op_to_verify(now) {
+        let listing = client.list_node_ops(&[]).await;
+        tracker.verify_in_flight(nonce, listing, now);
+    }
 }
 
 async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Option<NodeOp> {
@@ -1496,17 +1727,203 @@ mod tests {
         );
     }
 
+    fn listed_op(op: &str, nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
+        NodeOpRecord {
+            op: op.into(),
+            nonce,
+            status: status.into(),
+            error: error.map(Into::into),
+            txid: None,
+        }
+    }
+
+    /// Half an hour in, the Portal is asked. While it still lists the op as
+    /// queued or submitted — a signer's newer ops wait behind its unconfirmed
+    /// batch, so this is routine — the op stays in flight and nothing is
+    /// re-signed; the question is asked again every interval, not every
+    /// cycle. A listing that cannot be read changes nothing either.
     #[test]
-    fn an_op_that_never_lands_expires() {
+    fn an_op_the_portal_still_holds_stays_in_flight() {
         let tracker = StakeTracker::new(StakePolicy::default());
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
         tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
 
-        let later = t0 + OP_LANDING_TIMEOUT;
+        let soon = t0 + Duration::from_secs(60);
+        assert_eq!(tracker.op_to_verify(soon), None, "too early to ask");
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        observed(&tracker, &entry(Some("0"), Some("0")), check);
+        assert_eq!(tracker.op_to_verify(check), Some(10));
+
+        tracker.verify_in_flight(
+            10,
+            Ok(vec![
+                listed_op("claim_rewards", 11, "queued", None),
+                listed_op("add_stake", 10, "submitted", None),
+            ]),
+            check,
+        );
+        assert_eq!(tracker.plan(check, None), None, "still in flight");
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
+        assert_eq!(
+            tracker.op_to_verify(check + Duration::from_secs(30)),
+            None,
+            "asked a moment ago"
+        );
+        let again = check + OP_LANDING_CHECK_INTERVAL;
+        assert_eq!(tracker.op_to_verify(again), Some(10));
+
+        tracker.verify_in_flight(10, Err(anyhow::anyhow!("timed out")), again);
+        assert_eq!(tracker.plan(again, None), None, "unknown is not dropped");
+
+        tracker.verify_in_flight(
+            10,
+            Ok(vec![listed_op("add_stake", 10, "confirmed", None)]),
+            again,
+        );
+        assert_eq!(
+            tracker.plan(again, None),
+            None,
+            "confirmed: the nonce will say so at the next read"
+        );
+        assert_eq!(
+            tracker.op_to_verify(again + Duration::from_secs(1)),
+            None,
+            "a stale nonce is never asked about"
+        );
+        tracker.verify_in_flight(99, Ok(vec![]), again);
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
+    }
+
+    /// Dropped for good: the Portal no longer lists the op, or lists it as
+    /// failed (with Kontor's reason). The next plan decides again.
+    #[test]
+    fn an_op_the_portal_dropped_or_failed_is_decided_again() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        tracker.verify_in_flight(
+            10,
+            Ok(vec![listed_op("claim_rewards", 9, "confirmed", None)]),
+            check,
+        );
+        assert_eq!(
+            tracker.plan(check, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+        let message = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("dropped"), "{message}");
+
+        // Another op of this node at the nonce: ours was never stored.
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, check);
+        tracker.verify_in_flight(
+            10,
+            Ok(vec![listed_op("claim_rewards", 10, "queued", None)]),
+            check,
+        );
+        assert_eq!(
+            tracker.plan(check, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 11, check);
+        tracker.verify_in_flight(
+            11,
+            Ok(vec![listed_op(
+                "add_stake",
+                11,
+                "failed",
+                Some("nonce 11 is below the signer's next nonce"),
+            )]),
+            check + OP_LANDING_CHECK_INTERVAL,
+        );
+        assert_eq!(tracker.status()["in_flight"], Value::Null);
+        let message = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("failed"), "{message}");
+    }
+
+    /// Whatever the Portal says or cannot say, an op is not waited for
+    /// beyond the hard timeout.
+    #[test]
+    fn an_op_that_never_lands_expires_at_the_hard_timeout() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let late = t0 + OP_LANDING_HARD_TIMEOUT - Duration::from_secs(1);
+        observed(&tracker, &entry(Some("0"), Some("0")), late);
+        assert_eq!(tracker.plan(late, None), None);
+
+        let later = t0 + OP_LANDING_HARD_TIMEOUT;
         observed(&tracker, &entry(Some("0"), Some("0")), later);
         assert_eq!(
             tracker.plan(later, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+    }
+
+    /// Through the client: the Portal's listing is what decides. Listed as
+    /// queued, the op stays in flight and no new one is signed; gone from the
+    /// listing, the next plan goes out.
+    #[tokio::test]
+    async fn the_portal_s_listing_decides_whether_an_overdue_op_is_dropped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let page = |ops: Value| json!({"offset": 0, "limit": 100, "total": 1, "node_id": "NODE-test", "ops": ops});
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(json!([{
+                "id": "a", "node_id": "NODE-test", "op": "add_stake", "amount": "995",
+                "agreement_id": null, "nonce": 10, "status": "queued",
+                "transaction_id": null, "error": null, "txid": null,
+                "created_at": "2026-11-03T10:00:00+00:00",
+                "updated_at": "2026-11-03T10:00:00+00:00"
+            }]))))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            std::env::temp_dir(),
+            Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "token",
+            10,
+        )
+        .unwrap();
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        verify_overdue_op(&client, &tracker, check).await;
+        assert_eq!(tracker.plan(check, None), None, "the Portal still has it");
+
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let again = check + OP_LANDING_CHECK_INTERVAL;
+        verify_overdue_op(&client, &tracker, again).await;
+        assert_eq!(
+            tracker.plan(again, None),
             Some(NodeOp::AddStake(kor("995")))
         );
     }
@@ -1689,6 +2106,82 @@ mod tests {
                 collateral: Some(kor("10"))
             }
         );
+    }
+
+    /// A join's collateral is released when its row says the join will never
+    /// execute — this node's row in the listing is `invalid`, or the
+    /// agreement is no longer `ready`/`pending` — and otherwise held up to the
+    /// hard timeout, not the half hour an op is first asked about.
+    #[tokio::test]
+    async fn pending_joins_are_released_by_their_rows_or_the_hard_timeout() {
+        use crate::clients::portal::{Agreement, AgreementNode};
+        use crate::testutils::{setup_in_memory_db, AgreementFixture};
+        use sea_orm::ActiveModelTrait;
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        for id in ["AGR-invalid", "AGR-live", "AGR-failed", "AGR-still"] {
+            tracker.record_join(id, kor("10"), 10, t0);
+        }
+
+        let listed = |id: &str, status: &str| -> Agreement {
+            let mut agreement: Agreement = serde_json::from_value(json!({
+                "agreement_id": id,
+                "user_id": "user_1",
+                "file_id": format!("F-{id}"),
+                "filename": "test.bin",
+                "mime_type": "application/octet-stream",
+                "original_size": 123,
+                "nodes": [],
+                "transaction_id": null,
+                "status": "ready",
+                "created_at": "2024-01-01T00:00:00Z"
+            }))
+            .unwrap();
+            agreement.nodes = vec![AgreementNode {
+                node_id: "NODE-me".into(),
+                status: status.into(),
+            }];
+            agreement
+        };
+        let listing: ReadyListing = [
+            listed("AGR-invalid", "invalid"),
+            listed("AGR-live", "valid"),
+        ]
+        .into_iter()
+        .map(|agreement| (agreement.agreement_id.clone(), agreement))
+        .collect();
+
+        let db = setup_in_memory_db().await;
+        for (id, status) in [("AGR-failed", "failed"), ("AGR-still", "ready")] {
+            AgreementFixture {
+                status: status.into(),
+                nodes: json!([{"node_id": "NODE-me", "status": "valid"}]),
+                ..AgreementFixture::new(id, format!("F-{id}"))
+            }
+            .into_active_model()
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        settle_pending_joins(&db, &tracker, "NODE-me", &listing)
+            .await
+            .unwrap();
+        let mut held = tracker.pending_join_agreements();
+        held.sort();
+        assert_eq!(held, vec!["AGR-live", "AGR-still"]);
+
+        let hour = t0 + Duration::from_secs(60 * 60);
+        observed(&tracker, &entry(Some("100"), Some("100")), hour);
+        assert_eq!(tracker.pending_join_agreements().len(), 2, "still held");
+        observed(
+            &tracker,
+            &entry(Some("100"), Some("100")),
+            t0 + OP_LANDING_HARD_TIMEOUT,
+        );
+        assert!(tracker.pending_join_agreements().is_empty());
     }
 
     #[test]
@@ -2105,10 +2598,10 @@ mod tests {
         }
     }
 
-    /// A withdrawal that takes longer than [`OP_LANDING_TIMEOUT`] to execute is
-    /// no longer tracked when it lands. The snapshot still shows it — an exit
-    /// under way, then no bond and no withdrawal pending — and the balance it
-    /// returned is not bonded again.
+    /// A withdrawal that takes longer than [`OP_LANDING_HARD_TIMEOUT`] to
+    /// execute is no longer tracked when it lands. The snapshot still shows it
+    /// — an exit under way, then no bond and no withdrawal pending — and the
+    /// balance it returned is not bonded again.
     #[test]
     fn a_withdrawal_that_lands_late_still_ends_the_auto_stake() {
         let tracker = StakeTracker::new(StakePolicy::default());
@@ -2118,7 +2611,7 @@ mod tests {
         assert_eq!(tracker.plan(t0, None), Some(NodeOp::WithdrawStake));
         tracker.record_sent(NodeOp::WithdrawStake, 12, t0);
 
-        let late = t0 + OP_LANDING_TIMEOUT + Duration::from_secs(60);
+        let late = t0 + OP_LANDING_HARD_TIMEOUT + Duration::from_secs(60);
         observed(&tracker, &exiting_entry(12, "100"), late);
         assert_eq!(tracker.status()["in_flight"], Value::Null, "forgotten");
 

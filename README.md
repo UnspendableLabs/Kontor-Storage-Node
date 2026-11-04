@@ -518,10 +518,18 @@ Each sync cycle the node reads its bond from the Portal (`GET
 The node sends **one** stake or claim op at a time. The Portal only answers
 "queued", so the node learns that an op ran from its nonce: once Kontor's
 `next_nonce` moves past it, the op has executed, and the next decision is made
-from the balance and stake the Portal then reports. An op that is never
-reflected is given up after 30 minutes and decided again. One the Portal
-refuses is not signed again every cycle: a top-up, a claim or a leave (for that
-agreement only) waits an hour, a withdrawal six. The stake op is the
+from the balance and stake the Portal then reports. An op still not reflected
+after 30 minutes is looked up in the Portal's listing of the node's ops (`GET
+/api/nodes/{node_id}/ops`): while the Portal lists it as `queued` or
+`submitted` it stays in flight — a signer's newer ops wait behind its
+unconfirmed batch, so half an hour is routine, and signing the same top-up
+again would bond it twice — and it is only given up, and decided again, once
+the Portal no longer lists it or lists it as `failed`, or after 6 hours
+whatever the Portal says. The collateral set aside for a join is held the same
+way: until the join's nonce is consumed, until the Portal shows the join
+invalidated or the agreement closed to joins, or 6 hours at most. One the
+Portal refuses is not signed again every cycle: a top-up, a claim or a leave
+(for that agreement only) waits an hour, a withdrawal six. The stake op is the
 last thing a cycle signs, so it never takes a nonce a proof needed.
 
 The node's own nonce counter only moves forward. Each cycle raises it to
