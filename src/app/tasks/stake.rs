@@ -1075,6 +1075,26 @@ impl JoinBudget {
 /// Portal joins in the batch that creates it), a `failed` one never was.
 const NOT_ON_CHAIN: [&str; 3] = ["ready", "pending", "failed"];
 
+/// Statuses of this node's row in an agreement's `nodes` under which it holds
+/// no membership — the Portal's `agreement_nodes` statuses other than `valid`:
+/// the join `failed` on chain, was `invalid`ated before it ran, or the node has
+/// `left`. Old rows store bare node-id strings, which count as memberships.
+pub const NO_MEMBERSHIP: [&str; 3] = ["failed", "invalid", "left"];
+
+/// The one status in [`NO_MEMBERSHIP`] the Portal takes a new join in place of
+/// while the agreement is still `ready`: an `invalid` join was never applied
+/// on chain — its nonce was stale when the batch was composed, its signature
+/// no longer matched the node's key, or Kontor refused it — so nothing is
+/// owed, and nothing stops a fresh one. A `failed` or `left` row is final.
+pub const REJOINABLE_MEMBERSHIP: &str = "invalid";
+
+/// Whether a `nodes[]` status (`None` for a bare node-id string) is a
+/// membership this node holds.
+#[must_use]
+pub fn is_membership_status(status: Option<&str>) -> bool {
+    status.is_none_or(|status| !NO_MEMBERSHIP.contains(&status))
+}
+
 /// Challenge statuses that are not resolved yet: still to prove, or proved
 /// and waiting for the verdict.
 const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];

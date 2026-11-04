@@ -2,7 +2,9 @@ use crate::app::config::StorageMethod;
 use crate::app::daemon::StorageLimits;
 use crate::app::tasks::field_from_hex;
 use crate::app::tasks::getnewagreements::ReadyListing;
-use crate::app::tasks::stake::{JoinBudget, JoinDecision, StakeTracker};
+use crate::app::tasks::stake::{
+    is_membership_status, JoinBudget, JoinDecision, StakeTracker, REJOINABLE_MEMBERSHIP,
+};
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kor::Kor;
 use crate::clients::portal::{AgreementNode, JoinAgreementResponse};
@@ -221,9 +223,10 @@ fn check_storage_limits(
 /// staking upgrade a missed proof is slashed. The cost of this order is a
 /// download wasted when the join is refused, which the join budget keeps rare.
 ///
-/// Only for an agreement the node has no row in: the Portal answers
+/// Only for an agreement the node has no live row in: the Portal answers
 /// `created: false` for one it has, storing nothing, so signing that join would
-/// only spend a nonce. Returns `None` for an unauthenticated client (legacy
+/// only spend a nonce. An `invalid` row is the exception — the Portal replaces
+/// it with the new join. Returns `None` for an unauthenticated client (legacy
 /// tests), which has nothing to sign with.
 async fn join_downloaded_agreement(
     portal_client: &PortalClient,
@@ -260,27 +263,29 @@ async fn join_downloaded_agreement(
 /// cycle's listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Membership {
-    /// No row: the agreement is still to be joined.
+    /// No row, or only an `invalid` one: the agreement is still to be joined.
+    /// The Portal takes a new join in place of an `invalid` row — that join
+    /// was never applied on chain, so nothing is owed for it — while the
+    /// agreement is `ready`.
     None,
     /// A membership the node holds, or whose join is on its way: an obligation
     /// to store the file, which a challenge will slash it for not having.
     Held,
-    /// A row that is over — the join failed or was invalidated, or the node
+    /// A row that is over for good — the join failed on chain, or the node
     /// left. Nothing is owed, and the Portal answers a second join with
     /// `created: false` without storing it, so none is signed.
     Ended,
 }
 
-/// Statuses of a node's row in an agreement that are not a membership.
-const ENDED_MEMBERSHIP: [&str; 3] = ["failed", "invalid", "left"];
-
 /// Whether this node has a row in `agreement`, and whether it is still live.
 ///
-/// Both the local row and the listing are looked at because each lags in its
-/// own way: the local `nodes` is refreshed by reconciliation, which only lists
-/// agreements the node is in, and the listing is current but only covers
-/// agreements still ready. Old rows store bare node-id strings rather than
-/// `{node_id, status}` objects; those count as held.
+/// This cycle's listing is the truth for an agreement it has: it is current,
+/// and it carries this node's row whatever its status. The local `nodes` only
+/// stands in when the listing says nothing — it is refreshed by reconciliation,
+/// which lists the agreements the node *validly* belongs to, so a row the
+/// Portal has since invalidated keeps saying `valid` locally. Old rows store
+/// bare node-id strings rather than `{node_id, status}` objects; those count
+/// as held.
 fn membership(
     agreement: &agreements::Model,
     listed: Option<&crate::clients::portal::Agreement>,
@@ -289,7 +294,37 @@ fn membership(
     let Some(node_id) = node_id else {
         return Membership::None;
     };
-    let mut statuses: Vec<Option<&str>> = agreement
+    let statuses = membership_statuses(agreement, listed, node_id);
+    if statuses.iter().any(|status| is_membership_status(*status)) {
+        Membership::Held
+    } else if statuses
+        .iter()
+        .any(|status| *status != Some(REJOINABLE_MEMBERSHIP))
+    {
+        Membership::Ended
+    } else {
+        // No row at all, or only an invalidated join.
+        Membership::None
+    }
+}
+
+/// The statuses of this node's rows in `agreement`, `None` standing for a bare
+/// node-id string: the listing's when it has any, the local row's otherwise.
+fn membership_statuses<'a>(
+    agreement: &'a agreements::Model,
+    listed: Option<&'a crate::clients::portal::Agreement>,
+    node_id: &str,
+) -> Vec<Option<&'a str>> {
+    let from_listing: Vec<Option<&str>> = listed
+        .into_iter()
+        .flat_map(|listed| listed.nodes.iter())
+        .filter(|node: &&AgreementNode| node.node_id == node_id)
+        .map(|node| Some(node.status.as_str()))
+        .collect();
+    if !from_listing.is_empty() {
+        return from_listing;
+    }
+    agreement
         .nodes
         .as_array()
         .into_iter()
@@ -305,26 +340,41 @@ fn membership(
                 None
             }
         })
-        .collect();
-    if let Some(listed) = listed {
-        statuses.extend(
-            listed
+        .collect()
+}
+
+/// Agreements this node has already stored whose join the Portal invalidated,
+/// and still lists as ready: joined again in place of the invalid row.
+async fn invalidated_joins(
+    database: &DatabaseConnection,
+    listing: &ReadyListing,
+    node_id: Option<&str>,
+) -> Result<Vec<agreements::Model>> {
+    let Some(node_id) = node_id else {
+        return Ok(Vec::new());
+    };
+    let invalidated: Vec<String> = listing
+        .values()
+        .filter(|listed| {
+            let mine: Vec<&str> = listed
                 .nodes
                 .iter()
-                .filter(|node: &&AgreementNode| node.node_id == node_id)
-                .map(|node| Some(node.status.as_str())),
-        );
+                .filter(|node| node.node_id == node_id)
+                .map(|node| node.status.as_str())
+                .collect();
+            !mine.is_empty() && mine.iter().all(|status| *status == REJOINABLE_MEMBERSHIP)
+        })
+        .map(|listed| listed.agreement_id.clone())
+        .collect();
+    if invalidated.is_empty() {
+        return Ok(Vec::new());
     }
-    if statuses.is_empty() {
-        Membership::None
-    } else if statuses
-        .iter()
-        .any(|status| status.is_none_or(|status| !ENDED_MEMBERSHIP.contains(&status)))
-    {
-        Membership::Held
-    } else {
-        Membership::Ended
-    }
+    Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .filter(agreements::Column::AgreementId.is_in(invalidated))
+        .all(database)
+        .await
+        .context("failed to load agreements whose join was invalidated")
 }
 
 /// Store an agreement file to the configured storage backend and update the database.
@@ -471,6 +521,11 @@ pub async fn download_agreements(
 /// Portal would answer `created: false` and store nothing, and the nonce the
 /// join was signed at would go unused.
 ///
+/// A join the Portal has invalidated (never applied on chain) is made again in
+/// its place while the agreement is still listed as ready: budgeted like any
+/// new join, but with no second download — the file is already stored — and
+/// so no storage-limit check, which that file already passed.
+///
 /// A join the Portal refuses with a `422` (no stake, not enough unreserved
 /// collateral, cleanup pending, withdrawal requested) costs the downloaded
 /// file and pauses joins for a while — `tracker` remembers that across cycles
@@ -581,31 +636,15 @@ pub async fn download_agreements_gated(
                 format!("downloading file for agreement {}", agreement.agreement_id)
             })?;
 
-        let join = match membership {
-            Membership::None => join_downloaded_agreement(portal_client, &agreement).await,
-            Membership::Held | Membership::Ended => Ok(None),
-        };
-        match join {
-            Ok(Some(joined)) => {
-                record_reservation(tracker, &agreement, collateral, &joined);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let Some((422, code)) = status_and_code(&err) else {
-                    return Err(err);
-                };
-                let code = code.unwrap_or_else(|| "UNPROCESSABLE".to_string());
-                warn!(
-                    "The Portal refused to let this node join {} ({code}); joins are paused \
-                     for a while and the downloaded file is discarded: {err:#}",
+        if membership == Membership::None {
+            let attempt =
+                attempt_join(portal_client, &agreement, collateral, budget, tracker).await?;
+            if attempt == JoinAttempt::Refused {
+                debug!(
+                    "Discarding the file downloaded for {}",
                     agreement.agreement_id
                 );
                 discard_download(&downloaded.path).await;
-                budget.refund(collateral);
-                budget.close(&code);
-                if let Some(tracker) = tracker {
-                    tracker.pause_joins(&code, Instant::now());
-                }
                 continue;
             }
         }
@@ -628,11 +667,79 @@ pub async fn download_agreements_gated(
     if downloaded_count > 0 {
         info!("Downloaded {} agreements", downloaded_count);
     }
+
+    for agreement in invalidated_joins(database, listing, portal_client.node_id()).await? {
+        let listed = listing.get(&agreement.agreement_id);
+        let collateral = match budget.decide(
+            false,
+            listed.map(|listed| listed.required_collateral.as_deref()),
+        ) {
+            JoinDecision::Join { collateral } => collateral,
+            JoinDecision::Skip(reason) => {
+                debug!(
+                    "Not joining {} again this cycle: {reason}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        };
+        info!(
+            "Joining {} again: the Portal invalidated this node's previous join",
+            agreement.agreement_id
+        );
+        attempt_join(portal_client, &agreement, collateral, budget, tracker).await?;
+    }
+
     if let Some(summary) = budget.summary() {
         info!("Agreements not joined this cycle: {summary}");
     }
 
     Ok(())
+}
+
+/// How a join attempt ended, as far as the caller has to act on it.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinAttempt {
+    /// Signed and accepted, or nothing to sign (an unauthenticated client).
+    Joined,
+    /// The Portal refused it at its pre-check; joins are paused.
+    Refused,
+}
+
+/// Join `agreement` and hold its collateral; on a `422`, pause joins instead.
+///
+/// Any other failure is the cycle's to handle.
+async fn attempt_join(
+    portal_client: &PortalClient,
+    agreement: &agreements::Model,
+    collateral: Option<Kor>,
+    budget: &mut JoinBudget,
+    tracker: Option<&StakeTracker>,
+) -> Result<JoinAttempt> {
+    match join_downloaded_agreement(portal_client, agreement).await {
+        Ok(Some(joined)) => {
+            record_reservation(tracker, agreement, collateral, &joined);
+            Ok(JoinAttempt::Joined)
+        }
+        Ok(None) => Ok(JoinAttempt::Joined),
+        Err(err) => {
+            let Some((422, code)) = status_and_code(&err) else {
+                return Err(err);
+            };
+            let code = code.unwrap_or_else(|| "UNPROCESSABLE".to_string());
+            warn!(
+                "The Portal refused to let this node join {} ({code}); joins are paused for a \
+                 while: {err:#}",
+                agreement.agreement_id
+            );
+            budget.refund(collateral);
+            budget.close(&code);
+            if let Some(tracker) = tracker {
+                tracker.pause_joins(&code, Instant::now());
+            }
+            Ok(JoinAttempt::Refused)
+        }
+    }
 }
 
 /// Hold a fresh membership's collateral until its join executes.
@@ -2959,6 +3066,21 @@ mod tests {
         .unwrap()
     }
 
+    /// A listed agreement in which `node_id` has a row with `status`.
+    fn listed_with_status(
+        agreement_id: &str,
+        collateral: Option<&str>,
+        node_id: &str,
+        status: &str,
+    ) -> Agreement {
+        let mut agreement = listed(agreement_id, collateral, &[]);
+        agreement.nodes = vec![AgreementNode {
+            node_id: node_id.to_string(),
+            status: status.to_string(),
+        }];
+        agreement
+    }
+
     fn listing(agreements: Vec<Agreement>) -> ReadyListing {
         agreements
             .into_iter()
@@ -3399,12 +3521,87 @@ mod tests {
         assert_eq!(membership(&none, Some(&pending), me), Membership::Held);
         assert_eq!(membership(&none, None, me), Membership::None);
 
-        for status in ["failed", "invalid", "left"] {
+        for status in ["failed", "left"] {
             let ended = model(json!([{"node_id": "NODE-test", "status": status}]));
             assert_eq!(membership(&ended, None, me), Membership::Ended, "{status}");
         }
-        // Either source saying the membership is live is enough.
+        // An invalidated join is one the Portal takes again: no membership,
+        // nothing owed, and nothing in the way of a new one.
+        let invalid = model(json!([{"node_id": "NODE-test", "status": "invalid"}]));
+        assert_eq!(membership(&invalid, None, me), Membership::None);
+
+        // The listing is this cycle's truth where it has this node's row: the
+        // local row is only refreshed for memberships the Portal still counts
+        // as valid, so it is the one that goes stale.
         let left = model(json!([{"node_id": "NODE-test", "status": "left"}]));
         assert_eq!(membership(&left, Some(&pending), me), Membership::Held);
+        let invalidated = listed_with_status("AGR-1", Some("1"), "NODE-test", "invalid");
+        assert_eq!(
+            membership(&valid, Some(&invalidated), me),
+            Membership::None,
+            "a valid local row does not outlive the listing's invalid one"
+        );
+        let other = listed("AGR-1", Some("1"), &["NODE-other"]);
+        assert_eq!(
+            membership(&valid, Some(&other), me),
+            Membership::Held,
+            "a listing without this node's row leaves the local row to speak"
+        );
+    }
+
+    /// A join the Portal invalidated — never applied on chain — is made again
+    /// in its place while the agreement is listed as ready. The file is
+    /// already stored, so nothing is downloaded a second time; the collateral
+    /// is budgeted and held like any new join's. A `failed` row is final.
+    #[tokio::test]
+    async fn an_invalidated_join_is_made_again_without_a_second_download() {
+        let mock_server = MockServer::start().await;
+        for id in ["AGR-invalid", "AGR-failed"] {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        for id in ["AGR-invalid", "AGR-failed"] {
+            let mut fx = AgreementFixture::new(id, format!("FILE-{id}"));
+            // What reconciliation last wrote, before the Portal invalidated it.
+            fx.nodes = json!([{"node_id": "NODE-test", "status": "valid"}]);
+            fx.downloaded = true;
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_rejoin")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed_with_status("AGR-invalid", Some("30"), "NODE-test", "invalid"),
+            listed_with_status("AGR-failed", Some("30"), "NODE-test", "failed"),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-invalid/join"), 1);
+        assert_eq!(requests_to(&requests, "AGR-invalid/download"), 0);
+        assert_eq!(
+            requests_to(&requests, "AGR-failed"),
+            0,
+            "a failed join is final"
+        );
+        assert_eq!(
+            tracker.status()["pending_joins"],
+            json!([{"agreement_id": "AGR-invalid", "collateral": "30", "nonce": 0}])
+        );
     }
 }
