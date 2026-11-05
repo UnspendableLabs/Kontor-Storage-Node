@@ -272,9 +272,12 @@ enum Membership {
     /// A membership the node holds, or whose join is on its way: an obligation
     /// to store the file, which a challenge will slash it for not having.
     Held,
-    /// A row that is over for good — the join failed on chain, or the node
-    /// left. Nothing is owed, and the Portal answers a second join with
-    /// `created: false` without storing it, so none is signed.
+    /// A row that is over for good — the join failed on chain, the node left,
+    /// or the join was invalidated and the agreement is no longer open to a
+    /// new one. Nothing is owed, the Portal answers a second join with
+    /// `created: false` (or `403 INVALID_STATUS`) without storing it, so none
+    /// is signed, and the file is not fetched: the node has no membership to
+    /// store it for.
     Ended,
 }
 
@@ -287,6 +290,11 @@ enum Membership {
 /// Portal has since invalidated keeps saying `valid` locally. Old rows store
 /// bare node-id strings rather than `{node_id, status}` objects; those count
 /// as held.
+///
+/// An `invalid` row alone is [`Membership::None`] while a new join can replace
+/// it — the agreement is in this cycle's ready listing, or the local row still
+/// says `ready` or `pending` — and [`Membership::Ended`] once the agreement
+/// has moved on without this node.
 fn membership(
     agreement: &agreements::Model,
     listed: Option<&crate::clients::portal::Agreement>,
@@ -303,9 +311,15 @@ fn membership(
         .any(|status| *status != Some(REJOINABLE_MEMBERSHIP))
     {
         Membership::Ended
-    } else {
-        // No row at all, or only an invalidated join.
+    } else if statuses.is_empty()
+        || listed.is_some()
+        || matches!(agreement.status.as_str(), "ready" | "pending")
+    {
+        // No row at all, or only an invalidated join the Portal still takes
+        // a new one in place of.
         Membership::None
+    } else {
+        Membership::Ended
     }
 }
 
@@ -594,6 +608,17 @@ pub async fn download_agreements_gated(
     let mut failed: Vec<String> = Vec::new();
 
     for (agreement, membership) in pending {
+        // Nothing to store it for: the membership is over, and the agreement
+        // is not open to a new join. Downloading it would spend bandwidth and
+        // capacity on a file no challenge will ever ask this node for.
+        if membership == Membership::Ended {
+            debug!(
+                "Not downloading {}: this node's membership in it is over",
+                agreement.agreement_id
+            );
+            continue;
+        }
+
         let original_size: u64 = agreement
             .original_size
             .try_into()
@@ -3720,9 +3745,16 @@ mod tests {
             assert_eq!(membership(&ended, None, me), Membership::Ended, "{status}");
         }
         // An invalidated join is one the Portal takes again: no membership,
-        // nothing owed, and nothing in the way of a new one.
+        // nothing owed, and nothing in the way of a new one — while the
+        // agreement is still open to joins. Once it has moved on, the row is
+        // over like a failed one.
         let invalid = model(json!([{"node_id": "NODE-test", "status": "invalid"}]));
         assert_eq!(membership(&invalid, None, me), Membership::None);
+        let mut closed = model(json!([{"node_id": "NODE-test", "status": "invalid"}]));
+        closed.status = "confirmed".into();
+        assert_eq!(membership(&closed, None, me), Membership::Ended);
+        let reopened = listed_with_status("AGR-1", Some("1"), "NODE-test", "invalid");
+        assert_eq!(membership(&closed, Some(&reopened), me), Membership::None);
 
         // The listing is this cycle's truth where it has this node's row: the
         // local row is only refreshed for memberships the Portal still counts
@@ -3797,5 +3829,61 @@ mod tests {
             tracker.status()["pending_joins"],
             json!([{"agreement_id": "AGR-invalid", "collateral": "30", "nonce": 0}])
         );
+    }
+
+    /// A membership that is over — the node left, its join failed on chain, or
+    /// its join was invalidated and the agreement has moved on — is neither
+    /// joined again nor downloaded: there is no membership to store the file
+    /// for, and a challenge will never ask this node for it.
+    #[tokio::test]
+    async fn an_ended_membership_is_neither_downloaded_nor_joined() {
+        let mock_server = MockServer::start().await;
+        let ids = ["AGR-left", "AGR-failed-row", "AGR-invalid-closed"];
+        for id in ids {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        for (id, status) in [
+            ("AGR-left", "left"),
+            ("AGR-failed-row", "failed"),
+            ("AGR-invalid-closed", "invalid"),
+        ] {
+            let mut fx = AgreementFixture::new(id, format!("FILE-{id}"));
+            fx.nodes = json!([{"node_id": "NODE-test", "status": status}]);
+            fx.status = "confirmed".into();
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_ended")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "{requests:?}");
+        for id in ids {
+            let row = Agreements::find_by_id(id)
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!row.downloaded, "{id}");
+        }
+        assert_eq!(client.current_nonce(), Some(0), "nothing was signed");
     }
 }
