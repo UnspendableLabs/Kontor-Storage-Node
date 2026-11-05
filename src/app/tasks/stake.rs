@@ -409,6 +409,8 @@ struct LandedOp {
     nonce: u64,
     /// When the nonce was seen consumed.
     landed: Instant,
+    /// The Portal never confirmed storing the op (see [`InFlight::unsettled`]).
+    unsettled: bool,
 }
 
 /// An op the relay accepted and Kontor has not executed yet.
@@ -418,6 +420,10 @@ struct InFlight {
     nonce: u64,
     sent: Instant,
     sent_at: DateTime<Utc>,
+    /// The relay gave no answer that says whether it stored the op (see
+    /// [`StakeTracker::record_unsettled`]): the Portal may hold it, or may
+    /// never have seen it.
+    unsettled: bool,
     /// When the Portal's listing was last asked about it.
     checked: Option<Instant>,
     /// When the Portal's listing last said it still holds the op. The hard
@@ -703,7 +709,7 @@ impl StakeTracker {
         };
 
         let exited_before = state.exited;
-        let mut landed: Option<(NodeOp, u64)> = None;
+        let mut landed: Option<(NodeOp, u64, bool)> = None;
         if let Some(op) = state.in_flight.take() {
             if snapshot.next_nonce > op.nonce {
                 info!(
@@ -712,7 +718,7 @@ impl StakeTracker {
                     "the {} op has executed on Kontor",
                     op.op.name()
                 );
-                landed = Some((op.op, op.nonce));
+                landed = Some((op.op, op.nonce, op.unsettled));
             } else if op.given_up_at(now) {
                 warn!(
                     op = op.op.name(),
@@ -728,7 +734,7 @@ impl StakeTracker {
         }
 
         match &landed {
-            Some((op @ NodeOp::LeaveAgreement(agreement_id), nonce)) => {
+            Some((op @ NodeOp::LeaveAgreement(agreement_id), nonce, unsettled)) => {
                 // Its nonce went; whether Kontor accepted the leave is not in
                 // the registry. The Portal's listing says, and until it does
                 // the agreement is neither left nor left again (see
@@ -741,9 +747,10 @@ impl StakeTracker {
                     op: op.clone(),
                     nonce: *nonce,
                     landed: now,
+                    unsettled: *unsettled,
                 });
             }
-            Some((op @ NodeOp::AddStake(amount), nonce))
+            Some((op @ NodeOp::AddStake(amount), nonce, unsettled))
                 if state
                     .last_known
                     .as_ref()
@@ -766,13 +773,14 @@ impl StakeTracker {
                     op: op.clone(),
                     nonce: *nonce,
                     landed: now,
+                    unsettled: *unsettled,
                 });
                 state.last_event = Some((
                     Utc::now(),
                     format!("add_stake {amount} KOR executed without raising the bond"),
                 ));
             }
-            Some((NodeOp::WithdrawStake, _)) if !snapshot.stake.is_zero() => {
+            Some((NodeOp::WithdrawStake, _, _)) if !snapshot.stake.is_zero() => {
                 // Executed, and the bond is still there: too early, or an
                 // obligation the node's own rows did not show (a leave that
                 // failed on chain, say). Forget which leaves "worked" so they
@@ -785,7 +793,7 @@ impl StakeTracker {
                 state.left.clear();
                 state.memberships_refreshed = false;
             }
-            Some((NodeOp::WithdrawStake, _)) => state.exited = true,
+            Some((NodeOp::WithdrawStake, _, _)) => state.exited = true,
             _ => {}
         }
         // The snapshot says so too, whether or not the withdrawal is still
@@ -828,7 +836,7 @@ impl StakeTracker {
         });
 
         if let Some(previous) = &state.last_known {
-            let event = describe_transition(previous, &snapshot, landed.map(|(op, _)| op));
+            let event = describe_transition(previous, &snapshot, landed.map(|(op, _, _)| op));
             if let Some(event) = event {
                 state.last_event = Some((Utc::now(), event));
             }
@@ -981,7 +989,10 @@ impl StakeTracker {
     /// it without Kontor seeing it: a proof batched ahead of it took the nonce,
     /// and the Portal lists it `failed` with "no receipt"; or its nonce was
     /// stale by compose time, and the listing says so. Nothing was refused
-    /// then, and the backoff is lifted so the op is signed again.
+    /// then, and the backoff is lifted so the op is signed again. The same
+    /// goes for an op the relay gave no answer for ([`Self::record_unsettled`])
+    /// that the Portal turns out not to hold: it was never stored, and its
+    /// nonce went to another op.
     ///
     /// For a `leave-agreement` the registry says nothing at all, so the
     /// listing is the only word: `confirmed` and the agreement is left;
@@ -1096,6 +1107,20 @@ impl StakeTracker {
                     ),
                 ));
             }
+            _ if listed.is_none() && landed.unsettled => {
+                // The relay never answered for this op, and the Portal does
+                // not hold it: it was never stored, so Kontor never saw it.
+                // Its nonce went to another op, and nothing was refused.
+                info!(
+                    "the Portal never stored the {name} op at nonce {nonce} (no answer came back \
+                     for it); another op took the nonce, and it is signed again"
+                );
+                state.refused.remove(&refused_key(&op));
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("{name} never reached the Portal (nonce {nonce}); signing again"),
+                ));
+            }
             _ => match status {
                 Some(status) => debug!(
                     "the Portal lists the {name} op at nonce {nonce} as {status} ({error}); the \
@@ -1192,7 +1217,7 @@ impl StakeTracker {
     /// The relay accepted `op` at `nonce`.
     pub fn record_sent(&self, op: NodeOp, nonce: u64, now: Instant) {
         let event = describe_sent(&op, nonce);
-        self.track(op, nonce, now, event);
+        self.track(op, nonce, now, event, false);
     }
 
     /// `op` was signed at `nonce` and sent, and no answer came back that says
@@ -1203,10 +1228,10 @@ impl StakeTracker {
     /// [`Self::verify_in_flight`]) — gone, the plan is made again.
     pub fn record_unsettled(&self, op: NodeOp, nonce: u64, now: Instant) {
         let event = format!("{}; the Portal gave no answer", describe_sent(&op, nonce));
-        self.track(op, nonce, now, event);
+        self.track(op, nonce, now, event, true);
     }
 
-    fn track(&self, op: NodeOp, nonce: u64, now: Instant, event: String) {
+    fn track(&self, op: NodeOp, nonce: u64, now: Instant, event: String, unsettled: bool) {
         let mut state = self.lock();
         match op {
             NodeOp::ClaimRewards => state.last_claim = Some(now),
@@ -1222,6 +1247,7 @@ impl StakeTracker {
             nonce,
             sent: now,
             sent_at: Utc::now(),
+            unsettled,
             checked: None,
             vouched: None,
         });
@@ -3587,6 +3613,40 @@ mod tests {
 
             tracker.classify_landed(10, listing, t0);
             assert_eq!(tracker.op_to_classify().is_some(), asked_again);
+            assert_eq!(tracker.plan(t0, None).is_some(), signs_again);
+        }
+    }
+
+    /// An `add-stake` the relay gave no answer for, whose nonce then went
+    /// while the bond did not move, is backed off like any other — until the
+    /// Portal's listing shows it does not hold the op: then it was never
+    /// stored, another op took the nonce, and Kontor refused nothing.
+    #[test]
+    fn an_unsettled_add_stake_the_portal_never_stored_is_signed_again() {
+        for (record, signs_again) in [
+            (
+                StakeTracker::record_unsettled as fn(&StakeTracker, NodeOp, u64, Instant),
+                true,
+            ),
+            (StakeTracker::record_sent, false),
+        ] {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            observed(&tracker, &entry(Some("0"), Some("0")), t0);
+            assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+            record(&tracker, NodeOp::AddStake(kor("995")), 10, t0);
+            let mut unchanged = entry(Some("0"), Some("0"));
+            unchanged.next_nonce = Some(11);
+            observed(&tracker, &unchanged, t0);
+            assert_eq!(
+                tracker.plan(t0, None),
+                None,
+                "backed off until the Portal says"
+            );
+            assert_eq!(tracker.op_to_classify(), Some(10));
+
+            tracker.classify_landed(10, Ok(vec![]), t0);
+            assert_eq!(tracker.op_to_classify(), None);
             assert_eq!(tracker.plan(t0, None).is_some(), signs_again);
         }
     }
