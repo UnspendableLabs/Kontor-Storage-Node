@@ -472,6 +472,22 @@ impl PortalClient {
         result
     }
 
+    /// Serialize `payload` and build the signed `POST` that carries it, for the
+    /// ops signed with a nonce: the caller gives the nonce back if this fails,
+    /// since nothing was sent.
+    fn build_signed_json_request<T: Serialize>(
+        &self,
+        url: &str,
+        payload: &T,
+        what: &str,
+    ) -> Result<(Vec<u8>, reqwest::RequestBuilder)> {
+        let body_bytes = serde_json::to_vec(payload)
+            .with_context(|| format!("failed to serialize {what} request"))?;
+        let request =
+            self.build_signed_request(Method::POST, url, Some((&body_bytes, "application/json")))?;
+        Ok((body_bytes, request))
+    }
+
     /// Read the current local nonce counter (test-only helper).
     #[cfg(test)]
     pub fn current_nonce(&self) -> Option<u64> {
@@ -915,11 +931,9 @@ impl PortalClient {
             bls_signature,
             nonce,
         };
-        let body_bytes =
-            serde_json::to_vec(&payload).context("failed to serialize join request")?;
-
-        let request =
-            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
+        let (body_bytes, request) = self
+            .build_signed_json_request(&url, &payload, "join")
+            .inspect_err(|_| self.release_nonce(nonce))?;
 
         let resp = self
             .send_signed_op(
@@ -1094,11 +1108,9 @@ impl PortalClient {
             bls_signature,
             nonce,
         };
-        let body_bytes =
-            serde_json::to_vec(&payload).context("failed to serialize submit proof request")?;
-
-        let request =
-            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
+        let (body_bytes, request) = self
+            .build_signed_json_request(&url, &payload, "submit proof")
+            .inspect_err(|_| self.release_nonce(nonce))?;
 
         let resp = self
             .send_signed_op(
@@ -1149,12 +1161,12 @@ impl PortalClient {
             bls_signature,
             nonce,
         };
-        let body_bytes =
-            serde_json::to_vec(&payload).context("failed to serialize node op request")?;
-
         let url = self.api_path(&format!("/api/nodes/{}/ops", urlencoding::encode(&node_id)));
-        let request =
-            self.build_signed_request(Method::POST, &url, Some((&body_bytes, "application/json")))?;
+        // Nothing has left the node yet: a request that cannot even be built
+        // gives its nonce back, like a refusal does, rather than leave a gap.
+        let (body_bytes, request) = self
+            .build_signed_json_request(&url, &payload, "node op")
+            .inspect_err(|_| self.release_nonce(nonce))?;
 
         // Every 4xx is the Portal saying what became of the op: refused and
         // not stored (the nonce came back, see `send_signed_op`), or `409`,
