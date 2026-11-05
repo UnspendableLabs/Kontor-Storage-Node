@@ -462,6 +462,10 @@ struct TrackerState {
     /// Sticky: this Portal has reported a stake at least once.
     portal_reports_stake: bool,
     in_flight: Option<InFlight>,
+    /// The Portal's listing of this node's `queued` and `submitted` ops has
+    /// been read once in this process, and the newest adopted as in flight
+    /// (see [`StakeTracker::adopt_pending_ops`]). Nothing is planned before.
+    pending_ops_checked: bool,
     pending_joins: Vec<PendingJoin>,
     last_claim: Option<Instant>,
     /// When the Portal last refused an `add-stake` (`None` key) or a
@@ -874,6 +878,78 @@ impl StakeTracker {
         state.last_known = Some(snapshot.clone());
         state.snapshot = Some(snapshot);
         state.observed_at = Some(Utc::now());
+    }
+
+    /// Whether the Portal's listing of this node's pending ops has been read
+    /// in this process (see [`Self::adopt_pending_ops`]).
+    #[must_use]
+    pub fn pending_ops_checked(&self) -> bool {
+        self.lock().pending_ops_checked
+    }
+
+    /// Take the newest op the Portal still holds for this node — `queued` or
+    /// `submitted`, from `GET /api/nodes/{node_id}/ops?status=queued|submitted`
+    /// — as the op in flight, when none is tracked.
+    ///
+    /// In-flight tracking lives in memory. After a restart the node knows
+    /// nothing of the `add-stake` it signed before, which may well still be
+    /// queued at the Portal behind an unconfirmed batch; planned again from
+    /// the registry it would sign a second top-up — refused `409` while the
+    /// amount matches the first byte for byte, accepted at the next nonce as
+    /// soon as a proof's gas has changed the balance, and then both execute.
+    /// The listing is the Portal's own word on what it holds, the same word
+    /// [`Self::verify_in_flight`] trusts, so the op is adopted from it: tracked
+    /// as sent now and vouched for now, and waited for like one this process
+    /// sent. The same is done after a `409`: the nonce went to an op the
+    /// Portal already holds, which may be exactly this one.
+    ///
+    /// Returns the op adopted, if any. Marks the listing read either way.
+    pub fn adopt_pending_ops(&self, ops: &[NodeOpRecord], now: Instant) -> Option<(NodeOp, u64)> {
+        let mut state = self.lock();
+        state.pending_ops_checked = true;
+        if state.in_flight.is_some() {
+            return None;
+        }
+        let (op, record) = ops
+            .iter()
+            .filter(|record| matches!(record.status.as_str(), "queued" | "submitted"))
+            .filter_map(|record| NodeOp::from_record(record).map(|op| (op, record)))
+            .max_by_key(|(_, record)| record.nonce)?;
+        let nonce = record.nonce;
+        info!(
+            op = op.name(),
+            nonce,
+            status = %record.status,
+            "the Portal still holds a {} op of this node; waiting for it rather than signing \
+             another",
+            op.name()
+        );
+        match op {
+            NodeOp::ClaimRewards => state.last_claim = Some(now),
+            NodeOp::WithdrawStake => state.last_withdraw = Some(now),
+            _ => {}
+        }
+        if state.operator_request.as_ref() == Some(&op) {
+            state.operator_request = None;
+        }
+        state.last_event = Some((
+            Utc::now(),
+            format!(
+                "{} {} at the Portal (nonce {nonce}); adopted as in flight",
+                op.name(),
+                record.status
+            ),
+        ));
+        state.in_flight = Some(InFlight {
+            op: op.clone(),
+            nonce,
+            sent: now,
+            sent_at: Utc::now(),
+            unsettled: false,
+            checked: Some(now),
+            vouched: Some(now),
+        });
+        Some((op, nonce))
     }
 
     /// The nonce of the in-flight op the Portal should be asked about this
@@ -2114,10 +2190,48 @@ pub async fn manage_stake(
     exit: Option<&ExitInputs>,
 ) -> Option<NodeOp> {
     client.node_id()?;
+    // Once per process, before anything is planned: what the Portal still
+    // holds from before this process started (see
+    // [`StakeTracker::adopt_pending_ops`]). Unreadable, nothing is signed
+    // this cycle; the next one asks again.
+    if !tracker.pending_ops_checked() && !adopt_pending_ops(client, tracker).await {
+        return None;
+    }
     verify_overdue_op(client, tracker, Instant::now()).await;
     classify_landed_op(client, tracker).await;
     let op = tracker.plan(Instant::now(), exit)?;
     send(client, tracker, op).await
+}
+
+/// Read the ops the Portal still holds for this node and adopt the newest as
+/// in flight (see [`StakeTracker::adopt_pending_ops`]), moving the nonce
+/// counter past every one of them. Returns whether the listing was read: a
+/// Portal that answers `4xx` holds nothing to adopt (an old one has no such
+/// endpoint), one that cannot be reached is asked again.
+async fn adopt_pending_ops(client: &PortalClient, tracker: &StakeTracker) -> bool {
+    match client.list_node_ops(&["queued", "submitted"]).await {
+        Ok(ops) => {
+            if let Some(top) = ops.iter().map(|record| record.nonce).max() {
+                client.raise_nonce_above(top);
+            }
+            tracker.adopt_pending_ops(&ops, Instant::now());
+            true
+        }
+        Err(err) => match status_and_code(&err) {
+            Some((status, _)) if (400..500).contains(&status) => {
+                debug!("the Portal lists no pending ops for this node ({status}): {err:#}");
+                tracker.adopt_pending_ops(&[], Instant::now());
+                true
+            }
+            _ => {
+                warn!(
+                    "could not ask the Portal which ops it still holds for this node; signing \
+                     nothing this cycle: {err:#}"
+                );
+                false
+            }
+        },
+    }
 }
 
 /// Ask the Portal how an op that just landed ended — an `add-stake` that did
@@ -2153,10 +2267,16 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
         Err(err) => {
             match status_and_code(&err) {
                 // Not a refusal of the op: another op of this node holds the
-                // nonce, which stays consumed, and the next cycle signs a
-                // fresh one.
+                // nonce, which stays consumed. That op may be this very one,
+                // signed by an earlier process and still queued, so the
+                // Portal's listing is read before the next cycle plans again
+                // (see `StakeTracker::adopt_pending_ops`).
                 Some((409, _)) => {
-                    warn!("{} lost its nonce to another op: {err:#}", op.name());
+                    warn!(
+                        "{} lost its nonce to an op the Portal already holds: {err:#}",
+                        op.name()
+                    );
+                    adopt_pending_ops(client, tracker).await;
                 }
                 // Nor these, which say nothing about the op — the same rule
                 // as for proofs (`computeproofs::refused_by_portal`): the
@@ -2469,6 +2589,8 @@ mod tests {
     fn listed_op(op: &str, nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
         NodeOpRecord {
             op: op.into(),
+            amount: None,
+            agreement_id: None,
             nonce,
             status: status.into(),
             error: error.map(Into::into),
@@ -3187,6 +3309,8 @@ mod tests {
     fn leave_record(nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
         NodeOpRecord {
             op: "leave_agreement".into(),
+            amount: None,
+            agreement_id: None,
             nonce,
             status: status.into(),
             error: error.map(Into::into),
@@ -3677,6 +3801,8 @@ mod tests {
     fn an_add_stake_the_portal_retired_unexecuted_is_signed_again() {
         let failed = |error: &str| NodeOpRecord {
             op: "add_stake".into(),
+            amount: None,
+            agreement_id: None,
             nonce: 10,
             status: "failed".into(),
             error: Some(error.into()),
@@ -3684,6 +3810,8 @@ mod tests {
         };
         let submitted = || NodeOpRecord {
             op: "add_stake".into(),
+            amount: None,
+            agreement_id: None,
             nonce: 10,
             status: "submitted".into(),
             error: None,
@@ -3870,6 +3998,8 @@ mod tests {
         let listed = |status: &str| {
             Ok(vec![NodeOpRecord {
                 op: "add_stake".into(),
+                amount: None,
+                agreement_id: None,
                 nonce: 10,
                 status: status.into(),
                 error: None,
@@ -3974,10 +4104,20 @@ mod tests {
     /// plan, and an op the Portal retired goes out again in the same cycle.
     #[tokio::test]
     async fn a_retired_add_stake_is_signed_again_through_the_relay() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
+        // The process's first look at what the Portal still holds: nothing.
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(query_param("status", "queued|submitted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0, "limit": 100, "total": 0, "node_id": "NODE-test", "ops": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/ops"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -4025,6 +4165,148 @@ mod tests {
             Some(NodeOp::AddStake(kor("995")))
         );
         assert_eq!(tracker.status()["in_flight"]["op"], "add_stake");
+    }
+
+    /// A restart forgets the op in flight, not the Portal: an `add-stake` the
+    /// earlier process signed may still be queued there. Before the first plan
+    /// the node reads the Portal's pending ops, adopts the newest as in flight
+    /// and moves its nonce counter past it — so the same top-up is not signed
+    /// a second time, and not refused `409` first either.
+    #[tokio::test]
+    async fn a_restart_adopts_the_op_the_portal_still_holds() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .and(query_param("status", "queued|submitted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0, "limit": 100, "total": 2, "node_id": "NODE-test",
+                "ops": [{
+                    "id": "b", "node_id": "NODE-test", "op": "add_stake", "amount": "990",
+                    "agreement_id": null, "nonce": 12, "status": "submitted",
+                    "transaction_id": "T-1", "error": null, "txid": "ff",
+                    "created_at": "2026-11-03T10:00:00+00:00",
+                    "updated_at": "2026-11-03T10:30:00+00:00"
+                }, {
+                    "id": "a", "node_id": "NODE-test", "op": "claim_rewards", "amount": null,
+                    "agreement_id": null, "nonce": 10, "status": "queued",
+                    "transaction_id": null, "error": null, "txid": null,
+                    "created_at": "2026-11-03T09:00:00+00:00",
+                    "updated_at": "2026-11-03T09:00:00+00:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        // Kontor's next_nonce, where a fresh process starts its counter.
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            std::env::temp_dir(),
+            Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "token",
+            10,
+        )
+        .unwrap();
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        // The balance would call for a 995 KOR top-up: a different amount
+        // from the 990 still queued, so the Portal would not have answered it
+        // idempotently.
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        let status = tracker.status();
+        assert_eq!(status["in_flight"]["op"], "add_stake");
+        assert_eq!(status["in_flight"]["amount"], "990");
+        assert_eq!(status["in_flight"]["nonce"], 12);
+        assert_eq!(
+            client.current_nonce(),
+            Some(13),
+            "past every nonce the Portal holds"
+        );
+        assert_eq!(tracker.plan(t0, None), None);
+
+        // Landed: the registry moves past it, and the policy decides afresh.
+        let mut landed = entry(Some("990"), Some("990"));
+        landed.next_nonce = Some(13);
+        landed.kor_balance = Some("5".into());
+        observed(&tracker, &landed, t0);
+        assert_eq!(tracker.status()["in_flight"], Value::Null);
+        assert_eq!(tracker.plan(t0, None), None, "nothing above the reserve");
+    }
+
+    /// A `409` says the nonce went to an op the Portal already holds — after
+    /// a restart, most likely this node's own earlier `add-stake`. The listing
+    /// is read and that op adopted, so the next cycle does not sign the
+    /// top-up again at the next nonce and bond it twice.
+    #[tokio::test]
+    async fn a_conflict_adopts_the_op_holding_the_nonce() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let page = |ops: Value| json!({"offset": 0, "limit": 100, "total": 1, "node_id": "NODE-test", "ops": ops});
+        // Nothing pending at startup; the queued op shows up only after the
+        // 409 (it was stored between the two reads, or the first read was a
+        // page behind).
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(json!([]))))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "CONFLICT", "message": "nonce 10 is held", "status": 409}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(json!([{
+                "id": "a", "node_id": "NODE-test", "op": "add_stake", "amount": "990",
+                "agreement_id": null, "nonce": 10, "status": "queued",
+                "transaction_id": null, "error": null, "txid": null,
+                "created_at": "2026-11-03T10:00:00+00:00",
+                "updated_at": "2026-11-03T10:00:00+00:00"
+            }]))))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            std::env::temp_dir(),
+            Arc::new(crate::crypto::BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "token",
+            10,
+        )
+        .unwrap();
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        let status = tracker.status();
+        assert_eq!(status["in_flight"]["op"], "add_stake");
+        assert_eq!(status["in_flight"]["nonce"], 10);
+        assert_eq!(client.current_nonce(), Some(11));
+        assert_eq!(tracker.plan(t0, None), None, "waited for, not signed again");
     }
 
     /// Through the relay: an answer that says nothing about whether the op
@@ -4084,11 +4366,20 @@ mod tests {
             );
         }
 
-        // No Portal at all: the same open question, settled the same way.
+        // No Portal at all: the same open question, settled the same way. The
+        // Portal went away after this process read its pending ops — before
+        // that read, nothing is signed at all.
         let client = client_for("http://127.0.0.1:1".to_string());
         let tracker = StakeTracker::new(StakePolicy::default());
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        assert_eq!(
+            tracked(&tracker),
+            Value::Null,
+            "nothing signed before the pending ops are read"
+        );
+        tracker.adopt_pending_ops(&[], t0);
         assert_eq!(manage_stake(&client, &tracker, None).await, None);
         assert_eq!(tracked(&tracker), json!(10));
         assert_eq!(tracker.plan(t0, None), None);

@@ -159,6 +159,23 @@ impl NodeOp {
         }
     }
 
+    /// The op a record of the Portal's listing describes — the inverse of
+    /// [`Self::name`], [`Self::amount`] and [`Self::agreement_id`] — or `None`
+    /// for an op this node does not sign, or whose field does not read.
+    #[must_use]
+    pub fn from_record(record: &NodeOpRecord) -> Option<NodeOp> {
+        match record.op.as_str() {
+            "add_stake" => Kor::parse_positive(record.amount.as_deref()?)
+                .ok()
+                .map(NodeOp::AddStake),
+            "begin_unstake" => Some(NodeOp::BeginUnstake),
+            "withdraw_stake" => Some(NodeOp::WithdrawStake),
+            "claim_rewards" => Some(NodeOp::ClaimRewards),
+            "leave_agreement" => record.agreement_id.clone().map(NodeOp::LeaveAgreement),
+            _ => None,
+        }
+    }
+
     /// The contract the op calls and its WAVE expression (Portal
     /// `docs/node-portal-contract.md` §2).
     ///
@@ -423,6 +440,24 @@ impl PortalClient {
             tracing::info!(old, new, "advanced the local nonce to Kontor's next_nonce");
         }
         Ok(entry)
+    }
+
+    /// Move the local nonce counter past `nonce`, a nonce the Portal already
+    /// holds an op of this node under — so the next op this process signs is
+    /// not refused `409` for a nonce an earlier process spent. Never lowers
+    /// the counter.
+    pub fn raise_nonce_above(&self, nonce: u64) {
+        if let Some(auth) = &self.auth {
+            let floor = nonce.saturating_add(1);
+            let before = auth.next_nonce.fetch_max(floor, Ordering::Relaxed);
+            if before < floor {
+                tracing::info!(
+                    old = before,
+                    new = floor,
+                    "advanced the local nonce past an op the Portal still holds"
+                );
+            }
+        }
     }
 
     /// Give back the nonce of an op the Portal refused outright.
@@ -1609,6 +1644,12 @@ pub struct NodeOpRecord {
     /// `add_stake`, `begin_unstake`, `withdraw_stake`, `claim_rewards` or
     /// `leave_agreement`.
     pub op: String,
+    /// The amount of an `add_stake`, as a §1 string.
+    #[serde(default)]
+    pub amount: Option<String>,
+    /// The agreement of a `leave_agreement`.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
     pub nonce: u64,
     /// `queued` → `submitted` (batched) → `confirmed` / `failed`.
     pub status: String,
