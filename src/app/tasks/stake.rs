@@ -1416,13 +1416,39 @@ impl StakeTracker {
     }
 }
 
+/// The `error` the Portal writes on a `failed` op that Kontor never ran
+/// (Portal `docs/node-portal-contract.md` §2), each matched on its exact
+/// wording rather than a word it shares with Kontor's own errors:
+///
+/// - `NO_RECEIPT_ERROR`, the whole message, for an op whose nonce another op
+///   consumed before it ran (or whose gas hold the node's balance did not
+///   cover);
+/// - the stale-nonce retirement, `nonce N is below the signer's next nonce M
+///   on Kontor, so the op can never execute; sign it again with a fresh
+///   nonce`, matched on its fixed parts around the two numbers;
+/// - the key-rotation retirement, for a signature that no longer verifies
+///   against the key the node registered after signing;
+/// - a stored op the Portal cannot rebuild (`the stored op cannot be batched
+///   by this Portal (…), so it never executed (no receipt); sign a new op`).
+const PORTAL_NO_RECEIPT: &str = "no receipt recorded by Kontor (op never executed)";
+const PORTAL_STALE_NONCE_HEAD: &str = "nonce ";
+const PORTAL_STALE_NONCE_BODY: &str = " is below the signer's next nonce ";
+const PORTAL_UNVERIFIABLE_HEAD: &str =
+    "the stored signature does not verify against the signer's current BLS key";
+const PORTAL_UNBATCHABLE_HEAD: &str = "the stored op cannot be batched by this Portal";
+
 /// Whether a `failed` op's error is the Portal retiring it unexecuted rather
-/// than Kontor refusing it: the Portal's `NO_RECEIPT_ERROR` ("no receipt
-/// recorded by Kontor (op never executed)") for an op whose nonce another op
-/// consumed before it ran, or its stale-nonce retirement ("nonce N is below
-/// the signer's next nonce M on Kontor ...") for one it never batched.
+/// than Kontor refusing it. Only the Portal's own retirement messages count
+/// (see [`PORTAL_NO_RECEIPT`] and the constants after it): an op the Portal
+/// retired is signed again at once, one Kontor refused waits
+/// [`REFUSED_OP_RETRY_INTERVAL`], so a Kontor `ContractErr` that happens to
+/// mention a nonce must not pass for a retirement.
 fn retired_by_portal(error: &str) -> bool {
-    error.contains("no receipt") || error.contains("nonce")
+    let error = error.trim();
+    error == PORTAL_NO_RECEIPT
+        || (error.starts_with(PORTAL_STALE_NONCE_HEAD) && error.contains(PORTAL_STALE_NONCE_BODY))
+        || error.starts_with(PORTAL_UNVERIFIABLE_HEAD)
+        || error.starts_with(PORTAL_UNBATCHABLE_HEAD)
 }
 
 fn describe_sent(op: &NodeOp, nonce: u64) -> String {
@@ -3466,6 +3492,32 @@ mod tests {
                 backs_off,
                 "{status}"
             );
+        }
+    }
+
+    /// The Portal's retirement messages, and only those, say an op never ran.
+    #[test]
+    fn only_the_portal_s_own_retirement_messages_count_as_retired() {
+        for retired in [
+            "no receipt recorded by Kontor (op never executed)",
+            "nonce 10 is below the signer's next nonce 11 on Kontor, so the op can never \
+             execute; sign it again with a fresh nonce",
+            "the stored signature does not verify against the signer's current BLS key, \
+             registered after the op was signed, so the op never executed (no receipt); sign \
+             it again",
+            "the stored op cannot be batched by this Portal (unknown op kind), so it never \
+             executed (no receipt); sign a new op",
+        ] {
+            assert!(retired_by_portal(retired), "{retired}");
+        }
+        for refused in [
+            "ContractErr: err(message(\"nonce mismatch\"))",
+            "ContractErr: err(message(\"no receipt for this nonce\"))",
+            "ContractErr: insufficient balance",
+            "OutOfFuel",
+            "",
+        ] {
+            assert!(!retired_by_portal(refused), "{refused}");
         }
     }
 
