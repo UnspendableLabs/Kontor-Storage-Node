@@ -62,8 +62,8 @@ The node can be configured via command-line arguments or environment variables:
 | _(env only, deprecated)_ | `KONTOR_STORAGE_NETWORK` | `signet` | Network to derive against when migrating from `KONTOR_STORAGE_MNEMONIC`. Must match the Portal's own `PORTAL_BITCOIN_NETWORK`, or the derived address will never match its whitelist. New nodes choose it in the setup wizard. |
 | _(env only, deprecated)_ | `KONTOR_STORAGE_REGISTER_NEW_ACCOUNT` | `0` | Only consulted on the `KONTOR_STORAGE_MNEMONIC` path. A node set up through the wizard needs no such override: it commits to one account once, having shown you the address it derived. |
 | `--admin-password` | `ADMIN_PASSWORD` | _unset_ | Overrides the password chosen through `/admin`, and is the recovery path if it is forgotten. At least 16 characters. Leaving it unset is the normal case: the node mints a setup token instead. See [First-run setup](#first-run-setup). |
-| `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. |
-| `--kontor-staking-contract-address` | `KONTOR_STAKING_CONTRACT_ADDRESS` | `staking_0_0` | Kontor address of the staking contract the node bonds its collateral in. **Must match the Portal's own `KONTOR_STAKING_CONTRACT_ADDRESS`**, for the same reason: it is part of every signed stake op. |
+| `--kontor-contract-address` | `KONTOR_CONTRACT_ADDRESS` | `filestorage_0_0` | Kontor address of the filestorage contract. **Must match the Portal's own `KONTOR_CONTRACT_ADDRESS`**: the address is part of every signed Kontor op, so a mismatch makes the Portal reject every join and proof signature. Spelt as Kontor renders it, `name_height_txindex` with the height and tx index as plain decimals; a spelling Kontor would render differently (`filestorage_0_01`) is refused at startup. |
+| `--kontor-staking-contract-address` | `KONTOR_STAKING_CONTRACT_ADDRESS` | `staking_0_0` | Kontor address of the staking contract the node bonds its collateral in. **Must match the Portal's own `KONTOR_STAKING_CONTRACT_ADDRESS`**, for the same reason: it is part of every signed stake op. Same spelling rule. |
 | `--auto-stake` | `KONTOR_STORAGE_AUTO_STAKE` | `true` | Bond spare KOR as collateral and claim storage rewards automatically. `false` (also `0`, `no`, `off`) makes the node sign no stake or claim op on its own. See [Staking & collateral](#staking--collateral). |
 | `--gas-reserve-kor` | `KONTOR_STORAGE_GAS_RESERVE_KOR` | `5` | KOR kept liquid to pay the fees of the node's own joins and proofs. Never bonded. At least `0.0001`: Kontor holds an op's gas (100,000 gas × 10⁻⁹ KOR) from the balance before running it, so with less kept back, staking the rest always fails — and the minimum pays for that one op, not for the proofs after it. |
 | `--stake-target-kor` | `KONTOR_STORAGE_STAKE_TARGET_KOR` | _unset_ | Cap on the total bonded stake. Unset bonds everything above the gas reserve. |
@@ -105,7 +105,7 @@ The `STORAGE_CAPACITY`, `STORAGE_MAX_FILES`, and `STORAGE_MAX_FILE_SIZE` limits 
 When a `STORAGE_CAPACITY` is set, downloads are skipped if the next file would exceed the configured capacity, preserving disk space. When a `STORAGE_MAX_FILES` is set, the daemon stops fetching and joining new agreements once the stored file count reaches the limit — and keeps proving the ones it holds: a missed challenge is slashed.
 When a `STORAGE_MAX_FILE_SIZE` is set, only agreements whose files are at or below that size are downloaded.
 
-The three limits decide what the node takes on, not what it already owes. The file of an agreement the node is already a member of — after a database reset, a restart between a join and storing its file, or a limit lowered since — is downloaded whatever the limits say, before any new agreement, because a missing file is slashed at the first challenge on it. Such an agreement is not joined again.
+The three limits decide what the node takes on, not what it already owes. The file of an agreement the node is already a member of — after a database reset, a restart between a join and storing its file, or a limit lowered since — is downloaded whatever the limits say, before any new agreement, because a missing file is slashed at the first challenge on it. Such an agreement is not joined again. An agreement whose membership is over — the node left it, its join failed on chain, or its join was invalidated and the agreement has since moved on — is neither joined again nor downloaded: there is no membership to store the file for.
 
 ### First-run setup
 
@@ -518,7 +518,14 @@ Each sync cycle the node reads its bond from the Portal (`GET
 The node sends **one** stake or claim op at a time. The Portal only answers
 "queued", so the node learns that an op ran from its nonce: once Kontor's
 `next_nonce` moves past it, the op has executed, and the next decision is made
-from the balance and stake the Portal then reports. An op still not reflected
+from the balance and stake the Portal then reports. That tracking lives in
+memory, so before its first stake decision a process asks the Portal which of
+the node's ops it still holds (`GET /api/nodes/{node_id}/ops?status=queued|submitted`),
+takes the newest as the op in flight and moves its nonce counter past all of
+them: a restart neither signs the top-up the previous process already queued
+a second time, nor is refused `409` for a nonce that process spent. The same
+listing is read after any `409`, since the op holding the nonce may be exactly
+that one. An op still not reflected
 after 30 minutes is looked up in the Portal's listing of the node's ops (`GET
 /api/nodes/{node_id}/ops`): while the Portal lists it as `queued` or
 `submitted` it stays in flight — a signer's newer ops wait behind its
@@ -535,9 +542,10 @@ or a leave (for that agreement only) waits an hour, a withdrawal six. The stake
 op is the last thing a cycle signs, so it never takes a nonce a proof needed.
 
 The node's own nonce counter only moves forward. Each cycle raises it to
-Kontor's `next_nonce` when that is ahead, but never lowers it: between two
-blocks the ops it signed are still queued at the Portal under those nonces,
-and signing at them again would collide. An op that never runs leaves a gap,
+Kontor's `next_nonce` when that is ahead — and, at startup, past every op the
+Portal still lists for the node — but never lowers it: between two blocks the
+ops it signed are still queued at the Portal under those nonces, and signing
+at them again would collide. An op that never runs leaves a gap,
 which the Portal and Kontor both accept (up to 10,000 nonces ahead; a counter
 further ahead falls back to Kontor's value).
 
@@ -605,14 +613,19 @@ per cycle:
    an hour later, one that never ran at once.
 3. When no agreement is held, no challenge is unresolved, and the delay has
    passed, it sends **`withdraw-stake`**, which returns the whole bond to the
-   node's balance. After that it bonds nothing again in this process.
+   node's balance. After that it bonds nothing again in this process. A
+   challenge the Portal has marked `failed` counts as unresolved for an hour
+   after that: Kontor keeps the obligation until it has settled the penalty,
+   a bounded amount of work per block, and refuses the withdrawal before.
 
 The node cannot see the chain tip, so it times the delay from when it first saw
 the withdrawal height, assuming 10-minute blocks. That moment is recorded in
 its database (`node_state`), so a restart does not put the two weeks back on
 the clock; **Withdraw** (type `WITHDRAW`) tries it by hand at any time. A
 withdrawal that executes without returning the bond is retried every 6 hours,
-re-sending the leaves first.
+re-sending the leaves first — within the hour when the Portal's listing shows
+Kontor refused it for `unresolved storage obligations`, since the memberships
+are re-read and the challenges synced every cycle in between.
 
 A restart does not lose the leaves already made. The Portal marks a membership
 `left` once its `leave-agreement` is confirmed, and before the exit's first
@@ -623,7 +636,9 @@ shows memberships still `valid`), so no leave is paid for a membership that is
 gone. What a restart does not survive: a node restarted after its withdrawal
 with auto-stake still on bonds its balance again — set
 `KONTOR_STORAGE_AUTO_STAKE=false` first; the log says so when the bond comes
-back.
+back. (A record of the delay that outlived the withdrawal, because the process
+died before clearing it, does not change that: a read showing no withdrawal
+pending clears the record, and the policy goes on as configured.)
 
 ### Download and preparation pipeline
 

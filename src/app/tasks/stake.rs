@@ -65,6 +65,13 @@
 //! answered with a 5xx: the Portal may well hold it, so it is kept in flight
 //! like one it accepted, not signed again.
 //!
+//! All of this lives in memory. A new process therefore starts by asking the
+//! Portal which of the node's ops it still holds (§2,
+//! `?status=queued|submitted`), adopts the newest as the op in flight and
+//! moves its nonce counter past every one of them (see
+//! [`StakeTracker::adopt_pending_ops`]): the top-up the previous process
+//! queued is waited for, not signed again, and its nonce is not reused.
+//!
 //! # Why the op goes out last
 //!
 //! The daemon sends its stake op at the end of the cycle, after joins and

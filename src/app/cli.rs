@@ -107,7 +107,9 @@ pub struct Cli {
     /// Kontor address of the filestorage contract this node signs operations
     /// against. MUST match the Portal's own `KONTOR_CONTRACT_ADDRESS`: the
     /// contract address is part of the signed `Inst`, so a mismatch makes every
-    /// join/proof signature fail the Portal's verification.
+    /// join/proof signature fail the Portal's verification. Spelt as Kontor
+    /// renders it (`name_height_txindex`, plain decimals): a spelling Kontor
+    /// would render differently is refused at startup.
     #[arg(
         long,
         env = "KONTOR_CONTRACT_ADDRESS",
