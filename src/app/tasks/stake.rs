@@ -185,6 +185,28 @@ pub const ASSUMED_BLOCK_TIME: Duration = Duration::from_secs(600);
 /// know about).
 pub const WITHDRAW_RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// The retry interval after a `withdraw-stake` Kontor refused for
+/// [`KONTOR_UNRESOLVED_OBLIGATIONS`]: an obligation the node's rows did not
+/// show, which the re-read of its memberships and the next cycles' challenge
+/// sync pick up. Short, like a refusal, rather than the six hours a withdrawal
+/// made too early waits.
+pub const WITHDRAW_OBLIGATION_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Kontor's `withdraw-stake` error while the node still has storage
+/// obligations (`ensure_no_storage_obligations`, `native-contracts/staking`):
+/// an active membership, or a challenge not settled yet — `active`, or
+/// `expired`/`failed`/`invalid` with its penalty still to be applied.
+pub const KONTOR_UNRESOLVED_OBLIGATIONS: &str = "unresolved storage obligations";
+
+/// How long after the Portal marks a challenge `failed` it still counts as an
+/// obligation Kontor has to settle. The Portal renders every challenge Kontor
+/// holds `expired`, `failed` or `invalid` as `failed`, and Kontor keeps the
+/// obligation until the penalty is applied — a bounded amount of settlement
+/// work per block, so normally the next block or two. An hour covers that
+/// with room; past it, a `withdraw-stake` Kontor still refuses is retried
+/// after [`WITHDRAW_OBLIGATION_RETRY_INTERVAL`].
+pub const FAILED_CHALLENGE_SETTLEMENT_GRACE: Duration = Duration::from_secs(60 * 60);
+
 /// How the node manages its bond. The policy is the node's own: the Portal
 /// relays the ops it signs and imposes none.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -505,6 +527,10 @@ struct TrackerState {
     /// The database has been read for an earlier process's record.
     withdrawal_restored: bool,
     last_withdraw: Option<Instant>,
+    /// How long after `last_withdraw` the next automatic `withdraw-stake` may
+    /// go: [`WITHDRAW_RETRY_INTERVAL`] unless Kontor said why it refused the
+    /// last one (see [`StakeTracker::classify_landed`]).
+    withdraw_retry: Option<Duration>,
     /// The bond came back: the operator left the network. Nothing more is
     /// bonded automatically, whatever auto-stake says.
     exited: bool,
@@ -542,8 +568,10 @@ pub struct ExitInputs {
     /// only released once the challenge resolves, and the challenge must still
     /// be proved or it is slashed. So they are left after it resolves.
     pub deferred: Vec<String>,
-    /// Challenges not resolved yet (`active`, or proved and waiting). Kontor
-    /// refuses `withdraw-stake` while any exists.
+    /// Challenges not resolved yet: `active`, proved and waiting, or `failed`
+    /// less than [`FAILED_CHALLENGE_SETTLEMENT_GRACE`] ago, while Kontor may
+    /// still have its penalty to settle. Kontor refuses `withdraw-stake` while
+    /// any exists.
     pub unresolved_challenges: usize,
 }
 
@@ -800,18 +828,27 @@ impl StakeTracker {
                     format!("add_stake {amount} KOR executed without raising the bond"),
                 ));
             }
-            Some((NodeOp::WithdrawStake, _, _)) if !snapshot.stake.is_zero() => {
+            Some((op @ NodeOp::WithdrawStake, nonce, unsettled)) if !snapshot.stake.is_zero() => {
                 // Executed, and the bond is still there: too early, or an
                 // obligation the node's own rows did not show (a leave that
-                // failed on chain, say). Forget which leaves "worked" so they
-                // are sent again, and retry later.
+                // failed on chain, a challenge Kontor has still to settle).
+                // Forget which leaves "worked" so they are sent again, re-read
+                // the memberships, and retry later — sooner if the Portal's
+                // listing says Kontor named an obligation (see
+                // `classify_landed`).
                 warn!(
                     "withdraw-stake executed without returning the bond; leaves will be resent \
-                     and the withdrawal retried in {} hours",
+                     and the withdrawal retried in {} hours unless Kontor named an obligation",
                     WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
                 );
                 state.left.clear();
                 state.memberships_refreshed = false;
+                state.unexplained = Some(LandedOp {
+                    op: op.clone(),
+                    nonce: *nonce,
+                    landed: now,
+                    unsettled: *unsettled,
+                });
             }
             Some((NodeOp::WithdrawStake, _, _)) => state.exited = true,
             _ => {}
@@ -1199,6 +1236,9 @@ impl StakeTracker {
                      ({error}); signing it again"
                 );
                 state.refused.remove(&refused_key(&op));
+                if op == NodeOp::WithdrawStake {
+                    state.last_withdraw = None;
+                }
                 state.last_event = Some((
                     Utc::now(),
                     format!(
@@ -1215,9 +1255,31 @@ impl StakeTracker {
                      for it); another op took the nonce, and it is signed again"
                 );
                 state.refused.remove(&refused_key(&op));
+                if op == NodeOp::WithdrawStake {
+                    state.last_withdraw = None;
+                }
                 state.last_event = Some((
                     Utc::now(),
                     format!("{name} never reached the Portal (nonce {nonce}); signing again"),
+                ));
+            }
+            NodeOp::WithdrawStake
+                if status == Some("failed") && error.contains(KONTOR_UNRESOLVED_OBLIGATIONS) =>
+            {
+                // Kontor still counts a membership or a challenge against the
+                // node: a leave that did not take, or a failed challenge whose
+                // penalty it has yet to settle. The memberships are re-read
+                // (`observe` saw to that) and the challenges synced every
+                // cycle, so the retry is short.
+                warn!(
+                    "Kontor refused the withdrawal at nonce {nonce}: {error}; the memberships \
+                     and challenges are re-read, and it is retried in {} hour",
+                    WITHDRAW_OBLIGATION_RETRY_INTERVAL.as_secs() / 3600
+                );
+                state.withdraw_retry = Some(WITHDRAW_OBLIGATION_RETRY_INTERVAL);
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("withdraw_stake refused by Kontor: {error}; retrying within the hour"),
                 ));
             }
             _ => match status {
@@ -1334,7 +1396,10 @@ impl StakeTracker {
         let mut state = self.lock();
         match op {
             NodeOp::ClaimRewards => state.last_claim = Some(now),
-            NodeOp::WithdrawStake => state.last_withdraw = Some(now),
+            NodeOp::WithdrawStake => {
+                state.last_withdraw = Some(now);
+                state.withdraw_retry = None;
+            }
             _ => {}
         }
         if state.operator_request.as_ref() == Some(&op) {
@@ -1617,10 +1682,11 @@ fn withdraw_due(state: &TrackerState, now: Instant) -> bool {
     let Some(timer) = state.withdrawal else {
         return false;
     };
+    let retry = state.withdraw_retry.unwrap_or(WITHDRAW_RETRY_INTERVAL);
     timer.elapsed(now) >= withdrawal_delay()
         && state
             .last_withdraw
-            .is_none_or(|last| now.duration_since(last) >= WITHDRAW_RETRY_INTERVAL)
+            .is_none_or(|last| now.duration_since(last) >= retry)
 }
 
 /// Log, and return for the status page, what changed between two reads that
@@ -1880,7 +1946,8 @@ pub fn is_membership_status(status: Option<&str>) -> bool {
 }
 
 /// Challenge statuses that are not resolved yet: still to prove, or proved
-/// and waiting for the verdict.
+/// and waiting for the verdict. A `failed` one is unresolved too for
+/// [`FAILED_CHALLENGE_SETTLEMENT_GRACE`] after the Portal marked it so.
 const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
 
 /// The `node_state` key under which the start of the withdrawal delay is kept,
@@ -2143,9 +2210,15 @@ pub async fn exit_inputs(
     memberships.sort();
 
     let challenges = Challenges::find().all(database).await?;
+    let settling_until = Utc::now()
+        - chrono::Duration::from_std(FAILED_CHALLENGE_SETTLEMENT_GRACE).unwrap_or_default();
     let unresolved_challenges = challenges
         .iter()
-        .filter(|challenge| UNRESOLVED.contains(&challenge.status.as_str()))
+        .filter(|challenge| {
+            UNRESOLVED.contains(&challenge.status.as_str())
+                || (challenge.status == "failed"
+                    && DateTime::<Utc>::from(challenge.updated_at) > settling_until)
+        })
         .count();
     let mut deferred: Vec<String> = challenges
         .iter()
@@ -3680,6 +3753,84 @@ mod tests {
         );
     }
 
+    /// A withdrawal Kontor refused for an obligation the node's rows did not
+    /// show — a failed challenge whose penalty it had still to settle — is
+    /// retried within the hour, not six: the rows are re-read and the
+    /// challenges synced every cycle. One made too early keeps the long wait,
+    /// and one the Portal retired unexecuted is tried again at once.
+    #[test]
+    fn a_withdrawal_kontor_refused_for_an_obligation_is_retried_sooner() {
+        let withdraw_record = |error: &str| NodeOpRecord {
+            op: "withdraw_stake".into(),
+            amount: None,
+            agreement_id: None,
+            nonce: 11,
+            status: "failed".into(),
+            error: Some(error.into()),
+            txid: Some("ff".into()),
+        };
+        for (error, retried_after) in [
+            (
+                "ContractErr: err(message(\"unresolved storage obligations\"))",
+                Some(WITHDRAW_OBLIGATION_RETRY_INTERVAL),
+            ),
+            (
+                "ContractErr: err(message(\"withdrawal delay has not elapsed\"))",
+                Some(WITHDRAW_RETRY_INTERVAL),
+            ),
+            ("no receipt recorded by Kontor (op never executed)", None),
+        ] {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            observed(&tracker, &exiting_entry(10, "100"), t0);
+            let exit = ExitInputs {
+                memberships: vec!["AGR-a".into()],
+                ..ExitInputs::default()
+            };
+            tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+            observed(&tracker, &exiting_entry(11, "100"), t0);
+            leave_confirmed(&tracker, 10, t0);
+
+            let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+            assert_eq!(tracker.plan(due, Some(&exit)), Some(NodeOp::WithdrawStake));
+            tracker.record_sent(NodeOp::WithdrawStake, 11, due);
+            tracker.memberships_refreshed();
+            observed(&tracker, &exiting_entry(12, "100"), due);
+            assert!(tracker.memberships_need_refresh());
+            assert_eq!(tracker.op_to_classify(), Some(11), "asked how it ended");
+            tracker.classify_landed(11, Ok(vec![withdraw_record(error)]), due);
+
+            // The leave is resent and confirmed; then the withdrawal waits.
+            assert_eq!(
+                tracker.plan(due, Some(&exit)),
+                Some(NodeOp::LeaveAgreement("AGR-a".into())),
+                "{error}"
+            );
+            tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 12, due);
+            observed(&tracker, &exiting_entry(13, "100"), due);
+            leave_confirmed(&tracker, 12, due);
+            match retried_after {
+                Some(interval) => {
+                    assert_eq!(
+                        tracker.plan(due + interval / 2, Some(&exit)),
+                        None,
+                        "{error}: still waiting"
+                    );
+                    assert_eq!(
+                        tracker.plan(due + interval, Some(&exit)),
+                        Some(NodeOp::WithdrawStake),
+                        "{error}"
+                    );
+                }
+                None => assert_eq!(
+                    tracker.plan(due, Some(&exit)),
+                    Some(NodeOp::WithdrawStake),
+                    "{error}: never ran, tried again at once"
+                ),
+            }
+        }
+    }
+
     /// A refused `add-stake` used to be signed again every cycle. It now waits
     /// [`REFUSED_OP_RETRY_INTERVAL`]; a refused leave holds back that agreement
     /// only, and the exit goes on with the next one.
@@ -4557,11 +4708,14 @@ mod tests {
             .await
             .unwrap();
         }
-        for (id, agreement, status) in [
-            ("c1", "AGR-open", "active"),
-            ("c2", "AGR-live", "proved"),
-            ("c3", "AGR-live", "resolved"),
-            ("c4", "AGR-bare", "failed"),
+        let settled_long_ago = (Utc::now() - chrono::Duration::hours(2)).fixed_offset();
+        let just_now = Utc::now().fixed_offset();
+        for (id, agreement, status, updated_at) in [
+            ("c1", "AGR-open", "active", just_now),
+            ("c2", "AGR-live", "proved", just_now),
+            ("c3", "AGR-live", "resolved", just_now),
+            ("c4", "AGR-bare", "failed", settled_long_ago),
+            ("c5", "AGR-bare", "failed", just_now),
         ] {
             crate::entities::challenges::ActiveModel {
                 challenge_id: Set(id.into()),
@@ -4575,7 +4729,7 @@ mod tests {
                 proof: Set(None),
                 bls_signature: Set(None),
                 created_at: Set(chrono::Utc::now().fixed_offset()),
-                updated_at: Set(chrono::Utc::now().fixed_offset()),
+                updated_at: Set(updated_at),
             }
             .insert(&db)
             .await
@@ -4590,8 +4744,9 @@ mod tests {
         );
         assert_eq!(exit.deferred, vec!["AGR-open"]);
         assert_eq!(
-            exit.unresolved_challenges, 2,
-            "active and proved-but-unsettled"
+            exit.unresolved_challenges, 3,
+            "active, proved-but-unsettled, and failed while Kontor may still have its penalty \
+             to settle; one failed hours ago is settled by now"
         );
     }
 
