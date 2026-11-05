@@ -35,12 +35,25 @@ const KOR_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const KOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Returns true when the registry entry's `kor_balance` indicates no KOR
-/// (missing, unparsable, or non-positive).
+/// (missing, unparsable, or zero).
+///
+/// Read with [`Kor::parse`], exactly, like every other amount the Portal
+/// sends (Portal `docs/node-portal-contract.md` §1) — never through `f64`. A
+/// Portal that renders the balance with more than the 18 fractional digits
+/// the grammar allows is read to 18: the question here is only whether any
+/// KOR is there at all, and dust past the 18th digit does not change it.
 fn kor_balance_is_empty(balance: &Option<String>) -> bool {
-    match balance {
-        None => true,
-        Some(s) => s.parse::<f64>().unwrap_or(0.0) <= 0.0,
-    }
+    let Some(raw) = balance.as_deref() else {
+        return true;
+    };
+    let raw = raw.trim();
+    let parsed = Kor::parse(raw).or_else(|err| match raw.split_once('.') {
+        Some((whole, frac)) if frac.len() > crate::clients::kor::KOR_DECIMALS => Kor::parse(
+            &format!("{whole}.{}", &frac[..crate::clients::kor::KOR_DECIMALS]),
+        ),
+        _ => Err(err),
+    });
+    parsed.map_or(true, Kor::is_zero)
 }
 
 /// What the registry entry says about whether this node was ever funded,
@@ -378,6 +391,17 @@ mod tests {
         assert!(!kor_balance_is_empty(&Some("1".to_string())));
         assert!(!kor_balance_is_empty(&Some("0.5".to_string())));
         assert!(!kor_balance_is_empty(&Some("10.0".to_string())));
+        // Exact, not through a float: a balance of one unit is a balance.
+        assert!(!kor_balance_is_empty(&Some(
+            "0.000000000000000001".to_string()
+        )));
+        // A Portal rendering past the 18th digit is read to the 18th.
+        assert!(!kor_balance_is_empty(&Some(
+            "0.0000000000000000015".to_string()
+        )));
+        assert!(kor_balance_is_empty(&Some(
+            "0.0000000000000000005".to_string()
+        )));
     }
 
     #[tokio::test]
