@@ -633,6 +633,22 @@ impl StakeTracker {
         {
             return;
         }
+        // A read this process already made (onboarding reads the registry
+        // before the daemon reads the database) that shows no withdrawal
+        // pending outranks the record: the exit it belonged to is over, and
+        // the row is stale. Left as it is, it is cleared on the next persist.
+        if state
+            .last_known
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.withdrawal_height.is_none())
+        {
+            warn!(
+                "the database records a withdrawal delay started at {}, but no withdrawal is \
+                 pending; the record is stale and is cleared",
+                started_at.to_rfc3339()
+            );
+            return;
+        }
         let head_start = (Utc::now() - started_at).to_std().unwrap_or_default();
         info!(
             "the withdrawal delay has been running since {}; {} hours of it are already behind",
@@ -804,11 +820,18 @@ impl StakeTracker {
         // was slashed to the last KOR, which Kontor clears the withdrawal
         // height for as well. The exit is over either way, and nothing is
         // bonded again; `describe_transition` says which it was.
-        let was_exiting = state.withdrawal.is_some()
-            || state
-                .last_known
-                .as_ref()
-                .is_some_and(|previous| previous.withdrawal_height.is_some());
+        //
+        // Only a withdrawal height this process has read counts as an exit
+        // under way. A start restored from the database is not one: the row
+        // outlives a withdrawal when the process died between the read that
+        // saw the bond come back and the write that clears it, and on that
+        // evidence alone a restarted node would never bond again — against
+        // what the log promised the operator. Such a row is cleared below
+        // (no height, no timer) and the policy goes on as configured.
+        let was_exiting = state
+            .last_known
+            .as_ref()
+            .is_some_and(|previous| previous.withdrawal_height.is_some());
         if was_exiting && snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
             state.exited = true;
         }
@@ -1792,9 +1815,15 @@ pub const WITHDRAWAL_STARTED_AT: &str = "stake_withdrawal_started_at";
 /// into the tracker. Once per process, before the first cycle's read is acted
 /// on.
 ///
+/// A row that does not hold a timestamp is deleted and reported, and the
+/// tracker counts from this process: a record nothing can read would
+/// otherwise fail this step every cycle, and with it the write of the start
+/// this process witnesses.
+///
 /// # Errors
-/// If the row cannot be read; the tracker then still counts from this process
-/// and the next cycle tries again.
+/// If the row cannot be read or the unreadable one cannot be deleted; the
+/// tracker then still counts from this process and the next cycle tries
+/// again.
 pub async fn restore_withdrawal_start(
     database: &DatabaseConnection,
     tracker: &StakeTracker,
@@ -1808,11 +1837,21 @@ pub async fn restore_withdrawal_start(
         .await
         .context("reading the start of the withdrawal delay")?;
     let started_at = match row {
-        Some(row) => Some(
-            DateTime::parse_from_rfc3339(&row.value)
-                .with_context(|| format!("unreadable {WITHDRAWAL_STARTED_AT}: {}", row.value))?
-                .with_timezone(&Utc),
-        ),
+        Some(row) => match DateTime::parse_from_rfc3339(&row.value) {
+            Ok(started_at) => Some(started_at.with_timezone(&Utc)),
+            Err(err) => {
+                warn!(
+                    "the recorded start of the withdrawal delay is unreadable ({:?}: {err}); \
+                     deleting it and counting from this process",
+                    row.value
+                );
+                NodeState::delete_by_id(WITHDRAWAL_STARTED_AT)
+                    .exec(database)
+                    .await
+                    .context("deleting the unreadable start of the withdrawal delay")?;
+                None
+            }
+        },
         None => None,
     };
     tracker.restore_withdrawal_start(started_at, now);
@@ -3391,6 +3430,88 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(second.withdrawal_start_to_persist(), None);
+    }
+
+    /// A record of the withdrawal delay that outlived the withdrawal — the
+    /// process died between the read that saw the bond come back and the
+    /// write that clears the row — is not an exit under way: the row is
+    /// cleared, and the node bonds its balance again as the log promised.
+    #[tokio::test]
+    async fn a_stale_withdrawal_record_is_cleared_and_does_not_end_the_auto_stake() {
+        use crate::entities::node_state;
+        use crate::entities::prelude::NodeState;
+        use crate::testutils::setup_in_memory_db;
+        use sea_orm::{ActiveValue, EntityTrait};
+
+        let db = setup_in_memory_db().await;
+        let started_at = (Utc::now() - chrono::Duration::days(20)).to_rfc3339();
+        NodeState::insert(node_state::ActiveModel {
+            key: ActiveValue::Set(WITHDRAWAL_STARTED_AT.to_string()),
+            value: ActiveValue::Set(started_at),
+            updated_at: ActiveValue::Set(Utc::now().fixed_offset()),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        // Restored before any read of this process, as the daemon does it.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        restore_withdrawal_start(&db, &tracker, t0).await.unwrap();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        assert_eq!(tracker.status()["exited"], false);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+        assert_eq!(tracker.withdrawal_start_to_persist(), Some(None));
+        persist_withdrawal_start(&db, &tracker).await.unwrap();
+        assert!(NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Restored after a read, as when onboarding read the registry first.
+        let later = StakeTracker::new(StakePolicy::default());
+        observed(&later, &entry(Some("0"), Some("0")), t0);
+        later.restore_withdrawal_start(Some(Utc::now() - chrono::Duration::days(20)), t0);
+        assert_eq!(later.status()["exited"], false);
+        assert_eq!(later.withdrawal_start_to_persist(), Some(None));
+        assert_eq!(later.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+    }
+
+    /// A record nothing can read is deleted and reported, not tripped over
+    /// every cycle.
+    #[tokio::test]
+    async fn an_unreadable_withdrawal_record_is_deleted() {
+        use crate::entities::node_state;
+        use crate::entities::prelude::NodeState;
+        use crate::testutils::setup_in_memory_db;
+        use sea_orm::{ActiveValue, EntityTrait};
+
+        let db = setup_in_memory_db().await;
+        NodeState::insert(node_state::ActiveModel {
+            key: ActiveValue::Set(WITHDRAWAL_STARTED_AT.to_string()),
+            value: ActiveValue::Set("yesterday-ish".to_string()),
+            updated_at: ActiveValue::Set(Utc::now().fixed_offset()),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        restore_withdrawal_start(&db, &tracker, t0).await.unwrap();
+        assert!(tracker.withdrawal_start_restored());
+        assert!(NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none());
+        // This process counts from its own first sight of the height.
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        assert!(matches!(
+            tracker.withdrawal_start_to_persist(),
+            Some(Some(_))
+        ));
     }
 
     /// A withdrawal that executed without returning the bond means a leave
