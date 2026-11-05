@@ -233,11 +233,14 @@ impl Config {
 /// `ContractAddress` (`core/macros/src/contract_address.rs` at 80913826) and
 /// renders it back as `{name}_{height}_{tx_index}` before rebuilding the
 /// message it verifies the signature against; a spelling that parses but
-/// renders differently — `staking_00_0`, `staking_+1_0` — signs a different
-/// message, and every op fails `BLS_VERIFY_FAILED`. So the value must be what
-/// Kontor would render: exactly three `_`-separated parts, a name of lowercase
-/// letters, digits and hyphens starting with a letter, and a height (`u64`) and
-/// tx index (`u32`) written as plain decimals.
+/// renders differently — `staking_00_0`, `staking_+1_0`, `staking_0_01` —
+/// signs a different message, and every op fails `BLS_VERIFY_FAILED`. So the
+/// value must be what Kontor would render, and only that: exactly three
+/// `_`-separated parts, a height (`u64`) and a tx index (`u32`) written as
+/// plain decimals, and a name Kontor takes as it is. Kontor normalises
+/// nothing in the name — any text without `_` round-trips — so no charset is
+/// imposed on it beyond what cannot be meant in an address: an empty name,
+/// whitespace or a control character.
 ///
 /// # Errors
 /// With a message naming `variable`, if the value is not such an address.
@@ -256,16 +259,18 @@ pub fn parse_contract_address(raw: &str, variable: &str) -> Result<String> {
     let [name, height, tx_index] = parts[..] else {
         return Err(invalid("expected 3 parts separated by '_'"));
     };
-    let mut chars = name.chars();
-    if !chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if name.is_empty() {
+        return Err(invalid("the name is empty"));
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(invalid(
-            "the name must be lowercase letters, digits and hyphens, starting with a letter",
+            "the name contains whitespace or a control character",
         ));
     }
     if height.parse::<u64>().ok().map(|h| h.to_string()).as_deref() != Some(height) {
-        return Err(invalid("the height must be a plain decimal that fits u64"));
+        return Err(invalid(
+            "the height must be a plain decimal that fits u64, as Kontor renders it",
+        ));
     }
     if tx_index
         .parse::<u32>()
@@ -275,7 +280,7 @@ pub fn parse_contract_address(raw: &str, variable: &str) -> Result<String> {
         != Some(tx_index)
     {
         return Err(invalid(
-            "the tx index must be a plain decimal that fits u32",
+            "the tx index must be a plain decimal that fits u32, as Kontor renders it",
         ));
     }
     Ok(value.to_string())
@@ -613,6 +618,11 @@ mod tests {
             "filestorage_1_0",
             "my-contract2_80913826_3",
             "a_18446744073709551615_4294967295",
+            // Kontor imposes no charset on the name and renders it as it is,
+            // so these spellings are canonical too.
+            "Foo.bar_1_2",
+            "Staking_0_0",
+            "1staking_1_0",
         ] {
             assert_eq!(
                 parse_contract_address(&format!(" {good} "), "X").unwrap(),
@@ -620,7 +630,6 @@ mod tests {
             );
         }
         for (bad, why) in [
-            ("Staking_0_0", "name"),
             ("staking_00_0", "height"),
             ("staking_0_01", "tx index"),
             ("staking_+1_0", "height"),
@@ -628,7 +637,6 @@ mod tests {
             ("staking_0", "3 parts"),
             ("staking_0_0_0", "3 parts"),
             ("_1_0", "name"),
-            ("1staking_1_0", "name"),
             ("staking_18446744073709551616_0", "height"),
             ("staking_1_4294967296", "tx index"),
             ("staking_1_-1", "tx index"),
@@ -651,7 +659,7 @@ mod tests {
         let err = Config::from_cli(&cli).unwrap_err().to_string();
         assert!(err.contains("KONTOR_STAKING_CONTRACT_ADDRESS"), "{err}");
         let cli = Cli {
-            kontor_contract_address: "Filestorage_0_0".to_string(),
+            kontor_contract_address: "filestorage_0_01".to_string(),
             ..make_cli()
         };
         let err = Config::from_cli(&cli).unwrap_err().to_string();
