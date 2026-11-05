@@ -1614,24 +1614,23 @@ impl StakeTracker {
 }
 
 /// The `error` the Portal writes on a `failed` op that Kontor never ran
-/// (Portal `docs/node-portal-contract.md` §2), each matched on its exact
-/// wording rather than a word it shares with Kontor's own errors:
+/// (Portal `docs/node-portal-contract.md` §2 "Retirement reasons"). The
+/// Portal promises a stable token at the start of each message; the text
+/// after the colon is for humans and may change, so only the token is
+/// matched, with `starts_with`, never a word Kontor's own errors could share:
 ///
 /// - `NO_RECEIPT_ERROR`, the whole message, for an op whose nonce another op
 ///   consumed before it ran (or whose gas hold the node's balance did not
 ///   cover);
-/// - the stale-nonce retirement, `nonce N is below the signer's next nonce M
-///   on Kontor, so the op can never execute; sign it again with a fresh
-///   nonce`, matched on its fixed parts around the two numbers;
-/// - the key-rotation retirement, for a signature that no longer verifies
-///   against the key the node registered after signing;
+/// - `nonce already passed:`, the stale-nonce retirement at compose time;
+/// - `signature no longer verifies:`, the key-rotation retirement, for a
+///   signature that no longer verifies against the key the node registered
+///   after signing;
 /// - a stored op the Portal cannot rebuild (`the stored op cannot be batched
 ///   by this Portal (…), so it never executed (no receipt); sign a new op`).
 const PORTAL_NO_RECEIPT: &str = "no receipt recorded by Kontor (op never executed)";
-const PORTAL_STALE_NONCE_HEAD: &str = "nonce ";
-const PORTAL_STALE_NONCE_BODY: &str = " is below the signer's next nonce ";
-const PORTAL_UNVERIFIABLE_HEAD: &str =
-    "the stored signature does not verify against the signer's current BLS key";
+const PORTAL_STALE_NONCE_TOKEN: &str = "nonce already passed:";
+const PORTAL_UNVERIFIABLE_TOKEN: &str = "signature no longer verifies:";
 const PORTAL_UNBATCHABLE_HEAD: &str = "the stored op cannot be batched by this Portal";
 
 /// Whether a `failed` op's error is the Portal retiring it unexecuted rather
@@ -1643,8 +1642,8 @@ const PORTAL_UNBATCHABLE_HEAD: &str = "the stored op cannot be batched by this P
 fn retired_by_portal(error: &str) -> bool {
     let error = error.trim();
     error == PORTAL_NO_RECEIPT
-        || (error.starts_with(PORTAL_STALE_NONCE_HEAD) && error.contains(PORTAL_STALE_NONCE_BODY))
-        || error.starts_with(PORTAL_UNVERIFIABLE_HEAD)
+        || error.starts_with(PORTAL_STALE_NONCE_TOKEN)
+        || error.starts_with(PORTAL_UNVERIFIABLE_TOKEN)
         || error.starts_with(PORTAL_UNBATCHABLE_HEAD)
 }
 
@@ -2780,7 +2779,7 @@ mod tests {
                 "add_stake",
                 11,
                 "failed",
-                Some("nonce 11 is below the signer's next nonce"),
+                Some("nonce already passed: nonce 11 is below the signer's next nonce 12"),
             )]),
             check + OP_LANDING_CHECK_INTERVAL,
         );
@@ -3929,11 +3928,14 @@ mod tests {
     fn only_the_portal_s_own_retirement_messages_count_as_retired() {
         for retired in [
             "no receipt recorded by Kontor (op never executed)",
-            "nonce 10 is below the signer's next nonce 11 on Kontor, so the op can never \
-             execute; sign it again with a fresh nonce",
-            "the stored signature does not verify against the signer's current BLS key, \
-             registered after the op was signed, so the op never executed (no receipt); sign \
-             it again",
+            "nonce already passed: nonce 10 is below the signer's next nonce 11 on Kontor, \
+             so the op can never execute; sign it again with a fresh nonce",
+            "signature no longer verifies: the stored signature does not verify against the \
+             signer's current BLS key, registered after the op was signed, so the op never \
+             executed; sign it again",
+            // Only the token counts; the wording after it may change.
+            "nonce already passed: (reworded)",
+            "signature no longer verifies: (reworded)",
             "the stored op cannot be batched by this Portal (unknown op kind), so it never \
              executed (no receipt); sign a new op",
         ] {
@@ -3942,6 +3944,9 @@ mod tests {
         for refused in [
             "ContractErr: err(message(\"nonce mismatch\"))",
             "ContractErr: err(message(\"no receipt for this nonce\"))",
+            "ContractErr: err(message(\"nonce already passed: not the Portal's\"))",
+            "nonce 10 is below the signer's next nonce 11 on Kontor (old wording, no token)",
+            "the stored signature does not verify against the signer's current BLS key",
             "ContractErr: insufficient balance",
             "OutOfFuel",
             "",
@@ -3987,8 +3992,8 @@ mod tests {
             ),
             (
                 Ok(vec![failed(
-                    "nonce 10 is below the signer's next nonce 11 on Kontor, so the op can \
-                     never execute; sign it again with a fresh nonce",
+                    "nonce already passed: nonce 10 is below the signer's next nonce 11 on \
+                     Kontor, so the op can never execute; sign it again with a fresh nonce",
                 )]),
                 true,
                 false,
