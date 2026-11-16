@@ -150,10 +150,27 @@ pub const OP_LANDING_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// logged as an error on every failed attempt, so the operator hears of it.
 ///
 /// It still bounds how long a landed op waits for the Portal to say how it
-/// ended (see [`StakeTracker::classify_landed`]), and a join's committed
-/// collateral is held for the same length at most (see
-/// [`settle_pending_joins`]).
+/// ended (see [`StakeTracker::classify_landed`]).
 pub const OP_LANDING_HARD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long a join's collateral stays committed while the Portal cannot be
+/// asked whether it still holds the join.
+///
+/// A join is released on evidence: its nonce consumed, or the Portal's rows
+/// saying it will not execute (see [`settle_pending_joins`] and
+/// [`StakeTracker::join_verified`]). The Portal can hold a join for a day by
+/// default — an unsigned batch waits that long for its signature — so no
+/// shorter clock may release it: released while the Portal still holds it,
+/// the collateral is committed twice, and the join that loses is refused on
+/// chain. Only when neither the ready listing nor the agreement's detail can
+/// be read for this long is the join given up, twice the Portal's default
+/// hold.
+pub const JOIN_COMMITMENT_BACKSTOP: Duration = Duration::from_secs(48 * 60 * 60);
+
+/// Agreement details read per cycle to settle pending joins (see
+/// [`StakeTracker::joins_to_verify`]), so a node with many joins in flight
+/// does not spend its cycle asking about them.
+pub const MAX_JOIN_CHECKS_PER_CYCLE: usize = 8;
 
 /// At most one automatic `claim-rewards` per this interval. Each claim costs
 /// gas, and rewards accrue per block, so claiming more often only buys dust.
@@ -527,7 +544,12 @@ struct PendingJoin {
     agreement_id: String,
     collateral: Kor,
     nonce: u64,
-    sent: Instant,
+    /// When the Portal's rows last showed the join still held — its row
+    /// `valid` on an agreement still open — or when it was sent.
+    heard: Instant,
+    /// When the Portal's rows were last read for it, in the ready listing or
+    /// in the agreement's detail.
+    checked: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -1027,13 +1049,12 @@ impl StakeTracker {
         }
 
         // A join's collateral is held until its nonce says it has executed —
-        // or until its row says it never will (`settle_pending_joins`), with a
-        // long time limit behind both for a join the Portal lost without a
-        // trace.
-        state.pending_joins.retain(|join| {
-            snapshot.next_nonce <= join.nonce
-                && now.duration_since(join.sent) < OP_LANDING_HARD_TIMEOUT
-        });
+        // or until the Portal's rows say it never will (`settle_pending_joins`
+        // from the ready listing, `join_verified` from the agreement's
+        // detail). Not on a clock: the Portal can hold a join for a day.
+        state
+            .pending_joins
+            .retain(|join| snapshot.next_nonce <= join.nonce);
 
         if let Some(previous) = &state.last_known {
             let event = describe_transition(previous, &snapshot);
@@ -1692,6 +1713,75 @@ impl StakeTracker {
             .collect()
     }
 
+    /// The pending joins whose rows at the Portal have not been read for
+    /// [`OP_LANDING_CHECK_INTERVAL`] — neither in a ready listing nor in
+    /// their agreement's detail — longest unread first, at most
+    /// [`MAX_JOIN_CHECKS_PER_CYCLE`]. Each is looked up in its agreement's
+    /// detail (see [`Self::join_verified`]).
+    #[must_use]
+    pub fn joins_to_verify(&self, now: Instant) -> Vec<String> {
+        let state = self.lock();
+        let mut due: Vec<&PendingJoin> = state
+            .pending_joins
+            .iter()
+            .filter(|join| now.duration_since(join.checked) >= OP_LANDING_CHECK_INTERVAL)
+            .collect();
+        due.sort_by_key(|join| join.checked);
+        let mut ids: Vec<String> = Vec::new();
+        for join in due {
+            if !ids.contains(&join.agreement_id) {
+                ids.push(join.agreement_id.clone());
+            }
+            if ids.len() == MAX_JOIN_CHECKS_PER_CYCLE {
+                break;
+            }
+        }
+        ids
+    }
+
+    /// The Portal's rows show these joins still held: the row `valid`, the
+    /// agreement still open.
+    pub fn joins_vouched(&self, agreement_ids: &[String], now: Instant) {
+        let mut state = self.lock();
+        for join in &mut state.pending_joins {
+            if agreement_ids.contains(&join.agreement_id) {
+                join.heard = now;
+                join.checked = now;
+            }
+        }
+    }
+
+    /// What the agreement's detail says about the pending join of
+    /// `agreement_id` (see [`Self::joins_to_verify`]): `Some(true)` while the
+    /// Portal still holds it, `Some(false)` when it will never execute — the
+    /// collateral goes back to the budget — and `None` when the detail could
+    /// not be read. Unread, the join stays committed and is asked about again
+    /// next cycle; only after [`JOIN_COMMITMENT_BACKSTOP`] without a word is
+    /// it given up.
+    pub fn join_verified(&self, agreement_id: &str, held: Option<bool>, now: Instant) {
+        match held {
+            Some(true) => self.joins_vouched(&[agreement_id.to_string()], now),
+            Some(false) => self.release_joins(&[agreement_id.to_string()]),
+            None => {
+                let mut state = self.lock();
+                state.pending_joins.retain(|join| {
+                    let lost = join.agreement_id == agreement_id
+                        && now.duration_since(join.heard) >= JOIN_COMMITMENT_BACKSTOP;
+                    if lost {
+                        warn!(
+                            "the Portal has not been able to say whether it holds the join of {} \
+                             for {} hours; giving its {} KOR back to the budget",
+                            join.agreement_id,
+                            JOIN_COMMITMENT_BACKSTOP.as_secs() / 3600,
+                            join.collateral
+                        );
+                    }
+                    !lost
+                });
+            }
+        }
+    }
+
     /// Give back the collateral of joins that will never reserve anything.
     pub fn release_joins(&self, agreement_ids: &[String]) {
         if agreement_ids.is_empty() {
@@ -1928,7 +2018,8 @@ impl StakeTracker {
             agreement_id: agreement_id.to_string(),
             collateral,
             nonce,
-            sent: now,
+            heard: now,
+            checked: now,
         });
     }
 
@@ -2488,9 +2579,15 @@ pub async fn persist_withdrawal_start(
 /// signature that no longer verifies — or when the agreement it was for never
 /// makes it on chain. Both show in what the cycle has just read: this node's
 /// row in `listing` (the ready agreements, with every member's status) is in
-/// [`NO_MEMBERSHIP`], or the agreement is no longer `ready`/`pending` by its
-/// local row. Behind both, [`StakeTracker::observe`] still releases a join
-/// after [`OP_LANDING_HARD_TIMEOUT`].
+/// [`NO_MEMBERSHIP`] or missing, or the agreement is no longer
+/// `ready`/`pending` by its local row.
+///
+/// A join the listing shows still held — its row `valid` — is vouched for.
+/// One the listing does not carry while the local row still says
+/// `ready`/`pending` is not settled here: the agreement is in a batch, or the
+/// local row is behind. Its agreement's detail says which, and is read for it
+/// after [`OP_LANDING_CHECK_INTERVAL`] (see [`StakeTracker::joins_to_verify`]).
+/// No clock releases a join the Portal may still hold.
 ///
 /// # Errors
 /// If the rows cannot be read.
@@ -2509,23 +2606,19 @@ pub async fn settle_pending_joins(
         return Ok(());
     }
     let mut settled = Vec::new();
+    let mut vouched = Vec::new();
     let mut unlisted = Vec::new();
     for agreement_id in pending {
         match listing.get(&agreement_id) {
-            Some(listed) => {
-                let mine: Vec<&str> = listed
-                    .nodes
-                    .iter()
-                    .filter(|node| node.node_id == node_id)
-                    .map(|node| node.status.as_str())
-                    .collect();
-                if !mine.is_empty() && mine.iter().all(|status| NO_MEMBERSHIP.contains(status)) {
-                    settled.push(agreement_id);
-                }
-            }
+            // Every pending join was accepted before this listing was read,
+            // so its row is in it: `valid` and still held, or retired — and a
+            // listing with no row of this node at all holds no join of it.
+            Some(listed) if holds_join_of(&listed.nodes, node_id) => vouched.push(agreement_id),
+            Some(_) => settled.push(agreement_id),
             None => unlisted.push(agreement_id),
         }
     }
+    tracker.joins_vouched(&vouched, Instant::now());
     if !unlisted.is_empty() {
         let rows = Agreements::find()
             .filter(agreements::Column::AgreementId.is_in(unlisted))
@@ -2540,6 +2633,42 @@ pub async fn settle_pending_joins(
     }
     tracker.release_joins(&settled);
     Ok(())
+}
+
+/// Whether `nodes`, an agreement's member rows as the Portal lists them,
+/// carry a row of `node_id` that is a membership — a join still held, or one
+/// that has executed.
+fn holds_join_of(nodes: &[crate::clients::portal::AgreementNode], node_id: &str) -> bool {
+    nodes
+        .iter()
+        .any(|node| node.node_id == node_id && is_membership_status(Some(node.status.as_str())))
+}
+
+/// Ask the Portal about the pending joins the ready listing has not shown
+/// for a while (see [`StakeTracker::joins_to_verify`]): each agreement's
+/// detail says whether the join is still held — the agreement not failed,
+/// this node's row a membership — or will never execute. A `404` is the
+/// Portal no longer knowing the agreement, which is an answer; any other
+/// failure is none.
+async fn settle_overdue_joins(client: &PortalClient, tracker: &StakeTracker, now: Instant) {
+    let Some(node_id) = client.node_id() else {
+        return;
+    };
+    for agreement_id in tracker.joins_to_verify(now) {
+        let held = match client.get_agreement(&agreement_id).await {
+            Ok(agreement) => {
+                Some(agreement.status != "failed" && holds_join_of(&agreement.nodes, node_id))
+            }
+            Err(err) => match status_and_code(&err) {
+                Some((404, _)) => Some(false),
+                _ => {
+                    debug!("could not ask the Portal about the join of {agreement_id}: {err:#}");
+                    None
+                }
+            },
+        };
+        tracker.join_verified(&agreement_id, held, now);
+    }
 }
 
 /// Bring the rows of the memberships the exit acts on up to date with the
@@ -2721,6 +2850,7 @@ pub async fn manage_stake(
     exit: Option<&ExitInputs>,
 ) -> Option<NodeOp> {
     client.node_id()?;
+    settle_overdue_joins(client, tracker, Instant::now()).await;
     // Once per process, before anything is planned: what the Portal still
     // holds from before this process started (see
     // [`StakeTracker::adopt_pending_ops`]). Unreadable, nothing is signed
@@ -3566,7 +3696,7 @@ mod tests {
     /// agreement is no longer `ready`/`pending` — and otherwise held up to the
     /// hard timeout, not the half hour an op is first asked about.
     #[tokio::test]
-    async fn pending_joins_are_released_by_their_rows_or_the_hard_timeout() {
+    async fn pending_joins_are_released_by_their_rows_not_by_a_clock() {
         use crate::clients::portal::{Agreement, AgreementNode};
         use crate::testutils::{setup_in_memory_db, AgreementFixture};
         use sea_orm::ActiveModelTrait;
@@ -3626,15 +3756,23 @@ mod tests {
         held.sort();
         assert_eq!(held, vec!["AGR-live", "AGR-still"]);
 
-        let hour = t0 + Duration::from_secs(60 * 60);
-        observed(&tracker, &entry(Some("100"), Some("100")), hour);
+        // No clock releases what the Portal may still hold: a day later the
+        // two are still committed.
+        let day = t0 + Duration::from_secs(24 * 60 * 60);
+        observed(&tracker, &entry(Some("100"), Some("100")), day);
         assert_eq!(tracker.pending_join_agreements().len(), 2, "still held");
-        observed(
-            &tracker,
-            &entry(Some("100"), Some("100")),
-            t0 + OP_LANDING_HARD_TIMEOUT,
-        );
-        assert!(tracker.pending_join_agreements().is_empty());
+
+        // A listing that carries the agreement with no row of this node holds
+        // no join of it.
+        let mut rowless = listed("AGR-live", "valid");
+        rowless.nodes.clear();
+        let listing: ReadyListing = [(rowless.agreement_id.clone(), rowless)]
+            .into_iter()
+            .collect();
+        settle_pending_joins(&db, &tracker, "NODE-me", &listing)
+            .await
+            .unwrap();
+        assert_eq!(tracker.pending_join_agreements(), vec!["AGR-still"]);
     }
 
     #[test]
@@ -6337,5 +6475,122 @@ mod tests {
             vec!["AGR-broken"],
             "AGR-gone was refreshed; AGR-broken stands as it was"
         );
+    }
+    fn agreement_detail(id: &str, status: &str, membership: Option<&str>) -> Value {
+        let nodes: Vec<Value> = membership
+            .map(|status| json!({"node_id": "NODE-test", "status": status}))
+            .into_iter()
+            .collect();
+        json!({
+            "agreement_id": id,
+            "user_id": "user_1",
+            "file_id": format!("F-{id}"),
+            "filename": "test.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": nodes,
+            "transaction_id": null,
+            "status": status,
+            "created_at": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    /// A join's collateral used to go back to the budget six hours after it
+    /// was sent, whatever the Portal said. The Portal holds a join for as long
+    /// as the batch it is in waits to be signed — a day, by default — so the
+    /// same stake was then committed to a second join, and Kontor refused
+    /// whichever came last. The collateral is now held until the nonce is
+    /// consumed or the Portal's rows say the join will not execute: an
+    /// agreement that left the ready listing is looked up by its detail.
+    #[tokio::test]
+    async fn a_join_the_portal_still_holds_keeps_its_collateral_however_long() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        for (id, status, membership) in [
+            ("AGR-batched", "pending", Some("valid")),
+            ("AGR-retired", "pending", Some("invalid")),
+            ("AGR-failed", "failed", Some("valid")),
+            ("AGR-rowless", "ready", None),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/agreements/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(agreement_detail(id, status, membership)),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-unknown"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-unreadable"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        let client = client_at(&mock_server, 10);
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        for id in [
+            "AGR-batched",
+            "AGR-retired",
+            "AGR-failed",
+            "AGR-rowless",
+            "AGR-unknown",
+            "AGR-unreadable",
+        ] {
+            tracker.record_join(id, kor("10"), 10, t0);
+        }
+        assert_eq!(
+            tracker.joins_to_verify(t0 + Duration::from_secs(60)),
+            Vec::<String>::new(),
+            "too early to ask"
+        );
+
+        // Half an hour on, the Portal's rows are read.
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        settle_overdue_joins(&client, &tracker, check).await;
+        let mut held = tracker.pending_join_agreements();
+        held.sort();
+        assert_eq!(held, vec!["AGR-batched", "AGR-unreadable"]);
+
+        // A day later the batch is still unsigned, and the join still held.
+        let mut at = check;
+        while at < t0 + Duration::from_secs(30 * 60 * 60) {
+            at += OP_LANDING_CHECK_INTERVAL;
+            observed(&tracker, &entry(Some("100"), Some("100")), at);
+            settle_overdue_joins(&client, &tracker, at).await;
+        }
+        let mut held = tracker.pending_join_agreements();
+        held.sort();
+        assert_eq!(
+            held,
+            vec!["AGR-batched", "AGR-unreadable"],
+            "after 30 hours"
+        );
+        assert_eq!(
+            tracker.join_budget(at).decide(false, Some(Some("90"))),
+            JoinDecision::Skip(SkipReason::InsufficientCollateral),
+            "20 of the 100 are still committed"
+        );
+
+        // One the Portal cannot be asked about for two days is given up; one
+        // it vouches for never is.
+        let late = t0 + JOIN_COMMITMENT_BACKSTOP;
+        settle_overdue_joins(&client, &tracker, late).await;
+        assert_eq!(tracker.pending_join_agreements(), vec!["AGR-batched"]);
+
+        // Executed: the nonce releases it, as before.
+        let mut landed = entry(Some("100"), Some("90"));
+        landed.next_nonce = Some(11);
+        observed(&tracker, &landed, late);
+        assert!(tracker.pending_join_agreements().is_empty());
     }
 }
