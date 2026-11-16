@@ -208,10 +208,12 @@ fn funding(entry: &RegistryEntry) -> Funding {
 ///    returns immediately.
 /// 4. If the stake is unknown (see [`Funding::Unknown`]), asks the faucet once
 ///    and returns without waiting; a faucet error is only a warning.
-/// 5. Otherwise — no balance, no stake: a new node — calls the Portal faucet:
+/// 5. Otherwise — no balance, no stake: a new node — calls the Portal faucet,
+///    unless it was asked less than [`FAUCET_RETRY_INTERVAL`] ago:
 ///    - Success: logs the broadcast txids and polls until the balance appears.
-///    - 502/503: warns and polls anyway (e.g. waiting for a manual transfer).
-///    - Other errors: propagated.
+///    - 502/503, a timeout, an unreadable answer: warns and polls anyway — the
+///      transfer may be on its way, or a manual one may come.
+///    - A refusal (4xx) or a connection that could not be made: propagated.
 pub async fn ensure_kor_balance(
     client: &PortalClient,
     signer_id: u64,
@@ -294,35 +296,53 @@ pub async fn ensure_kor_balance(
         Funding::Unfunded => {}
     }
 
-    writeln!(
-        writer,
-        "KOR balance: 0 → requesting {amount} KOR from the faucet…"
-    )?;
-    match faucet.ask(client, recipient, writer).await {
-        Ok(resp) => {
-            writeln!(
-                writer,
-                "✓ Faucet broadcast: commit={} reveal={}",
-                resp.commit_txid, resp.reveal_txid
-            )?;
-        }
-        Err(e) => {
-            let status = e
-                .downcast_ref::<HttpStatusError>()
-                .map(|s| s.status.as_u16());
-            match status {
-                Some(502) | Some(503) => {
-                    writeln!(
-                        writer,
-                        "⚠ Faucet unavailable; waiting for a manual KOR transfer…"
-                    )?;
+    if faucet.may_ask(Instant::now()) {
+        writeln!(
+            writer,
+            "KOR balance: 0 → requesting {amount} KOR from the faucet…"
+        )?;
+        match faucet.ask(client, recipient, writer).await {
+            Ok(resp) => {
+                writeln!(
+                    writer,
+                    "✓ Faucet broadcast: commit={} reveal={}",
+                    resp.commit_txid, resp.reveal_txid
+                )?;
+            }
+            Err(e) if nothing_was_sent(&e) => return Err(e),
+            Err(e) => {
+                let status = e
+                    .downcast_ref::<HttpStatusError>()
+                    .map(|s| s.status.as_u16());
+                match status {
+                    Some(502) | Some(503) => {
+                        writeln!(
+                            writer,
+                            "⚠ Faucet unavailable; waiting for a manual KOR transfer…"
+                        )?;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "the faucet request got no usable answer; its transfer may still \
+                             have been broadcast: {e:#}"
+                        );
+                        writeln!(
+                            writer,
+                            "⚠ Faucet request unanswered; waiting for its transfer, or a manual \
+                             one…"
+                        )?;
+                    }
                 }
-                _ => return Err(e),
             }
         }
+    } else {
+        writeln!(
+            writer,
+            "KOR balance: 0 → the faucet was already asked; waiting for that transfer…"
+        )?;
     }
 
-    poll_until_balance(client, signer_id, writer).await
+    poll_until_balance(client, signer_id, recipient, faucet, writer).await
 }
 
 /// Ask the faucet for a node the daemon finds unfunded, without waiting.
@@ -410,9 +430,13 @@ fn faucet_cap(message: &str) -> Option<Kor> {
     Kor::parse_positive(cap).ok()
 }
 
+/// Wait for a balance to appear, asking the faucet again each time
+/// [`FAUCET_RETRY_INTERVAL`] has passed without one.
 async fn poll_until_balance(
     client: &PortalClient,
     signer_id: u64,
+    recipient: &str,
+    faucet: &Faucet,
     writer: &mut impl Write,
 ) -> Result<()> {
     write!(writer, "Waiting for KOR balance")?;
@@ -438,6 +462,25 @@ async fn poll_until_balance(
                 tracing::warn!("Transient error while polling KOR balance: {e:#}");
                 write!(writer, "!")?;
                 writer.flush()?;
+            }
+        }
+        // Still nothing an interval after the last request: whatever it
+        // broadcast, if anything, did not arrive. A refusal here is only
+        // logged — the wait goes on, for the next request or a manual
+        // transfer.
+        if faucet.may_ask(Instant::now()) {
+            match faucet.ask(client, recipient, &mut std::io::sink()).await {
+                Ok(resp) => tracing::info!(
+                    commit = %resp.commit_txid,
+                    reveal = %resp.reveal_txid,
+                    "asked the faucet again: the previous request brought no balance"
+                ),
+                Err(e) => {
+                    // Asked and refused: wait out the interval all the same,
+                    // rather than ask on every poll.
+                    faucet.asked(Instant::now());
+                    tracing::warn!("asking the faucet again failed: {e:#}");
+                }
             }
         }
     }
@@ -698,6 +741,65 @@ mod tests {
         faucet.asked(start);
         faucet.forget();
         assert!(faucet.may_ask(start));
+    }
+
+    /// A faucet request whose answer never came may still have been
+    /// broadcast. The activation retry that follows used to ask again, every
+    /// time, each one a new transfer; it now waits for the first.
+    #[tokio::test]
+    async fn an_unanswered_faucet_request_is_not_repeated_by_the_next_activation() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
+            .up_to_n_times(3)
+            .mount(&mock_server)
+            .await;
+        // A 500: the Portal failed somewhere after taking the request.
+        mount_faucet(&mock_server, 500, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("1000"))),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let faucet = Faucet::new(Kor::whole(1000));
+
+        // First activation: asks, gets no usable answer, and waits.
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, &faucet, &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("Faucet request unanswered"), "{output}");
+        assert!(output.contains("✓ KOR balance: 1000"), "{output}");
+
+        // A second activation in the same process, the balance not there yet.
+        let second = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
+            .up_to_n_times(2)
+            .mount(&second)
+            .await;
+        mount_faucet(&second, 200, 0).await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("1000"))),
+            )
+            .mount(&second)
+            .await;
+        let client = PortalClient::try_new(second.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, &faucet, &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("already asked"), "{output}");
     }
 
     #[test]
