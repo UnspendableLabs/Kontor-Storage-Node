@@ -798,7 +798,10 @@
         : "", true);
     show($("staking-paused"), staking.joins_paused
       ? "Joins paused for a few minutes: the Portal refused one (" + staking.joins_paused + ")."
-      : "", true);
+      : reported && (staking.available === null || staking.available === undefined)
+        ? "Joins paused: the Portal did not report how much of the bond is unreserved this time. " +
+          "Everything else goes on."
+        : "", true);
   }
 
   function loadStatus() {
