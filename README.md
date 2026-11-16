@@ -525,29 +525,43 @@ Each sync cycle the node reads its bond from the Portal (`GET
 3. **Claims rewards** once `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` (1 KOR) is
    claimable, at most hourly, so the next cycle bonds them.
 
-The node sends **one** stake or claim op at a time. The Portal only answers
+The node sends **one** stake or claim op at a time (only the leaves of an exit
+go several at once, see [Leaving](#leaving)). The Portal only answers
 "queued", so the node learns that an op ran from its nonce: once Kontor's
 `next_nonce` moves past it, the op has executed, and the next decision is made
 from the balance and stake the Portal then reports. That tracking lives in
 memory, so before its first stake decision a process asks the Portal which of
 the node's ops it still holds (`GET /api/nodes/{node_id}/ops?status=queued|submitted`),
-takes the newest as the op in flight and moves its nonce counter past all of
+takes every one of them as in flight and moves its nonce counter past all of
 them: a restart neither signs the top-up the previous process already queued
-a second time, nor is refused `409` for a nonce that process spent. The same
-listing is read after any `409`, since the op holding the nonce may be exactly
-that one. An op still not reflected
+a second time, nor is refused `409` for a nonce that process spent. Only a
+listing that was actually read settles this: a `404`/`405` means a Portal
+without the endpoint (nothing to adopt), anything else — `401`, `408`, `429`,
+a `5xx`, a timeout — leaves the question open, and nothing is signed until it
+is answered. The same listing is read again on every activation of the node
+in a running process, and after any `409`, since the op holding the nonce may
+be exactly that one. An op still not reflected
 after 30 minutes is looked up in the Portal's listing of the node's ops (`GET
 /api/nodes/{node_id}/ops`): while the Portal lists it as `queued` or
 `submitted` it stays in flight — a signer's newer ops wait behind its
 unconfirmed batch, so half an hour is routine, and signing the same top-up
 again would bond it twice — and it is only given up, and decided again, once
-the Portal no longer lists it or lists it as `failed`, or after 6 hours
-without the Portal saying it holds it (a Portal that keeps answering `queued`
-or `submitted` is believed for as long as it does: the op is not lost, and a
-batch signed late routinely takes longer). The collateral set aside for a join
-is held the same way: until the join's nonce is consumed, until the Portal
-shows the join invalidated or the agreement closed to joins, or 6 hours at
-most. A join the Portal gave no usable answer to (a timeout, a `5xx`) is held
+the Portal no longer lists it or lists it as `failed`. No clock gives an op
+up: a listing that cannot be read is asked again the next cycle, and past six
+hours each failed read is logged as an error. An op the Portal lists as
+`failed` is settled by why it failed: retired before it ran (`nonce already
+passed:`, `signature no longer verifies:`, `no receipt recorded by Kontor (op
+never executed)`, `the stored op cannot be batched by this Portal`) it is
+signed again; refused by Kontor it waits as described below; and when the
+Portal lost track of its transaction (`the Portal transaction that carried the
+op no longer exists`) it stays in flight until its nonce is consumed, six
+hours at most, and is then decided again from the balance and stake. The
+collateral set aside for a join is held for as long as the Portal can still
+execute that join: until the join's nonce is consumed, or until the Portal's
+rows show the join invalidated or the agreement closed to joins. A join the
+ready listing no longer shows is looked up in `GET /api/agreements/{id}` every
+30 minutes; one the Portal cannot be asked about for 48 hours is given up. A
+join the Portal gave no usable answer to (a timeout, a `5xx`) is held
 like an accepted one, since the Portal may have stored it; the next ready
 listing settles it — the agreement listed with no row for this node means it
 was never stored, and the collateral is free again. One the Portal refuses is not signed again every cycle: a top-up, a claim
@@ -643,8 +657,7 @@ why challenges were missed — a node slashed into cleanup once will be again.
 
 Leaving takes one action: `/admin` → **Withdraw the collateral** → **Begin
 unstake** (type `UNSTAKE`). Asked for again while the first is still in flight,
-it is refused (`409`): both would execute. The rest is the daemon's, one op
-per cycle:
+it is refused (`409`): both would execute. The rest is the daemon's:
 
 1. **No new joins** from the moment the request is queued.
 2. Once `begin-unstake` has executed — starting Kontor's withdrawal delay of
@@ -653,12 +666,17 @@ per cycle:
    after the challenge is proved. Kontor would allow leaving earlier, and does
    not penalise it, but it changes nothing: the challenge must still be proved
    or it is slashed, and its collateral stays reserved until it resolves. The
-   node keeps proving throughout. An agreement only counts as left once the
-   Portal lists the leave as `confirmed`; one Kontor refused is tried again
-   an hour later, one that never ran at once.
+   node keeps proving throughout. Leaves are the one kind of op sent several
+   at a time — up to 8 signed per cycle and 32 in flight — so that a node with
+   many agreements is out before the delay ends. An agreement counts as left
+   once the Portal lists the leave as `confirmed`, or once Kontor refuses the
+   leave because the membership no longer exists (`node N not in agreement`,
+   `agreement not found`: a bond cleanup removes the memberships of a node
+   slashed to zero). One Kontor refused for another reason is tried again an
+   hour later, one that never ran at once.
 3. When no agreement is held, no challenge is unresolved, and the delay has
    passed, it sends **`withdraw-stake`**, which returns the whole bond to the
-   node's balance. After that it bonds nothing again in this process. A
+   node's balance. After that it bonds nothing again on its own. A
    challenge the Portal has marked `failed` counts as unresolved for an hour
    after that: Kontor keeps the obligation until it has settled the penalty,
    a bounded amount of work per block, and refuses the withdrawal before.
@@ -678,12 +696,19 @@ step in a new process — and again before resending leaves after a withdrawal
 that did not take — the node re-reads each membership it still has a row for
 (`GET /api/agreements/{id}`; the node-filtered listing it reconciles from only
 shows memberships still `valid`), so no leave is paid for a membership that is
-gone. What a restart does not survive: a node restarted after its withdrawal
-with auto-stake still on bonds its balance again — set
-`KONTOR_STORAGE_AUTO_STAKE=false` first; the log says so when the bond comes
-back. (A record of the delay that outlived the withdrawal, because the process
-died before clearing it, does not change that: a read showing no withdrawal
-pending clears the record, and the policy goes on as configured.)
+gone. A finished exit survives a restart too: it is recorded in `node_state`
+(`stake_exited_at`), read before the first stake decision, and a node that has
+exited bonds nothing on its own, whatever `KONTOR_STORAGE_AUTO_STAKE` says —
+including when the withdrawal executed while the node was down (the start of
+the delay is on record, and the first read shows neither a bond nor a
+withdrawal pending). Staking starts again only when the operator asks:
+`/admin` → **Resume staking** (type `STAKE`). A record older than a bond the
+node now holds is stale and clears itself.
+
+An unstake or a withdrawal the operator asked for is followed to an outcome:
+one the Portal retired before it ran is requested again, one Kontor refused is
+reported in the log and in `/admin`, and joins stay closed while an unstake is
+undecided.
 
 ### Download and preparation pipeline
 
