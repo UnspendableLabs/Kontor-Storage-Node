@@ -2242,7 +2242,7 @@ impl StakeTracker {
                 "nonce": op.nonce,
                 "sent_at": op.sent_at.to_rfc3339(),
             })),
-                        "in_flight_count": state.in_flight.len(),
+            "in_flight_count": state.in_flight.len(),
             "pending_joins": state.pending_joins.iter().map(|join| json!({
                 "agreement_id": join.agreement_id,
                 "collateral": join.collateral,
