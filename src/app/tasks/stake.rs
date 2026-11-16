@@ -70,7 +70,8 @@
 //!
 //! All of this lives in memory. A new process therefore starts by asking the
 //! Portal which of the node's ops it still holds (§2,
-//! `?status=queued|submitted`), adopts each as an op in flight and moves its
+//! `?status=queued|submitted|failed`), adopts each one it still holds — or lost
+//! track of after batching it — as an op in flight and moves its
 //! nonce counter past every one of them (see
 //! [`StakeTracker::adopt_pending_ops`]): the top-up the previous process
 //! queued is waited for, not signed again, and its nonce is not reused. The
@@ -596,6 +597,9 @@ struct TrackerState {
     /// been read once in this process, and the newest adopted as in flight
     /// (see [`StakeTracker::adopt_pending_ops`]). Nothing is planned before.
     pending_ops_checked: bool,
+    /// Since when the Portal's listing of this node's pending ops could not
+    /// be read (see [`StakeTracker::adoption_stalled`]); `None` once read.
+    adoption_stalled_since: Option<Instant>,
     pending_joins: Vec<PendingJoin>,
     last_claim: Option<Instant>,
     /// When the Portal last refused an `add-stake` (`None` key) or a
@@ -1258,7 +1262,8 @@ impl StakeTracker {
     }
 
     /// Take the ops the Portal still holds for this node — `queued` or
-    /// `submitted`, from `GET /api/nodes/{node_id}/ops?status=queued|submitted`
+    /// `submitted`, from `GET /api/nodes/{node_id}/ops?status=queued|submitted|failed`
+    /// (a `failed` one only when the Portal lost track of its transaction)
     /// — as ops in flight, each one the tracker does not know already.
     ///
     /// In-flight tracking lives in memory. After a restart the node knows
@@ -1275,10 +1280,28 @@ impl StakeTracker {
     ///
     /// Returns the newest op adopted, if any. Marks the listing read either
     /// way.
+    /// The Portal's listing of this node's pending ops could not be read, so
+    /// nothing is signed this cycle. Says so where the operator looks —
+    /// `/admin` shows `last_event`, and a request made there would otherwise
+    /// just sit as "requested" — and returns for how long it has been so.
+    pub fn adoption_stalled(&self, now: Instant, why: &str) -> Duration {
+        let mut state = self.lock();
+        let since = *state.adoption_stalled_since.get_or_insert(now);
+        state.last_event = Some((
+            Utc::now(),
+            format!(
+                "signing no stake op: the Portal's list of this node's pending ops cannot be \
+                 read ({why})"
+            ),
+        ));
+        now.duration_since(since)
+    }
+
     pub fn adopt_pending_ops(&self, ops: &[NodeOpRecord], now: Instant) -> Option<(NodeOp, u64)> {
         let mut state = self.lock();
         let state = &mut *state;
         state.pending_ops_checked = true;
+        state.adoption_stalled_since = None;
         // An op whose nonce Kontor has already consumed by the latest registry
         // read has executed, or never will: the Portal's listing is simply
         // behind (it reconciles a block after Kontor runs it). Adopted, it
@@ -1289,7 +1312,13 @@ impl StakeTracker {
             .map_or(0, |snapshot| snapshot.next_nonce);
         let mut held: Vec<(NodeOp, &NodeOpRecord)> = ops
             .iter()
-            .filter(|record| matches!(record.status.as_str(), "queued" | "submitted"))
+            // Held by the Portal, or batched in a transaction the Portal then
+            // lost track of: that one may still execute, and this process
+            // waits for it as the one that signed it would have.
+            .filter(|record| {
+                matches!(record.status.as_str(), "queued" | "submitted")
+                    || is_orphaned_record(record)
+            })
             .filter(|record| record.nonce >= next_nonce)
             .filter(|record| !state.in_flight.iter().any(|op| op.nonce == record.nonce))
             .filter_map(|record| NodeOp::from_record(record).map(|op| (op, record)))
@@ -2270,6 +2299,7 @@ impl StakeTracker {
                 })
             }),
             "exited": state.exited,
+            "pending_ops_read": state.pending_ops_checked,
             "last_event": state.last_event.as_ref().map(|(at, what)| json!({
                 "at": at.to_rfc3339(),
                 "message": what,
@@ -3142,9 +3172,19 @@ pub async fn manage_stake(
 /// `429`), it cannot be reached — and the Portal may well hold a queued
 /// `add-stake`: nothing is signed until the listing has actually been read.
 async fn adopt_pending_ops(client: &PortalClient, tracker: &StakeTracker) -> bool {
-    match client.list_node_ops(&["queued", "submitted"]).await {
+    // `failed` too: an op whose transaction the Portal lost track of is listed
+    // so, and may still execute (see [`is_orphaned_record`]).
+    match client
+        .list_node_ops(&["queued", "submitted", "failed"])
+        .await
+    {
         Ok(ops) => {
-            if let Some(top) = ops.iter().map(|record| record.nonce).max() {
+            let top = ops
+                .iter()
+                .filter(|record| record.status != "failed" || is_orphaned_record(record))
+                .map(|record| record.nonce)
+                .max();
+            if let Some(top) = top {
                 client.raise_nonce_above(top);
             }
             tracker.adopt_pending_ops(&ops, Instant::now());
@@ -3157,14 +3197,38 @@ async fn adopt_pending_ops(client: &PortalClient, tracker: &StakeTracker) -> boo
                 true
             }
             _ => {
-                warn!(
-                    "could not ask the Portal which ops it still holds for this node; signing \
-                     nothing this cycle: {err:#}"
+                let why = status_and_code(&err).map_or_else(
+                    || "no answer".to_string(),
+                    |(status, _)| format!("HTTP {status}"),
                 );
+                let stalled = tracker.adoption_stalled(Instant::now(), &why);
+                if stalled >= OP_LANDING_HARD_TIMEOUT {
+                    error!(
+                        "the Portal has not listed this node's pending ops for {} hours; no \
+                         stake, claim, leave or withdrawal is signed until it does: {err:#}",
+                        stalled.as_secs() / 3600
+                    );
+                } else {
+                    warn!(
+                        "could not ask the Portal which ops it still holds for this node; \
+                         signing nothing this cycle: {err:#}"
+                    );
+                }
                 false
             }
         },
     }
+}
+
+/// Whether the Portal lists `record` as failed because it lost track of the
+/// transaction that carried it ([`PORTAL_ORPHANED_HEAD`]): whether the op ran
+/// is unknown to the Portal, and it may still run.
+fn is_orphaned_record(record: &NodeOpRecord) -> bool {
+    record.status == "failed"
+        && record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(PORTAL_ORPHANED_HEAD))
 }
 
 /// Ask the Portal how an op that just landed ended — an `add-stake` that did
@@ -5256,7 +5320,7 @@ mod tests {
         // The process's first look at what the Portal still holds: nothing.
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/ops"))
-            .and(query_param("status", "queued|submitted"))
+            .and(query_param("status", "queued|submitted|failed"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0, "limit": 100, "total": 0, "node_id": "NODE-test", "ops": []
             })))
@@ -5325,7 +5389,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/nodes/NODE-test/ops"))
-            .and(query_param("status", "queued|submitted"))
+            .and(query_param("status", "queued|submitted|failed"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "offset": 0, "limit": 100, "total": 2, "node_id": "NODE-test",
                 "ops": [{
@@ -5854,6 +5918,86 @@ mod tests {
             nonce,
         )
         .unwrap()
+    }
+
+    /// An op the Portal batched and then lost track of is listed `failed`,
+    /// with the reason, and may still execute. The process that signed it
+    /// keeps it in flight; a process started meanwhile only read the `queued`
+    /// and `submitted` ops, saw nothing, and signed the same top-up again.
+    #[tokio::test]
+    async fn a_restart_adopts_an_op_the_portal_lost_track_of() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let mut orphaned = queued_add_stake("990", 12);
+        orphaned["status"] = json!("failed");
+        orphaned["error"] = json!(format!("{PORTAL_ORPHANED_HEAD} (transaction T-1)"));
+        // One Kontor refused, at a nonce not consumed by the last read either:
+        // it ran, and is not adopted.
+        let mut refused = queued_add_stake("5", 11);
+        refused["status"] = json!("failed");
+        refused["error"] = json!("ContractErr: err(message(\"insufficient funds\"))");
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ops_page(json!([orphaned, refused]))),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let client = client_at(&mock_server, 10);
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &entry(Some("0"), Some("0")), Instant::now());
+
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        let status = tracker.status();
+        assert_eq!(status["in_flight"]["op"], "add_stake");
+        assert_eq!(status["in_flight"]["nonce"], 12);
+        assert_eq!(status["in_flight_count"], 1);
+        assert_eq!(status["pending_ops_read"], true);
+        assert_eq!(
+            client.current_nonce(),
+            Some(13),
+            "the counter is past the op that may still execute"
+        );
+    }
+
+    /// While the listing cannot be read nothing is signed, and the operator
+    /// is told so in `/admin`, not only in the log.
+    #[tokio::test]
+    async fn a_stalled_adoption_is_shown_to_the_operator() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&mock_server)
+            .await;
+        let client = client_at(&mock_server, 10);
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &entry(Some("0"), Some("0")), Instant::now());
+
+        assert_eq!(manage_stake(&client, &tracker, None).await, None);
+        let status = tracker.status();
+        assert_eq!(status["pending_ops_read"], false);
+        let message = status["last_event"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("pending ops cannot be read") && message.contains("429"),
+            "{message}"
+        );
+        let t0 = Instant::now();
+        assert!(
+            tracker.adoption_stalled(t0 + OP_LANDING_HARD_TIMEOUT, "HTTP 429")
+                >= OP_LANDING_HARD_TIMEOUT - Duration::from_secs(5)
+        );
     }
 
     fn ops_page(ops: Value) -> Value {
