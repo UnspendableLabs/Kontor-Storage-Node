@@ -263,8 +263,10 @@ pub struct StakeSnapshot {
     pub stake: Kor,
     /// Stake held by joined agreements, when reported.
     pub reserved: Option<Kor>,
-    /// What new joins can still reserve.
-    pub available: Kor,
+    /// What new joins can still reserve. `None` when the Portal reported
+    /// neither it nor the reserved part this time: the bond is known, how
+    /// much of it is free is not, and no join is made against it.
+    pub available: Option<Kor>,
     /// Non-null once `begin-unstake` has executed.
     pub withdrawal_height: Option<u64>,
     /// Whether the stake was slashed to zero and Kontor is still unwinding
@@ -283,15 +285,22 @@ impl StakeSnapshot {
     ///
     /// `None` when the Portal does not report a stake — absent, `null`, or
     /// unreadable — which is what an old Portal looks like. `stake_available`
-    /// falls back to `stake − stake_reserved` when only those two are sent; an
-    /// entry with neither is treated as not reporting a stake at all, because
-    /// joining against a stake whose reservations are unknown is joining blind.
+    /// falls back to `stake − stake_reserved` when only those two are sent.
+    ///
+    /// An entry with the stake and neither of them still makes a snapshot,
+    /// with `available` unknown. The Portal reads the reservation from another
+    /// contract than the bond, and when that one view fails it sends both
+    /// `stake_reserved` and `stake_available` as `null`: joining against a
+    /// stake whose reservations are unknown would be joining blind, so joins
+    /// close (see [`StakeTracker::join_budget`]) — but the bond, the balance
+    /// and the withdrawal are known, and the top-up, the claims, the exit and
+    /// `/admin` do not wait for a view none of them reads.
     #[must_use]
     pub fn from_entry(entry: &RegistryEntry) -> Option<Self> {
         let stake = parse_field("stake", entry.stake.as_deref())?;
         let reserved = parse_field("stake_reserved", entry.stake_reserved.as_deref());
         let available = parse_field("stake_available", entry.stake_available.as_deref())
-            .or_else(|| reserved.map(|reserved| stake.saturating_sub(reserved)))?;
+            .or_else(|| reserved.map(|reserved| stake.saturating_sub(reserved)));
 
         Some(Self {
             kor_balance: parse_field("kor_balance", entry.kor_balance.as_deref()),
@@ -830,8 +839,8 @@ impl StakeTracker {
         let mut state = self.lock();
 
         // A `stake` field, readable or not, is a Portal that knows about
-        // staking: an entry with the stake but not what is free of it must
-        // close this cycle's joins, not pass for an old Portal.
+        // staking: an entry whose stake cannot be read must close this
+        // cycle's joins, not pass for an old Portal.
         let reports_stake = entry.is_some_and(|entry| entry.stake.is_some());
         if reports_stake {
             state.portal_reports_stake = true;
@@ -839,8 +848,8 @@ impl StakeTracker {
         let Some(snapshot) = snapshot else {
             if reports_stake {
                 warn!(
-                    "the Portal's signer entry reports a stake but not how much of it is \
-                     unreserved; joins are paused this cycle"
+                    "the Portal's signer entry carries a stake this node cannot read; joins are \
+                     paused this cycle"
                 );
             } else if entry.is_some() && state.portal_reports_stake {
                 warn!("the Portal's signer entry no longer reports a stake; joins are paused");
@@ -848,6 +857,13 @@ impl StakeTracker {
             state.snapshot = None;
             return;
         };
+
+        if snapshot.available.is_none() {
+            warn!(
+                "the Portal's signer entry reports a stake but not how much of it is unreserved; \
+                 joins are paused this cycle, everything else goes on"
+            );
+        }
 
         let exited_before = state.exited;
         let mut landed: Vec<InFlight> = Vec::new();
@@ -1865,9 +1881,12 @@ impl StakeTracker {
             (Some(_), Some((_, code))) => {
                 BudgetMode::Closed(SkipReason::RecentlyRefused(code.clone()))
             }
-            (Some(snapshot), None) => match snapshot.join_blocker() {
-                Some(reason) => BudgetMode::Closed(reason),
-                None => {
+            (Some(snapshot), None) => match (snapshot.join_blocker(), snapshot.available) {
+                (Some(reason), _) => BudgetMode::Closed(reason),
+                // The bond is known, what is free of it is not: no join
+                // against reservations nobody could read.
+                (None, None) => BudgetMode::Closed(SkipReason::StakeUnknown),
+                (None, Some(available)) => {
                     let held = state.pending_joins.iter().fold(Kor::ZERO, |sum, join| {
                         sum.checked_add(join.collateral).unwrap_or(sum)
                     });
@@ -1879,7 +1898,7 @@ impl StakeTracker {
                         .max()
                         .unwrap_or(Kor::ZERO);
                     BudgetMode::Metered {
-                        remaining: snapshot.available.saturating_sub(held),
+                        remaining: available.saturating_sub(held),
                         estimate: state.policy.unknown_collateral_estimate.max(seen),
                         guesses_left: MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE,
                     }
@@ -1927,7 +1946,7 @@ impl StakeTracker {
             "kor_balance": state.snapshot.as_ref().and_then(|s| s.kor_balance),
             "stake": state.snapshot.as_ref().map(|s| s.stake),
             "reserved": state.snapshot.as_ref().and_then(|s| s.reserved),
-            "available": state.snapshot.as_ref().map(|s| s.available),
+            "available": state.snapshot.as_ref().and_then(|s| s.available),
             "withdrawal_height": state.snapshot.as_ref().and_then(|s| s.withdrawal_height),
             "bond_cleanup_pending": state.snapshot.as_ref().and_then(|s| s.bond_cleanup_pending),
             "reward_balance": state.snapshot.as_ref().and_then(|s| s.reward_balance),
@@ -2854,11 +2873,19 @@ pub async fn bootstrap_stake(
         }
         return Ok(());
     };
-    writeln!(
-        writer,
-        "✓ Stake: {} KOR bonded, {} KOR unreserved",
-        snapshot.stake, snapshot.available
-    )?;
+    match snapshot.available {
+        Some(available) => writeln!(
+            writer,
+            "✓ Stake: {} KOR bonded, {available} KOR unreserved",
+            snapshot.stake
+        )?,
+        None => writeln!(
+            writer,
+            "✓ Stake: {} KOR bonded; ⚠ the unreserved part was not reported this time, joins \
+             wait for a read that has it",
+            snapshot.stake
+        )?,
+    }
     if snapshot.bond_cleanup_pending == Some(true) {
         writeln!(
             writer,
@@ -2904,7 +2931,7 @@ mod tests {
             kor_balance: Some(kor(balance)),
             stake: kor(stake),
             reserved: Some(Kor::ZERO),
-            available: kor(stake),
+            available: Some(kor(stake)),
             withdrawal_height: None,
             bond_cleanup_pending: Some(false),
             reward_balance: None,
@@ -2919,9 +2946,11 @@ mod tests {
             StakeSnapshot::from_entry(&entry(Some("x"), Some("1"))),
             None
         );
-        // A stake with nothing saying how much of it is free: not enough to
-        // join against.
-        assert_eq!(StakeSnapshot::from_entry(&entry(Some("10"), None)), None);
+        // A stake with nothing saying how much of it is free is still a
+        // bond: read, with its unreserved part unknown.
+        let partial = StakeSnapshot::from_entry(&entry(Some("10"), None)).unwrap();
+        assert_eq!(partial.stake, kor("10"));
+        assert_eq!(partial.available, None);
     }
 
     /// A stake reported without its unreserved part is not an old Portal: on
@@ -2934,12 +2963,10 @@ mod tests {
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("10"), None), t0);
         assert_eq!(tracker.status()["portal_reports_stake"], true);
-        assert_eq!(tracker.status()["reported"], false);
         assert_eq!(
             tracker.join_budget(t0).decide(false, Some(Some("1"))),
             JoinDecision::Skip(SkipReason::StakeUnknown)
         );
-        assert_eq!(tracker.plan(t0, None), None, "nothing to decide from");
 
         // An unreadable stake says the same: this Portal has the field.
         let tracker = StakeTracker::new(StakePolicy::default());
@@ -2955,7 +2982,7 @@ mod tests {
         let mut e = entry(Some("100"), None);
         e.stake_reserved = Some("30.5".into());
         let snapshot = StakeSnapshot::from_entry(&e).unwrap();
-        assert_eq!(snapshot.available, kor("69.5"));
+        assert_eq!(snapshot.available, Some(kor("69.5")));
         assert_eq!(snapshot.reserved, Some(kor("30.5")));
         assert_eq!(snapshot.kor_balance, Some(kor("1000")));
     }
@@ -6119,5 +6146,49 @@ mod tests {
         read.bond_cleanup_pending = Some(false);
         observed(&tracker, &read, t0);
         assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+    }
+    /// The Portal reads the reservation from another contract than the bond.
+    /// When that one view fails it sends `stake_reserved` and
+    /// `stake_available` as `null` — and the node used to drop the whole
+    /// snapshot: no top-up, no claim, the exit paused, and `/admin` answering
+    /// "stake not reported yet", for as long as that view kept failing. Only
+    /// joins need the unreserved part, and only joins wait for it.
+    #[test]
+    fn a_bond_whose_unreserved_part_is_not_reported_only_closes_joins() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut read = entry(Some("10"), None);
+        read.reward_balance = Some("3".into());
+        observed(&tracker, &read, t0);
+
+        let status = tracker.status();
+        assert_eq!(status["reported"], true);
+        assert_eq!(status["stake"], "10");
+        assert_eq!(status["available"], Value::Null);
+        assert!(tracker.snapshot().is_some(), "/admin can act on it");
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::StakeUnknown)
+        );
+        assert_eq!(
+            tracker.plan(t0, None),
+            Some(NodeOp::AddStake(kor("995"))),
+            "the top-up does not read the reservation"
+        );
+
+        // Nor does the exit.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let mut exiting = exiting_entry(10, "100");
+        exiting.stake_available = None;
+        observed(&tracker, &exiting, t0);
+        assert!(tracker.exiting());
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-a".into()))
+        );
     }
 }
