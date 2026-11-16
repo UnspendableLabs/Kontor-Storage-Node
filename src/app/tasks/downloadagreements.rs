@@ -558,6 +558,71 @@ pub async fn download_agreements_gated(
     budget: &mut JoinBudget,
     tracker: Option<&StakeTracker>,
 ) -> Result<()> {
+    download_agreements_scoped(
+        portal_client,
+        database,
+        storage_limits,
+        storage_backend,
+        listing,
+        budget,
+        tracker,
+        Scope::Everything,
+    )
+    .await
+}
+
+/// Download the files of the memberships this node holds, and nothing else.
+///
+/// What a cycle falls back to when the ready listing cannot be read. Joining
+/// needs that listing — it says what is still open and at what collateral —
+/// but a membership the node already holds needs nothing from it, and a
+/// challenge on a held agreement whose file is missing is slashed. So the
+/// listing failing must not keep those files from being fetched. No join is
+/// signed and no limit applies, exactly as for a held agreement in
+/// [`download_agreements_gated`].
+///
+/// # Errors
+/// As [`download_agreements_gated`]: only if the node's own rows cannot be
+/// read.
+pub async fn download_held_agreements(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+) -> Result<()> {
+    download_agreements_scoped(
+        portal_client,
+        database,
+        StorageLimits::default(),
+        storage_backend,
+        &ReadyListing::new(),
+        &mut JoinBudget::unmetered(),
+        None,
+        Scope::HeldOnly,
+    )
+    .await
+}
+
+/// Which pending agreements a download pass works on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Held memberships first, then whatever the limits and the budget allow.
+    Everything,
+    /// Held memberships only: nothing is joined.
+    HeldOnly,
+}
+
+// The gated pass's seven inputs and the scope.
+#[allow(clippy::too_many_arguments)]
+async fn download_agreements_scoped(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
+    listing: &ReadyListing,
+    budget: &mut JoinBudget,
+    tracker: Option<&StakeTracker>,
+    scope: Scope,
+) -> Result<()> {
     let gcs_client = match storage_backend.method {
         StorageMethod::Local => None,
         StorageMethod::Gcs => Some(
@@ -616,6 +681,9 @@ pub async fn download_agreements_gated(
                 "Not downloading {}: this node's membership in it is over",
                 agreement.agreement_id
             );
+            continue;
+        }
+        if scope == Scope::HeldOnly && membership != Membership::Held {
             continue;
         }
 
@@ -732,7 +800,13 @@ pub async fn download_agreements_gated(
         info!("Downloaded {} agreements", downloaded_count);
     }
 
-    for agreement in invalidated_joins(database, listing, portal_client.node_id()).await? {
+    // Nothing is joined without this cycle's listing; `invalidated_joins`
+    // reads it and would find nothing in an empty one anyway.
+    let rejoin = match scope {
+        Scope::Everything => invalidated_joins(database, listing, portal_client.node_id()).await?,
+        Scope::HeldOnly => Vec::new(),
+    };
+    for agreement in rejoin {
         // Just joined above, in place of the same invalid row: its file was
         // only now stored, which is why it shows up here too.
         if joined.contains(&agreement.agreement_id) {
