@@ -507,9 +507,10 @@ Each sync cycle the node reads its bond from the Portal (`GET
    batch as the transaction that creates the agreement, and Kontor only fixes
    the collateral then. Such an agreement is still joined, charged an
    estimate — `KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR` (10 KOR), or the
-   largest collateral the node has seen on an agreement in the last day if that
-   is more — as long as the unreserved stake left covers that estimate, and no
-   more than 3 per cycle. A guess that turns
+   largest collateral among the agreements created in the last day (the ready
+   listing's, and the node's own) if that is more — as long as the unreserved
+   stake left covers that estimate, and no more than 3 per cycle. An older
+   agreement the node holds does not count, however much it cost. A guess that turns
    out short costs a download: Kontor refuses a join the stake cannot cover,
    and a refused join is not slashed. A known collateral is checked exactly.
 3. **Claims rewards** once `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` (1 KOR) is

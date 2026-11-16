@@ -7,12 +7,14 @@ use crate::app::tasks::getnewagreements::sync_ready_agreements;
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{
     exit_inputs, manage_stake, persist_withdrawal_start, refresh_memberships,
-    restore_withdrawal_start, settle_pending_joins, JoinBudget, StakeTracker,
+    restore_withdrawal_start, settle_pending_joins, JoinBudget, StakeTracker, COLLATERAL_MEMORY,
 };
+use crate::clients::portal::Agreement;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use crate::node::faucet::{fund_if_unfunded, Faucet};
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::convert::Infallible;
@@ -346,12 +348,7 @@ async fn sync_portal_once(
             storage_dir,
             false,
             |agreements| {
-                let now = Instant::now();
-                for agreement in agreements {
-                    memory
-                        .staking
-                        .note_collateral(agreement.required_collateral.as_deref(), now);
-                }
+                note_recent_collateral(&memory.staking, agreements, Utc::now(), Instant::now());
             },
         )
         .await
@@ -495,6 +492,48 @@ async fn sync_portal_once(
     }
 
     failures.into_result()
+}
+
+/// Feed the unknown-collateral estimate from the agreements this node holds:
+/// only those created within [`COLLATERAL_MEMORY`], each dated to its
+/// creation.
+///
+/// The estimate is "the largest collateral seen in the last 24 hours", and a
+/// held agreement is the one place a collateral reliably shows — the ready
+/// listing is joined before the agreement exists on chain. But the node reads
+/// its held agreements every cycle, and noting them all as seen *now* kept the
+/// largest it had ever joined in that window for good: Kontor divides the
+/// collateral by the network's total weight, so an early agreement costs more
+/// than today's, and a node holding one old, expensive agreement skipped
+/// every new join its unreserved stake could in fact cover. What a new
+/// agreement costs is what recent ones cost, so an agreement informs the
+/// estimate for 24 hours from its creation and no longer.
+///
+/// `now` minus an agreement's age cannot always be represented — a monotonic
+/// clock starts when the machine does. Such an agreement is dated `now`,
+/// which only ever makes the estimate more cautious, and for a day at most.
+fn note_recent_collateral(
+    staking: &StakeTracker,
+    agreements: &[Agreement],
+    wall: DateTime<Utc>,
+    now: Instant,
+) {
+    for agreement in agreements {
+        let Some(collateral) = agreement.required_collateral.as_deref() else {
+            continue;
+        };
+        let Ok(created) = DateTime::parse_from_rfc3339(&agreement.created_at) else {
+            continue;
+        };
+        // A creation time ahead of this clock is an age of zero.
+        let age = (wall - created.with_timezone(&Utc))
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        if age >= COLLATERAL_MEMORY {
+            continue;
+        }
+        staking.note_collateral(Some(collateral), now.checked_sub(age).unwrap_or(now));
+    }
 }
 
 async fn downloaded_files_count(database: &DatabaseConnection) -> Result<u64> {
@@ -2109,6 +2148,126 @@ mod tests {
             !requests.iter().any(|r| r.url.path().ends_with("/join")),
             "nothing is joined without the listing"
         );
+    }
+
+    /// The estimate for a join of unknown collateral follows what agreements
+    /// cost now. A node holding one old, expensive agreement used to carry
+    /// that agreement's collateral as its estimate for ever — re-noted every
+    /// cycle as if just seen — and skipped every new join its stake could
+    /// cover. Only an agreement created in the last 24 hours informs it.
+    #[tokio::test]
+    async fn an_old_agreement_does_not_pin_the_collateral_estimate() {
+        // 100 KOR unreserved: enough for the default estimate of 10, not for
+        // the 500 the held agreement cost.
+        let mut entry = funded_entry(3);
+        entry["kor_balance"] = json!("5");
+        entry["stake"] = json!("600");
+        entry["stake_reserved"] = json!("500");
+        entry["stake_available"] = json!("100");
+
+        for (created_at, joins) in [
+            ("2024-01-01T00:00:00Z".to_string(), true),
+            (
+                (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+                false,
+            ),
+        ] {
+            let mock_server = MockServer::start().await;
+            mount_empty_challenges(&mock_server).await;
+            let mut ready = agreement_payload("AGR-new", "FILE-new", "ready");
+            ready["nodes"] = json!([]);
+            Mock::given(method("GET"))
+                .and(path("/api/agreements"))
+                .and(query_param("status", "ready"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "offset": 0, "limit": 20, "total": 1, "agreements": [ready]
+                })))
+                .mount(&mock_server)
+                .await;
+            let mut held = agreement_payload("AGR-held", "FILE-held", "confirmed");
+            held["required_collateral"] = json!("500");
+            held["created_at"] = json!(created_at);
+            Mock::given(method("GET"))
+                .and(path("/api/agreements"))
+                .and(query_param("nodes", "NODE-test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "offset": 0, "limit": 20, "total": 1, "agreements": [held]
+                })))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/signers/42"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(entry.clone()))
+                .mount(&mock_server)
+                .await;
+            // The held agreement's own file: fetched whatever the estimate.
+            Mock::given(method("GET"))
+                .and(path("/api/agreements/AGR-held/download"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/agreements/AGR-new/download"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(u64::from(joins))
+                .mount(&mock_server)
+                .await;
+
+            let database = setup_in_memory_db().await;
+            let storage_dir = unique_test_path("daemon_estimate");
+            fs::create_dir_all(&storage_dir).ok();
+            sync_portal_once(
+                &portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0),
+                &database,
+                StorageLimits::default(),
+                &StorageBackend::local(),
+                &storage_dir,
+                &DaemonMemory::default(),
+            )
+            .await
+            .unwrap();
+            mock_server.verify().await;
+        }
+    }
+
+    #[test]
+    fn only_a_recent_agreement_informs_the_collateral_estimate() {
+        let agreement = |created_at: String, collateral: Option<&str>| -> Agreement {
+            let mut value = agreement_payload("AGR-x", "FILE-x", "confirmed");
+            value["created_at"] = json!(created_at);
+            value["required_collateral"] = json!(collateral);
+            serde_json::from_value(value).unwrap()
+        };
+        let wall = Utc::now();
+        let hours_ago = |hours: i64| (wall - chrono::Duration::hours(hours)).to_rfc3339();
+        // What a join of unknown collateral is charged, with those noted.
+        let noted = |agreements: &[Agreement]| {
+            let staking = StakeTracker::default();
+            let mut entry = funded_entry(0);
+            entry["stake"] = json!("100000");
+            entry["stake_available"] = json!("100000");
+            let entry = serde_json::from_value(entry).unwrap();
+            staking.observe(Some(&entry), Instant::now());
+            note_recent_collateral(&staking, agreements, wall, Instant::now());
+            match staking
+                .join_budget(Instant::now())
+                .decide(false, Some(None))
+            {
+                crate::app::tasks::stake::JoinDecision::Join { collateral } => collateral,
+                other => panic!("a join the stake covers was not allowed: {other:?}"),
+            }
+        };
+
+        let baseline = noted(&[]);
+        assert_eq!(noted(&[agreement(hours_ago(25), Some("500"))]), baseline);
+        assert_eq!(noted(&[agreement(hours_ago(1), None)]), baseline);
+        assert_eq!(
+            noted(&[agreement("not a date".into(), Some("500"))]),
+            baseline
+        );
+        assert_ne!(noted(&[agreement(hours_ago(1), Some("500"))]), baseline);
+        // Ahead of this clock: an age of zero, not a reason to skip it.
+        assert_ne!(noted(&[agreement(hours_ago(-1), Some("500"))]), baseline);
     }
 
     /// A new node whose balance the Portal could not read at startup started
