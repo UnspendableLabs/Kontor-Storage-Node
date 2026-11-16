@@ -6,6 +6,7 @@ use crate::crypto::BlsKeyPair;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use reqwest::{Client, Method};
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,7 +209,8 @@ impl NodeOp {
 /// queued at the Portal under its nonce. Rewinding to Kontor's value — what
 /// the node used to do every cycle — signed the next cycle's ops at nonces
 /// those queued ops already held, and they collided. So the counter never
-/// moves back, not after an op that failed on chain, nor across startup: an
+/// moves back, not after an op that failed on chain, nor across a restart
+/// (the highest nonce signed is recorded, see [`starting_nonce`]): an
 /// op that never ran just leaves a gap, and gaps are fine — the Portal takes
 /// strictly ascending nonces at or above `next_nonce`, and Kontor accepts any
 /// nonce up to [`KONTOR_MAX_NONCE_GAP`] past it (Portal
@@ -226,6 +228,83 @@ pub fn resynced_nonce(local: u64, kontor: u64) -> u64 {
     }
 }
 
+/// The nonce a client starts signing from: Kontor's `next_nonce`, or one past
+/// the highest nonce an earlier process of this node signed with if that is
+/// further on — with the same fall-back to Kontor's value as
+/// [`resynced_nonce`] when it is further than Kontor accepts.
+///
+/// Kontor's value alone is behind for as long as ops are waiting at the
+/// Portal: every join, proof and stake op signed since the last block holds a
+/// nonce at or above it. A client that started there after a restart signed
+/// its first ops at those nonces again — a join refused `409` after its file
+/// was downloaded, a proof tied with the one already queued and sent back to
+/// `active`.
+#[must_use]
+pub fn starting_nonce(highest_signed: Option<u64>, kontor: u64) -> u64 {
+    match highest_signed {
+        Some(highest) => resynced_nonce(highest.saturating_add(1), kontor),
+        None => kontor,
+    }
+}
+
+/// Where the highest nonce this node has signed with is kept across restarts
+/// and re-activations: one `node_state` row per signer.
+#[derive(Clone, Debug)]
+pub struct NonceStore {
+    database: DatabaseConnection,
+    key: String,
+}
+
+impl NonceStore {
+    /// The store of `signer_id`'s nonces. Keyed by signer: a node registered
+    /// again under another key signs from that signer's own sequence.
+    #[must_use]
+    pub fn new(database: DatabaseConnection, signer_id: u64) -> Self {
+        Self {
+            database,
+            key: format!("highest_signed_nonce:{signer_id}"),
+        }
+    }
+
+    /// The highest nonce recorded, `None` if this signer never signed (or the
+    /// row cannot be read as a number).
+    ///
+    /// # Errors
+    /// If the row cannot be read.
+    pub async fn load(&self) -> Result<Option<u64>> {
+        use crate::entities::prelude::NodeState;
+        use sea_orm::EntityTrait;
+
+        let row = NodeState::find_by_id(self.key.clone())
+            .one(&self.database)
+            .await
+            .context("reading the highest signed nonce")?;
+        Ok(row.and_then(|row| row.value.parse().ok()))
+    }
+
+    async fn record(&self, nonce: u64) -> Result<()> {
+        use crate::entities::node_state;
+        use crate::entities::prelude::NodeState;
+        use sea_orm::{ActiveValue, EntityTrait};
+
+        let row = node_state::ActiveModel {
+            key: ActiveValue::Set(self.key.clone()),
+            value: ActiveValue::Set(nonce.to_string()),
+            updated_at: ActiveValue::Set(chrono::Utc::now().fixed_offset()),
+        };
+        NodeState::insert(row)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(node_state::Column::Key)
+                    .update_columns([node_state::Column::Value, node_state::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec(&self.database)
+            .await
+            .context("recording the highest signed nonce")?;
+        Ok(())
+    }
+}
+
 /// Authentication credentials for Portal API requests.
 #[derive(Clone)]
 pub struct PortalAuth {
@@ -234,6 +313,9 @@ pub struct PortalAuth {
     signer_id: u64,
     token: String,
     next_nonce: Arc<AtomicU64>,
+    /// Where signed nonces are recorded, and one past the highest recorded so
+    /// far (0 when none), so a nonce that is not a new high costs no write.
+    nonce_store: Option<(NonceStore, Arc<AtomicU64>)>,
 }
 
 impl std::fmt::Debug for PortalAuth {
@@ -373,10 +455,50 @@ impl PortalClient {
                 signer_id,
                 token: token.into(),
                 next_nonce: Arc::new(AtomicU64::new(initial_nonce)),
+                nonce_store: None,
             }),
             contract_address: DEFAULT_FILESTORAGE_CONTRACT.to_string(),
             staking_contract_address: DEFAULT_STAKING_CONTRACT.to_string(),
         })
+    }
+
+    /// Record every nonce this client signs with in `store`, so the next
+    /// process — or the next activation of this one — starts past them (see
+    /// [`starting_nonce`]). Does nothing on an unauthenticated client.
+    #[must_use]
+    pub fn with_nonce_store(mut self, store: NonceStore) -> Self {
+        if let Some(auth) = &mut self.auth {
+            auth.nonce_store = Some((store, Arc::new(AtomicU64::new(0))));
+        }
+        self
+    }
+
+    /// Record `nonce` as signed, before the op that carries it goes out.
+    ///
+    /// Before, not after: whether the Portal kept an op whose answer never
+    /// came is unknown, and a process that died waiting for it must still
+    /// start past that nonce. A nonce later given back (a `4xx`, see
+    /// [`Self::release_nonce`]) stays recorded, which costs the next process
+    /// a gap of one — Kontor skips it. A write that fails is only logged: the
+    /// op still goes out, and the next one records a higher nonce anyway.
+    async fn remember_nonce(&self, nonce: u64) {
+        let Some((store, recorded)) = self.auth.as_ref().and_then(|a| a.nonce_store.as_ref())
+        else {
+            return;
+        };
+        let next = nonce.saturating_add(1);
+        if recorded.load(Ordering::Relaxed) >= next {
+            return;
+        }
+        match store.record(nonce).await {
+            Ok(()) => {
+                recorded.fetch_max(next, Ordering::Relaxed);
+            }
+            Err(err) => tracing::warn!(
+                nonce,
+                "could not record the nonce just signed; a restart may sign at it again: {err:#}"
+            ),
+        }
     }
 
     /// Get the node ID if authenticated.
@@ -969,6 +1091,7 @@ impl PortalClient {
         let (body_bytes, request) = self
             .build_signed_json_request(&url, &payload, "join")
             .inspect_err(|_| self.release_nonce(nonce))?;
+        self.remember_nonce(nonce).await;
 
         let resp = self
             .send_signed_op(
@@ -1146,6 +1269,7 @@ impl PortalClient {
         let (body_bytes, request) = self
             .build_signed_json_request(&url, &payload, "submit proof")
             .inspect_err(|_| self.release_nonce(nonce))?;
+        self.remember_nonce(nonce).await;
 
         let resp = self
             .send_signed_op(
@@ -1202,6 +1326,7 @@ impl PortalClient {
         let (body_bytes, request) = self
             .build_signed_json_request(&url, &payload, "node op")
             .inspect_err(|_| self.release_nonce(nonce))?;
+        self.remember_nonce(nonce).await;
 
         // Every 4xx is the Portal saying what became of the op: refused and
         // not stored (the nonce came back, see `send_signed_op`), or `409`,
@@ -1743,9 +1868,9 @@ pub struct FaucetResponse {
 mod tests {
     #![allow(deprecated)]
     use super::{
-        join_agreement_expr, resynced_nonce, verify_proof_expr, wave_string_literal, NodeOp,
-        OpContract, PortalClient, RegistryEntry, UnsettledOp, DEFAULT_FILESTORAGE_CONTRACT,
-        DEFAULT_STAKING_CONTRACT, KONTOR_MAX_NONCE_GAP,
+        join_agreement_expr, resynced_nonce, starting_nonce, verify_proof_expr,
+        wave_string_literal, NodeOp, NonceStore, OpContract, PortalClient, RegistryEntry,
+        UnsettledOp, DEFAULT_FILESTORAGE_CONTRACT, DEFAULT_STAKING_CONTRACT, KONTOR_MAX_NONCE_GAP,
     };
     use crate::clients::kontor_op::{build_signing_message, Inst, InstKind, SignerRef};
     use crate::clients::kor::Kor;
@@ -2627,6 +2752,7 @@ mod tests {
             signer_id: 42,
             token: "secret-token".to_string(),
             next_nonce: Arc::new(AtomicU64::new(7)),
+            nonce_store: None,
         };
         let debug = format!("{auth:?}");
         assert!(debug.contains("NODE-debug"));
@@ -3543,5 +3669,109 @@ mod tests {
 
         client.join_agreement("AGR-1").await.unwrap_err();
         assert_eq!(client.current_nonce(), Some(9), "same rule for a join");
+    }
+
+    #[test]
+    fn starting_nonce_is_past_what_an_earlier_process_signed() {
+        // Never signed: Kontor's value.
+        assert_eq!(starting_nonce(None, 7), 7);
+        // Ops still queued at the Portal hold nonces 7..=11: start at 12.
+        assert_eq!(starting_nonce(Some(11), 7), 12);
+        // Kontor has moved past everything recorded.
+        assert_eq!(starting_nonce(Some(11), 30), 30);
+        // The same fall-back as within a process: further ahead than Kontor
+        // accepts, the recorded value is of no use.
+        assert_eq!(
+            starting_nonce(Some(6 + KONTOR_MAX_NONCE_GAP), 7),
+            7 + KONTOR_MAX_NONCE_GAP
+        );
+        assert_eq!(starting_nonce(Some(7 + KONTOR_MAX_NONCE_GAP), 7), 7);
+        assert_eq!(starting_nonce(Some(u64::MAX), 7), 7);
+    }
+
+    /// The counter used to start again at Kontor's `next_nonce` with every
+    /// process and every re-activation, under the ops the previous one had
+    /// left queued at the Portal. Each nonce is now recorded before its op
+    /// goes out — whatever the Portal answers — and the next client starts
+    /// past the highest.
+    #[tokio::test]
+    async fn the_nonces_a_client_signs_with_outlive_it() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "agreement_id": "AGR-1", "node_id": "NODE-test",
+                "joined_at": "2024-01-01T00:00:00Z", "created": true
+            })))
+            .mount(&mock_server)
+            .await;
+        // A proof the Portal never answers properly: its nonce is spent all
+        // the same, as far as anyone can tell.
+        Mock::given(method("POST"))
+            .and(path("/api/challenges/chal_1"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let database = crate::testutils::setup_in_memory_db().await;
+        let store = NonceStore::new(database.clone(), 42);
+        assert_eq!(store.load().await.unwrap(), None);
+
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            storage_dir("nonce_store"),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            starting_nonce(store.load().await.unwrap(), 7),
+        )
+        .unwrap()
+        .with_nonce_store(store.clone());
+
+        client.join_agreement("AGR-1").await.unwrap();
+        assert_eq!(store.load().await.unwrap(), Some(7));
+        client.submit_proof("chal_1", "00").await.unwrap_err();
+        assert_eq!(store.load().await.unwrap(), Some(8));
+
+        // The next process: Kontor has executed nothing yet and still says 7.
+        assert_eq!(starting_nonce(store.load().await.unwrap(), 7), 9);
+        // Another signer of the same database has its own sequence.
+        assert_eq!(NonceStore::new(database, 43).load().await.unwrap(), None);
+    }
+
+    /// A nonce the Portal refused and gave back stays recorded: the worst a
+    /// restart can then do is skip it, never sign under a queued op.
+    #[tokio::test]
+    async fn a_refused_op_leaves_its_nonce_recorded() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-1/join"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": { "code": "NO_BONDED_STAKE", "message": "no stake", "status": 422 }
+            })))
+            .mount(&mock_server)
+            .await;
+        let database = crate::testutils::setup_in_memory_db().await;
+        let store = NonceStore::new(database, 42);
+        let client = PortalClient::try_with_auth(
+            mock_server.uri(),
+            storage_dir("nonce_store_refused"),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            7,
+        )
+        .unwrap()
+        .with_nonce_store(store.clone());
+
+        client.join_agreement("AGR-1").await.unwrap_err();
+        assert_eq!(
+            client.current_nonce(),
+            Some(7),
+            "given back in this process"
+        );
+        assert_eq!(store.load().await.unwrap(), Some(7));
     }
 }

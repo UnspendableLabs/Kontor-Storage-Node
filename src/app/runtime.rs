@@ -30,6 +30,7 @@ use crate::app::output::SharedWriter;
 use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
 use crate::app::tasks::stake;
+use crate::clients::portal::{starting_nonce, NonceStore};
 use crate::clients::PortalClient;
 use crate::crypto::keystore::{Keystore, SealKey, SealKeySource};
 use crate::database::DBClient;
@@ -826,6 +827,17 @@ impl Supervisor {
         } = result;
 
         let keypair = Arc::new(keypair);
+        // Start past every nonce an earlier process — or an earlier
+        // activation of this one — signed with: the ops that hold them may
+        // still be queued at the Portal, where Kontor's `next_nonce` does not
+        // show them. Unreadable, the counter starts at Kontor's value as it
+        // always did; the stake task's own read of the Portal's queue then
+        // moves it past the relayed ops at least.
+        let nonces = NonceStore::new(self.parts.conn.clone(), signer_id);
+        let highest_signed = nonces.load().await.unwrap_or_else(|e| {
+            tracing::warn!("could not read the highest nonce signed so far: {e:#}");
+            None
+        });
         let authenticated = PortalClient::try_with_auth(
             &self.config.portal_url,
             &self.config.storage_dir,
@@ -833,10 +845,11 @@ impl Supervisor {
             &node_id,
             signer_id,
             token,
-            next_nonce,
+            starting_nonce(highest_signed, next_nonce),
         )?
         .with_contract_address(&self.config.kontor_contract_address)
-        .with_staking_contract_address(&self.config.kontor_staking_contract_address);
+        .with_staking_contract_address(&self.config.kontor_staking_contract_address)
+        .with_nonce_store(nonces);
 
         if let Err(e) = authenticated.announce_node(&self.config.public_url).await {
             tracing::warn!("Failed to announce node URL: {e}");
