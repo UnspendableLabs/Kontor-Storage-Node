@@ -467,6 +467,10 @@ struct InFlight {
     checked: Option<Instant>,
     /// When the Portal's listing last said it still holds the op.
     vouched: Option<Instant>,
+    /// When the Portal's listing first said it lost track of the op (see
+    /// [`PORTAL_ORPHANED_HEAD`]): its transaction may still confirm, so the
+    /// op stays in flight for [`OP_LANDING_HARD_TIMEOUT`] from here.
+    orphaned: Option<Instant>,
 }
 
 impl InFlight {
@@ -556,6 +560,38 @@ struct TrackerState {
     exited: bool,
     /// The exit as of the last plan, for `/admin`.
     exit: Option<ExitInputs>,
+}
+
+impl TrackerState {
+    /// `op` consumed its nonce, or was failed by the Portal, without the
+    /// effect it was sent for: remember it until the Portal's listing says
+    /// how it ended (see [`StakeTracker::classify_landed`]), and take what
+    /// each kind needs in the meantime.
+    fn landed_without_effect(&mut self, op: &NodeOp, nonce: u64, unsettled: bool, now: Instant) {
+        match op {
+            // The same op signed again next cycle would most likely meet the
+            // same answer, and each attempt costs gas: it waits as long as
+            // one the Portal refused, unless the listing says it never ran.
+            NodeOp::AddStake(_) => {
+                self.refused.insert(refused_key(op), now);
+            }
+            // The bond is still there: too early, or an obligation the
+            // node's own rows did not show. Forget which leaves "worked" so
+            // they are sent again, and re-read the memberships.
+            NodeOp::WithdrawStake => {
+                self.left.clear();
+                self.memberships_refreshed = false;
+            }
+            _ => {}
+        }
+        self.unexplained.retain(|landed| landed.nonce != nonce);
+        self.unexplained.push(LandedOp {
+            op: op.clone(),
+            nonce,
+            landed: now,
+            unsettled,
+        });
+    }
 }
 
 /// An op kind, and the agreement it names, that the Portal refused.
@@ -806,14 +842,9 @@ impl StakeTracker {
                     // `classify_landed` and `next_exit_op`).
                     info!(
                         "the leave of agreement {agreement_id} has executed; asking the Portal \
-                     whether Kontor accepted it"
+                         whether Kontor accepted it"
                     );
-                    state.unexplained.push(LandedOp {
-                        op: op.clone(),
-                        nonce: *nonce,
-                        landed: now,
-                        unsettled: *unsettled,
-                    });
+                    state.landed_without_effect(op, *nonce, *unsettled, now);
                 }
                 NodeOp::AddStake(amount)
                     if state
@@ -833,13 +864,7 @@ impl StakeTracker {
                      it again for {} hour unless the Portal says it never ran",
                         REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
                     );
-                    state.refused.insert(refused_key(op), now);
-                    state.unexplained.push(LandedOp {
-                        op: op.clone(),
-                        nonce: *nonce,
-                        landed: now,
-                        unsettled: *unsettled,
-                    });
+                    state.landed_without_effect(op, *nonce, *unsettled, now);
                     state.last_event = Some((
                         Utc::now(),
                         format!("add_stake {amount} KOR executed without raising the bond"),
@@ -858,14 +883,7 @@ impl StakeTracker {
                      and the withdrawal retried in {} hours unless Kontor named an obligation",
                     WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
                 );
-                    state.left.clear();
-                    state.memberships_refreshed = false;
-                    state.unexplained.push(LandedOp {
-                        op: op.clone(),
-                        nonce: *nonce,
-                        landed: now,
-                        unsettled: *unsettled,
-                    });
+                    state.landed_without_effect(op, *nonce, *unsettled, now);
                 }
                 NodeOp::WithdrawStake => state.exited = true,
                 _ => {}
@@ -1025,6 +1043,7 @@ impl StakeTracker {
             unsettled: false,
             checked: Some(now),
             vouched: Some(now),
+            orphaned: None,
         });
         Some((op, nonce))
     }
@@ -1052,8 +1071,15 @@ impl StakeTracker {
     /// Still `queued` or `submitted`: it is waiting for a batch, or in one that
     /// is not confirmed yet, and stays in flight. `confirmed`: it has executed
     /// and the registry read is behind; it stays in flight for the nonce to
-    /// say so. `failed`, or missing from the listing: the Portal will never
-    /// relay it, so it is given up and the next plan decides again. A listing
+    /// say so. Missing from the listing: the Portal will never relay it, so
+    /// it is given up and the next plan decides again. `failed`: it will not
+    /// be relayed either, and why decides what comes next, so it is handed to
+    /// [`Self::classify_landed`] like an op whose nonce went — a refusal by
+    /// Kontor waits its hour, a retirement by the Portal is signed again at
+    /// once. `failed` because the Portal lost the transaction that carried it
+    /// ([`PORTAL_ORPHANED_HEAD`]) is the one case where the op may still
+    /// execute: it stays in flight until its nonce is consumed, for
+    /// [`OP_LANDING_HARD_TIMEOUT`] at most. A listing
     /// that could not be read says nothing: the op stays in flight and the
     /// next cycle asks again, however long the Portal stays silent — it may
     /// hold the op all that time.
@@ -1136,15 +1162,44 @@ impl StakeTracker {
                 return;
             }
             Some("failed") => {
-                warn!(
-                    "the Portal reports the {name} op at nonce {nonce} as failed: {}; deciding \
-                     again",
-                    listed
-                        .as_ref()
-                        .and_then(|listed| listed.error.as_deref())
-                        .unwrap_or("no error given")
-                );
-                format!("{name} failed at the Portal (nonce {nonce})")
+                let error = listed
+                    .as_ref()
+                    .and_then(|listed| listed.error.as_deref())
+                    .unwrap_or("no error given");
+                if orphaned_by_portal(error) {
+                    // The Portal no longer has the transaction the op was
+                    // batched in, so it cannot say whether the op ran — and
+                    // if that transaction is still out there, it may yet.
+                    // Signing the op again now could make both execute. The
+                    // nonce decides: consumed, the op is over one way or the
+                    // other; still free after the timeout, it is given up.
+                    let since = *op.orphaned.get_or_insert(now);
+                    if now.duration_since(since) < OP_LANDING_HARD_TIMEOUT {
+                        warn!(
+                            "the Portal lost track of the {name} op at nonce {nonce} ({error}); \
+                             keeping it in flight until its nonce is consumed, for {} hours at \
+                             most",
+                            OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
+                        );
+                        return;
+                    }
+                    warn!(
+                        "the {name} op at nonce {nonce}, which the Portal lost track of, has not \
+                         executed in {} hours; deciding again",
+                        OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
+                    );
+                    format!("{name} lost by the Portal (nonce {nonce})")
+                } else {
+                    warn!("the Portal reports the {name} op at nonce {nonce} as failed: {error}");
+                    let (op, unsettled) = (op.op.clone(), op.unsettled);
+                    state.in_flight.retain(|op| op.nonce != nonce);
+                    state.landed_without_effect(&op, nonce, unsettled, now);
+                    state.last_event = Some((
+                        Utc::now(),
+                        format!("{name} failed at the Portal (nonce {nonce})"),
+                    ));
+                    return;
+                }
             }
             Some(other) => {
                 warn!(
@@ -1284,6 +1339,13 @@ impl StakeTracker {
             return;
         }
         let retired = status == Some("failed") && retired_by_portal(error);
+        // The Portal lost the transaction that carried the op, and cannot say
+        // whether Kontor ran it. Not a refusal: the nonce is consumed, so the
+        // op is over, and it is decided again from the state as it stands —
+        // an `add-stake` that did run shows in the bond, a leave that did run
+        // is answered "not in agreement" the second time, which counts as
+        // left.
+        let orphaned = status == Some("failed") && orphaned_by_portal(error);
         match &op {
             NodeOp::LeaveAgreement(agreement_id) => match status {
                 Some("confirmed") => {
@@ -1291,7 +1353,9 @@ impl StakeTracker {
                     state.left.insert(agreement_id.clone());
                     state.last_event = Some((Utc::now(), format!("left agreement {agreement_id}")));
                 }
-                Some("failed") if !retired && no_membership_to_leave(error, agreement_id) => {
+                Some("failed")
+                    if !retired && !orphaned && no_membership_to_leave(error, agreement_id) =>
+                {
                     // Kontor holds no membership of this node in the
                     // agreement: bond cleanup unwound it after a slash to
                     // zero, or the Portal's row was behind. Nothing is left
@@ -1308,7 +1372,7 @@ impl StakeTracker {
                         format!("agreement {agreement_id} was already left on Kontor"),
                     ));
                 }
-                Some("failed") if !retired => {
+                Some("failed") if !retired && !orphaned => {
                     warn!(
                         "Kontor refused the leave of agreement {agreement_id} ({error}); trying \
                          again in {} hour",
@@ -1321,11 +1385,13 @@ impl StakeTracker {
                     ));
                 }
                 _ => {
-                    // Retired unexecuted, or not held by the Portal at all:
-                    // the membership stands and the leave is signed again.
+                    // Retired unexecuted, lost track of, or not held by the
+                    // Portal at all: for all the node knows the membership
+                    // stands, and the leave is signed again.
+                    state.refused.remove(&refused_key(&op));
                     warn!(
-                        "the leave of agreement {agreement_id} at nonce {nonce} never ran ({}); \
-                         signing it again",
+                        "the leave of agreement {agreement_id} at nonce {nonce} is not known to \
+                         have run ({}); signing it again",
                         if listed.is_some() {
                             error
                         } else {
@@ -1334,10 +1400,27 @@ impl StakeTracker {
                     );
                     state.last_event = Some((
                         Utc::now(),
-                        format!("leave_agreement {agreement_id} never ran (nonce {nonce}); signing again"),
+                        format!(
+                            "leave_agreement {agreement_id} not known to have run (nonce \
+                             {nonce}); signing again"
+                        ),
                     ));
                 }
             },
+            _ if orphaned => {
+                warn!(
+                    "the Portal cannot say whether the {name} op at nonce {nonce} ran ({error}); \
+                     deciding again from the bond as it stands"
+                );
+                state.refused.remove(&refused_key(&op));
+                if op == NodeOp::WithdrawStake {
+                    state.last_withdraw = None;
+                }
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("{name} lost by the Portal (nonce {nonce}); deciding again"),
+                ));
+            }
             _ if retired => {
                 info!(
                     "the Portal retired the {name} op at nonce {nonce} before Kontor ran it \
@@ -1388,6 +1471,24 @@ impl StakeTracker {
                 state.last_event = Some((
                     Utc::now(),
                     format!("withdraw_stake refused by Kontor: {error}; retrying within the hour"),
+                ));
+            }
+            NodeOp::AddStake(amount) if status == Some("failed") => {
+                // Kontor ran it and refused it. `observe` has already put the
+                // hour's wait on one it saw land; one the Portal's listing
+                // reported first gets it here.
+                warn!(
+                    "Kontor refused the add-stake of {amount} KOR at nonce {nonce} ({error}); \
+                     not signing it again for {} hour",
+                    REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
+                );
+                state
+                    .refused
+                    .entry(refused_key(&op))
+                    .or_insert(landed.landed);
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("add_stake {amount} KOR refused by Kontor: {error}"),
                 ));
             }
             _ => match status {
@@ -1522,6 +1623,7 @@ impl StakeTracker {
             unsettled,
             checked: None,
             vouched: None,
+            orphaned: None,
         });
         state.in_flight.sort_by_key(|op| op.nonce);
     }
@@ -1728,12 +1830,20 @@ impl StakeTracker {
 /// - `signature no longer verifies:`, the key-rotation retirement, for a
 ///   signature that no longer verifies against the key the node registered
 ///   after signing;
-/// - a stored op the Portal cannot rebuild (`the stored op cannot be batched
-///   by this Portal (…), so it never executed (no receipt); sign a new op`).
+/// - `the stored op cannot be batched by this Portal`, the start of the
+///   message for a stored op the Portal cannot rebuild (`… (reason), so it
+///   never executed (no receipt); sign a new op`).
 const PORTAL_NO_RECEIPT: &str = "no receipt recorded by Kontor (op never executed)";
 const PORTAL_STALE_NONCE_TOKEN: &str = "nonce already passed:";
 const PORTAL_UNVERIFIABLE_TOKEN: &str = "signature no longer verifies:";
 const PORTAL_UNBATCHABLE_HEAD: &str = "the stored op cannot be batched by this Portal";
+
+/// The start of the `error` the Portal writes on a `submitted` op whose
+/// transaction row it no longer has (§2, same list): `the Portal transaction
+/// that carried the op no longer exists, so whether it executed cannot be
+/// checked; …`. Neither a retirement nor a refusal — the Portal does not know
+/// whether Kontor ran the op. See [`orphaned_by_portal`].
+const PORTAL_ORPHANED_HEAD: &str = "the Portal transaction that carried the op no longer exists";
 
 /// Whether a `failed` op's error is the Portal retiring it unexecuted rather
 /// than Kontor refusing it. Only the Portal's own retirement messages count
@@ -1760,6 +1870,17 @@ fn retired_by_portal(error: &str) -> bool {
 fn no_membership_to_leave(error: &str, agreement_id: &str) -> bool {
     error.contains(&format!("not in agreement {agreement_id}"))
         || error.contains(&format!("agreement not found: {agreement_id}"))
+}
+
+/// Whether a `failed` op's error is the Portal saying it lost the transaction
+/// that carried the op ([`PORTAL_ORPHANED_HEAD`]), and so cannot tell whether
+/// the op ran. Decided by what the nonce and the bond say: while the nonce is
+/// free the op may still execute and is not signed again
+/// ([`StakeTracker::verify_in_flight`]); once it is consumed the op is over,
+/// and the next plan is made from the state as it stands, without the wait a
+/// refusal by Kontor earns ([`StakeTracker::classify_landed`]).
+fn orphaned_by_portal(error: &str) -> bool {
+    error.trim().starts_with(PORTAL_ORPHANED_HEAD)
 }
 
 fn describe_sent(op: &NodeOp, nonce: u64) -> String {
@@ -5346,5 +5467,160 @@ mod tests {
             "ContractErr: err(message(\"node 42 not in agreement AGR-b\"))",
             "AGR-a"
         ));
+    }
+    /// The Portal's message for a `submitted` op whose transaction row it no
+    /// longer has (Portal `docs/node-portal-contract.md` §2).
+    const ORPHANED: &str = "the Portal transaction that carried the op no longer exists, so \
+        whether it executed cannot be checked; verify the signer's state on Kontor before \
+        signing a new op";
+
+    fn add_stake_record(nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
+        listed_op("add_stake", nonce, status, error)
+    }
+
+    #[test]
+    fn the_portal_s_lost_transaction_message_is_neither_a_retirement_nor_a_refusal() {
+        assert!(orphaned_by_portal(ORPHANED));
+        assert!(!retired_by_portal(ORPHANED));
+        assert!(retired_by_portal(
+            "the stored op cannot be batched by this Portal (unknown op kind), so it never \
+             executed (no receipt); sign a new op"
+        ));
+        assert!(!orphaned_by_portal(
+            "ContractErr: err(message(\"the Portal transaction that carried the op no longer \
+             exists\"))"
+        ));
+        assert!(!orphaned_by_portal(PORTAL_NO_RECEIPT));
+    }
+
+    /// The Portal lost the transaction an op was batched in, and lists the
+    /// op `failed` without knowing whether it ran. That transaction may still
+    /// confirm. The op used to be dropped and signed again at once — both
+    /// could execute. It now stays in flight until its nonce is consumed, and
+    /// is given up only if that has not happened after the hard timeout.
+    #[test]
+    fn an_op_the_portal_lost_track_of_stays_in_flight_until_its_nonce_decides() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        let orphaned = || Ok(vec![add_stake_record(10, "failed", Some(ORPHANED))]);
+        tracker.verify_in_flight(10, orphaned(), check);
+        assert_eq!(tracker.plan(check, None), None, "it may still execute");
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
+
+        // It did execute: the nonce went and the bond rose. Nothing more.
+        let mut landed = entry(Some("995"), Some("995"));
+        landed.next_nonce = Some(11);
+        landed.kor_balance = Some("5".into());
+        observed(&tracker, &landed, check);
+        assert_eq!(tracker.status()["in_flight"], Value::Null);
+        assert_eq!(tracker.plan(check, None), None);
+
+        // One whose nonce is never consumed is given up after the timeout,
+        // counted from the Portal's verdict.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+        tracker.verify_in_flight(10, orphaned(), check);
+        let almost = check + OP_LANDING_HARD_TIMEOUT - Duration::from_secs(1);
+        tracker.verify_in_flight(10, orphaned(), almost);
+        assert_eq!(tracker.plan(almost, None), None);
+        let over = check + OP_LANDING_HARD_TIMEOUT;
+        tracker.verify_in_flight(10, orphaned(), over);
+        assert_eq!(tracker.plan(over, None), Some(NodeOp::AddStake(kor("995"))));
+    }
+
+    /// Its nonce consumed and the bond unmoved, an op the Portal lost track
+    /// of is over either way. It is not a refusal by Kontor: no hour's wait.
+    #[test]
+    fn a_landed_op_the_portal_lost_track_of_is_decided_again_at_once() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+        let mut consumed = entry(Some("0"), Some("0"));
+        consumed.next_nonce = Some(11);
+        observed(&tracker, &consumed, t0);
+        assert_eq!(tracker.plan(t0, None), None, "the hour's wait, for now");
+
+        tracker.classify_landed(
+            10,
+            Ok(vec![add_stake_record(10, "failed", Some(ORPHANED))]),
+            t0,
+        );
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+
+        // A leave the Portal lost track of is signed again too: had it run,
+        // the second one is answered "not in agreement", which counts as left.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        tracker.classify_landed(10, Ok(vec![leave_record(10, "failed", Some(ORPHANED))]), t0);
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-a".into()))
+        );
+    }
+
+    /// The Portal's listing can report an op `failed` before the registry
+    /// read shows its nonce consumed. It used to be dropped there and then,
+    /// whatever the reason: an `add-stake` Kontor had refused was signed
+    /// again on the same cycle, and a leave Kontor had answered "not in
+    /// agreement" was not counted as left. Why it failed now decides, exactly
+    /// as for an op whose nonce went first.
+    #[test]
+    fn an_op_the_listing_reports_failed_is_settled_by_why_it_failed() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("0"), Some("0")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+        let check = t0 + OP_LANDING_CHECK_INTERVAL;
+        let refused = || {
+            Ok(vec![add_stake_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"insufficient funds\"))"),
+            )])
+        };
+        tracker.verify_in_flight(10, refused(), check);
+        assert_eq!(tracker.status()["in_flight"], Value::Null);
+        assert_eq!(tracker.ops_to_classify(), vec![10]);
+        tracker.classify_landed(10, refused(), check);
+        assert_eq!(
+            tracker.plan(check, None),
+            None,
+            "refused by Kontor: an hour"
+        );
+        assert_eq!(
+            tracker.plan(check + REFUSED_OP_RETRY_INTERVAL, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+        let gone = || {
+            Ok(vec![leave_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"node 42 not in agreement AGR-a\"))"),
+            )])
+        };
+        tracker.verify_in_flight(10, gone(), check);
+        tracker.classify_landed(10, gone(), check);
+        let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+        assert_eq!(tracker.plan(due, Some(&exit)), Some(NodeOp::WithdrawStake));
     }
 }
