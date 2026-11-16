@@ -690,6 +690,9 @@ async fn download_agreements_scoped(
     // that failed, for one line at the end.
     let mut joined: HashSet<String> = HashSet::new();
     let mut failed: Vec<String> = Vec::new();
+    // Failed attempts on new agreements of unknown collateral this cycle (see
+    // [`MAX_FAILED_NEW_JOINS_PER_CYCLE`]).
+    let mut failed_new = 0usize;
 
     for (agreement, membership) in pending {
         // Nothing to store it for: the membership is over, and the agreement
@@ -736,6 +739,18 @@ async fn download_agreements_scoped(
         // Collateral last among the checks: it is the one that sets something
         // aside, and an agreement skipped for size must not hold any.
         let listed = listing.get(&agreement.agreement_id);
+        // A new agreement whose collateral the Portal does not list yet is
+        // joined on an estimate, a limited number of times per cycle.
+        let guessed = membership == Membership::None
+            && listed.is_some_and(|listed| listed.required_collateral.is_none());
+        if guessed && failed_new >= MAX_FAILED_NEW_JOINS_PER_CYCLE {
+            debug!(
+                "Not joining {} this cycle: {failed_new} attempts on new agreements already \
+                 failed",
+                agreement.agreement_id
+            );
+            continue;
+        }
         let collateral = match budget.decide(
             membership != Membership::None,
             listed.map(|listed| listed.required_collateral.as_deref()),
@@ -761,6 +776,14 @@ async fn download_agreements_scoped(
                     agreement.agreement_id
                 );
                 budget.refund(collateral);
+                // Nothing was joined: the guess goes back too, or a few
+                // agreements whose file cannot be fetched, first in line every
+                // cycle, would use up every cycle's guesses and the node would
+                // join nothing.
+                if guessed {
+                    budget.return_guess();
+                    failed_new += 1;
+                }
                 failed.push(agreement.agreement_id.clone());
                 continue;
             }
@@ -985,6 +1008,12 @@ async fn discard_download(path: &Path) {
     }
 }
 
+/// How many new agreements of unknown collateral one cycle may fail to fetch
+/// before it stops trying new ones. Each failed download gives its guess back
+/// (see `JoinBudget::return_guess`), so without a bound a long run of
+/// unfetchable agreements would cost a cycle one download timeout each.
+const MAX_FAILED_NEW_JOINS_PER_CYCLE: usize = 10;
+
 /// How long this process must have seen a membership over before the file
 /// stored for it is removed.
 ///
@@ -994,6 +1023,17 @@ async fn discard_download(path: &Path) {
 /// several of the Portal's passes. Counted from when this process first saw
 /// the membership over — a restart starts the hour again, which only delays.
 pub const ENDED_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// The same wait for a membership the node **left**.
+///
+/// A membership that was never on chain (an invalidated join, a failed
+/// agreement) cannot be challenged. One the node left can: a challenge issued
+/// before the leave executed stays open after it, for up to Kontor's deadline
+/// of 2016 blocks (about two weeks), and is slashed like any other if it
+/// expires. The node only learns of a challenge through the Portal, whose feed
+/// can lag, and a removed file is not fetched again. So the file of a left
+/// membership is kept until no such challenge can still be open.
+pub const LEFT_FILE_GRACE: Duration = Duration::from_secs(15 * 24 * 60 * 60);
 
 /// How many agreements one cycle re-reads from the Portal to learn whether
 /// the membership a stored file was for is over.
@@ -1007,8 +1047,9 @@ const OPEN_CHALLENGE: [&str; 3] = [STATUS_ACTIVE, STATUS_PROVED, STATUS_SUBMITTE
 /// What a cycle last learned about a stored file the node may no longer owe.
 #[derive(Clone, Copy, Debug)]
 enum Seen {
-    /// The Portal says the membership is over, first seen so at this instant.
-    Over(Instant),
+    /// The Portal says the membership is over: first seen so at `since`,
+    /// last confirmed at `checked`.
+    Over { since: Instant, checked: Instant },
     /// The Portal did not say so when asked at this instant.
     NotOver(Instant),
 }
@@ -1045,6 +1086,20 @@ fn membership_is_over(remote: &crate::clients::portal::Agreement, node_id: &str)
         || !matches!(remote.status.as_str(), "ready" | "pending")
 }
 
+/// How long the file of an ended membership waits before it is removed:
+/// [`LEFT_FILE_GRACE`] when the node left it, [`ENDED_FILE_GRACE`] otherwise.
+fn ended_file_grace(remote: &crate::clients::portal::Agreement, node_id: &str) -> Duration {
+    let left = remote
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && node.status == "left");
+    if left {
+        LEFT_FILE_GRACE
+    } else {
+        ENDED_FILE_GRACE
+    }
+}
+
 /// Remove the stored files of memberships that are over, and stop counting
 /// them against the storage limits.
 ///
@@ -1063,7 +1118,8 @@ fn membership_is_over(remote: &crate::clients::portal::Agreement, node_id: &str)
 /// - the agreement, re-read from the Portal, carries a row of this node and
 ///   none of its rows is a membership (see [`membership_is_over`]) — checked
 ///   when the file first becomes a candidate and again right before removal;
-/// - this process has seen it so for [`ENDED_FILE_GRACE`];
+/// - this process has seen it so for [`ENDED_FILE_GRACE`], or for
+///   [`LEFT_FILE_GRACE`] when the node left it;
 /// - no challenge on the agreement is still open;
 /// - no other stored agreement uses the same file.
 ///
@@ -1123,8 +1179,8 @@ pub async fn remove_ended_files(
     // Never-seen ones first, and at most `ENDED_CHECKS_PER_CYCLE` in all.
     candidates.retain(|candidate| match known.get(&candidate.agreement_id) {
         None => true,
-        Some(Seen::Over(since) | Seen::NotOver(since)) => {
-            now.duration_since(*since) >= ENDED_FILE_GRACE
+        Some(Seen::Over { checked: asked, .. } | Seen::NotOver(asked)) => {
+            now.duration_since(*asked) >= ENDED_FILE_GRACE
         }
     });
     candidates.sort_by_key(|candidate| known.contains_key(&candidate.agreement_id));
@@ -1132,16 +1188,6 @@ pub async fn remove_ended_files(
 
     let mut removed = 0usize;
     for agreement in candidates {
-        let remote = match portal_client.get_agreement(&agreement.agreement_id).await {
-            Ok(remote) => remote,
-            Err(err) => {
-                debug!(
-                    "could not re-read agreement {} to see whether its file is still owed: {err:#}",
-                    agreement.agreement_id
-                );
-                continue;
-            }
-        };
         let record = |seen: Seen| {
             ended
                 .seen
@@ -1149,24 +1195,46 @@ pub async fn remove_ended_files(
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(agreement.agreement_id.clone(), seen);
         };
+        let remote = match portal_client.get_agreement(&agreement.agreement_id).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                debug!(
+                    "could not re-read agreement {} to see whether its file is still owed: {err:#}",
+                    agreement.agreement_id
+                );
+                // Asked, and not told it is over: it waits its turn like the
+                // others, so rows the Portal cannot serve do not take every
+                // cycle's reads from the ones it can.
+                record(Seen::NotOver(now));
+                continue;
+            }
+        };
         if !membership_is_over(&remote, node_id) {
             record(Seen::NotOver(now));
             continue;
         }
+        let grace = ended_file_grace(&remote, node_id);
         let since = match known.get(&agreement.agreement_id) {
-            Some(Seen::Over(since)) => *since,
+            Some(Seen::Over { since, .. }) => *since,
             _ => {
-                record(Seen::Over(now));
+                record(Seen::Over {
+                    since: now,
+                    checked: now,
+                });
                 debug!(
                     "the membership in {} is over; its file is removed in {} minutes if nothing \
                      asks for it",
                     agreement.agreement_id,
-                    ENDED_FILE_GRACE.as_secs() / 60
+                    grace.as_secs() / 60
                 );
                 continue;
             }
         };
-        if now.duration_since(since) < ENDED_FILE_GRACE {
+        if now.duration_since(since) < grace {
+            record(Seen::Over {
+                since,
+                checked: now,
+            });
             continue;
         }
 
@@ -4699,6 +4767,8 @@ mod tests {
         .update(&database)
         .await
         .unwrap();
+        // A membership the node left can still be challenged from before the
+        // leave: its file waits out Kontor's deadline, not the short grace.
         let removed = remove_ended_files(
             &client,
             &database,
@@ -4708,6 +4778,20 @@ mod tests {
             &listing,
             &ended,
             t0 + ENDED_FILE_GRACE * 5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(storage_dir.join("FILE-AGR-challenged").exists());
+        let removed = remove_ended_files(
+            &client,
+            &database,
+            &StorageBackend::local(),
+            &storage_dir,
+            &held,
+            &listing,
+            &ended,
+            t0 + LEFT_FILE_GRACE + ENDED_FILE_GRACE * 5,
         )
         .await
         .unwrap();
@@ -4749,7 +4833,7 @@ mod tests {
                 &held,
                 &listing,
                 &ended,
-                t0 + ENDED_FILE_GRACE * step,
+                t0 + LEFT_FILE_GRACE * step,
             )
             .await
             .unwrap();
@@ -4760,5 +4844,65 @@ mod tests {
             "but the file the live agreement uses stays"
         );
         assert_eq!(current_downloaded_count(&database).await.unwrap(), 1);
+    }
+
+    /// Three agreements of unknown collateral whose file cannot be fetched,
+    /// first in line every cycle, used to spend the cycle's three guesses:
+    /// nothing behind them was ever joined. A failed download now gives its
+    /// guess back.
+    #[tokio::test]
+    async fn agreements_that_cannot_be_fetched_do_not_use_up_the_cycle_s_guesses() {
+        let mock_server = MockServer::start().await;
+        let broken = ["AGR-a1", "AGR-a2", "AGR-a3"];
+        for id in broken {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/agreements/{id}/download")))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&mock_server)
+                .await;
+        }
+        mount_download(&mock_server, "AGR-z").await;
+        mount_join_agreement_mock(&mock_server, "AGR-z").await;
+
+        let database = setup_agreements_db().await;
+        for id in broken {
+            insert_unjoined(&database, id, &format!("FILE-{id}")).await;
+        }
+        insert_unjoined(&database, "AGR-z", "FILE-AGR-z").await;
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_guess_back")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-a1", None, &[]),
+            listed("AGR-a2", None, &[]),
+            listed("AGR-a3", None, &[]),
+            listed("AGR-z", None, &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let z = Agreements::find_by_id("AGR-z")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            z.downloaded,
+            "the agreement behind the three that cannot be fetched is joined"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-z/join"), 1);
     }
 }

@@ -2620,6 +2620,15 @@ impl JoinBudget {
         }
     }
 
+    /// Give back the guess [`Self::decide`] spent on a join of unknown
+    /// collateral that was never attempted (its file could not be fetched), so
+    /// the next agreement in line can still be tried this cycle.
+    pub fn return_guess(&mut self) {
+        if let BudgetMode::Metered { guesses_left, .. } = &mut self.mode {
+            *guesses_left = (*guesses_left + 1).min(MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE);
+        }
+    }
+
     /// The Portal refused a join for a reason that holds node-wide: nothing
     /// else this cycle.
     pub fn close(&mut self, code: &str) {
