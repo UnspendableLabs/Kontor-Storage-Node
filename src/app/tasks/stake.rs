@@ -950,6 +950,20 @@ impl StakeTracker {
         self.lock().pending_ops_checked = false;
     }
 
+    /// The highest nonce among the ops and joins this tracker still waits
+    /// for. A client built for a new activation starts its counter at Kontor's
+    /// `next_nonce`, which is at or below every one of them.
+    #[must_use]
+    pub fn highest_tracked_nonce(&self) -> Option<u64> {
+        let state = self.lock();
+        state
+            .in_flight
+            .iter()
+            .map(|op| op.nonce)
+            .chain(state.pending_joins.iter().map(|join| join.nonce))
+            .max()
+    }
+
     /// Take the newest op the Portal still holds for this node — `queued` or
     /// `submitted`, from `GET /api/nodes/{node_id}/ops?status=queued|submitted`
     /// — as the op in flight, when none is tracked.
@@ -2439,6 +2453,18 @@ pub async fn bootstrap_stake(
     tracker: &Arc<StakeTracker>,
     writer: &mut impl Write,
 ) -> std::io::Result<()> {
+    // The tracker outlives activations; `client` does not. A node onboarded
+    // again in the same process (`/admin` can re-register a running node)
+    // gets a client whose nonce counter starts over at Kontor's `next_nonce`,
+    // and the daemon it replaces may have been stopped in the middle of a
+    // relay request the Portal went on to store. So each activation moves the
+    // new counter past what the tracker still waits for, and reads the
+    // Portal's listing again before anything is signed.
+    tracker.recheck_pending_ops();
+    if let Some(nonce) = tracker.highest_tracked_nonce() {
+        client.raise_nonce_above(nonce);
+    }
+
     let entry = match client.resync_from_registry().await {
         Ok(entry) => entry,
         Err(err) => {
@@ -5046,5 +5072,72 @@ mod tests {
         assert_eq!(manage_stake(&client, &tracker, None).await, None);
         assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
         assert_eq!(tracker.plan(t0, None), None, "waited for, not signed again");
+    }
+    fn signer_entry_json(next_nonce: u64, balance: &str, stake: &str) -> Value {
+        json!({
+            "signer_id": 42, "x_only_pubkey": "ab", "bls_pubkey": null,
+            "next_nonce": next_nonce, "kor_balance": balance,
+            "stake": stake, "stake_reserved": "0", "stake_available": stake,
+            "stake_withdrawal_height": null, "bond_cleanup_pending": false,
+            "reward_balance": "0"
+        })
+    }
+
+    /// The tracker outlives an activation, the client does not. Onboarded
+    /// again in the same process, the node used to keep "listing already
+    /// read" from the first activation: an `add-stake` the stopped daemon had
+    /// sent — stored by the Portal, its answer never read — was neither
+    /// adopted nor known, and the new daemon signed the top-up again. Each
+    /// activation now reads the listing again, and starts the new client's
+    /// counter past the nonces the tracker still waits for.
+    #[tokio::test]
+    async fn a_new_activation_reads_the_listing_again_and_keeps_its_nonces() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(signer_entry_json(10, "1000", "0")),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ops_page(json!([queued_add_stake("990", 12)]))),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        // The first activation read the listing, and has a join in flight.
+        let tracker = Arc::new(StakeTracker::new(StakePolicy::default()));
+        let t0 = Instant::now();
+        tracker.adopt_pending_ops(&[], t0);
+        tracker.record_join("AGR-1", kor("1"), 14, t0);
+        assert!(tracker.pending_ops_checked());
+
+        // The second starts a client at Kontor's next_nonce.
+        let client = client_at(&mock_server, 10);
+        bootstrap_stake(&client, &tracker, &mut Vec::new())
+            .await
+            .unwrap();
+        let status = tracker.status();
+        assert_eq!(status["in_flight"]["op"], "add_stake");
+        assert_eq!(status["in_flight"]["amount"], "990");
+        assert_eq!(
+            client.current_nonce(),
+            Some(15),
+            "past the join the tracker waits for and the op the Portal holds"
+        );
     }
 }
