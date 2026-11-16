@@ -1553,11 +1553,19 @@ pub(crate) async fn rebuild_ledger(
     database: &DatabaseConnection,
     storage_root: &Path,
 ) -> Result<LedgerStats> {
+    // Every agreement this node has prepared a file for, whether the file is
+    // still stored or was removed once the membership ended (see
+    // [`remove_ended_files`]): a slot only needs the root, the padded length
+    // and the ledger index, not the bytes. Dropping the removed ones would
+    // lower the file count while the highest slot stays, and a node leaving
+    // many agreements would run into kontor-crypto's sparsity limit — and
+    // lose the ledger its remaining proofs are made against.
     let downloaded = Agreements::find()
-        .filter(agreements::Column::Downloaded.eq(true))
+        .filter(agreements::Column::Root.is_not_null())
+        .filter(agreements::Column::PaddedLen.is_not_null())
         .all(database)
         .await
-        .context("loading downloaded agreements for ledger rebuild")?;
+        .context("loading the prepared agreements for ledger rebuild")?;
 
     let mut entries: Vec<IndexedFile> = Vec::with_capacity(downloaded.len());
     let mut stats = LedgerStats::default();

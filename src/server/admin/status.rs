@@ -139,8 +139,9 @@ fn registration_status(state: &DownloadServerState) -> Value {
 async fn ledger_status(state: &DownloadServerState) -> Result<Value, ApiError> {
     // Same split as `rebuild_ledger`: a row missing `root`/`padded_len` was
     // never post-processed and is neither placed nor waiting on a slot.
+    // A file removed after its membership ended keeps its slot (see
+    // `rebuild_ledger`), so `downloaded` is not part of the predicate.
     let described = Agreements::find()
-        .filter(agreements::Column::Downloaded.eq(true))
         .filter(agreements::Column::Root.is_not_null())
         .filter(agreements::Column::PaddedLen.is_not_null());
 
