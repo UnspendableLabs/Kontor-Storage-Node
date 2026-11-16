@@ -447,6 +447,8 @@ async fn serve(
     }
 
     let config = Arc::new(config);
+    let daemon = TaskSlot::default();
+    let watcher = TaskSlot::default();
     let supervisor = tokio::spawn(
         Supervisor {
             config: config.clone(),
@@ -454,8 +456,8 @@ async fn serve(
             parts: parts.clone(),
             runtime: runtime.clone(),
             writer,
-            daemon: None,
-            watcher: None,
+            daemon: daemon.clone(),
+            watcher: watcher.clone(),
             keystore: None,
             migrating: None,
             retry_in: None,
@@ -480,8 +482,42 @@ async fn serve(
 
     supervisor.abort();
     let _ = supervisor.await;
+    // The supervisor's tasks do not end with it: a spawned task outlives the
+    // handle that is dropped. The daemon in particular now runs until it is
+    // told to stop, holding its lock, so it is stopped here — and waited for,
+    // like everywhere else it is stopped.
+    stop_task(&daemon).await;
+    stop_task(&watcher).await;
 
     outcome
+}
+
+/// Where a background task's handle is kept, shared between the supervisor
+/// that starts and replaces the task and the shutdown path that ends it.
+type TaskSlot = Arc<std::sync::Mutex<Option<JoinHandle<()>>>>;
+
+/// Stop the task in `slot`, if any, and **wait for it to be gone**.
+///
+/// The await is the whole point. `abort()` only schedules cancellation, and
+/// the daemon holds its lock until its guard drops; re-spawning before that
+/// lands means the new daemon finds the old one's lock genuinely held and
+/// has to wait for it.
+async fn stop_task(slot: &TaskSlot) {
+    let handle = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// Put a freshly spawned task in `slot`.
+fn keep_task(slot: &TaskSlot, handle: JoinHandle<()>) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 }
 
 /// Open the keystore, migrating a legacy node into one if that is what this
@@ -514,8 +550,8 @@ struct Supervisor {
     parts: ServerParts,
     runtime: NodeRuntime,
     writer: SharedWriter,
-    daemon: Option<JoinHandle<()>>,
-    watcher: Option<JoinHandle<()>>,
+    daemon: TaskSlot,
+    watcher: TaskSlot,
     /// Kept so the node can be onboarded again without the operator supplying
     /// anything: unsealing a raw slot is one AEAD open, so re-deriving the keys
     /// is cheaper than keeping a `NodeKeys` alive across every await.
@@ -832,7 +868,7 @@ impl Supervisor {
             public,
         ));
 
-        self.daemon = Some(spawn_portal_daemon(
+        let daemon = spawn_portal_daemon(
             authenticated,
             self.parts.conn.clone(),
             self.config.portal_polling_interval,
@@ -846,7 +882,8 @@ impl Supervisor {
             self.config.storage_dir.clone(),
             staking,
             Some(self.faucet.clone()),
-        ));
+        );
+        keep_task(&self.daemon, daemon);
 
         writeln!(
             self.writer,
@@ -889,7 +926,7 @@ impl Supervisor {
 
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        self.watcher = Some(tokio::spawn(async move {
+        let watcher = tokio::spawn(async move {
             // The last outcome reported, so a Portal that keeps giving the same
             // answer is logged once rather than every tick — which would bury
             // the line that says which address has to be whitelisted.
@@ -945,7 +982,8 @@ impl Supervisor {
                     }
                 }
             }
-        }));
+        });
+        keep_task(&self.watcher, watcher);
     }
 
     /// Land in [`Phase::Failed`] with the reason on record, and arrange to try
@@ -1002,26 +1040,13 @@ impl Supervisor {
         self.runtime.enter(Phase::Failed);
     }
 
-    /// Stop the daemon and **wait for it to be gone**.
-    ///
-    /// The await is the whole point. `abort()` only schedules cancellation, and
-    /// the daemon holds its lock until its guard drops; re-spawning before that
-    /// lands means the new daemon finds the old one's lock genuinely held,
-    /// reports "another daemon is already running" into a log line, and quietly
-    /// never runs. A node that serves files while proving nothing looks healthy
-    /// from outside, which is the worst way to fail.
+    /// Stop the daemon and wait for it to be gone — see [`stop_task`].
     async fn stop_daemon(&mut self) {
-        if let Some(handle) = self.daemon.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        stop_task(&self.daemon).await;
     }
 
     async fn stop_watcher(&mut self) {
-        if let Some(handle) = self.watcher.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        stop_task(&self.watcher).await;
     }
 }
 

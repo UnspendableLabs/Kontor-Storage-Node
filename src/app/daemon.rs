@@ -13,9 +13,12 @@ use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
 use crate::node::faucet::{fund_if_unfunded, Faucet};
 use anyhow::{anyhow, Context, Result};
+use futures_util::FutureExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
+use std::convert::Infallible;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -50,6 +53,13 @@ pub(crate) struct DaemonMemory {
     pub faucet: Option<Arc<Faucet>>,
 }
 
+/// Wait before a daemon that stopped is started again; doubles up to
+/// [`MAX_BACKOFF`].
+#[cfg(not(test))]
+const DAEMON_RESTART_MIN: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DAEMON_RESTART_MIN: Duration = Duration::from_millis(20);
+
 /// Starts the portal synchronization daemon that periodically fetches agreements
 /// ready to be signed, stores the new ones locally, and downloads their files.
 ///
@@ -58,6 +68,12 @@ pub(crate) struct DaemonMemory {
 /// `faucet` is shared with the startup step the same way: a node the Portal
 /// could not read at startup is funded by the first cycle that reads it as
 /// new.
+///
+/// The task only ends when it is aborted. A daemon that stops — its lock
+/// could not be taken, or a cycle panicked — is started again after a wait:
+/// nothing else watches this task, and a node that goes on serving files with
+/// no daemon behind it proves nothing while every challenge it is sent
+/// expires, slashed.
 // Nine plain inputs, each from a different part of the configuration;
 // bundling them would only move the list into a struct used exactly here.
 #[allow(clippy::too_many_arguments)]
@@ -73,24 +89,64 @@ pub fn spawn_portal_daemon(
     faucet: Option<Arc<Faucet>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run_portal_daemon(
-            portal_client,
-            database,
-            interval,
-            lock_path,
-            storage_limits,
-            storage_backend,
-            storage_dir,
-            staking,
-            faucet,
-        )
-        .await
-        {
-            error!("portal daemon stopped with error: {err:#}");
+        let mut restart_in = DAEMON_RESTART_MIN;
+        loop {
+            let started = Instant::now();
+            // In this task, not one of its own: aborting the handle then
+            // drops the daemon — and its lock — before the abort is reported
+            // as done, which is what `Supervisor::stop_daemon` waits for.
+            let run = AssertUnwindSafe(run_portal_daemon(
+                portal_client.clone(),
+                database.clone(),
+                interval,
+                lock_path.clone(),
+                storage_limits,
+                storage_backend.clone(),
+                storage_dir.clone(),
+                staking.clone(),
+                faucet.clone(),
+            ))
+            .catch_unwind()
+            .await;
+            match run {
+                Ok(Ok(never)) => match never {},
+                Ok(Err(err)) => {
+                    error!("portal daemon stopped with error: {err:#}; starting it again in {restart_in:?}");
+                }
+                Err(panic) => {
+                    error!(
+                        "portal daemon panicked: {}; starting it again in {restart_in:?}",
+                        panic_message(panic.as_ref())
+                    );
+                }
+            }
+            // A daemon that had been running for a while starts over at the
+            // short wait; one that stops as soon as it starts backs off.
+            if started.elapsed() > MAX_BACKOFF {
+                restart_in = DAEMON_RESTART_MIN;
+            }
+            time::sleep(restart_in).await;
+            restart_in = (restart_in * 2).min(MAX_BACKOFF);
         }
     })
 }
 
+/// What a panic said, for the log.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+/// Run the daemon until it is aborted.
+///
+/// Returns only if the lock cannot be taken. A failing cycle never ends it,
+/// the first one included: the cycle is tried again after a backoff. The
+/// first cycle and the startup reconciliation used to be the exception — one
+/// 5xx from the Portal while the node booted and the daemon was gone for the
+/// life of the process, the node still reporting `Running`.
 #[allow(clippy::too_many_arguments)]
 async fn run_portal_daemon(
     portal_client: PortalClient,
@@ -102,7 +158,7 @@ async fn run_portal_daemon(
     storage_dir: PathBuf,
     staking: Arc<StakeTracker>,
     faucet: Option<Arc<Faucet>>,
-) -> Result<()> {
+) -> Result<Infallible> {
     let memory = DaemonMemory {
         staking,
         proofs: ProofRetries::default(),
@@ -113,37 +169,38 @@ async fn run_portal_daemon(
     let _lock =
         LockFileGuard::acquire(lock_path).context("failed to acquire portal daemon lock")?;
 
-    if let Some(node_id) = portal_client.node_id() {
-        // Startup reconcile: ignore the failed-transitions counter. The nonce
-        // was just freshly read from the registry during onboarding, so there
-        // is no desync window to recover from at this point.
-        let _ = reconcile::reconcile_from_portal(
-            &portal_client,
-            &database,
-            node_id,
-            &storage_backend,
-            &storage_dir,
-            true,
-        )
-        .await
-        .context("startup reconciliation failed")?;
-    }
+    // The startup reconciliation differs from a cycle's in one thing: on GCS
+    // it fetches back the files the database has lost track of. It is tried
+    // before each cycle until it has succeeded once, so a Portal that was not
+    // reachable when the node booted delays it rather than cancels it.
+    let mut startup_reconciled = portal_client.node_id().is_none();
 
     // Run immediately, then on each tick.
-    sync_portal_once(
-        &portal_client,
-        &database,
-        storage_limits,
-        &storage_backend,
-        &storage_dir,
-        &memory,
-    )
-    .await
-    .context("initial portal sync failed")?;
-
     let mut current_backoff = interval;
     loop {
-        time::sleep(current_backoff).await;
+        if !startup_reconciled {
+            if let Some(node_id) = portal_client.node_id() {
+                // The failed-transitions counter is ignored: the nonce was
+                // freshly read from the registry during onboarding, so there
+                // is no desync window to recover from at this point.
+                match reconcile::reconcile_from_portal(
+                    &portal_client,
+                    &database,
+                    node_id,
+                    &storage_backend,
+                    &storage_dir,
+                    true,
+                )
+                .await
+                {
+                    Ok(_) => startup_reconciled = true,
+                    Err(err) => {
+                        warn!("startup reconciliation failed; trying again next cycle: {err:#}");
+                    }
+                }
+            }
+        }
+
         match sync_portal_once(
             &portal_client,
             &database,
@@ -174,6 +231,7 @@ async fn run_portal_daemon(
                 current_backoff = next_backoff;
             }
         }
+        time::sleep(current_backoff).await;
     }
 }
 
@@ -791,22 +849,49 @@ mod tests {
         let _ = fs::remove_file(&lock_path);
     }
 
-    #[tokio::test]
-    async fn run_portal_daemon_returns_error_when_initial_sync_fails() {
-        let mock_server = MockServer::start().await;
+    /// Waits until `count(requests)` reaches `at_least`, for at most 10 s.
+    async fn wait_for_requests(
+        mock_server: &MockServer,
+        at_least: usize,
+        count: impl Fn(&wiremock::Request) -> bool,
+    ) -> usize {
+        let start = time::Instant::now();
+        loop {
+            let seen = mock_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| count(request))
+                .count();
+            if seen >= at_least || start.elapsed() > Duration::from_secs(10) {
+                return seen;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
+    /// A first cycle that fails is retried like any other. It used to end the
+    /// daemon: one 5xx while the node booted, and it served files and proved
+    /// nothing until someone restarted it.
+    #[tokio::test]
+    async fn a_failing_first_cycle_does_not_stop_the_daemon() {
+        let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/agreements"))
             .and(query_param("status", "ready"))
             .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
             .mount(&mock_server)
             .await;
+        mount_empty_ready_agreements(&mock_server).await;
 
         let database = setup_in_memory_db().await;
-        let lock_path = unique_test_path("lock_error");
-        let storage_dir = unique_test_path("storage_error");
+        let lock_path = unique_test_path("lock_first_cycle");
+        let storage_dir = unique_test_path("storage_first_cycle");
+        fs::remove_file(&lock_path).ok();
 
-        let error = run_portal_daemon(
+        let handle = spawn_portal_daemon(
             PortalClient::new(mock_server.uri(), storage_dir.clone()),
             database,
             Duration::from_millis(5),
@@ -816,18 +901,129 @@ mod tests {
             storage_dir,
             Arc::new(StakeTracker::default()),
             None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("initial portal sync failed"),
-            "initial sync errors should be surfaced"
         );
+
+        let listings = wait_for_requests(&mock_server, 3, |request| {
+            request.url.path() == "/api/agreements"
+        })
+        .await;
+        assert!(
+            listings >= 3,
+            "the daemon went on after its first cycle failed, got {listings} listing(s)"
+        );
+        assert!(!handle.is_finished(), "the daemon is still running");
+        assert!(lock_is_held(&lock_path), "and still holds its lock");
+
+        handle.abort();
+        let _ = handle.await;
         assert!(
             !lock_is_held(&lock_path),
-            "the lock should be released even when an error occurs"
+            "the lock is released once the daemon is stopped"
         );
+    }
+
+    /// The startup reconciliation is tried again until it has succeeded: a
+    /// Portal that fails it does not take the daemon down with it.
+    #[tokio::test]
+    async fn a_failing_startup_reconciliation_does_not_stop_the_daemon() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements"))
+            .and(query_param("nodes", "NODE-test"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        mount_empty_node(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+
+        let database = setup_in_memory_db().await;
+        let lock_path = unique_test_path("lock_startup_reconcile");
+        let storage_dir = unique_test_path("storage_startup_reconcile");
+        fs::remove_file(&lock_path).ok();
+        fs::create_dir_all(&storage_dir).ok();
+
+        let handle = spawn_portal_daemon(
+            create_authenticated_portal_client(&mock_server.uri(), storage_dir.clone()),
+            database,
+            Duration::from_millis(5),
+            lock_path.clone(),
+            StorageLimits::default(),
+            StorageBackend::local(),
+            storage_dir,
+            Arc::new(StakeTracker::default()),
+            None,
+        );
+
+        // Two failures, then the startup reconciliation and a cycle's own.
+        let reconciliations = wait_for_requests(&mock_server, 4, |request| {
+            request.url.query().is_some_and(|q| q.contains("nodes="))
+        })
+        .await;
+        assert!(
+            reconciliations >= 4,
+            "reconciliation was tried again after failing, got {reconciliations}"
+        );
+        assert!(!handle.is_finished(), "the daemon is still running");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// A daemon that cannot take its lock is not gone for good: it is started
+    /// again, and runs once the lock is free.
+    #[tokio::test]
+    async fn a_daemon_that_could_not_start_is_started_again() {
+        let mock_server = MockServer::start().await;
+        mount_empty_ready_agreements(&mock_server).await;
+
+        let database = setup_in_memory_db().await;
+        let lock_path = unique_test_path("lock_restart");
+        let storage_dir = unique_test_path("storage_restart");
+        fs::remove_file(&lock_path).ok();
+        let held = LockFileGuard::acquire(lock_path.clone()).unwrap();
+
+        let handle = spawn_portal_daemon(
+            PortalClient::new(mock_server.uri(), storage_dir.clone()),
+            database,
+            Duration::from_millis(5),
+            lock_path.clone(),
+            StorageLimits::default(),
+            StorageBackend::local(),
+            storage_dir,
+            Arc::new(StakeTracker::default()),
+            None,
+        );
+
+        time::sleep(DAEMON_RESTART_MIN * 3).await;
+        assert!(
+            !handle.is_finished(),
+            "it keeps trying while the lock is held"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "and runs no cycle without the lock"
+        );
+
+        drop(held);
+        let listings = wait_for_requests(&mock_server, 1, |request| {
+            request.url.path() == "/api/agreements"
+        })
+        .await;
+        assert!(listings >= 1, "the daemon started once the lock was free");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn panic_message_reads_both_kinds_of_payload() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("boom");
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(String::from("boom 2"));
+        let other: Box<dyn std::any::Any + Send> = Box::new(7u8);
+        assert_eq!(panic_message(literal.as_ref()), "boom");
+        assert_eq!(panic_message(formatted.as_ref()), "boom 2");
+        assert_eq!(panic_message(other.as_ref()), "no message");
     }
 
     /// The page the Portal serves for `agreements` under either listing.
@@ -1028,49 +1224,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!stored.downloaded, "left for the next cycle");
-    }
-
-    #[tokio::test]
-    async fn run_portal_daemon_logs_when_daemon_task_fails() {
-        // Force the daemon spawned via spawn_portal_daemon to hit the error
-        // logging branch (line 52) by making the initial sync fail.
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/agreements"))
-            .and(query_param("status", "ready"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&mock_server)
-            .await;
-
-        let database = setup_in_memory_db().await;
-        let lock_path = unique_test_path("lock_spawn_error");
-        let storage_dir = unique_test_path("storage_spawn_error");
-        fs::remove_file(&lock_path).ok();
-
-        let handle = spawn_portal_daemon(
-            PortalClient::new(mock_server.uri(), storage_dir.clone()),
-            database,
-            Duration::from_millis(5),
-            lock_path.clone(),
-            StorageLimits::default(),
-            StorageBackend::local(),
-            storage_dir,
-            Arc::new(StakeTracker::default()),
-            None,
-        );
-
-        // Wait for the daemon to fail and exit on its own. The spawned task
-        // should complete because run_portal_daemon returns Err on initial sync failure.
-        let res = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        assert!(
-            res.is_ok(),
-            "daemon task should exit after logging the error"
-        );
-        assert!(
-            !lock_is_held(&lock_path),
-            "the lock should be released after the daemon exits"
-        );
     }
 
     fn create_authenticated_portal_client(
