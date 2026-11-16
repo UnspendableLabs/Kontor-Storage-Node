@@ -356,7 +356,9 @@
     </p>
     <p class="muted">
       When nothing is held any more and the delay has passed by the node's
-      count, it withdraws the bond itself, and bonds nothing again. The node
+      count, it withdraws the bond itself, and bonds nothing again — not after
+      a restart either: the exit is recorded, and only <strong>Resume
+      staking</strong> below puts the stake policy back in force. The node
       cannot see the chain tip, so it times the delay assuming 10-minute blocks;
       <strong>Withdraw</strong> tries it now, by hand. Kontor refuses a withdrawal
       while any agreement or open challenge holds part of the bond. Nothing is
@@ -368,6 +370,7 @@
       <select id="exit-action">
         <option value="begin_unstake" data-phrase="UNSTAKE">Begin unstake</option>
         <option value="withdraw_stake" data-phrase="WITHDRAW">Withdraw the bond</option>
+        <option value="resume_stake" data-phrase="STAKE">Resume staking (after an exit)</option>
       </select>
       <label class="muted" for="exit-confirm">Type <code id="exit-phrase">UNSTAKE</code> to confirm</label>
       <input type="text" id="exit-confirm" placeholder="UNSTAKE" autocomplete="off">
@@ -769,7 +772,10 @@
     }
 
     var policy = staking.policy || {};
-    $("staking-policy").textContent = policy.auto_stake === false
+    $("staking-policy").textContent = staking.exited === true
+      ? "paused — this node has exited and bonds nothing on its own, across restarts too; " +
+        "\"Resume staking\" below puts the policy back in force"
+      : policy.auto_stake === false
       ? "off — this node signs no stake or claim op on its own"
       : "on — bonds " + (policy.stake_target ? "up to " + policy.stake_target + " KOR" : "everything") +
         " above a " + policy.gas_reserve + " KOR gas reserve; claims rewards from " +
@@ -1207,7 +1213,9 @@
     var action = $("exit-action").value;
     var warning = action === "begin_unstake"
       ? "Begin the unstake? This node will stop taking on agreements for good."
-      : "Withdraw the whole bond? Kontor refuses it while any agreement still holds collateral.";
+      : action === "resume_stake"
+        ? "Resume staking? The node will bond its balance again as its stake policy says."
+        : "Withdraw the whole bond? Kontor refuses it while any agreement still holds collateral.";
     if (!window.confirm(warning)) { return; }
 
     $("exit-submit").disabled = true;

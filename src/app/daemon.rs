@@ -1753,9 +1753,14 @@ mod tests {
         let client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 3);
         let memory = DaemonMemory::default();
 
-        crate::app::tasks::stake::bootstrap_stake(&client, &memory.staking, &mut Vec::new())
-            .await
-            .unwrap();
+        crate::app::tasks::stake::bootstrap_stake(
+            &client,
+            &database,
+            &memory.staking,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(client.current_nonce(), Some(4), "the top-up took nonce 3");
 
         sync_portal_once(

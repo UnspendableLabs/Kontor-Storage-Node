@@ -1,8 +1,9 @@
-//! `POST /api/admin/stake` — start an unstake, or withdraw the bond.
+//! `POST /api/admin/stake` — start an unstake, withdraw the bond, or resume
+//! staking after an exit.
 //!
-//! The two operator decisions the stake policy never makes on its own. Both
-//! are one-way enough to deserve the reset's treatment — a typed confirmation
-//! phrase — and neither is signed here. The handler only queues the op on the
+//! The operator decisions the stake policy never makes on its own. Each is
+//! weighty enough to deserve the reset's treatment — a typed confirmation
+//! phrase — and none is signed here. The handler only queues the op on the
 //! daemon's [`StakeTracker`](crate::app::tasks::stake::StakeTracker), and the
 //! daemon signs it on its next cycle: the daemon is the only thing that holds
 //! the authenticated client, and keeping it the only signer means the nonce
@@ -20,6 +21,15 @@
 //!   estimate of when the delay ends. Kontor refuses it before that height or
 //!   while any agreement or open challenge holds part of the bond; the refusal
 //!   shows as an op that landed without the stake moving.
+//!
+//! And one that touches nothing on Kontor:
+//!
+//! - `resume_stake` ends the standstill an exit leaves behind. A node whose
+//!   bond came back bonds nothing more on its own, and keeps to that across
+//!   restarts (the exit is recorded in its database) — otherwise the first
+//!   unattended restart would put the returned balance back at stake, two
+//!   weeks from being withdrawable again. Resuming puts the configured stake
+//!   policy back in force from the daemon's next cycle.
 
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -34,11 +44,13 @@ use crate::server::state::DownloadServerState;
 pub const UNSTAKE_PHRASE: &str = "UNSTAKE";
 /// Phrase that arms `withdraw_stake`.
 pub const WITHDRAW_PHRASE: &str = "WITHDRAW";
+/// Phrase that arms `resume_stake`.
+pub const RESUME_PHRASE: &str = "STAKE";
 
 /// Request body for `POST /api/admin/stake`.
 #[derive(Debug, Default, Deserialize)]
 pub struct StakeActionRequest {
-    /// `begin_unstake` or `withdraw_stake`.
+    /// `begin_unstake`, `withdraw_stake` or `resume_stake`.
     #[serde(default)]
     pub action: String,
     /// Must equal the action's phrase.
@@ -46,24 +58,31 @@ pub struct StakeActionRequest {
     pub confirm: String,
 }
 
-/// Queue the requested op for the daemon's next cycle.
+/// Queue the requested op for the daemon's next cycle, or — for
+/// `resume_stake` — put the stake policy of a node that has exited back in
+/// force.
 ///
 /// # Errors
 /// - `400 CONFIRMATION_REQUIRED` for an unknown action or a wrong phrase.
 /// - `409 STAKE_UNAVAILABLE` when no daemon is running to sign it, the bond
-///   has not been read yet, the bond's state rules the action out, or another
-///   request is already waiting.
+///   has not been read yet, the bond's state rules the action out, another
+///   request is already waiting, or — for `resume_stake` — the node has not
+///   exited.
 pub fn request_stake_action(
     request: &StakeActionRequest,
     state: &DownloadServerState,
 ) -> Result<Value, ApiError> {
     let (op, phrase) = match request.action.as_str() {
-        "begin_unstake" => (NodeOp::BeginUnstake, UNSTAKE_PHRASE),
-        "withdraw_stake" => (NodeOp::WithdrawStake, WITHDRAW_PHRASE),
+        "begin_unstake" => (Some(NodeOp::BeginUnstake), UNSTAKE_PHRASE),
+        "withdraw_stake" => (Some(NodeOp::WithdrawStake), WITHDRAW_PHRASE),
+        "resume_stake" => (None, RESUME_PHRASE),
         other => {
             return Err(ApiError::bad_request(
                 error_codes::CONFIRMATION_REQUIRED,
-                format!("unknown action {other:?}: expected begin_unstake or withdraw_stake"),
+                format!(
+                    "unknown action {other:?}: expected begin_unstake, withdraw_stake or \
+                     resume_stake"
+                ),
             ))
         }
     };
@@ -88,6 +107,13 @@ pub fn request_stake_action(
         ));
     }
     let tracker = state.runtime.staking();
+    let Some(op) = op else {
+        tracker.resume_staking().map_err(unavailable)?;
+        return Ok(json!({
+            "resumed": true,
+            "message": "resumed: the stake policy is in force again from the daemon's next cycle",
+        }));
+    };
     let Some(snapshot) = tracker.snapshot() else {
         return Err(unavailable(
             "the Portal has not reported this node's stake yet; try again after the next cycle",
@@ -274,5 +300,30 @@ mod tests {
         state.runtime = NodeRuntime::new(Phase::Sealed, Default::default());
         let err = request_stake_action(&request("begin_unstake", "UNSTAKE"), &state).unwrap_err();
         assert_eq!(err.code, error_codes::STAKE_UNAVAILABLE);
+    }
+    /// A node that has exited bonds nothing on its own until the operator
+    /// says so. Resuming is that word: it needs its phrase, and is refused
+    /// on a node that never exited.
+    #[tokio::test]
+    async fn staking_is_resumed_after_an_exit_and_only_then() {
+        let (state, _dir) = state().await;
+        let tracker = state.runtime.staking();
+        observe(&state, "100", None);
+        let err = request_stake_action(&request("resume_stake", "STAKE"), &state).unwrap_err();
+        assert_eq!(err.code, error_codes::STAKE_UNAVAILABLE, "not exited");
+
+        // The exit: a withdrawal pending, then the bond gone.
+        observe(&state, "100", Some(5000));
+        observe(&state, "0", None);
+        assert_eq!(tracker.status()["exited"], true);
+
+        let err = request_stake_action(&request("resume_stake", "UNSTAKE"), &state).unwrap_err();
+        assert_eq!(err.code, error_codes::CONFIRMATION_REQUIRED);
+        assert_eq!(tracker.status()["exited"], true);
+
+        let value = request_stake_action(&request("resume_stake", "STAKE"), &state).unwrap();
+        assert_eq!(value["resumed"], true);
+        assert_eq!(tracker.status()["exited"], false);
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
     }
 }

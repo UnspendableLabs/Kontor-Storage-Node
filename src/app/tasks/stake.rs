@@ -26,7 +26,9 @@
 //!   estimate instead (see [`JoinBudget::decide`]).
 //! - **Exit.** Once the operator's `begin-unstake` has executed, the node leaves
 //!   its agreements one op per cycle and, when none is left, withdraws the bond
-//!   (see [`ExitInputs`]).
+//!   (see [`ExitInputs`]). A node that has exited bonds nothing more on its
+//!   own, and that is recorded in its database: a restart does not put the
+//!   returned bond back at stake. The operator resumes staking from `/admin`.
 //!
 //! # Knowing when an op has landed
 //!
@@ -617,8 +619,19 @@ struct TrackerState {
     /// last one (see [`StakeTracker::classify_landed`]).
     withdraw_retry: Option<Duration>,
     /// The bond came back: the operator left the network. Nothing more is
-    /// bonded automatically, whatever auto-stake says.
+    /// bonded automatically, whatever auto-stake says — in this process and,
+    /// by the record kept in the database, in the next ones — until the
+    /// operator resumes staking from `/admin` (see [`StakeTracker::resume_staking`]).
     exited: bool,
+    /// What the database holds as "the exit is over", as far as this process
+    /// knows. Compared with `exited` to decide what to write (see
+    /// [`persist_withdrawal_start`]).
+    persisted_exited: bool,
+    /// The database has been read for an earlier process's record of a
+    /// finished exit. Until it has, nothing is bonded automatically: a
+    /// top-up planned before the record is read would put back at stake the
+    /// bond an exit has just returned.
+    exit_record_read: bool,
     /// The exit as of the last plan, for `/admin`.
     exit: Option<ExitInputs>,
 }
@@ -660,6 +673,27 @@ impl TrackerState {
             unsettled: *unsettled,
             requested: *requested,
         });
+    }
+
+    /// The exit whose withdrawal delay an earlier process recorded as started
+    /// at `started_at` ended while no process was watching: the first read
+    /// shows no bond and no withdrawal pending. Withdrawn, or slashed to
+    /// zero; either way the node is out, and stays out.
+    fn end_exit_unseen(&mut self, started_at: DateTime<Utc>) {
+        if self.exited {
+            return;
+        }
+        warn!(
+            "an exit was under way (its withdrawal delay started at {}) and no stake is bonded \
+             any more: it ended while this node was not running. This node bonds nothing more \
+             on its own; resume staking from /admin to bond again",
+            started_at.to_rfc3339()
+        );
+        self.exited = true;
+        self.last_event = Some((
+            Utc::now(),
+            "the exit ended while the node was not running".to_string(),
+        ));
     }
 
     /// Put an operator's op that never ran back as a request, unless another
@@ -721,6 +755,8 @@ impl StakeTracker {
         Self {
             state: Mutex::new(TrackerState {
                 policy,
+                // No database behind a unit test's tracker: nothing to read.
+                exit_record_read: true,
                 ..TrackerState::default()
             }),
         }
@@ -802,16 +838,23 @@ impl StakeTracker {
         // before the daemon reads the database) that shows no withdrawal
         // pending outranks the record: the exit it belonged to is over, and
         // the row is stale. Left as it is, it is cleared on the next persist.
-        if state
+        if let Some(snapshot) = state
             .last_known
             .as_ref()
-            .is_some_and(|snapshot| snapshot.withdrawal_height.is_none())
+            .filter(|snapshot| snapshot.withdrawal_height.is_none())
         {
-            warn!(
-                "the database records a withdrawal delay started at {}, but no withdrawal is \
-                 pending; the record is stale and is cleared",
-                started_at.to_rfc3339()
-            );
+            if snapshot.stake.is_zero() {
+                // An exit was under way when the last process stopped, and
+                // now there is neither a bond nor a withdrawal pending: it
+                // ended while nobody was watching. The exit is over.
+                state.end_exit_unseen(started_at);
+            } else {
+                warn!(
+                    "the database records a withdrawal delay started at {}, but no withdrawal \
+                     is pending and a stake is bonded; the record is stale and is cleared",
+                    started_at.to_rfc3339()
+                );
+            }
             return;
         }
         let head_start = (Utc::now() - started_at).to_std().unwrap_or_default();
@@ -848,6 +891,61 @@ impl StakeTracker {
     /// The database now holds `started_at` as the start of the delay.
     pub fn withdrawal_start_persisted(&self, started_at: Option<DateTime<Utc>>) {
         self.lock().persisted_withdrawal_start = started_at;
+    }
+
+    /// What an earlier process recorded in the database: whether the node had
+    /// finished an exit (see [`restore_withdrawal_start`]). From here on the
+    /// policy may bond again — or, if it had exited, may not.
+    pub fn restore_exited(&self, recorded: bool) {
+        let mut state = self.lock();
+        state.exit_record_read = true;
+        state.persisted_exited = recorded;
+        if !recorded || state.exited {
+            return;
+        }
+        // A read this process already made that shows a stake bonded with no
+        // withdrawal pending outranks the record: the node stakes again, and
+        // the row is cleared on the next persist.
+        if state.last_known.as_ref().is_some_and(|snapshot| {
+            !snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none()
+        }) {
+            return;
+        }
+        info!(
+            "this node has exited: it bonds nothing on its own until staking is resumed from \
+             /admin"
+        );
+        state.exited = true;
+    }
+
+    /// Whether the database should be told the exit is over, or no longer
+    /// is: `Some` when it does not hold what the tracker says. Nothing until
+    /// the record has been read.
+    #[must_use]
+    pub fn exited_to_persist(&self) -> Option<bool> {
+        let state = self.lock();
+        (state.exit_record_read && state.exited != state.persisted_exited).then_some(state.exited)
+    }
+
+    /// The database now holds `exited`.
+    pub fn exited_persisted(&self, exited: bool) {
+        self.lock().persisted_exited = exited;
+    }
+
+    /// The operator, from `/admin`, puts a node that has exited back in the
+    /// network: the policy bonds again as configured, from the next cycle.
+    ///
+    /// # Errors
+    /// If the node has not exited: there is nothing to resume.
+    pub fn resume_staking(&self) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        if !state.exited {
+            return Err("this node has not exited: its stake policy is already in force");
+        }
+        state.exited = false;
+        state.last_event = Some((Utc::now(), "staking resumed from /admin".to_string()));
+        info!("staking resumed from /admin: the stake policy is in force again");
+        Ok(())
     }
 
     /// Whether the node is in its exit: the operator's unstake has executed.
@@ -1020,24 +1118,36 @@ impl StakeTracker {
         // height for as well. The exit is over either way, and nothing is
         // bonded again; `describe_transition` says which it was.
         //
-        // Only a withdrawal height this process has read counts as an exit
-        // under way. A start restored from the database is not one: the row
-        // outlives a withdrawal when the process died between the read that
-        // saw the bond come back and the write that clears it, and on that
-        // evidence alone a restarted node would never bond again — against
-        // what the log promised the operator. Such a row is cleared below
-        // (no height, no timer) and the policy goes on as configured.
+        //
+        // On this process's first read, the start of a withdrawal delay
+        // restored from the database says the same of the process before it:
+        // an exit was under way when it stopped. No bond and no withdrawal
+        // now, and that exit ended while nobody was watching — the withdrawal
+        // landed just after the process died, typically. It used to be taken
+        // for a stale row, and the restarted node bonded the returned
+        // balance again.
         let was_exiting = state
             .last_known
             .as_ref()
             .is_some_and(|previous| previous.withdrawal_height.is_some());
-        if was_exiting && snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
+        let exit_ended = snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none();
+        if was_exiting && exit_ended {
             state.exited = true;
+        }
+        if let (None, Some(timer), true) = (&state.last_known, state.withdrawal, exit_ended) {
+            state.end_exit_unseen(timer.started_at);
+        }
+        // A bond with no withdrawal pending is a node that stakes: whatever
+        // said it had exited — a record older than the stake — no longer
+        // holds.
+        if state.exited && !snapshot.stake.is_zero() && snapshot.withdrawal_height.is_none() {
+            info!("a stake is bonded and no withdrawal is pending: the recorded exit is over");
+            state.exited = false;
         }
         if state.exited && !exited_before && snapshot.bond_cleanup_pending == Some(false) {
             warn!(
-                "the bond has been withdrawn: this node bonds nothing more on its own. Set \
-                 KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will stake again"
+                "the bond has been withdrawn: this node bonds nothing more on its own, and a \
+                 restart does not change that. Resume staking from /admin to bond again"
             );
         }
         if snapshot.withdrawal_height.is_some() {
@@ -1834,7 +1944,7 @@ impl StakeTracker {
             return None;
         }
 
-        if !state.exited {
+        if !state.exited && state.exit_record_read {
             if let Some(amount) = top_up_amount(&state.policy, snapshot) {
                 let op = NodeOp::AddStake(amount);
                 if !refused_recently(state, &op, now) {
@@ -2272,8 +2382,9 @@ fn describe_transition(previous: &StakeSnapshot, current: &StakeSnapshot) -> Opt
             warn!(
                 "the exit is over: no stake is bonded and no withdrawal is pending, but the \
                  Portal could not say whether bond cleanup is pending, so whether the bond was \
-                 withdrawn or slashed to zero is not known. This node bonds nothing more on its \
-                 own; check the balance before restarting it with auto-stake on"
+                                  withdrawn or slashed to zero is not known. This node bonds nothing more on its \
+                 own, across restarts too; check the balance, and resume staking from /admin \
+                 to bond again"
             );
             event =
                 Some("exit over: withdrawn or slashed, the Portal could not say which".to_string());
@@ -2281,9 +2392,9 @@ fn describe_transition(previous: &StakeSnapshot, current: &StakeSnapshot) -> Opt
         (Some(_), None) if current.bond_cleanup_pending == Some(true) => {
             warn!(
                 "the exit ended in a slash: the stake went to zero before it was withdrawn, \
-                 and Kontor cleared the withdrawal with it. This node bonds nothing more on \
-                 its own; set KONTOR_STORAGE_AUTO_STAKE=false before restarting it, or it will \
-                 stake again once bond cleanup is done"
+                                  and Kontor cleared the withdrawal with it. This node bonds nothing more on \
+                 its own, across restarts too; resume staking from /admin to bond again once \
+                 bond cleanup is done"
             );
             event = Some("slashed to zero during the exit: nothing left to withdraw".to_string());
         }
@@ -2479,9 +2590,16 @@ const UNRESOLVED: [&str; 3] = ["active", "proved", "submitted"];
 /// as an RFC 3339 timestamp.
 pub const WITHDRAWAL_STARTED_AT: &str = "stake_withdrawal_started_at";
 
-/// Read the start of the withdrawal delay an earlier process recorded, if any,
-/// into the tracker. Once per process, before the first cycle's read is acted
-/// on.
+/// The `node_state` key that records a finished exit: present, with the
+/// moment it was recorded as an RFC 3339 timestamp, from when the bond came
+/// back until the operator resumes staking from `/admin`.
+pub const EXITED_AT: &str = "stake_exited_at";
+
+/// Read what an earlier process recorded about the node's exit into the
+/// tracker: the start of the withdrawal delay, if one was running, and
+/// whether the exit had finished. Once per process, before anything is
+/// planned from it — the policy bonds nothing until the second is known (see
+/// [`StakeTracker::restore_exited`]).
 ///
 /// A row that does not hold a timestamp is deleted and reported, and the
 /// tracker counts from this process: a record nothing can read would
@@ -2499,6 +2617,13 @@ pub async fn restore_withdrawal_start(
 ) -> anyhow::Result<()> {
     use crate::entities::prelude::NodeState;
     use sea_orm::EntityTrait;
+
+    let exited = NodeState::find_by_id(EXITED_AT)
+        .one(database)
+        .await
+        .context("reading whether the node has exited")?
+        .is_some();
+    tracker.restore_exited(exited);
 
     let row = NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
         .one(database)
@@ -2526,12 +2651,13 @@ pub async fn restore_withdrawal_start(
     Ok(())
 }
 
-/// Record the start of the withdrawal delay as the tracker counts it, or clear
-/// the record once the withdrawal is over. A no-op while the database already
-/// says the same.
+/// Record the exit as the tracker has it: the start of the withdrawal delay
+/// as it counts it, cleared once the withdrawal is over, and that the exit
+/// has finished, cleared when the operator resumes staking. A no-op while
+/// the database already says the same.
 ///
 /// # Errors
-/// If the row cannot be written; the next cycle tries again.
+/// If a row cannot be written; the next cycle tries again.
 pub async fn persist_withdrawal_start(
     database: &DatabaseConnection,
     tracker: &StakeTracker,
@@ -2539,6 +2665,34 @@ pub async fn persist_withdrawal_start(
     use crate::entities::node_state;
     use crate::entities::prelude::NodeState;
     use sea_orm::{ActiveValue, EntityTrait};
+
+    // The finished exit first: it is what keeps a restart from bonding the
+    // returned balance again, and must not wait behind the other row.
+    if let Some(exited) = tracker.exited_to_persist() {
+        if exited {
+            let now = Utc::now();
+            let row = node_state::ActiveModel {
+                key: ActiveValue::Set(EXITED_AT.to_string()),
+                value: ActiveValue::Set(now.to_rfc3339()),
+                updated_at: ActiveValue::Set(now.fixed_offset()),
+            };
+            NodeState::insert(row)
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::column(node_state::Column::Key)
+                        .update_columns([node_state::Column::Value, node_state::Column::UpdatedAt])
+                        .to_owned(),
+                )
+                .exec(database)
+                .await
+                .context("recording that the node has exited")?;
+        } else {
+            NodeState::delete_by_id(EXITED_AT)
+                .exec(database)
+                .await
+                .context("clearing the record of the node's exit")?;
+        }
+        tracker.exited_persisted(exited);
+    }
 
     let Some(started_at) = tracker.withdrawal_start_to_persist() else {
         return Ok(());
@@ -2995,10 +3149,16 @@ async fn send(client: &PortalClient, tracker: &StakeTracker, op: NodeOp) -> Opti
 /// looks at any agreement — joins are refused until it lands. Best effort:
 /// failure here only defers the top-up to the first cycle.
 ///
+/// The policy bonds nothing before it knows whether the node has exited, so
+/// the record an earlier process left of that is read here first (see
+/// [`restore_withdrawal_start`]), and what this read learns is recorded
+/// before anything is signed.
+///
 /// # Errors
 /// Only if the progress line cannot be written.
 pub async fn bootstrap_stake(
     client: &PortalClient,
+    database: &DatabaseConnection,
     tracker: &Arc<StakeTracker>,
     writer: &mut impl Write,
 ) -> std::io::Result<()> {
@@ -3013,6 +3173,14 @@ pub async fn bootstrap_stake(
     if let Some(nonce) = tracker.highest_tracked_nonce() {
         client.raise_nonce_above(nonce);
     }
+    if !tracker.withdrawal_start_restored() {
+        if let Err(err) = restore_withdrawal_start(database, tracker, Instant::now()).await {
+            warn!(
+                "could not read what the database records of this node's exit; nothing is \
+                 bonded until the first cycle has read it: {err:#}"
+            );
+        }
+    }
 
     let entry = match client.resync_from_registry().await {
         Ok(entry) => entry,
@@ -3022,6 +3190,9 @@ pub async fn bootstrap_stake(
         }
     };
     tracker.observe(Some(&entry), Instant::now());
+    if let Err(err) = persist_withdrawal_start(database, tracker).await {
+        warn!("could not record the state of this node's exit: {err:#}");
+    }
 
     let Some(snapshot) = tracker.snapshot() else {
         if tracker.status()["portal_reports_stake"] == true {
@@ -3055,6 +3226,13 @@ pub async fn bootstrap_stake(
         writeln!(
             writer,
             "⚠ Bond cleanup pending: the stake was slashed to zero; no joins until it finishes"
+        )?;
+    }
+    if tracker.status()["exited"] == true {
+        writeln!(
+            writer,
+            "⚠ This node has exited: it bonds nothing on its own. Resume staking from /admin \
+             to bond again"
         )?;
     }
 
@@ -4286,12 +4464,15 @@ mod tests {
         assert_eq!(second.withdrawal_start_to_persist(), None);
     }
 
-    /// A record of the withdrawal delay that outlived the withdrawal — the
-    /// process died between the read that saw the bond come back and the
-    /// write that clears the row — is not an exit under way: the row is
-    /// cleared, and the node bonds its balance again as the log promised.
+    /// An exit was under way when the last process stopped — the database
+    /// holds the start of its withdrawal delay — and the first read of this
+    /// one shows neither a bond nor a withdrawal pending: the exit ended while
+    /// the node was not running. That used to be taken for a stale row, which
+    /// was cleared, and the restarted node bonded the returned balance again:
+    /// two more weeks before it could be withdrawn. The node is out, stays
+    /// out, and says so in its database.
     #[tokio::test]
-    async fn a_stale_withdrawal_record_is_cleared_and_does_not_end_the_auto_stake() {
+    async fn an_exit_that_ended_while_the_node_was_down_is_not_bonded_again() {
         use crate::entities::node_state;
         use crate::entities::prelude::NodeState;
         use crate::testutils::setup_in_memory_db;
@@ -4308,28 +4489,62 @@ mod tests {
         .await
         .unwrap();
 
-        // Restored before any read of this process, as the daemon does it.
-        let tracker = StakeTracker::new(StakePolicy::default());
+        // Restored before any read of this process, as startup does it.
+        let tracker = StakeTracker::default();
         let t0 = Instant::now();
         restore_withdrawal_start(&db, &tracker, t0).await.unwrap();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
-        assert_eq!(tracker.status()["exited"], false);
-        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
-        assert_eq!(tracker.withdrawal_start_to_persist(), Some(None));
+        assert_eq!(tracker.status()["exited"], true);
+        assert_eq!(tracker.plan(t0, None), None, "1000 KOR back, none bonded");
         persist_withdrawal_start(&db, &tracker).await.unwrap();
-        assert!(NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
-            .one(&db)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            NodeState::find_by_id(WITHDRAWAL_STARTED_AT)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the delay is over"
+        );
+        assert!(
+            NodeState::find_by_id(EXITED_AT)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some(),
+            "and the exit is on record"
+        );
 
-        // Restored after a read, as when onboarding read the registry first.
+        // Restored after a read, as when the registry was read first.
         let later = StakeTracker::new(StakePolicy::default());
         observed(&later, &entry(Some("0"), Some("0")), t0);
         later.restore_withdrawal_start(Some(Utc::now() - chrono::Duration::days(20)), t0);
+        assert_eq!(later.status()["exited"], true);
+        assert_eq!(later.withdrawal_start_to_persist(), Some(None));
+        assert_eq!(later.plan(t0, None), None);
+    }
+
+    /// The start of a withdrawal delay recorded for a node that has a stake
+    /// bonded and no withdrawal pending belongs to an exit long over: the
+    /// row is cleared, and the policy goes on as configured.
+    #[test]
+    fn a_withdrawal_record_older_than_the_stake_is_stale() {
+        let t0 = Instant::now();
+        let mut bonded = entry(Some("100"), Some("100"));
+        bonded.kor_balance = Some("105".into());
+        let old = Some(Utc::now() - chrono::Duration::days(20));
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        tracker.restore_withdrawal_start(old, t0);
+        observed(&tracker, &bonded, t0);
+        assert_eq!(tracker.status()["exited"], false);
+        assert_eq!(tracker.withdrawal_start_to_persist(), Some(None));
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("100"))));
+
+        let later = StakeTracker::new(StakePolicy::default());
+        observed(&later, &bonded, t0);
+        later.restore_withdrawal_start(old, t0);
         assert_eq!(later.status()["exited"], false);
         assert_eq!(later.withdrawal_start_to_persist(), Some(None));
-        assert_eq!(later.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
     }
 
     /// A record nothing can read is deleted and reported, not tripped over
@@ -5724,7 +5939,8 @@ mod tests {
 
         // The second starts a client at Kontor's next_nonce.
         let client = client_at(&mock_server, 10);
-        bootstrap_stake(&client, &tracker, &mut Vec::new())
+        let db = crate::testutils::setup_in_memory_db().await;
+        bootstrap_stake(&client, &db, &tracker, &mut Vec::new())
             .await
             .unwrap();
         let status = tracker.status();
@@ -6592,5 +6808,101 @@ mod tests {
         landed.next_nonce = Some(11);
         observed(&tracker, &landed, late);
         assert!(tracker.pending_join_agreements().is_empty());
+    }
+    /// A node whose bond came back bonds nothing more on its own. That lived
+    /// in memory only: restarted unattended — a crash, a host reboot — with
+    /// auto-stake on, it bonded the whole returned balance again, and the
+    /// operator was two weeks from withdrawing it once more. The exit is now
+    /// recorded in the database, read before anything is planned, and kept
+    /// until the operator resumes staking.
+    #[tokio::test]
+    async fn a_finished_exit_survives_a_restart_until_staking_is_resumed() {
+        use crate::entities::prelude::NodeState;
+        use crate::testutils::setup_in_memory_db;
+        use sea_orm::EntityTrait;
+
+        let db = setup_in_memory_db().await;
+        let t0 = Instant::now();
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = Some(13);
+        withdrawn.kor_balance = Some("1005".into());
+
+        // The process that saw the exit through.
+        let first = StakeTracker::default();
+        restore_withdrawal_start(&db, &first, t0).await.unwrap();
+        observed(&first, &exiting_entry(12, "1000"), t0);
+        persist_withdrawal_start(&db, &first).await.unwrap();
+        observed(&first, &withdrawn, t0);
+        assert_eq!(first.status()["exited"], true);
+        persist_withdrawal_start(&db, &first).await.unwrap();
+        assert!(NodeState::find_by_id(EXITED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some());
+
+        // The next one: 1005 KOR liquid, auto-stake on, nothing bonded.
+        let second = StakeTracker::default();
+        observed(&second, &withdrawn, t0);
+        assert_eq!(
+            second.plan(t0, None),
+            None,
+            "nothing is bonded before the record has been read"
+        );
+        restore_withdrawal_start(&db, &second, t0).await.unwrap();
+        observed(&second, &withdrawn, t0);
+        assert_eq!(second.status()["exited"], true);
+        assert_eq!(second.plan(t0, None), None, "the exit stands");
+        assert_eq!(second.exited_to_persist(), None, "already on record");
+
+        // The operator resumes: the policy bonds again, and the record goes.
+        assert!(
+            StakeTracker::default().resume_staking().is_err(),
+            "not exited"
+        );
+        second.resume_staking().unwrap();
+        assert_eq!(second.plan(t0, None), Some(NodeOp::AddStake(kor("1000"))));
+        persist_withdrawal_start(&db, &second).await.unwrap();
+        assert!(NodeState::find_by_id(EXITED_AT)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none());
+
+        // And a third process stakes like any other.
+        let third = StakeTracker::default();
+        restore_withdrawal_start(&db, &third, t0).await.unwrap();
+        observed(&third, &withdrawn, t0);
+        assert_eq!(third.status()["exited"], false);
+        assert_eq!(third.plan(t0, None), Some(NodeOp::AddStake(kor("1000"))));
+    }
+
+    /// A record of an exit on a node that has a stake bonded and no
+    /// withdrawal pending is older than that stake: it no longer holds, and
+    /// is cleared.
+    #[test]
+    fn a_recorded_exit_older_than_the_stake_is_dropped() {
+        let t0 = Instant::now();
+        let mut bonded = entry(Some("100"), Some("100"));
+        bonded.kor_balance = Some("105".into());
+
+        let tracker = StakeTracker::default();
+        tracker.restore_exited(true);
+        assert_eq!(tracker.status()["exited"], true);
+        observed(&tracker, &bonded, t0);
+        assert_eq!(tracker.status()["exited"], false);
+        assert_eq!(
+            tracker.exited_to_persist(),
+            Some(false),
+            "the row is cleared"
+        );
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("100"))));
+
+        // Read first, restored after.
+        let later = StakeTracker::default();
+        observed(&later, &bonded, t0);
+        later.restore_exited(true);
+        assert_eq!(later.status()["exited"], false);
+        assert_eq!(later.exited_to_persist(), Some(false));
     }
 }

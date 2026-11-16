@@ -819,7 +819,8 @@ impl Supervisor {
         // Bond what the faucet just funded before looking at any agreement:
         // Kontor refuses every join until the stake has landed.
         let staking = self.runtime.staking();
-        stake::bootstrap_stake(&authenticated, &staking, &mut self.writer).await?;
+        stake::bootstrap_stake(&authenticated, &self.parts.conn, &staking, &mut self.writer)
+            .await?;
 
         // The admin UI can re-register an already-registered node, so it gets
         // the same key and an unauthenticated client here as it would on a node
