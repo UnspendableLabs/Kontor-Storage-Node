@@ -38,7 +38,9 @@ use crate::clients::kor::Kor;
 use crate::clients::portal::{FaucetResponse, RegistryEntry};
 use crate::clients::PortalClient;
 use anyhow::Result;
+use sea_orm::DatabaseConnection;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -57,19 +59,36 @@ const KOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// went nowhere is not left unfunded for long.
 pub const FAUCET_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// How long the node waits after the faucet refused a request (a `4xx`).
+///
+/// Nothing was broadcast, so there is no transfer to wait for — but a faucet
+/// that refuses now (rate limit, no such route, a node it will not fund) most
+/// likely refuses a cycle later too, and asking on every cycle only fills two
+/// logs.
+pub const FAUCET_REFUSAL_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// `node_state` key under which the time of the last faucet request that may
+/// have broadcast a transfer is kept, as an RFC 3339 timestamp.
+const FAUCET_ASKED_AT: &str = "faucet_asked_at";
+
 /// How many times startup reads a balance the Portal reports as unknown
 /// before starting without it.
 const UNKNOWN_BALANCE_READS: u32 = 3;
 
-/// What this node asks the faucet for, and when it last did.
+/// What this node asks the faucet for, and when it may next ask.
 ///
 /// One per process, shared by every activation and by the daemon, so that
 /// neither an activation retry nor a daemon cycle repeats a request another
-/// of them has just made.
+/// of them has just made. With a store (see [`Self::with_store`]) the time of
+/// a request that may have broadcast is also kept in `node_state`, so a
+/// process restarted before the transfer lands does not ask for a second one.
 #[derive(Debug)]
 pub struct Faucet {
     amount: Kor,
-    last_asked: Mutex<Option<Instant>>,
+    /// No request before this instant; `None` when one may go out now.
+    next_allowed: Mutex<Option<Instant>>,
+    store: Option<DatabaseConnection>,
+    restored: AtomicBool,
 }
 
 impl Faucet {
@@ -77,33 +96,123 @@ impl Faucet {
     pub fn new(amount: Kor) -> Self {
         Self {
             amount,
-            last_asked: Mutex::new(None),
+            next_allowed: Mutex::new(None),
+            store: None,
+            restored: AtomicBool::new(false),
         }
     }
 
-    /// Whether a request may go out now: none has yet, or the last one is
-    /// older than [`FAUCET_RETRY_INTERVAL`].
+    /// Keep the time of the last request in `database` across restarts.
+    #[must_use]
+    pub fn with_store(mut self, database: DatabaseConnection) -> Self {
+        self.store = Some(database);
+        self
+    }
+
+    /// Whether a request may go out now: none is on record, or the wait the
+    /// last one set has passed.
     fn may_ask(&self, now: Instant) -> bool {
-        self.last_asked
+        self.next_allowed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_none_or(|asked| now.duration_since(asked) >= FAUCET_RETRY_INTERVAL)
+            .is_none_or(|next| now >= next)
     }
 
+    fn wait_until(&self, next: Option<Instant>) {
+        *self
+            .next_allowed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+    }
+
+    /// A request went out at `now` and may have broadcast a transfer.
     fn asked(&self, now: Instant) {
-        *self
-            .last_asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(now);
+        self.wait_until(Some(now + FAUCET_RETRY_INTERVAL));
     }
 
-    /// The last request is known to have sent nothing: the next one need not
-    /// wait.
+    /// The faucet refused the request made at `now`.
+    fn refused(&self, now: Instant) {
+        self.wait_until(Some(now + FAUCET_REFUSAL_RETRY_INTERVAL));
+    }
+
+    /// The last request is known to have reached nobody: the next one need
+    /// not wait.
     fn forget(&self) {
-        *self
-            .last_asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.wait_until(None);
+    }
+
+    /// Take over, once per process, the request an earlier process recorded:
+    /// one made less than [`FAUCET_RETRY_INTERVAL`] ago is waited for as if
+    /// this process had made it. A record that cannot be read is no record.
+    async fn restore(&self) {
+        use crate::entities::prelude::NodeState;
+        use sea_orm::EntityTrait;
+
+        let Some(database) = &self.store else {
+            return;
+        };
+        if self.restored.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let asked_at = match NodeState::find_by_id(FAUCET_ASKED_AT).one(database).await {
+            Ok(row) => row.and_then(|row| chrono::DateTime::parse_from_rfc3339(&row.value).ok()),
+            Err(err) => {
+                tracing::warn!("could not read when the faucet was last asked: {err:#}");
+                // Asked again at the next call.
+                self.restored.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let Some(asked_at) = asked_at else {
+            return;
+        };
+        let since = chrono::Utc::now().signed_duration_since(asked_at);
+        let remaining = since
+            .to_std()
+            .ok()
+            .and_then(|since| FAUCET_RETRY_INTERVAL.checked_sub(since));
+        if let Some(remaining) = remaining {
+            if self.may_ask(Instant::now()) {
+                self.wait_until(Some(Instant::now() + remaining));
+            }
+        }
+    }
+
+    /// Record in the store that a request went out now (`true`), or that the
+    /// last one sent nothing (`false`). Best effort: a failed write only
+    /// costs the protection across a restart.
+    async fn persist(&self, asked: bool) {
+        use crate::entities::node_state;
+        use crate::entities::prelude::NodeState;
+        use sea_orm::{sea_query::OnConflict, ActiveValue, EntityTrait};
+
+        let Some(database) = &self.store else {
+            return;
+        };
+        let result = if asked {
+            let now = chrono::Utc::now();
+            NodeState::insert(node_state::ActiveModel {
+                key: ActiveValue::Set(FAUCET_ASKED_AT.to_string()),
+                value: ActiveValue::Set(now.to_rfc3339()),
+                updated_at: ActiveValue::Set(now.fixed_offset()),
+            })
+            .on_conflict(
+                OnConflict::column(node_state::Column::Key)
+                    .update_columns([node_state::Column::Value, node_state::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec(database)
+            .await
+            .map(|_| ())
+        } else {
+            NodeState::delete_by_id(FAUCET_ASKED_AT)
+                .exec(database)
+                .await
+                .map(|_| ())
+        };
+        if let Err(err) = result {
+            tracing::warn!("could not record the faucet request: {err:#}");
+        }
     }
 
     /// Ask for the configured amount (or the Portal's cap, if lower), keeping
@@ -112,7 +221,8 @@ impl Faucet {
     /// The request is on record before it goes out, so that whatever becomes
     /// of the answer — a timeout included — the next caller knows one may be
     /// in flight. It is struck off again only when the failure shows nothing
-    /// was sent (see [`nothing_was_sent`]).
+    /// was sent (see [`nothing_was_sent`]); a refusal is then waited out for
+    /// [`FAUCET_REFUSAL_RETRY_INTERVAL`] instead.
     async fn ask(
         &self,
         client: &PortalClient,
@@ -120,12 +230,26 @@ impl Faucet {
         writer: &mut impl Write,
     ) -> Result<FaucetResponse> {
         self.asked(Instant::now());
+        self.persist(true).await;
         let result = request_within_cap(client, recipient, self.amount, writer).await;
-        if result.as_ref().is_err_and(nothing_was_sent) {
-            self.forget();
+        if let Err(err) = &result {
+            if was_refused(err) {
+                self.refused(Instant::now());
+                self.persist(false).await;
+            } else if nothing_was_sent(err) {
+                self.forget();
+                self.persist(false).await;
+            }
         }
         result
     }
+}
+
+/// Whether a failed faucet request was refused by the Portal (a `4xx`): it
+/// composed nothing, and is likely to refuse again for a while.
+fn was_refused(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpStatusError>()
+        .is_some_and(|status| status.status.is_client_error())
 }
 
 /// Whether a failed faucet request certainly broadcast nothing.
@@ -220,6 +344,7 @@ pub async fn ensure_kor_balance(
     faucet: &Faucet,
     writer: &mut impl Write,
 ) -> Result<()> {
+    faucet.restore().await;
     let mut entry = client.get_registry_entry(signer_id).await?;
     for _ in 1..UNKNOWN_BALANCE_READS {
         if entry.kor_balance.is_some() {
@@ -362,6 +487,7 @@ pub async fn fund_if_unfunded(
     faucet: &Faucet,
     exiting: bool,
 ) -> bool {
+    faucet.restore().await;
     if exiting
         || !parse_balance(&entry.kor_balance).is_some_and(Kor::is_zero)
         || funding(entry) != Funding::Unfunded
@@ -443,6 +569,10 @@ async fn poll_until_balance(
     writer.flush()?;
     loop {
         tokio::time::sleep(KOR_POLL_INTERVAL).await;
+        // Whether this read showed a balance that is known to be empty: the
+        // only case in which the faucet is asked again (Portal
+        // `docs/node-portal-contract.md` §3: `null` is "could not be read").
+        let mut known_empty = false;
         // Transient HTTP errors must not kill the process: if main exits, the
         // container is restarted, onboarding sees `kor_balance: 0`, and a
         // brand-new faucet broadcast is fired. A single network hiccup then
@@ -455,6 +585,7 @@ async fn poll_until_balance(
                     writeln!(writer, "✓ KOR balance: {balance}")?;
                     return Ok(());
                 }
+                known_empty = parse_balance(&entry.kor_balance).is_some_and(Kor::is_zero);
                 write!(writer, ".")?;
                 writer.flush()?;
             }
@@ -468,7 +599,7 @@ async fn poll_until_balance(
         // broadcast, if anything, did not arrive. A refusal here is only
         // logged — the wait goes on, for the next request or a manual
         // transfer.
-        if faucet.may_ask(Instant::now()) {
+        if known_empty && faucet.may_ask(Instant::now()) {
             match faucet.ask(client, recipient, &mut std::io::sink()).await {
                 Ok(resp) => tracing::info!(
                     commit = %resp.commit_txid,
@@ -712,15 +843,20 @@ mod tests {
     /// again; one that failed any other way may have been broadcast, and
     /// stands for the retry interval.
     #[tokio::test]
-    async fn the_daemon_asks_again_at_once_only_after_a_refusal() {
+    async fn a_refused_request_waits_a_while_and_an_unanswered_one_the_full_interval() {
         let new_node = entry(registry_entry_json(Some("0")));
 
+        // Refused: nothing was sent, so the full interval is not waited —
+        // but the next cycle does not ask again either.
         let refusing = MockServer::start().await;
-        mount_faucet(&refusing, 429, 2).await;
+        mount_faucet(&refusing, 429, 1).await;
         let client = PortalClient::try_new(refusing.uri(), std::env::temp_dir()).unwrap();
         let faucet = Faucet::new(Kor::whole(1000));
         assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
-        assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        assert!(!fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        let now = Instant::now();
+        assert!(!faucet.may_ask(now));
+        assert!(faucet.may_ask(now + FAUCET_REFUSAL_RETRY_INTERVAL));
 
         let failing = MockServer::start().await;
         mount_faucet(&failing, 500, 1).await;
@@ -728,6 +864,36 @@ mod tests {
         let faucet = Faucet::new(Kor::whole(1000));
         assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
         assert!(!fund_if_unfunded(&client, &new_node, &faucet, false).await);
+    }
+
+    /// A process restarted before the first transfer landed read an empty
+    /// balance and asked for a second one. The request is now on record in
+    /// `node_state`, and the next process waits for it.
+    #[tokio::test]
+    async fn a_request_made_by_an_earlier_process_is_not_repeated_after_a_restart() {
+        let new_node = entry(registry_entry_json(Some("0")));
+        let database = crate::testutils::setup_in_memory_db().await;
+
+        // The answer is lost (a 500): the transfer may have been broadcast.
+        let portal = MockServer::start().await;
+        mount_faucet(&portal, 500, 1).await;
+        let client = PortalClient::try_new(portal.uri(), std::env::temp_dir()).unwrap();
+        let first = Faucet::new(Kor::whole(1000)).with_store(database.clone());
+        assert!(fund_if_unfunded(&client, &new_node, &first, false).await);
+
+        // A new process, same database: it does not ask again.
+        let second = Faucet::new(Kor::whole(1000)).with_store(database.clone());
+        assert!(!fund_if_unfunded(&client, &new_node, &second, false).await);
+
+        // A refusal sent nothing: it leaves no record for the next process.
+        let refusing = MockServer::start().await;
+        mount_faucet(&refusing, 429, 2).await;
+        let client = PortalClient::try_new(refusing.uri(), std::env::temp_dir()).unwrap();
+        let database = crate::testutils::setup_in_memory_db().await;
+        let first = Faucet::new(Kor::whole(1000)).with_store(database.clone());
+        assert!(fund_if_unfunded(&client, &new_node, &first, false).await);
+        let second = Faucet::new(Kor::whole(1000)).with_store(database);
+        assert!(fund_if_unfunded(&client, &new_node, &second, false).await);
     }
 
     #[test]

@@ -462,7 +462,7 @@ async fn serve(
             keystore: None,
             migrating: None,
             retry_in: None,
-            faucet: Arc::new(Faucet::new(config.faucet_amount)),
+            faucet: Arc::new(Faucet::new(config.faucet_amount).with_store(parts.conn.clone())),
         }
         .run(start),
     );
