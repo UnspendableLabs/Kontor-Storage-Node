@@ -1204,9 +1204,11 @@ impl StakeTracker {
     ///
     /// For a `leave-agreement` the registry says nothing at all, so the
     /// listing is the only word: `confirmed` and the agreement is left;
-    /// `failed` by Kontor and it is tried again after the hour a refusal
-    /// earns; retired by the Portal, or no longer listed, and it is tried
-    /// again at once. Until then the exit neither counts the agreement as
+    /// `failed` by Kontor because there is no membership to leave (see
+    /// [`no_membership_to_leave`]) and it is left all the same; `failed` by
+    /// Kontor for another reason and it is tried again after the hour a
+    /// refusal earns; retired by the Portal, or no longer listed, and it is
+    /// tried again at once. Until then the exit neither counts the agreement as
     /// left nor leaves it again.
     ///
     /// A listing that still shows the op `queued` or `submitted` — the Portal
@@ -1288,6 +1290,23 @@ impl StakeTracker {
                     info!("left agreement {agreement_id}");
                     state.left.insert(agreement_id.clone());
                     state.last_event = Some((Utc::now(), format!("left agreement {agreement_id}")));
+                }
+                Some("failed") if !retired && no_membership_to_leave(error, agreement_id) => {
+                    // Kontor holds no membership of this node in the
+                    // agreement: bond cleanup unwound it after a slash to
+                    // zero, or the Portal's row was behind. Nothing is left
+                    // to leave, which is what the exit wanted; asking again
+                    // every hour would never get another answer, and the
+                    // withdrawal would wait behind it for ever.
+                    info!(
+                        "Kontor holds no membership of this node in agreement {agreement_id} \
+                         ({error}); counting it as left"
+                    );
+                    state.left.insert(agreement_id.clone());
+                    state.last_event = Some((
+                        Utc::now(),
+                        format!("agreement {agreement_id} was already left on Kontor"),
+                    ));
                 }
                 Some("failed") if !retired => {
                     warn!(
@@ -1728,6 +1747,19 @@ fn retired_by_portal(error: &str) -> bool {
         || error.starts_with(PORTAL_STALE_NONCE_TOKEN)
         || error.starts_with(PORTAL_UNVERIFIABLE_TOKEN)
         || error.starts_with(PORTAL_UNBATCHABLE_HEAD)
+}
+
+/// Whether Kontor's error for a `leave-agreement` says this node holds no
+/// membership in `agreement_id` to leave. `filestorage::leave-agreement`
+/// answers `node {signer} not in agreement {id}` when the membership row is
+/// missing or no longer active — which is how bond cleanup leaves every
+/// membership of a node slashed to zero, without the Portal's row ever
+/// turning `left` — and `agreement not found: {id}` when the agreement itself
+/// is gone. The Portal relays the receipt as `ContractErr: <value>`, so the
+/// phrases are looked for inside it.
+fn no_membership_to_leave(error: &str, agreement_id: &str) -> bool {
+    error.contains(&format!("not in agreement {agreement_id}"))
+        || error.contains(&format!("agreement not found: {agreement_id}"))
 }
 
 fn describe_sent(op: &NodeOp, nonce: u64) -> String {
@@ -5249,5 +5281,70 @@ mod tests {
         );
         assert_eq!(tracker.status()["exit"]["left"], 2);
         assert_eq!(tracker.status()["exit"]["memberships_left"], json!([]));
+    }
+    /// After a slash to zero Kontor's bond cleanup deactivates every
+    /// membership of the node, and the Portal's rows keep saying `valid`. A
+    /// node that later exits sends a leave for each, and Kontor answers that
+    /// there is nothing to leave. That used to count as a refusal, retried
+    /// every hour for ever, with the withdrawal waiting behind it. It is the
+    /// outcome the exit wanted: the agreement counts as left.
+    #[test]
+    fn a_leave_kontor_refuses_for_lack_of_a_membership_counts_as_left() {
+        for error in [
+            "ContractErr: err(message(\"node 42 not in agreement AGR-a\"))",
+            "ContractErr: err(message(\"agreement not found: AGR-a\"))",
+        ] {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            observed(&tracker, &exiting_entry(10, "100"), t0);
+            let exit = ExitInputs {
+                memberships: vec!["AGR-a".into()],
+                ..ExitInputs::default()
+            };
+            tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+            observed(&tracker, &exiting_entry(11, "100"), t0);
+            tracker.classify_landed(10, Ok(vec![leave_record(10, "failed", Some(error))]), t0);
+
+            let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+            assert_eq!(
+                tracker.plan(due, Some(&exit)),
+                Some(NodeOp::WithdrawStake),
+                "{error}: nothing left to leave, the withdrawal goes"
+            );
+            assert_eq!(tracker.status()["exit"]["left"], 1);
+        }
+
+        // Any other refusal by Kontor still waits its hour, and still holds
+        // the withdrawal back: the membership stands.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into()],
+            ..ExitInputs::default()
+        };
+        tracker.record_sent(NodeOp::LeaveAgreement("AGR-a".into()), 10, t0);
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        tracker.classify_landed(
+            10,
+            Ok(vec![leave_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"agreement reward cleanup in progress\"))"),
+            )]),
+            t0,
+        );
+        let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+        assert_eq!(
+            tracker.plan(due, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-a".into())),
+            "the hour has passed: tried again, not withdrawn"
+        );
+        assert_eq!(tracker.plan(t0, Some(&exit)), None, "backed off meanwhile");
+        // The error of another agreement's leave says nothing about this one.
+        assert!(!no_membership_to_leave(
+            "ContractErr: err(message(\"node 42 not in agreement AGR-b\"))",
+            "AGR-a"
+        ));
     }
 }
