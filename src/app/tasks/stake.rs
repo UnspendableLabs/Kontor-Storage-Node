@@ -54,11 +54,11 @@
 //! as `queued` or `submitted` — a signer's newer ops wait while its earlier
 //! ones sit in an unconfirmed batch, so half an hour is routine — and is
 //! declared dropped only when the Portal no longer lists it, or lists it as
-//! `failed`. A listing that cannot be read leaves it in flight, up to
-//! [`OP_LANDING_HARD_TIMEOUT`] after the Portal's last word; a Portal that
-//! keeps listing the op is believed for as long as it does (§2: an op still
-//! `queued` or `submitted` has not been lost and must not be signed again).
-//! Giving an op up too early is the expensive
+//! `failed`. A listing that cannot be read leaves it in flight and is asked
+//! for again on the next cycle, for as long as it takes: only the Portal's
+//! word, or the nonce, ends the wait (§2: an op still `queued` or `submitted`
+//! has not been lost and must not be signed again), and a Portal that cannot
+//! say what it holds may hold the op. Giving an op up too early is the expensive
 //! mistake here: the same `add-stake` signed again with a fresh nonce makes
 //! both execute, and the bond overshoots its target. The same listing settles
 //! an op whose answer never came — the request timed out, or the Portal
@@ -131,17 +131,26 @@ pub const MIN_GAS_RESERVE: Kor = Kor::from_units(DEFAULT_GAS_LIMIT as u128 * GAS
 /// blocks, so most ops never prompt the question.
 pub const OP_LANDING_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// How long an accepted op stays in flight without the Portal vouching for
-/// it. The clock runs from when the op was sent, and is restarted each time
-/// the Portal's listing says it still holds the op (`queued`, `submitted` or
-/// `confirmed`); an op the Portal cannot be asked about for this long, or
-/// stopped listing without saying `failed`, has been lost for all the node can
-/// tell, and is decided again. One the Portal keeps listing is waited for
-/// however long that takes (Portal `docs/node-portal-contract.md` §2: an op
-/// still `queued` or `submitted` has not been lost and must not be signed
-/// again) — a batch the operator signs late, or that the Portal cancels and
-/// re-queues, routinely takes longer than this. A join's committed collateral
-/// is held for the same length at most (see [`settle_pending_joins`]).
+/// How long a wait may last before it is reported as a problem rather than
+/// as routine: an op still in flight, or one whose nonce went and whose
+/// outcome the Portal has not given.
+///
+/// It no longer ends an in-flight op. An op is given up on the Portal's word
+/// only — its listing no longer shows it, or shows it `failed` — or when its
+/// nonce is consumed. One the Portal keeps listing is waited for however long
+/// that takes (Portal `docs/node-portal-contract.md` §2: an op still `queued`
+/// or `submitted` has not been lost and must not be signed again) — a batch
+/// the operator signs late, or that the Portal cancels and re-queues,
+/// routinely takes longer than this. And one the Portal cannot be asked
+/// about is waited for too: a listing that fails for six hours says nothing
+/// about what the Portal holds, and signing the op again on that silence was
+/// how the same top-up came to execute twice. Past this length the wait is
+/// logged as an error on every failed attempt, so the operator hears of it.
+///
+/// It still bounds how long a landed op waits for the Portal to say how it
+/// ended (see [`StakeTracker::classify_landed`]), and a join's committed
+/// collateral is held for the same length at most (see
+/// [`settle_pending_joins`]).
 pub const OP_LANDING_HARD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// At most one automatic `claim-rewards` per this interval. Each claim costs
@@ -453,19 +462,18 @@ struct InFlight {
     /// [`StakeTracker::record_unsettled`]): the Portal may hold it, or may
     /// never have seen it.
     unsettled: bool,
-    /// When the Portal's listing was last asked about it.
+    /// When the Portal's listing was last read for it. A listing that could
+    /// not be read does not count: the question is asked again next cycle.
     checked: Option<Instant>,
-    /// When the Portal's listing last said it still holds the op. The hard
-    /// timeout counts from here, or from `sent` while the Portal has not
-    /// been heard.
+    /// When the Portal's listing last said it still holds the op.
     vouched: Option<Instant>,
 }
 
 impl InFlight {
-    /// Whether the op has gone [`OP_LANDING_HARD_TIMEOUT`] without the Portal
-    /// vouching for it.
-    fn given_up_at(&self, now: Instant) -> bool {
-        now.duration_since(self.vouched.unwrap_or(self.sent)) >= OP_LANDING_HARD_TIMEOUT
+    /// How long the op has gone without the Portal's listing vouching for
+    /// it, counted from when it was sent while the Portal has not been heard.
+    fn unvouched_for(&self, now: Instant) -> Duration {
+        now.duration_since(self.vouched.unwrap_or(self.sent))
     }
 }
 
@@ -738,9 +746,8 @@ impl StakeTracker {
 
     /// Fold in this cycle's registry read: `None` when it failed outright.
     ///
-    /// Retires in-flight work whose nonce Kontor has consumed (or that has
-    /// waited past [`OP_LANDING_HARD_TIMEOUT`]), and says out loud when the stake
-    /// shrank or bond cleanup started — the two things an operator must not
+    /// Retires in-flight work whose nonce Kontor has consumed, and says out
+    /// loud when the stake shrank or bond cleanup started — the two things an operator must not
     /// learn from a dashboard a week later.
     pub fn observe(&self, entry: Option<&RegistryEntry>, now: Instant) {
         let snapshot = entry.and_then(StakeSnapshot::from_entry);
@@ -777,15 +784,6 @@ impl StakeTracker {
                     op.op.name()
                 );
                 landed.push(op);
-            } else if op.given_up_at(now) {
-                warn!(
-                    op = op.op.name(),
-                    nonce = op.nonce,
-                    "the {} op is still not reflected after {} hours without the Portal saying \
-                     it holds it; giving it up for lost and deciding again",
-                    op.op.name(),
-                    OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
-                );
             } else {
                 state.in_flight.push(op);
             }
@@ -1031,7 +1029,9 @@ impl StakeTracker {
 
     /// The nonce of the in-flight op the Portal should be asked about this
     /// cycle, if there is one that has waited [`OP_LANDING_CHECK_INTERVAL`]
-    /// since it was sent or last asked about.
+    /// since it was sent or since the listing was last read for it. A listing
+    /// that could not be read is not a reading: the op is asked about again
+    /// on the next cycle, not half an hour later.
     #[must_use]
     pub fn op_to_verify(&self, now: Instant) -> Option<u64> {
         let state = self.lock();
@@ -1052,8 +1052,9 @@ impl StakeTracker {
     /// and the registry read is behind; it stays in flight for the nonce to
     /// say so. `failed`, or missing from the listing: the Portal will never
     /// relay it, so it is given up and the next plan decides again. A listing
-    /// that could not be read says nothing, and nothing changes until the next
-    /// check or [`OP_LANDING_HARD_TIMEOUT`].
+    /// that could not be read says nothing: the op stays in flight and the
+    /// next cycle asks again, however long the Portal stays silent — it may
+    /// hold the op all that time.
     pub fn verify_in_flight(
         &self,
         nonce: u64,
@@ -1065,18 +1066,28 @@ impl StakeTracker {
         let Some(op) = state.in_flight.iter_mut().find(|op| op.nonce == nonce) else {
             return;
         };
-        op.checked = Some(now);
         let name = op.op.name();
         let listed = match listing {
             Ok(ops) => ops.into_iter().find(|listed| listed.nonce == nonce),
             Err(err) => {
-                warn!(
-                    "could not ask the Portal about the {name} op at nonce {nonce}; keeping it in \
-                     flight: {err:#}"
-                );
+                let silent = op.unvouched_for(now);
+                if silent >= OP_LANDING_HARD_TIMEOUT {
+                    error!(
+                        "the Portal has not been able to say whether it holds the {name} op at \
+                         nonce {nonce} for {} hours; no other stake op is signed until its \
+                         listing can be read or the nonce is consumed: {err:#}",
+                        silent.as_secs() / 3600
+                    );
+                } else {
+                    warn!(
+                        "could not ask the Portal about the {name} op at nonce {nonce}; keeping \
+                         it in flight and asking again next cycle: {err:#}"
+                    );
+                }
                 return;
             }
         };
+        op.checked = Some(now);
         if let Some(other) = listed.as_ref().filter(|listed| listed.op != name) {
             // Another op of this node holds the nonce — the relay's `409`
             // after the fact. Ours was never stored.
@@ -2771,6 +2782,11 @@ mod tests {
 
         tracker.verify_in_flight(10, Err(anyhow::anyhow!("timed out")), again);
         assert_eq!(tracker.plan(again, None), None, "unknown is not dropped");
+        assert_eq!(
+            tracker.op_to_verify(again + Duration::from_secs(30)),
+            Some(10),
+            "a listing that could not be read is asked for again next cycle"
+        );
 
         tracker.verify_in_flight(
             10,
@@ -2847,25 +2863,30 @@ mod tests {
         assert!(message.contains("failed"), "{message}");
     }
 
-    /// Whatever the Portal says or cannot say, an op is not waited for
-    /// beyond the hard timeout.
+    /// A Portal that cannot say what it holds may hold the op. However long
+    /// its listing stays unreadable, the op stays in flight and nothing is
+    /// signed again — the op used to be given up for lost at the hard
+    /// timeout, and the same top-up then executed twice. The question is
+    /// asked on every cycle, and the Portal's word, when it comes, decides.
     #[test]
-    fn an_op_that_never_lands_expires_at_the_hard_timeout() {
+    fn an_op_the_portal_cannot_be_asked_about_is_never_given_up_on_silence() {
         let tracker = StakeTracker::new(StakePolicy::default());
         let t0 = Instant::now();
         observed(&tracker, &entry(Some("0"), Some("0")), t0);
         tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
 
-        let late = t0 + OP_LANDING_HARD_TIMEOUT - Duration::from_secs(1);
-        observed(&tracker, &entry(Some("0"), Some("0")), late);
-        assert_eq!(tracker.plan(late, None), None);
+        let mut at = t0 + OP_LANDING_CHECK_INTERVAL;
+        while at < t0 + OP_LANDING_HARD_TIMEOUT * 2 {
+            observed(&tracker, &entry(Some("0"), Some("0")), at);
+            assert_eq!(tracker.op_to_verify(at), Some(10), "asked every cycle");
+            tracker.verify_in_flight(10, Err(anyhow::anyhow!("503")), at);
+            assert_eq!(tracker.plan(at, None), None, "at +{:?}", at - t0);
+            at += Duration::from_secs(600);
+        }
 
-        let later = t0 + OP_LANDING_HARD_TIMEOUT;
-        observed(&tracker, &entry(Some("0"), Some("0")), later);
-        assert_eq!(
-            tracker.plan(later, None),
-            Some(NodeOp::AddStake(kor("995")))
-        );
+        // The listing reads again, and no longer shows the op: dropped.
+        tracker.verify_in_flight(10, Ok(vec![]), at);
+        assert_eq!(tracker.plan(at, None), Some(NodeOp::AddStake(kor("995"))));
     }
 
     /// Through the client: the Portal's listing is what decides. Listed as
@@ -4249,16 +4270,14 @@ mod tests {
         assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
 
         // No word from the Portal for the whole timeout after its last one:
-        // given up, and decided again.
+        // still waited for. Silence is not the Portal saying it dropped the op.
         observed(
             &tracker,
             &entry(Some("0"), Some("0")),
             vouched + OP_LANDING_HARD_TIMEOUT,
         );
-        assert_eq!(
-            tracker.plan(vouched + OP_LANDING_HARD_TIMEOUT, None),
-            Some(NodeOp::AddStake(kor("995")))
-        );
+        assert_eq!(tracker.plan(vouched + OP_LANDING_HARD_TIMEOUT, None), None);
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
     }
 
     /// The same op asked for from `/admin` while the daemon's copy is still
@@ -4636,8 +4655,11 @@ mod tests {
         assert_eq!(tracker.plan(t0, None), Some(NodeOp::WithdrawStake));
         tracker.record_sent(NodeOp::WithdrawStake, 12, t0);
 
-        let late = t0 + OP_LANDING_HARD_TIMEOUT + Duration::from_secs(60);
+        // The Portal's listing no longer shows it (a page behind, say): the
+        // op is forgotten, and executes all the same.
+        let late = t0 + OP_LANDING_CHECK_INTERVAL;
         observed(&tracker, &exiting_entry(12, "100"), late);
+        tracker.verify_in_flight(12, Ok(vec![]), late);
         assert_eq!(tracker.status()["in_flight"], Value::Null, "forgotten");
 
         let mut withdrawn = entry(Some("0"), Some("0"));
