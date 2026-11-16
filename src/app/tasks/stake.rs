@@ -449,6 +449,8 @@ struct LandedOp {
     landed: Instant,
     /// The Portal never confirmed storing the op (see [`InFlight::unsettled`]).
     unsettled: bool,
+    /// The operator asked for it (see [`InFlight::requested`]).
+    requested: bool,
 }
 
 /// An op the relay accepted and Kontor has not executed yet.
@@ -462,6 +464,11 @@ struct InFlight {
     /// [`StakeTracker::record_unsettled`]): the Portal may hold it, or may
     /// never have seen it.
     unsettled: bool,
+    /// The operator asked for this op from `/admin` — every `begin-unstake`,
+    /// and a `withdraw-stake` made by hand. The policy does not plan these
+    /// again on its own, so one that never ran is put back as a request
+    /// instead of being forgotten.
+    requested: bool,
     /// The bond when the op was planned, for an op this process planned: what
     /// an `add-stake` has to exceed to have raised it. `None` for an op
     /// adopted from the Portal's listing, whose starting point is not known.
@@ -571,7 +578,14 @@ impl TrackerState {
     /// effect it was sent for: remember it until the Portal's listing says
     /// how it ended (see [`StakeTracker::classify_landed`]), and take what
     /// each kind needs in the meantime.
-    fn landed_without_effect(&mut self, op: &NodeOp, nonce: u64, unsettled: bool, now: Instant) {
+    fn landed_without_effect(&mut self, flight: &InFlight, now: Instant) {
+        let InFlight {
+            op,
+            nonce,
+            unsettled,
+            requested,
+            ..
+        } = flight;
         match op {
             // The same op signed again next cycle would most likely meet the
             // same answer, and each attempt costs gas: it waits as long as
@@ -588,13 +602,22 @@ impl TrackerState {
             }
             _ => {}
         }
-        self.unexplained.retain(|landed| landed.nonce != nonce);
+        self.unexplained.retain(|landed| landed.nonce != *nonce);
         self.unexplained.push(LandedOp {
             op: op.clone(),
-            nonce,
+            nonce: *nonce,
             landed: now,
-            unsettled,
+            unsettled: *unsettled,
+            requested: *requested,
         });
+    }
+
+    /// Put an operator's op that never ran back as a request, unless another
+    /// one is waiting.
+    fn request_again(&mut self, op: &NodeOp) {
+        if self.operator_request.is_none() {
+            self.operator_request = Some(op.clone());
+        }
     }
 }
 
@@ -831,14 +854,13 @@ impl StakeTracker {
             }
         }
 
-        for InFlight {
-            op,
-            nonce,
-            unsettled,
-            stake_before,
-            ..
-        } in &landed
-        {
+        for flight in &landed {
+            let InFlight {
+                op,
+                nonce,
+                stake_before,
+                ..
+            } = flight;
             match op {
                 NodeOp::LeaveAgreement(agreement_id) => {
                     // Its nonce went; whether Kontor accepted the leave is not in
@@ -849,7 +871,7 @@ impl StakeTracker {
                         "the leave of agreement {agreement_id} has executed; asking the Portal \
                          whether Kontor accepted it"
                     );
-                    state.landed_without_effect(op, *nonce, *unsettled, now);
+                    state.landed_without_effect(flight, now);
                 }
                 NodeOp::AddStake(amount) => match stake_before {
                     // The bond is above what it was when the op was planned:
@@ -869,7 +891,7 @@ impl StakeTracker {
                             "the add-stake of {amount} KOR adopted at nonce {nonce} has \
                              executed; asking the Portal how it ended before signing another"
                         );
-                        state.landed_without_effect(op, *nonce, *unsettled, now);
+                        state.landed_without_effect(flight, now);
                     }
                     Some(_) => {
                         // Its nonce went, its KOR did not. Either Kontor executed and
@@ -886,7 +908,7 @@ impl StakeTracker {
                      it again for {} hour unless the Portal says it never ran",
                         REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
                     );
-                        state.landed_without_effect(op, *nonce, *unsettled, now);
+                        state.landed_without_effect(flight, now);
                         state.last_event = Some((
                             Utc::now(),
                             format!("add_stake {amount} KOR executed without raising the bond"),
@@ -906,9 +928,26 @@ impl StakeTracker {
                      and the withdrawal retried in {} hours unless Kontor named an obligation",
                     WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
                 );
-                    state.landed_without_effect(op, *nonce, *unsettled, now);
+                    state.landed_without_effect(flight, now);
                 }
                 NodeOp::WithdrawStake => state.exited = true,
+                NodeOp::BeginUnstake if snapshot.withdrawal_height.is_none() => {
+                    // Its nonce went and no withdrawal is pending: Kontor
+                    // refused it, or the Portal retired it before Kontor saw
+                    // it. The operator asked for this by hand and nothing
+                    // plans it again, so it must not just disappear: the
+                    // Portal's listing says which it was (`classify_landed`),
+                    // and until it does no join is made.
+                    warn!(
+                        "begin-unstake at nonce {nonce} executed without starting the \
+                         withdrawal; asking the Portal how it ended"
+                    );
+                    state.landed_without_effect(flight, now);
+                    state.last_event = Some((
+                        Utc::now(),
+                        "begin_unstake executed without starting the withdrawal".to_string(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -969,6 +1008,28 @@ impl StakeTracker {
                  or add stake until Kontor finishes unwinding its memberships"
             );
             state.last_event = Some((Utc::now(), "bond cleanup pending".to_string()));
+        }
+
+        // A request the bond has overtaken is dropped rather than signed: a
+        // withdrawal with none pending any more (it completed, or a slash to
+        // zero cleared it), an unstake once a withdrawal is pending or there
+        // is nothing bonded. `/admin` checks the same when it takes the
+        // request; a request put back after its op was lost (see
+        // `request_again`) is checked here.
+        let moot = match &state.operator_request {
+            Some(NodeOp::WithdrawStake) => snapshot.withdrawal_height.is_none(),
+            Some(NodeOp::BeginUnstake) => {
+                snapshot.withdrawal_height.is_some() || snapshot.stake.is_zero()
+            }
+            _ => false,
+        };
+        if moot {
+            if let Some(op) = state.operator_request.take() {
+                info!(
+                    "dropping the {} requested from /admin: the bond no longer calls for it",
+                    op.name()
+                );
+            }
         }
 
         state.last_known = Some(snapshot.clone());
@@ -1055,6 +1116,9 @@ impl StakeTracker {
             NodeOp::WithdrawStake => state.last_withdraw = Some(now),
             _ => {}
         }
+        // An unstake is only ever the operator's; an adopted withdrawal is
+        // one only if the request for it is still waiting here.
+        let requested = op == NodeOp::BeginUnstake || state.operator_request.as_ref() == Some(&op);
         if state.operator_request.as_ref() == Some(&op) {
             state.operator_request = None;
         }
@@ -1072,6 +1136,7 @@ impl StakeTracker {
             sent: now,
             sent_at: Utc::now(),
             unsettled: false,
+            requested,
             stake_before: None,
             checked: Some(now),
             vouched: Some(now),
@@ -1156,7 +1221,11 @@ impl StakeTracker {
                  was not relayed and is decided again",
                 other.op
             );
+            let flight = op.clone();
             state.in_flight.retain(|op| op.nonce != nonce);
+            if flight.requested {
+                state.request_again(&flight.op);
+            }
             state.last_event = Some((
                 Utc::now(),
                 format!("{name} lost nonce {nonce} to a {} op", other.op),
@@ -1223,9 +1292,9 @@ impl StakeTracker {
                     format!("{name} lost by the Portal (nonce {nonce})")
                 } else {
                     warn!("the Portal reports the {name} op at nonce {nonce} as failed: {error}");
-                    let (op, unsettled) = (op.op.clone(), op.unsettled);
+                    let flight = op.clone();
                     state.in_flight.retain(|op| op.nonce != nonce);
-                    state.landed_without_effect(&op, nonce, unsettled, now);
+                    state.landed_without_effect(&flight, now);
                     state.last_event = Some((
                         Utc::now(),
                         format!("{name} failed at the Portal (nonce {nonce})"),
@@ -1248,7 +1317,14 @@ impl StakeTracker {
                 format!("{name} dropped by the Portal (nonce {nonce})")
             }
         };
+        // The Portal will not relay it. An op the policy plans is planned
+        // again from the state as it stands; one the operator asked for is
+        // put back as their request.
+        let flight = op.clone();
         state.in_flight.retain(|op| op.nonce != nonce);
+        if flight.requested {
+            state.request_again(&flight.op);
+        }
         state.last_event = Some((Utc::now(), dropped));
     }
 
@@ -1448,6 +1524,9 @@ impl StakeTracker {
                 if op == NodeOp::WithdrawStake {
                     state.last_withdraw = None;
                 }
+                if landed.requested {
+                    state.request_again(&op);
+                }
                 state.last_event = Some((
                     Utc::now(),
                     format!("{name} lost by the Portal (nonce {nonce}); deciding again"),
@@ -1461,6 +1540,9 @@ impl StakeTracker {
                 state.refused.remove(&refused_key(&op));
                 if op == NodeOp::WithdrawStake {
                     state.last_withdraw = None;
+                }
+                if landed.requested {
+                    state.request_again(&op);
                 }
                 state.last_event = Some((
                     Utc::now(),
@@ -1480,6 +1562,9 @@ impl StakeTracker {
                 state.refused.remove(&refused_key(&op));
                 if op == NodeOp::WithdrawStake {
                     state.last_withdraw = None;
+                }
+                if landed.requested {
+                    state.request_again(&op);
                 }
                 state.last_event = Some((
                     Utc::now(),
@@ -1503,6 +1588,19 @@ impl StakeTracker {
                 state.last_event = Some((
                     Utc::now(),
                     format!("withdraw_stake refused by Kontor: {error}; retrying within the hour"),
+                ));
+            }
+            NodeOp::BeginUnstake if status == Some("failed") => {
+                // Kontor ran the operator's unstake and refused it. Signing
+                // it again would meet the same answer; the operator is told
+                // why, and asks again once it no longer holds.
+                error!(
+                    "Kontor refused the unstake requested from /admin (nonce {nonce}): {error}. \
+                     No withdrawal is pending; request it again once that no longer holds"
+                );
+                state.last_event = Some((
+                    Utc::now(),
+                    format!("begin_unstake refused by Kontor: {error}"),
                 ));
             }
             NodeOp::AddStake(amount) if status == Some("confirmed") => {
@@ -1653,6 +1751,7 @@ impl StakeTracker {
             }
             _ => {}
         }
+        let requested = op == NodeOp::BeginUnstake || state.operator_request.as_ref() == Some(&op);
         if state.operator_request.as_ref() == Some(&op) {
             state.operator_request = None;
         }
@@ -1664,6 +1763,7 @@ impl StakeTracker {
             sent: now,
             sent_at: Utc::now(),
             unsettled,
+            requested,
             stake_before,
             checked: None,
             vouched: None,
@@ -1734,12 +1834,18 @@ impl StakeTracker {
         }
 
         // An unstake on its way: no join from the moment the operator asked,
-        // not only from the block it executes in.
+        // not only from the block it executes in — nor while one that landed
+        // without starting the withdrawal waits for the Portal to say whether
+        // it ran at all (it is signed again if it did not).
         let leaving = matches!(state.operator_request, Some(NodeOp::BeginUnstake))
             || state
                 .in_flight
                 .iter()
-                .any(|op| op.op == NodeOp::BeginUnstake);
+                .any(|op| op.op == NodeOp::BeginUnstake)
+            || state
+                .unexplained
+                .iter()
+                .any(|landed| landed.op == NodeOp::BeginUnstake);
 
         let mode = match (&state.snapshot, &state.joins_paused) {
             (None, _) if !state.portal_reports_stake => BudgetMode::Unmetered,
@@ -3246,10 +3352,30 @@ mod tests {
 
         // Sent: the request is done, another may follow.
         let t0 = Instant::now();
-        observed(&tracker, &entry(Some("10"), Some("10")), t0);
+        observed(&tracker, &exiting_entry(10, "10"), t0);
         assert_eq!(tracker.plan(t0, None), Some(NodeOp::WithdrawStake));
         tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
         assert!(tracker.request(NodeOp::BeginUnstake).is_ok());
+    }
+
+    /// A request the bond has overtaken is dropped at the next read, not
+    /// signed: a withdrawal when none is pending any more, an unstake once
+    /// one is.
+    #[test]
+    fn a_request_the_bond_has_overtaken_is_dropped() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        let mut bonded = entry(Some("10"), Some("10"));
+        bonded.kor_balance = Some("5".into());
+        observed(&tracker, &bonded, t0);
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
+        assert_eq!(tracker.plan(t0, None), None);
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        observed(&tracker, &exiting_entry(10, "10"), t0);
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
     }
 
     #[test]
@@ -5835,5 +5961,122 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(event, "withdrawal completed");
+    }
+    fn unstake_record(nonce: u64, status: &str, error: Option<&str>) -> NodeOpRecord {
+        listed_op("begin_unstake", nonce, status, error)
+    }
+
+    /// The operator's `begin-unstake` consumed its nonce and no withdrawal is
+    /// pending. Nothing plans an unstake again, and the op used to vanish
+    /// without a word: joins resumed and the operator believed the exit had
+    /// begun. The Portal's listing now says how it ended. Retired before
+    /// Kontor ran it (a proof took its nonce), it is put back as the
+    /// operator's request and signed again; and until the listing has
+    /// answered, no join is made.
+    #[test]
+    fn an_unstake_that_never_ran_is_signed_again_and_joins_stay_closed_meanwhile() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut bonded = entry(Some("100"), Some("100"));
+        bonded.kor_balance = Some("5".into());
+        observed(&tracker, &bonded, t0);
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::BeginUnstake));
+        tracker.record_sent(NodeOp::BeginUnstake, 10, t0);
+
+        // Nonce consumed, no withdrawal height.
+        let mut consumed = bonded.clone();
+        consumed.next_nonce = Some(11);
+        observed(&tracker, &consumed, t0);
+        let event = tracker.status()["last_event"]["message"].to_string();
+        assert!(event.contains("without starting the withdrawal"), "{event}");
+        assert_eq!(tracker.ops_to_classify(), vec![10]);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::Leaving),
+            "undecided: no join in between"
+        );
+        assert_eq!(tracker.plan(t0, None), None);
+
+        tracker.classify_landed(
+            10,
+            Ok(vec![unstake_record(10, "failed", Some(PORTAL_NO_RECEIPT))]),
+            t0,
+        );
+        assert_eq!(tracker.status()["operator_request"], "begin_unstake");
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::BeginUnstake));
+    }
+
+    /// Refused by Kontor, the unstake is not signed again — it would meet the
+    /// same answer — and the operator is told why. Joins resume.
+    #[test]
+    fn an_unstake_kontor_refused_is_reported_to_the_operator() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut bonded = entry(Some("100"), Some("100"));
+        bonded.kor_balance = Some("5".into());
+        observed(&tracker, &bonded, t0);
+        tracker.request(NodeOp::BeginUnstake).unwrap();
+        tracker.record_sent(NodeOp::BeginUnstake, 10, t0);
+        let mut consumed = bonded.clone();
+        consumed.next_nonce = Some(11);
+        observed(&tracker, &consumed, t0);
+
+        tracker.classify_landed(
+            10,
+            Ok(vec![unstake_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"withdrawal already requested\"))"),
+            )]),
+            t0,
+        );
+        let event = tracker.status()["last_event"]["message"].to_string();
+        assert!(event.contains("begin_unstake refused by Kontor"), "{event}");
+        assert!(event.contains("withdrawal already requested"), "{event}");
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
+        assert_eq!(tracker.plan(t0, None), None);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Join {
+                collateral: Some(kor("1"))
+            }
+        );
+    }
+
+    /// An unstake, or a withdrawal made by hand, that the Portal dropped
+    /// before relaying it is the operator's request again. The policy plans
+    /// neither on its own, so "deciding again" used to mean forgetting it.
+    #[test]
+    fn an_operator_s_op_the_portal_dropped_is_requested_again() {
+        for op in [NodeOp::BeginUnstake, NodeOp::WithdrawStake] {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            let read = if op == NodeOp::WithdrawStake {
+                exiting_entry(10, "100")
+            } else {
+                let mut bonded = entry(Some("100"), Some("100"));
+                bonded.kor_balance = Some("5".into());
+                bonded
+            };
+            observed(&tracker, &read, t0);
+            tracker.request(op.clone()).unwrap();
+            tracker.record_sent(op.clone(), 10, t0);
+            assert_eq!(tracker.status()["operator_request"], Value::Null);
+
+            let check = t0 + OP_LANDING_CHECK_INTERVAL;
+            tracker.verify_in_flight(10, Ok(vec![]), check);
+            assert_eq!(tracker.status()["operator_request"], op.name());
+            assert_eq!(tracker.plan(check, None), Some(op));
+        }
+
+        // A withdrawal the exit planned on its own is planned again by the
+        // exit when it is due, not turned into a request.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
+        tracker.verify_in_flight(10, Ok(vec![]), t0 + OP_LANDING_CHECK_INTERVAL);
+        assert_eq!(tracker.status()["operator_request"], Value::Null);
     }
 }
