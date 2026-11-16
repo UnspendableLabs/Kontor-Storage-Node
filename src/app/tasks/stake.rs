@@ -490,7 +490,10 @@ struct TrackerState {
     observed_at: Option<DateTime<Utc>>,
     /// Sticky: this Portal has reported a stake at least once.
     portal_reports_stake: bool,
-    in_flight: Option<InFlight>,
+    /// The ops the relay took that Kontor has not executed yet, by ascending
+    /// nonce. One at a time for every op but the exit's leaves (see
+    /// [`StakeTracker::plan`]).
+    in_flight: Vec<InFlight>,
     /// The Portal's listing of this node's `queued` and `submitted` ops has
     /// been read once in this process, and the newest adopted as in flight
     /// (see [`StakeTracker::adopt_pending_ops`]). Nothing is planned before.
@@ -764,8 +767,8 @@ impl StakeTracker {
         };
 
         let exited_before = state.exited;
-        let mut landed: Option<(NodeOp, u64, bool)> = None;
-        if let Some(op) = state.in_flight.take() {
+        let mut landed: Vec<InFlight> = Vec::new();
+        for op in std::mem::take(&mut state.in_flight) {
             if snapshot.next_nonce > op.nonce {
                 info!(
                     op = op.op.name(),
@@ -773,7 +776,7 @@ impl StakeTracker {
                     "the {} op has executed on Kontor",
                     op.op.name()
                 );
-                landed = Some((op.op, op.nonce, op.unsettled));
+                landed.push(op);
             } else if op.given_up_at(now) {
                 warn!(
                     op = op.op.name(),
@@ -784,81 +787,89 @@ impl StakeTracker {
                     OP_LANDING_HARD_TIMEOUT.as_secs() / 3600
                 );
             } else {
-                state.in_flight = Some(op);
+                state.in_flight.push(op);
             }
         }
 
-        match &landed {
-            Some((op @ NodeOp::LeaveAgreement(agreement_id), nonce, unsettled)) => {
-                // Its nonce went; whether Kontor accepted the leave is not in
-                // the registry. The Portal's listing says, and until it does
-                // the agreement is neither left nor left again (see
-                // `classify_landed` and `next_exit_op`).
-                info!(
-                    "the leave of agreement {agreement_id} has executed; asking the Portal \
+        for InFlight {
+            op,
+            nonce,
+            unsettled,
+            ..
+        } in &landed
+        {
+            match op {
+                NodeOp::LeaveAgreement(agreement_id) => {
+                    // Its nonce went; whether Kontor accepted the leave is not in
+                    // the registry. The Portal's listing says, and until it does
+                    // the agreement is neither left nor left again (see
+                    // `classify_landed` and `next_exit_op`).
+                    info!(
+                        "the leave of agreement {agreement_id} has executed; asking the Portal \
                      whether Kontor accepted it"
-                );
-                state.unexplained = Some(LandedOp {
-                    op: op.clone(),
-                    nonce: *nonce,
-                    landed: now,
-                    unsettled: *unsettled,
-                });
-            }
-            Some((op @ NodeOp::AddStake(amount), nonce, unsettled))
-                if state
-                    .last_known
-                    .as_ref()
-                    .is_some_and(|previous| snapshot.stake <= previous.stake) =>
-            {
-                // Its nonce went, its KOR did not. Either Kontor executed and
-                // refused it for a reason the snapshot and the Portal's
-                // pre-check did not see — the same op signed again next cycle
-                // meets the same answer, and each attempt costs gas, so it
-                // waits as long as one the Portal refused — or the Portal
-                // retired it before Kontor saw it, which its listing says, and
-                // `classify_landed` lifts the wait for.
-                warn!(
-                    "add-stake of {amount} KOR executed without raising the bond; not signing \
+                    );
+                    state.unexplained = Some(LandedOp {
+                        op: op.clone(),
+                        nonce: *nonce,
+                        landed: now,
+                        unsettled: *unsettled,
+                    });
+                }
+                NodeOp::AddStake(amount)
+                    if state
+                        .last_known
+                        .as_ref()
+                        .is_some_and(|previous| snapshot.stake <= previous.stake) =>
+                {
+                    // Its nonce went, its KOR did not. Either Kontor executed and
+                    // refused it for a reason the snapshot and the Portal's
+                    // pre-check did not see — the same op signed again next cycle
+                    // meets the same answer, and each attempt costs gas, so it
+                    // waits as long as one the Portal refused — or the Portal
+                    // retired it before Kontor saw it, which its listing says, and
+                    // `classify_landed` lifts the wait for.
+                    warn!(
+                        "add-stake of {amount} KOR executed without raising the bond; not signing \
                      it again for {} hour unless the Portal says it never ran",
-                    REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
-                );
-                state.refused.insert(refused_key(op), now);
-                state.unexplained = Some(LandedOp {
-                    op: op.clone(),
-                    nonce: *nonce,
-                    landed: now,
-                    unsettled: *unsettled,
-                });
-                state.last_event = Some((
-                    Utc::now(),
-                    format!("add_stake {amount} KOR executed without raising the bond"),
-                ));
-            }
-            Some((op @ NodeOp::WithdrawStake, nonce, unsettled)) if !snapshot.stake.is_zero() => {
-                // Executed, and the bond is still there: too early, or an
-                // obligation the node's own rows did not show (a leave that
-                // failed on chain, a challenge Kontor has still to settle).
-                // Forget which leaves "worked" so they are sent again, re-read
-                // the memberships, and retry later — sooner if the Portal's
-                // listing says Kontor named an obligation (see
-                // `classify_landed`).
-                warn!(
+                        REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
+                    );
+                    state.refused.insert(refused_key(op), now);
+                    state.unexplained = Some(LandedOp {
+                        op: op.clone(),
+                        nonce: *nonce,
+                        landed: now,
+                        unsettled: *unsettled,
+                    });
+                    state.last_event = Some((
+                        Utc::now(),
+                        format!("add_stake {amount} KOR executed without raising the bond"),
+                    ));
+                }
+                NodeOp::WithdrawStake if !snapshot.stake.is_zero() => {
+                    // Executed, and the bond is still there: too early, or an
+                    // obligation the node's own rows did not show (a leave that
+                    // failed on chain, a challenge Kontor has still to settle).
+                    // Forget which leaves "worked" so they are sent again, re-read
+                    // the memberships, and retry later — sooner if the Portal's
+                    // listing says Kontor named an obligation (see
+                    // `classify_landed`).
+                    warn!(
                     "withdraw-stake executed without returning the bond; leaves will be resent \
                      and the withdrawal retried in {} hours unless Kontor named an obligation",
                     WITHDRAW_RETRY_INTERVAL.as_secs() / 3600
                 );
-                state.left.clear();
-                state.memberships_refreshed = false;
-                state.unexplained = Some(LandedOp {
-                    op: op.clone(),
-                    nonce: *nonce,
-                    landed: now,
-                    unsettled: *unsettled,
-                });
+                    state.left.clear();
+                    state.memberships_refreshed = false;
+                    state.unexplained = Some(LandedOp {
+                        op: op.clone(),
+                        nonce: *nonce,
+                        landed: now,
+                        unsettled: *unsettled,
+                    });
+                }
+                NodeOp::WithdrawStake => state.exited = true,
+                _ => {}
             }
-            Some((NodeOp::WithdrawStake, _, _)) => state.exited = true,
-            _ => {}
         }
         // The snapshot says so too, whether or not the withdrawal is still
         // tracked in flight — one given up as lost has been forgotten by then
@@ -907,7 +918,8 @@ impl StakeTracker {
         });
 
         if let Some(previous) = &state.last_known {
-            let event = describe_transition(previous, &snapshot, landed.map(|(op, _, _)| op));
+            let withdraw_landed = landed.iter().any(|op| op.op == NodeOp::WithdrawStake);
+            let event = describe_transition(previous, &snapshot, withdraw_landed);
             if let Some(event) = event {
                 state.last_event = Some((Utc::now(), event));
             }
@@ -951,7 +963,7 @@ impl StakeTracker {
     pub fn adopt_pending_ops(&self, ops: &[NodeOpRecord], now: Instant) -> Option<(NodeOp, u64)> {
         let mut state = self.lock();
         state.pending_ops_checked = true;
-        if state.in_flight.is_some() {
+        if !state.in_flight.is_empty() {
             return None;
         }
         let (op, record) = ops
@@ -984,7 +996,7 @@ impl StakeTracker {
                 record.status
             ),
         ));
-        state.in_flight = Some(InFlight {
+        state.in_flight.push(InFlight {
             op: op.clone(),
             nonce,
             sent: now,
@@ -1002,9 +1014,13 @@ impl StakeTracker {
     #[must_use]
     pub fn op_to_verify(&self, now: Instant) -> Option<u64> {
         let state = self.lock();
-        let op = state.in_flight.as_ref()?;
-        let since = op.checked.unwrap_or(op.sent);
-        (now.duration_since(since) >= OP_LANDING_CHECK_INTERVAL).then_some(op.nonce)
+        state
+            .in_flight
+            .iter()
+            .find(|op| {
+                now.duration_since(op.checked.unwrap_or(op.sent)) >= OP_LANDING_CHECK_INTERVAL
+            })
+            .map(|op| op.nonce)
     }
 
     /// What the Portal's listing of this node's ops says about the in-flight
@@ -1024,7 +1040,8 @@ impl StakeTracker {
         now: Instant,
     ) {
         let mut state = self.lock();
-        let Some(op) = state.in_flight.as_mut().filter(|op| op.nonce == nonce) else {
+        let state = &mut *state;
+        let Some(op) = state.in_flight.iter_mut().find(|op| op.nonce == nonce) else {
             return;
         };
         op.checked = Some(now);
@@ -1047,7 +1064,7 @@ impl StakeTracker {
                  was not relayed and is decided again",
                 other.op
             );
-            state.in_flight = None;
+            state.in_flight.retain(|op| op.nonce != nonce);
             state.last_event = Some((
                 Utc::now(),
                 format!("{name} lost nonce {nonce} to a {} op", other.op),
@@ -1110,7 +1127,7 @@ impl StakeTracker {
                 format!("{name} dropped by the Portal (nonce {nonce})")
             }
         };
-        state.in_flight = None;
+        state.in_flight.retain(|op| op.nonce != nonce);
         state.last_event = Some((Utc::now(), dropped));
     }
 
@@ -1344,7 +1361,7 @@ impl StakeTracker {
         state.exit = exit.cloned();
         let state = &*state;
         let snapshot = state.snapshot.as_ref()?;
-        if state.in_flight.is_some() {
+        if !state.in_flight.is_empty() {
             return None;
         }
 
@@ -1413,7 +1430,7 @@ impl StakeTracker {
             state.operator_request = None;
         }
         state.last_event = Some((Utc::now(), event));
-        state.in_flight = Some(InFlight {
+        state.in_flight.push(InFlight {
             op,
             nonce,
             sent: now,
@@ -1422,6 +1439,7 @@ impl StakeTracker {
             checked: None,
             vouched: None,
         });
+        state.in_flight.sort_by_key(|op| op.nonce);
     }
 
     /// The relay refused `op`. A refusal is not retried until something
@@ -1462,7 +1480,7 @@ impl StakeTracker {
         if state.operator_request.is_some() {
             return Err("another request is already waiting for the next cycle");
         }
-        if state.in_flight.as_ref().is_some_and(|sent| sent.op == op) {
+        if state.in_flight.iter().any(|sent| sent.op == op) {
             return Err(match op {
                 NodeOp::BeginUnstake => {
                     "an unstake is already in flight: signed, and not executed yet"
@@ -1490,8 +1508,8 @@ impl StakeTracker {
         let leaving = matches!(state.operator_request, Some(NodeOp::BeginUnstake))
             || state
                 .in_flight
-                .as_ref()
-                .is_some_and(|op| op.op == NodeOp::BeginUnstake);
+                .iter()
+                .any(|op| op.op == NodeOp::BeginUnstake);
 
         let mode = match (&state.snapshot, &state.joins_paused) {
             (None, _) if !state.portal_reports_stake => BudgetMode::Unmetered,
@@ -1572,7 +1590,7 @@ impl StakeTracker {
                 "stake_target": policy.stake_target,
                 "claim_threshold": policy.claim_threshold,
             },
-            "in_flight": state.in_flight.as_ref().map(|op| json!({
+            "in_flight": state.in_flight.first().map(|op| json!({
                 "op": op.op.name(),
                 "amount": op.op.amount(),
                 "nonce": op.nonce,
@@ -1700,7 +1718,7 @@ fn withdraw_due(state: &TrackerState, now: Instant) -> bool {
 fn describe_transition(
     previous: &StakeSnapshot,
     current: &StakeSnapshot,
-    landed: Option<NodeOp>,
+    withdraw_landed: bool,
 ) -> Option<String> {
     let mut event = None;
 
@@ -1713,8 +1731,7 @@ fn describe_transition(
     // registry otherwise looks the same. Whether cleanup is pending has to be
     // known for that: unread, the drop is reported as what it may be.
     let exit_over = current.stake.is_zero() && previous.withdrawal_height.is_some();
-    let withdrawn = landed == Some(NodeOp::WithdrawStake)
-        || (exit_over && current.bond_cleanup_pending == Some(false));
+    let withdrawn = withdraw_landed || (exit_over && current.bond_cleanup_pending == Some(false));
     let undecided = exit_over && current.bond_cleanup_pending.is_none();
     if current.stake < previous.stake && !withdrawn && !undecided {
         let lost = previous.stake.saturating_sub(current.stake);
