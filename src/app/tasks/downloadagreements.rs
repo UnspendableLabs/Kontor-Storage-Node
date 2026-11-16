@@ -18,7 +18,8 @@ use sea_orm::sea_query::Expr;
 use sea_orm::DbErr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+    EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -384,9 +385,12 @@ async fn invalidated_joins(
     if invalidated.is_empty() {
         return Ok(Vec::new());
     }
+    // Oldest first, like every join (see `download_agreements_scoped`).
     Agreements::find()
         .filter(agreements::Column::Downloaded.eq(true))
         .filter(agreements::Column::AgreementId.is_in(invalidated))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
         .all(database)
         .await
         .context("failed to load agreements whose join was invalidated")
@@ -522,7 +526,8 @@ pub async fn download_agreements(
 /// Download agreement files that are not yet stored locally.
 ///
 /// This function orchestrates the download workflow:
-/// 1. Queries for pending agreements, memberships the node already holds first
+/// 1. Queries for pending agreements, memberships the node already holds
+///    first, and within each group the oldest agreement first
 /// 2. For each agreement it does not hold yet, checks storage limits, then
 ///    whether the stake can cover joining it (`budget`, from this cycle's
 ///    `listing`)
@@ -645,15 +650,24 @@ async fn download_agreements_scoped(
         None => 0,
     };
 
+    // Oldest first. The order new agreements are taken on in is the order
+    // their joins are signed in, so the order of this node's nonces. An
+    // uploader's `create-agreement`s carry nonces in upload order, and the
+    // Portal composes an agreement's create and its joins together: a node
+    // that joined newest first (the order of the Portal's listing, and so of
+    // the rows) ran its nonces against the uploader's, and the Portal could
+    // then batch neither sequence without passing over an op of the other.
     let pending = Agreements::find()
         .filter(agreements::Column::Downloaded.eq(false))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
         .all(database)
         .await
         .context("failed to load agreements to download")?;
 
     // Held memberships first, so the files the node already owes are fetched
     // before new agreements use up the limits. The sort is stable: within
-    // each group the order is the database's, as before.
+    // each group the order stays oldest first.
     let mut pending: Vec<(agreements::Model, Membership)> = pending
         .into_iter()
         .map(|agreement| {
@@ -3733,6 +3747,77 @@ mod tests {
                 .decide(false, Some(Some("30"))),
             JoinDecision::Join { .. }
         ));
+    }
+
+    /// Agreements are joined oldest first, whatever order their rows were
+    /// stored in — the Portal lists newest first, and the node used to join in
+    /// that order. An uploader's creates carry nonces in upload order; joining
+    /// against it left the Portal no batch that respected both sequences.
+    #[tokio::test]
+    async fn new_agreements_are_joined_oldest_first() {
+        let mock_server = MockServer::start().await;
+        let database = setup_agreements_db().await;
+        // Stored newest first, as the listing gives them.
+        for (agreement_id, created_at) in [
+            ("AGR-c", "2024-03-01T00:00:00Z"),
+            ("AGR-b", "2024-02-01T00:00:00Z"),
+            ("AGR-a2", "2024-01-01T00:00:00Z"),
+            ("AGR-a1", "2024-01-01T00:00:00Z"),
+        ] {
+            mount_download(&mock_server, agreement_id).await;
+            mount_join_agreement_mock(&mock_server, agreement_id).await;
+            let mut fx = AgreementFixture::new(agreement_id, format!("FILE-{agreement_id}"));
+            fx.nodes = json!([]);
+            fx.created_at = chrono::DateTime::parse_from_rfc3339(created_at).unwrap();
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let storage_dir = unique_storage_dir("oldest_first");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        download_agreements(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+        )
+        .await
+        .unwrap();
+
+        let joined: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/join"))
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                "/api/agreements/AGR-a1/join",
+                "/api/agreements/AGR-a2/join",
+                "/api/agreements/AGR-b/join",
+                "/api/agreements/AGR-c/join",
+            ],
+            "oldest first, ties by id"
+        );
+        // And so are the nonces: ascending with the agreements' age.
+        let nonces: Vec<u64> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/join"))
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["nonce"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            nonces.windows(2).all(|pair| pair[0] < pair[1]),
+            "{nonces:?}"
+        );
     }
 
     /// A download the Portal cannot serve is the same: that agreement waits,
