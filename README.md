@@ -67,7 +67,7 @@ The node can be configured via command-line arguments or environment variables:
 | `--auto-stake` | `KONTOR_STORAGE_AUTO_STAKE` | `true` | Bond spare KOR as collateral and claim storage rewards automatically. `false` (also `0`, `no`, `off`) makes the node sign no stake or claim op on its own. See [Staking & collateral](#staking--collateral). |
 | `--gas-reserve-kor` | `KONTOR_STORAGE_GAS_RESERVE_KOR` | `5` | KOR kept liquid to pay the fees of the node's own joins and proofs. Never bonded. At least `0.0001`: Kontor holds an op's gas (100,000 gas × 10⁻⁹ KOR) from the balance before running it, so with less kept back, staking the rest always fails — and the minimum pays for that one op, not for the proofs after it. |
 | `--stake-target-kor` | `KONTOR_STORAGE_STAKE_TARGET_KOR` | _unset_ | Cap on the total bonded stake. Unset bonds everything above the gas reserve. |
-| `--faucet-amount-kor` | `KONTOR_STORAGE_FAUCET_AMOUNT_KOR` | `1000` | KOR requested from the Portal faucet when the node starts with neither a liquid balance nor a bonded stake — a staked node with nothing liquid is not funded again on restart, and one whose stake the Portal does not report asks once without waiting for it. The Portal caps it (`PORTAL_FAUCET_MAX_AMOUNT_KOR`); a node asking for more is told the cap and asks again for exactly that. |
+| `--faucet-amount-kor` | `KONTOR_STORAGE_FAUCET_AMOUNT_KOR` | `1000` | KOR requested from the Portal faucet when the node has neither a liquid balance nor a bonded stake — at startup, or from the first sync cycle that reads it so (a balance the Portal reports as `null` is unknown, not empty, and is not funded on). A staked node with nothing liquid is not funded again on restart, and one whose stake the Portal does not report asks once without waiting for it. The faucet is asked again only an hour after a request that brought no balance. The Portal caps the amount (`PORTAL_FAUCET_MAX_AMOUNT_KOR`); a node asking for more is told the cap and asks again for exactly that. |
 | `--claim-threshold-kor` | `KONTOR_STORAGE_CLAIM_THRESHOLD_KOR` | `1` | Claim storage rewards once at least this much is claimable (at most once an hour). |
 | `--unknown-collateral-estimate-kor` | `KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR` | `10` | What a join is budgeted at when the agreement's collateral is not known yet — the usual case. Raised automatically to the largest collateral seen in the last day. |
 
@@ -500,6 +500,13 @@ Each sync cycle the node reads its bond from the Portal (`GET
    `add-stake(min(free, target − stake))` and hands it to the Portal, which
    publishes it like a join. A fresh node does this right after the faucet funds
    it — 1000 KOR by default, so 995 bonded — before it looks at any agreement.
+   A new node is one the Portal reports with a balance of `"0"` and a stake of
+   `"0"`: startup asks the faucet and waits for the balance, and if startup
+   could not read the balance (the Portal sends `null` when it cannot), the
+   first cycle that reads it as `"0"` asks instead. A request whose answer
+   never came may still have been broadcast, so it is not repeated — not by a
+   retry of the activation, not by the next cycle — until an hour has passed
+   without a balance.
 2. **Joins only what the bond covers.** Before downloading a ready agreement it
    checks the agreement's collateral against the unreserved stake, less what
    this cycle and still-unexecuted earlier joins have already committed.
@@ -540,7 +547,10 @@ or `submitted` is believed for as long as it does: the op is not lost, and a
 batch signed late routinely takes longer). The collateral set aside for a join
 is held the same way: until the join's nonce is consumed, until the Portal
 shows the join invalidated or the agreement closed to joins, or 6 hours at
-most. One the Portal refuses is not signed again every cycle: a top-up, a claim
+most. A join the Portal gave no usable answer to (a timeout, a `5xx`) is held
+like an accepted one, since the Portal may have stored it; the next ready
+listing settles it — the agreement listed with no row for this node means it
+was never stored, and the collateral is free again. One the Portal refuses is not signed again every cycle: a top-up, a claim
 or a leave (for that agreement only) waits an hour, a withdrawal six. The stake
 op is the last thing a cycle signs, so it never takes a nonce a proof needed.
 
@@ -550,7 +560,18 @@ Portal still lists for the node — but never lowers it: between two blocks the
 ops it signed are still queued at the Portal under those nonces, and signing
 at them again would collide. An op that never runs leaves a gap,
 which the Portal and Kontor both accept (up to 10,000 nonces ahead; a counter
-further ahead falls back to Kontor's value).
+further ahead falls back to Kontor's value). The counter survives a restart
+and an in-process re-activation: the highest nonce signed is recorded in the
+database (`node_state`, one row per signer) before the op goes out, and a new
+client starts one past it, or at Kontor's `next_nonce` if that is further —
+so the first join or proof after a restart is not signed at a nonce a queued
+op of the previous process still holds.
+
+New agreements are taken on oldest first (by `created_at`, then id), after
+the files of memberships the node already holds. That makes the node's join
+nonces ascend in the same order as the uploader's `create-agreement` nonces,
+which the Portal needs to batch an agreement's create and its joins together
+without passing over either signer's earlier op.
 
 The gas reserve is not optional in spirit: the node pays its own fees, and a
 node with nothing liquid cannot submit proofs — which is the expensive way to
@@ -560,6 +581,16 @@ hand; joins are still gated on whatever stake there is.
 Against a Portal that predates staking (its signer entry reports no stake) the
 node behaves as it always did: no stake ops, no gating. Once a Portal *has*
 reported a stake, a cycle in which it cannot be read joins nothing.
+
+**Deployment order.** Upgrade the nodes no later than the Portal they talk to.
+The staking Portal refuses the join of a node with no bond (`422
+NO_BONDED_STAKE`), and a node from before this release treats a refused join
+as a failed cycle: it downloads the file again every cycle, backs off, and —
+because its cycle joined before it proved — submits no proof for as long as a
+ready agreement is listed, while its challenges run towards a 30× slash. This
+release proves first and treats a refused join as that agreement's problem,
+so it is safe on either side of the Portal's upgrade: against an older Portal
+it simply does no staking.
 
 #### Slashing risk
 
@@ -579,7 +610,15 @@ can lose its whole bond to a short outage. The node defends what it can:
 - a refused join (`422` from the Portal) pauses joins for 10 minutes; any other
   failure of one agreement — a download the Portal cannot serve, a join it
   answers with anything else, a file that cannot be stored — costs that
-  agreement this cycle and nothing more. Neither fails the cycle.
+  agreement this cycle and nothing more. Neither fails the cycle;
+- no step of a cycle waits on another's failure: the proofs run even when the
+  node's agreements could not be listed, and the files of memberships it holds
+  are fetched even when the ready listing would not load (nothing is joined
+  without it). The cycle reports its first failure at the end and backs off;
+- the daemon does not stop. A failing first cycle or startup reconciliation is
+  retried like any other, and a daemon that ever ends — a panic, a lock it
+  could not take — is started again after a short wait, instead of leaving
+  the node in phase `running` with nothing proving its challenges.
 
 It cannot defend against being down, against a file it lost, or against the
 [ledger limitation](#the-aggregated-ledger) below, which stops every proof at
