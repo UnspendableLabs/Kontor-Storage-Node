@@ -1,7 +1,6 @@
 # Kontor Storage Node
 
 [![CI](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml/badge.svg)](https://github.com/UnspendableLabs/Kontor-Storage-Node/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node/graph/badge.svg?token=Rwusewkjbh)](https://codecov.io/gh/UnspendableLabs/Kontor-Storage-Node)
 [![crates.io](https://img.shields.io/crates/v/kontor-storage-node.svg)](https://crates.io/crates/kontor-storage-node)
 [![Licence](https://img.shields.io/crates/l/kontor-storage-node.svg)](#licence)
 
@@ -505,8 +504,11 @@ Each sync cycle the node reads its bond from the Portal (`GET
    could not read the balance (the Portal sends `null` when it cannot), the
    first cycle that reads it as `"0"` asks instead. A request whose answer
    never came may still have been broadcast, so it is not repeated — not by a
-   retry of the activation, not by the next cycle — until an hour has passed
-   without a balance.
+   retry of the activation, not by the next cycle, not by a restart (the
+   request is recorded in `node_state`) — until an hour has passed with a
+   balance read as empty; a balance the Portal cannot read never triggers a
+   new request. A request the faucet refuses (a `4xx`) sent nothing, and is
+   tried again ten minutes later rather than on every cycle.
 2. **Joins only what the bond covers.** Before downloading a ready agreement it
    checks the agreement's collateral against the unreserved stake, less what
    this cycle and still-unexecuted earlier joins have already committed.
@@ -531,7 +533,7 @@ go several at once, see [Leaving](#leaving)). The Portal only answers
 `next_nonce` moves past it, the op has executed, and the next decision is made
 from the balance and stake the Portal then reports. That tracking lives in
 memory, so before its first stake decision a process asks the Portal which of
-the node's ops it still holds (`GET /api/nodes/{node_id}/ops?status=queued|submitted`),
+the node's ops it still holds (`GET /api/nodes/{node_id}/ops?status=queued|submitted|failed`; a `failed` one counts only when the Portal lost track of the transaction that carried it, since it may still execute),
 takes every one of them as in flight and moves its nonce counter past all of
 them: a restart neither signs the top-up the previous process already queued
 a second time, nor is refused `409` for a nonce that process spent. Only a
@@ -618,7 +620,10 @@ can lose its whole bond to a short outage. The node defends what it can:
 - a proof Kontor rejects leaves the challenge open, and the node proves it again
   — five times a few minutes apart (1, 2, 4 and 8 minutes), then once an hour
   for as long as the challenge stays open, with an ERROR line when it slows
-  down. It never gives a challenge up: the Portal hands one back for reasons
+  down. The hourly pace shortens as the deadline nears: the node cannot see
+  the chain tip, so it estimates what is left of the window (its length in
+  blocks at ten minutes each, less the time since the challenge was created)
+  and waits an eighth of that, never under five minutes. It never gives a challenge up: the Portal hands one back for reasons
   that say nothing about the proof (a nonce that was passed, gas the balance
   could not cover), and a proof costs 0.0001 KOR against a 30× slash;
 - a refused join (`422` from the Portal) pauses joins for 10 minutes; any other
