@@ -70,6 +70,41 @@ const RESUBMIT_MAX_DELAY: Duration = Duration::from_secs(16 * 60);
 /// few minutes.
 const SLOW_RESUBMIT_DELAY: Duration = Duration::from_secs(60 * 60);
 
+/// Floor of the slow wait when a challenge's deadline looks close (see
+/// [`slow_resubmit_delay`]).
+const MIN_SLOW_RESUBMIT_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// What the node counts a block as when it estimates how much of a
+/// challenge's window is left. It cannot see the chain tip.
+const ESTIMATED_BLOCK_TIME: Duration = Duration::from_secs(10 * 60);
+
+/// The slow wait for `challenge`: [`SLOW_RESUBMIT_DELAY`], shortened as the
+/// deadline nears.
+///
+/// The node cannot see the chain tip, so it estimates what is left of the
+/// window from the window's length in blocks (`deadline_height -
+/// block_height`, at [`ESTIMATED_BLOCK_TIME`] each) and the time since the
+/// challenge was created, and waits an eighth of that, between
+/// [`MIN_SLOW_RESUBMIT_DELAY`] and [`SLOW_RESUBMIT_DELAY`]. A challenge handed
+/// back in its last hours is then proved again several times before it
+/// expires, instead of once an hour whatever the deadline.
+fn slow_resubmit_delay(
+    challenge: &challenges::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    let window_blocks = challenge
+        .deadline_height
+        .saturating_sub(challenge.block_height)
+        .max(0);
+    let window =
+        ESTIMATED_BLOCK_TIME.saturating_mul(u32::try_from(window_blocks).unwrap_or(u32::MAX));
+    let known_for = now
+        .signed_duration_since(challenge.created_at)
+        .to_std()
+        .unwrap_or_default();
+    (window.saturating_sub(known_for) / 8).clamp(MIN_SLOW_RESUBMIT_DELAY, SLOW_RESUBMIT_DELAY)
+}
+
 /// Bookkeeping for challenges that have been proved at least once.
 ///
 /// In memory: a restart starts every count again, which costs at most another
@@ -101,17 +136,33 @@ enum RetryCheck {
 }
 
 impl ProofRetries {
+    #[cfg(test)]
     fn check(&self, challenge_id: &str, now: Instant) -> RetryCheck {
+        self.check_at_pace(challenge_id, now, SLOW_RESUBMIT_DELAY)
+    }
+
+    /// [`RetryCheck`] for one active challenge, `slow_delay` being the wait
+    /// between submissions once the fast ones are spent (see
+    /// [`slow_resubmit_delay`]).
+    fn check_at_pace(&self, challenge_id: &str, now: Instant, slow_delay: Duration) -> RetryCheck {
         let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(entry) = attempts.get_mut(challenge_id) else {
             return RetryCheck::Prove;
         };
         let slow = entry.submissions >= FAST_PROOF_SUBMISSIONS;
-        let announce = slow && !entry.slowed_down_logged;
-        if announce {
-            entry.slowed_down_logged = true;
-        }
-        if now.duration_since(entry.last) < resubmit_delay(entry.submissions) {
+        let delay = if slow {
+            slow_delay
+        } else {
+            resubmit_delay(entry.submissions)
+        };
+        if now.duration_since(entry.last) < delay {
+            // Announced on the first wait at the slow pace, and only marked
+            // then: a challenge that came back when its wait had already
+            // passed is proved at once, and announced on the wait after.
+            let announce = slow && !entry.slowed_down_logged;
+            if announce {
+                entry.slowed_down_logged = true;
+            }
             RetryCheck::Wait { announce }
         } else {
             RetryCheck::Prove
@@ -307,20 +358,22 @@ async fn prove_active_challenges<G: ProofGenerator>(
     let mut submitted_count = 0usize;
 
     for challenge in active_challenges {
-        match retries.check(&challenge.challenge_id, now) {
+        let slow_delay = slow_resubmit_delay(&challenge, chrono::Utc::now());
+        match retries.check_at_pace(&challenge.challenge_id, now, slow_delay) {
             RetryCheck::Prove => {}
             RetryCheck::Wait { announce } => {
                 if announce {
                     error!(
                         "Challenge {} (agreement {}, deadline height {}) is still open after \
                          {FAST_PROOF_SUBMISSIONS} proofs. It is proved again every {} minutes \
-                         for as long as it stays open; if it expires it is slashed at 30× the \
-                         agreement's collateral — check the node's KOR balance (a proof needs \
-                         its gas), the stored file and its ledger slot.",
+                         (more often as its deadline nears) for as long as it stays open; if \
+                         it expires it is slashed at 30× the agreement's collateral — check \
+                         the node's KOR balance (a proof needs its gas), the stored file and \
+                         its ledger slot.",
                         challenge.challenge_id,
                         challenge.agreement_id,
                         challenge.deadline_height,
-                        SLOW_RESUBMIT_DELAY.as_secs() / 60
+                        slow_delay.as_secs() / 60
                     );
                 } else {
                     debug!(
@@ -2607,5 +2660,82 @@ mod tests {
         // Forgotten a day after it stops being active.
         retries.prune(&[], now + Duration::from_secs(24 * 3600));
         assert_eq!(retries.check("c", now), RetryCheck::Prove);
+    }
+
+    fn challenge_with_window(blocks: i64, known_for: chrono::Duration) -> challenges::Model {
+        let created = chrono::Utc::now() - known_for;
+        challenges::Model {
+            challenge_id: "chal_window".into(),
+            agreement_id: "agr_window".into(),
+            block_height: 1_000,
+            challenge_count: 1,
+            seed: String::new(),
+            prover_id: String::new(),
+            deadline_height: 1_000 + blocks,
+            status: STATUS_ACTIVE.into(),
+            proof: None,
+            bls_signature: None,
+            created_at: created.into(),
+            updated_at: created.into(),
+        }
+    }
+
+    /// The slow pace is an hour while the deadline is far, and shortens as
+    /// the estimated end of the window nears — down to five minutes — so a
+    /// challenge handed back late is still proved several times.
+    #[test]
+    fn the_slow_pace_shortens_as_the_deadline_nears() {
+        let now = chrono::Utc::now();
+        // 2016 blocks, just issued: two weeks left.
+        let fresh = challenge_with_window(2016, chrono::Duration::zero());
+        assert_eq!(slow_resubmit_delay(&fresh, now), SLOW_RESUBMIT_DELAY);
+        // About four hours left by the estimate: an eighth of that.
+        let late = challenge_with_window(2016, chrono::Duration::minutes(2016 * 10 - 240));
+        let delay = slow_resubmit_delay(&late, now);
+        assert!(
+            delay >= Duration::from_secs(29 * 60) && delay <= Duration::from_secs(31 * 60),
+            "{delay:?}"
+        );
+        // Past the estimate, or a window that makes no sense: the floor.
+        let overdue = challenge_with_window(2016, chrono::Duration::days(30));
+        assert_eq!(slow_resubmit_delay(&overdue, now), MIN_SLOW_RESUBMIT_DELAY);
+        let nonsense = challenge_with_window(-5, chrono::Duration::zero());
+        assert_eq!(slow_resubmit_delay(&nonsense, now), MIN_SLOW_RESUBMIT_DELAY);
+    }
+
+    /// The line that tells the operator a challenge is still open after its
+    /// fast proofs was lost when the challenge came back after the slow wait
+    /// had already passed: that check proved at once and marked the line as
+    /// said. It is now said on the first wait at the slow pace, whenever
+    /// that is.
+    #[test]
+    fn the_slow_pace_is_announced_on_its_first_wait_even_after_a_late_return() {
+        let retries = ProofRetries::default();
+        let t0 = Instant::now();
+        for _ in 0..FAST_PROOF_SUBMISSIONS {
+            retries.record_submission("chal_late", t0);
+        }
+        // Back to active only after the slow wait: proved at once, no wait
+        // to announce on yet.
+        let back = t0 + SLOW_RESUBMIT_DELAY;
+        assert_eq!(retries.check("chal_late", back), RetryCheck::Prove);
+        retries.record_submission("chal_late", back);
+        assert_eq!(
+            retries.check("chal_late", back + Duration::from_secs(1)),
+            RetryCheck::Wait { announce: true }
+        );
+        assert_eq!(
+            retries.check("chal_late", back + Duration::from_secs(2)),
+            RetryCheck::Wait { announce: false }
+        );
+        // A shorter slow pace is honoured.
+        assert_eq!(
+            retries.check_at_pace(
+                "chal_late",
+                back + MIN_SLOW_RESUBMIT_DELAY,
+                MIN_SLOW_RESUBMIT_DELAY
+            ),
+            RetryCheck::Prove
+        );
     }
 }
