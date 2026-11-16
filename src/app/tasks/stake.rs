@@ -2551,12 +2551,18 @@ pub async fn settle_pending_joins(
 /// out of that listing and the local row keeps saying `valid`. Before the
 /// exit's first step in a process, and again whenever it has to resend its
 /// leaves, each membership the rows still show is re-read one by one, and its
-/// `nodes` and `status` rewritten. A leave is then never paid for a membership
+/// `nodes` and `status` rewritten. A leave is then not paid for a membership
 /// that is already gone.
 ///
+/// One agreement the Portal cannot serve does not hold the others back, nor
+/// the exit: its row is left as it is and reported, and the rest are
+/// refreshed. Acting on that one stale row costs at most a leave Kontor
+/// answers "not in agreement" — which counts as left — where waiting for it
+/// stalled the whole exit for as long as that one request kept failing.
+/// Reconciliation re-reads the stale rows every cycle, so it is tried again.
+///
 /// # Errors
-/// If the rows cannot be read or written, or any agreement cannot be fetched;
-/// the exit then waits a cycle rather than act on stale rows.
+/// If the rows cannot be read or written; the exit then waits a cycle.
 pub async fn refresh_memberships(
     client: &PortalClient,
     database: &DatabaseConnection,
@@ -2585,16 +2591,21 @@ pub async fn refresh_memberships_except(
     use sea_orm::{ActiveValue, EntityTrait};
 
     let rows = Agreements::find().all(database).await?;
+    let mut unread = Vec::new();
     for row in rows
         .into_iter()
         .filter(|agreement| !current.contains(&agreement.agreement_id))
         .filter(|agreement| !NOT_ON_CHAIN.contains(&agreement.status.as_str()))
         .filter(|agreement| is_live_member(&agreement.nodes, node_id))
     {
-        let remote = client
-            .get_agreement(&row.agreement_id)
-            .await
-            .with_context(|| format!("re-reading membership {}", row.agreement_id))?;
+        let remote = match client.get_agreement(&row.agreement_id).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                debug!("could not re-read membership {}: {err:#}", row.agreement_id);
+                unread.push(row.agreement_id);
+                continue;
+            }
+        };
         let nodes = serde_json::to_value(&remote.nodes).context("serializing agreement nodes")?;
         if nodes == row.nodes && remote.status == row.status {
             continue;
@@ -2614,6 +2625,19 @@ pub async fn refresh_memberships_except(
         .exec(database)
         .await
         .context("updating a membership's row")?;
+    }
+    if !unread.is_empty() {
+        warn!(
+            "could not re-read {} membership(s) from the Portal ({}); their rows stand as they \
+             are until the next cycle",
+            unread.len(),
+            unread
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }
@@ -6255,5 +6279,63 @@ mod tests {
 
         // A value still reads as a value.
         assert_eq!(signer(Some(json!("995"))).stake.as_deref(), Some("995"));
+    }
+    /// One agreement the Portal cannot serve used to fail the whole refresh,
+    /// every cycle, and the exit waited behind it. The others are refreshed,
+    /// and that row stands until it can be read.
+    #[tokio::test]
+    async fn one_unreadable_membership_does_not_hold_the_others_back() {
+        use crate::testutils::{setup_in_memory_db, AgreementFixture};
+        use sea_orm::ActiveModelTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-broken"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-gone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agreement_id": "AGR-gone",
+                "user_id": "user_1",
+                "file_id": "F-AGR-gone",
+                "filename": "test.bin",
+                "mime_type": "application/octet-stream",
+                "original_size": 123,
+                "nodes": [{"node_id": "NODE-test", "status": "left"}],
+                "transaction_id": null,
+                "status": "confirmed",
+                "created_at": "2024-01-01T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let db = setup_in_memory_db().await;
+        // `AGR-broken` sorts first: it used to end the loop before `AGR-gone`.
+        for id in ["AGR-broken", "AGR-gone"] {
+            AgreementFixture {
+                status: "confirmed".into(),
+                nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+                ..AgreementFixture::new(id, format!("F-{id}"))
+            }
+            .into_active_model()
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let client = client_at(&mock_server, 10);
+
+        refresh_memberships(&client, &db, "NODE-test")
+            .await
+            .expect("an unreadable agreement is not a failed refresh");
+        assert_eq!(
+            exit_inputs(&db, "NODE-test").await.unwrap().memberships,
+            vec!["AGR-broken"],
+            "AGR-gone was refreshed; AGR-broken stands as it was"
+        );
     }
 }
