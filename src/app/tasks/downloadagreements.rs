@@ -7,7 +7,7 @@ use crate::app::tasks::stake::{
 };
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kor::Kor;
-use crate::clients::portal::{AgreementNode, JoinAgreementResponse};
+use crate::clients::portal::{AgreementNode, JoinAgreementResponse, UnsettledOp};
 use crate::clients::{GcsClient, PortalClient};
 use crate::entities::{agreements, prelude::Agreements};
 use anyhow::{anyhow, Context, Result};
@@ -545,9 +545,11 @@ pub async fn download_agreements(
 /// collateral, cleanup pending, withdrawal requested) costs the downloaded
 /// file and pauses joins for a while — `tracker` remembers that across cycles.
 /// Any other failure of one agreement — a download the Portal cannot serve, a
-/// join it answers with anything else, a file that cannot be stored — costs
-/// that agreement this cycle and nothing more: it is logged, its download
-/// discarded, and the next agreement is tried. The cycle itself only fails
+/// join it refuses otherwise, a file that cannot be stored — costs that
+/// agreement this cycle and nothing more: it is logged, its download
+/// discarded, and the next agreement is tried. A join the Portal gave no
+/// usable answer to is the same, except that its collateral stays set aside:
+/// the Portal may hold it (see [`attempt_join`]). The cycle itself only fails
 /// when the node's own rows cannot be read.
 pub async fn download_agreements_gated(
     portal_client: &PortalClient,
@@ -759,6 +761,15 @@ async fn download_agreements_scoped(
                     discard_download(&downloaded.path).await;
                     continue;
                 }
+                Ok(JoinAttempt::Unanswered) => {
+                    // The collateral stays set aside (see `attempt_join`).
+                    // The file goes: if the Portal did store the join, the
+                    // next cycle sees the membership and fetches it as one
+                    // the node holds; if it did not, nothing is owed.
+                    discard_download(&downloaded.path).await;
+                    failed.push(agreement.agreement_id.clone());
+                    continue;
+                }
                 Err(err) => {
                     warn!(
                         "joining agreement {} failed; trying again next cycle: {err:#}",
@@ -830,14 +841,17 @@ async fn download_agreements_scoped(
             "Joining {} again: the Portal invalidated this node's previous join",
             agreement.agreement_id
         );
-        if let Err(err) = attempt_join(portal_client, &agreement, collateral, budget, tracker).await
-        {
-            warn!(
-                "joining agreement {} again failed; trying again next cycle: {err:#}",
-                agreement.agreement_id
-            );
-            budget.refund(collateral);
-            failed.push(agreement.agreement_id.clone());
+        match attempt_join(portal_client, &agreement, collateral, budget, tracker).await {
+            Ok(JoinAttempt::Joined | JoinAttempt::Refused) => {}
+            Ok(JoinAttempt::Unanswered) => failed.push(agreement.agreement_id.clone()),
+            Err(err) => {
+                warn!(
+                    "joining agreement {} again failed; trying again next cycle: {err:#}",
+                    agreement.agreement_id
+                );
+                budget.refund(collateral);
+                failed.push(agreement.agreement_id.clone());
+            }
         }
     }
 
@@ -862,9 +876,20 @@ enum JoinAttempt {
     Joined,
     /// The Portal refused it at its pre-check; joins are paused.
     Refused,
+    /// Signed and sent, and the answer never came or could not be read: the
+    /// Portal may hold the join. Its collateral stays set aside.
+    Unanswered,
 }
 
 /// Join `agreement` and hold its collateral; on a `422`, pause joins instead.
+///
+/// A join whose answer was lost (a timeout, a 5xx, an unreadable `2xx`) is
+/// held like an accepted one. The Portal may have stored it, and then Kontor
+/// will reserve its collateral: giving that back to the budget would let the
+/// next joins commit the same stake twice, to be refused on chain. The hold
+/// ends like any other pending join's — its nonce is consumed, the Portal's
+/// rows show it will not execute, or the next ready listing shows the Portal
+/// never stored it (see `daemon::joins_the_portal_never_stored`).
 ///
 /// Any other failure is the caller's to handle, for this agreement alone.
 async fn attempt_join(
@@ -881,6 +906,22 @@ async fn attempt_join(
         }
         Ok(None) => Ok(JoinAttempt::Joined),
         Err(err) => {
+            if let Some(unsettled) = err.downcast_ref::<UnsettledOp>() {
+                warn!(
+                    "joining agreement {} got no usable answer; the Portal may hold the join, so \
+                     its collateral stays set aside until the next listing settles it: {err:#}",
+                    agreement.agreement_id
+                );
+                if let (Some(tracker), Some(collateral)) = (tracker, collateral) {
+                    tracker.record_join(
+                        &agreement.agreement_id,
+                        collateral,
+                        unsettled.nonce,
+                        Instant::now(),
+                    );
+                }
+                return Ok(JoinAttempt::Unanswered);
+            }
             let Some((422, code)) = status_and_code(&err) else {
                 return Err(err);
             };
@@ -3526,17 +3567,17 @@ mod tests {
         ));
     }
 
-    /// Any other join failure — a `500`, a `403` for an agreement that left
-    /// `ready` between the listing and the join — costs that agreement this
-    /// cycle, not the cycle: its download is discarded, its collateral given
-    /// back, joins are not paused, and the next agreement is still taken on.
+    /// Any other refusal — a `403` for an agreement that left `ready` between
+    /// the listing and the join — costs that agreement this cycle, not the
+    /// cycle: its download is discarded, its collateral given back, joins are
+    /// not paused, and the next agreement is still taken on.
     #[tokio::test]
     async fn other_join_failures_cost_the_agreement_not_the_cycle() {
         let mock_server = MockServer::start().await;
         mount_download(&mock_server, "AGR-x").await;
         Mock::given(method("POST"))
             .and(path("/api/agreements/AGR-x/join"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(403))
             .mount(&mock_server)
             .await;
         mount_download(&mock_server, "AGR-y").await;
@@ -3545,7 +3586,7 @@ mod tests {
         let database = setup_agreements_db().await;
         insert_unjoined(&database, "AGR-x", "FILE-AGR-x").await;
         insert_unjoined(&database, "AGR-y", "FILE-AGR-y").await;
-        let storage_dir = unique_storage_dir("gate_500");
+        let storage_dir = unique_storage_dir("gate_403");
         let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
 
         let tracker = tracker_with_available("50");
@@ -3604,6 +3645,94 @@ mod tests {
             ),
             "AGR-x's collateral went back to the budget"
         );
+    }
+
+    /// A join the Portal gave no usable answer to — a timeout, a 5xx — may be
+    /// stored there all the same, and Kontor will then reserve its
+    /// collateral. It used to go straight back to the budget, which let the
+    /// next joins commit the same stake a second time. It stays set aside,
+    /// like an accepted join's, until the Portal's rows settle it.
+    #[tokio::test]
+    async fn a_join_whose_answer_was_lost_keeps_its_collateral_set_aside() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-x").await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-x/join"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        mount_download(&mock_server, "AGR-y").await;
+        mount_join_agreement_mock(&mock_server, "AGR-y").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-x", "FILE-AGR-x").await;
+        insert_unjoined(&database, "AGR-y", "FILE-AGR-y").await;
+        let storage_dir = unique_storage_dir("gate_500");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-x", Some("10"), &[]),
+            listed("AGR-y", Some("10"), &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .expect("an unanswered join is that agreement's problem");
+
+        let stored = |id: &'static str| {
+            let database = database.clone();
+            async move {
+                Agreements::find_by_id(id)
+                    .one(&database)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert!(
+            !stored("AGR-x").await.downloaded,
+            "AGR-x is not stored: the next cycle fetches it if the join turns out held"
+        );
+        assert!(
+            !storage_dir.join("FILE-AGR-x").exists(),
+            "its download is discarded"
+        );
+        assert!(stored("AGR-y").await.downloaded, "AGR-y was still taken on");
+        let mut pending = tracker.pending_join_agreements();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec!["AGR-x".to_string(), "AGR-y".to_string()],
+            "the unanswered join holds its collateral like the accepted one"
+        );
+        // 50 unreserved, 10 set aside for each: 30 left this cycle, and the
+        // next cycle's budget starts from the same 30.
+        assert!(matches!(
+            budget.decide(false, Some(Some("40"))),
+            JoinDecision::Skip(_)
+        ));
+        assert!(matches!(
+            tracker
+                .join_budget(Instant::now())
+                .decide(false, Some(Some("40"))),
+            JoinDecision::Skip(_)
+        ));
+        assert!(matches!(
+            tracker
+                .join_budget(Instant::now())
+                .decide(false, Some(Some("30"))),
+            JoinDecision::Join { .. }
+        ));
     }
 
     /// A download the Portal cannot serve is the same: that agreement waits,

@@ -1093,17 +1093,29 @@ impl PortalClient {
             .inspect_err(|_| self.release_nonce(nonce))?;
         self.remember_nonce(nonce).await;
 
+        // As for a relayed op: a 4xx is the Portal saying it stored nothing
+        // (or, `409`, that the nonce is taken). No answer, a 5xx or a `2xx`
+        // that cannot be read leaves open whether the join is stored — the
+        // Portal reads Kontor before it writes the row, so a client timeout
+        // after the write is routine — and the caller must go on counting its
+        // collateral as possibly committed.
+        let unsettled = |err: anyhow::Error| match status_and_code(&err) {
+            Some((status, _)) if (400..500).contains(&status) => err,
+            _ => err.context(UnsettledOp { nonce }),
+        };
         let resp = self
             .send_signed_op(
                 request.body(body_bytes),
                 nonce,
                 &format!("join agreement {agreement_id}"),
             )
-            .await?;
+            .await
+            .map_err(unsettled)?;
         let mut body = resp
             .json::<JoinAgreementResponse>()
             .await
-            .context("failed to deserialize join response")?;
+            .context("failed to deserialize join response")
+            .map_err(unsettled)?;
         body.nonce = Some(nonce);
         Ok(body)
     }
@@ -1826,8 +1838,9 @@ pub struct NodeOpResponse {
     pub nonce: Option<u64>,
 }
 
-/// Attached to a [`PortalClient::submit_node_op`] error when the Portal may
-/// hold the op all the same: the request failed in transit or timed out, the
+/// Attached to a [`PortalClient::submit_node_op`] or
+/// [`PortalClient::join_agreement`] error when the Portal may hold the op all
+/// the same: the request failed in transit or timed out, the
 /// Portal answered with a 5xx, or its `202` could not be read. The Portal
 /// stores the op only after several Kontor reads, so a client timeout after
 /// the row is written is routine. The op was signed at `nonce`, which stays

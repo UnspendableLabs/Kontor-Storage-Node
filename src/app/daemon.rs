@@ -3,7 +3,7 @@ use crate::app::tasks::downloadagreements::{
     download_agreements_gated, download_held_agreements, rebuild_ledger, StorageBackend,
 };
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
-use crate::app::tasks::getnewagreements::sync_ready_agreements;
+use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
 use crate::app::tasks::reconcile;
 use crate::app::tasks::stake::{
     exit_inputs, manage_stake, persist_withdrawal_start, refresh_memberships,
@@ -409,6 +409,11 @@ async fn sync_portal_once(
                 {
                     warn!("could not settle the pending joins this cycle: {err:#}");
                 }
+                memory.staking.release_joins(&joins_the_portal_never_stored(
+                    memory.staking.pending_join_agreements(),
+                    &listing,
+                    node_id,
+                ));
             }
             let mut budget = if portal_client.node_id().is_some() {
                 memory.staking.join_budget(Instant::now())
@@ -492,6 +497,31 @@ async fn sync_portal_once(
     }
 
     failures.into_result()
+}
+
+/// The pending joins this cycle's ready listing shows the Portal does not
+/// hold: their agreement is listed, and this node has no row in it.
+///
+/// The Portal lists every row of a ready agreement, whatever its status, and
+/// never deletes one. A join it accepted is therefore there; one that is not
+/// was never stored — the request whose answer was lost (see
+/// `downloadagreements::attempt_join`) did not get that far. Its collateral
+/// goes back to the budget, and the agreement is free to be joined again.
+/// An agreement the listing does not carry says nothing either way and is
+/// left to [`settle_pending_joins`].
+fn joins_the_portal_never_stored(
+    pending: Vec<String>,
+    listing: &ReadyListing,
+    node_id: &str,
+) -> Vec<String> {
+    pending
+        .into_iter()
+        .filter(|agreement_id| {
+            listing
+                .get(agreement_id)
+                .is_some_and(|listed| listed.nodes.iter().all(|node| node.node_id != node_id))
+        })
+        .collect()
 }
 
 /// Feed the unknown-collateral estimate from the agreements this node holds:
@@ -2228,6 +2258,51 @@ mod tests {
             .unwrap();
             mock_server.verify().await;
         }
+    }
+
+    /// A pending join is given up as never stored only on the evidence of
+    /// this cycle's listing: the agreement is in it, and this node has no row
+    /// there. Any row, whatever its status, is the Portal holding the join;
+    /// an agreement the listing does not carry says nothing.
+    #[test]
+    fn a_join_is_never_stored_only_if_the_listing_shows_no_row_for_it() {
+        let listed = |agreement_id: &str, nodes: serde_json::Value| -> Agreement {
+            let mut value = agreement_payload(agreement_id, "FILE-x", "ready");
+            value["nodes"] = nodes;
+            serde_json::from_value(value).unwrap()
+        };
+        let listing: ReadyListing = [
+            listed(
+                "AGR-lost",
+                json!([{"node_id": "NODE-other", "status": "valid"}]),
+            ),
+            listed("AGR-empty", json!([])),
+            listed(
+                "AGR-held",
+                json!([{"node_id": "NODE-test", "status": "valid"}]),
+            ),
+            listed(
+                "AGR-invalid",
+                json!([{"node_id": "NODE-test", "status": "invalid"}]),
+            ),
+        ]
+        .into_iter()
+        .map(|agreement| (agreement.agreement_id.clone(), agreement))
+        .collect();
+        let pending = [
+            "AGR-lost",
+            "AGR-empty",
+            "AGR-held",
+            "AGR-invalid",
+            "AGR-gone",
+        ]
+        .map(String::from)
+        .to_vec();
+
+        assert_eq!(
+            joins_the_portal_never_stored(pending, &listing, "NODE-test"),
+            vec!["AGR-lost".to_string(), "AGR-empty".to_string()]
+        );
     }
 
     #[test]
