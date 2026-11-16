@@ -462,6 +462,10 @@ struct InFlight {
     /// [`StakeTracker::record_unsettled`]): the Portal may hold it, or may
     /// never have seen it.
     unsettled: bool,
+    /// The bond when the op was planned, for an op this process planned: what
+    /// an `add-stake` has to exceed to have raised it. `None` for an op
+    /// adopted from the Portal's listing, whose starting point is not known.
+    stake_before: Option<Kor>,
     /// When the Portal's listing was last read for it. A listing that could
     /// not be read does not count: the question is asked again next cycle.
     checked: Option<Instant>,
@@ -831,6 +835,7 @@ impl StakeTracker {
             op,
             nonce,
             unsettled,
+            stake_before,
             ..
         } in &landed
         {
@@ -846,30 +851,48 @@ impl StakeTracker {
                     );
                     state.landed_without_effect(op, *nonce, *unsettled, now);
                 }
-                NodeOp::AddStake(amount)
-                    if state
-                        .last_known
-                        .as_ref()
-                        .is_some_and(|previous| snapshot.stake <= previous.stake) =>
-                {
-                    // Its nonce went, its KOR did not. Either Kontor executed and
-                    // refused it for a reason the snapshot and the Portal's
-                    // pre-check did not see — the same op signed again next cycle
-                    // meets the same answer, and each attempt costs gas, so it
-                    // waits as long as one the Portal refused — or the Portal
-                    // retired it before Kontor saw it, which its listing says, and
-                    // `classify_landed` lifts the wait for.
-                    warn!(
+                NodeOp::AddStake(amount) => match stake_before {
+                    // The bond is above what it was when the op was planned:
+                    // it ran. Measured from the plan, not from the previous
+                    // read — the Portal reads the nonce and the bond in two
+                    // requests, so a read can already show the raised bond
+                    // under the old nonce, and the next one, which shows the
+                    // nonce consumed, then finds the bond "unchanged".
+                    Some(before) if snapshot.stake > *before => {}
+                    // An op adopted from the Portal's listing: what the bond
+                    // was before it is not known, so the bond cannot say
+                    // whether it ran. The listing will; until it does the
+                    // next top-up waits like one behind a refusal, since that
+                    // is what it may turn out to be.
+                    None => {
+                        info!(
+                            "the add-stake of {amount} KOR adopted at nonce {nonce} has \
+                             executed; asking the Portal how it ended before signing another"
+                        );
+                        state.landed_without_effect(op, *nonce, *unsettled, now);
+                    }
+                    Some(_) => {
+                        // Its nonce went, its KOR did not. Either Kontor executed and
+                        // refused it for a reason the snapshot and the Portal's
+                        // pre-check did not see — the same op signed again next cycle
+                        // meets the same answer, and each attempt costs gas, so it
+                        // waits as long as one the Portal refused — or the Portal
+                        // retired it before Kontor saw it, which its listing says, and
+                        // `classify_landed` lifts the wait for. Or it did run and a
+                        // slash took more than it added: the listing says
+                        // `confirmed`, and the wait is lifted as well.
+                        warn!(
                         "add-stake of {amount} KOR executed without raising the bond; not signing \
                      it again for {} hour unless the Portal says it never ran",
                         REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
                     );
-                    state.landed_without_effect(op, *nonce, *unsettled, now);
-                    state.last_event = Some((
-                        Utc::now(),
-                        format!("add_stake {amount} KOR executed without raising the bond"),
-                    ));
-                }
+                        state.landed_without_effect(op, *nonce, *unsettled, now);
+                        state.last_event = Some((
+                            Utc::now(),
+                            format!("add_stake {amount} KOR executed without raising the bond"),
+                        ));
+                    }
+                },
                 NodeOp::WithdrawStake if !snapshot.stake.is_zero() => {
                     // Executed, and the bond is still there: too early, or an
                     // obligation the node's own rows did not show (a leave that
@@ -1005,9 +1028,18 @@ impl StakeTracker {
         if !state.in_flight.is_empty() {
             return None;
         }
+        // An op whose nonce Kontor has already consumed by the latest registry
+        // read has executed, or never will: the Portal's listing is simply
+        // behind (it reconciles a block after Kontor runs it). Adopted, it
+        // would be seen "landing" on the next read without the bond moving.
+        let next_nonce = state
+            .last_known
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.next_nonce);
         let (op, record) = ops
             .iter()
             .filter(|record| matches!(record.status.as_str(), "queued" | "submitted"))
+            .filter(|record| record.nonce >= next_nonce)
             .filter_map(|record| NodeOp::from_record(record).map(|op| (op, record)))
             .max_by_key(|(_, record)| record.nonce)?;
         let nonce = record.nonce;
@@ -1041,6 +1073,7 @@ impl StakeTracker {
             sent: now,
             sent_at: Utc::now(),
             unsettled: false,
+            stake_before: None,
             checked: Some(now),
             vouched: Some(now),
             orphaned: None,
@@ -1473,6 +1506,16 @@ impl StakeTracker {
                     format!("withdraw_stake refused by Kontor: {error}; retrying within the hour"),
                 ));
             }
+            NodeOp::AddStake(amount) if status == Some("confirmed") => {
+                // It ran. The bond did not show it — a slash took more than
+                // the op added, or the op was adopted and its starting point
+                // unknown — and nothing was refused.
+                info!(
+                    "the Portal confirms the add-stake of {amount} KOR at nonce {nonce} ran; \
+                     nothing to retry"
+                );
+                state.refused.remove(&refused_key(&op));
+            }
             NodeOp::AddStake(amount) if status == Some("failed") => {
                 // Kontor ran it and refused it. `observe` has already put the
                 // hour's wait on one it saw land; one the Portal's listing
@@ -1615,12 +1658,14 @@ impl StakeTracker {
             state.operator_request = None;
         }
         state.last_event = Some((Utc::now(), event));
+        let stake_before = state.snapshot.as_ref().map(|snapshot| snapshot.stake);
         state.in_flight.push(InFlight {
             op,
             nonce,
             sent: now,
             sent_at: Utc::now(),
             unsettled,
+            stake_before,
             checked: None,
             vouched: None,
             orphaned: None,
@@ -5622,5 +5667,137 @@ mod tests {
         tracker.classify_landed(10, gone(), check);
         let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
         assert_eq!(tracker.plan(due, Some(&exit)), Some(NodeOp::WithdrawStake));
+    }
+    /// The Portal reads a signer's nonce and its bond in two requests. A read
+    /// can show the bond already raised under the old nonce; the next shows
+    /// the nonce consumed and the bond "unchanged" since the previous read.
+    /// Compared with the previous read, that was an add-stake that "executed
+    /// without raising the bond", and the next top-up waited an hour. The
+    /// bond is compared with what it was when the op was planned.
+    #[test]
+    fn a_top_up_is_measured_from_the_bond_it_was_planned_from() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &entry(Some("100"), Some("100")), t0);
+        tracker.record_sent(NodeOp::AddStake(kor("995")), 10, t0);
+
+        // Bond raised, nonce not yet: the op is still in flight.
+        let mut torn = entry(Some("1095"), Some("1095"));
+        torn.kor_balance = Some("5".into());
+        observed(&tracker, &torn, t0);
+        assert_eq!(tracker.status()["in_flight"]["nonce"], 10);
+
+        // Nonce consumed, bond as on the previous read.
+        let mut landed = torn.clone();
+        landed.next_nonce = Some(11);
+        observed(&tracker, &landed, t0);
+        assert_eq!(tracker.ops_to_classify(), Vec::<u64>::new(), "it ran");
+        let event = tracker.status()["last_event"]["message"].to_string();
+        assert!(!event.contains("without raising"), "{event}");
+
+        // New funds are bonded at once, not an hour later.
+        landed.kor_balance = Some("505".into());
+        observed(&tracker, &landed, t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("500"))));
+    }
+
+    /// An add-stake that ran while a slash took more than it added leaves
+    /// the bond below where it started. The Portal's `confirmed` says it ran:
+    /// the hour's wait is lifted.
+    #[test]
+    fn a_confirmed_top_up_is_not_backed_off_when_the_bond_fell_for_another_reason() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut before = entry(Some("100"), Some("100"));
+        before.kor_balance = Some("15".into());
+        observed(&tracker, &before, t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("10"))));
+        tracker.record_sent(NodeOp::AddStake(kor("10")), 10, t0);
+
+        let mut after = entry(Some("80"), Some("80"));
+        after.next_nonce = Some(11);
+        after.kor_balance = Some("505".into());
+        observed(&tracker, &after, t0);
+        assert_eq!(tracker.plan(t0, None), None, "looks refused, for now");
+
+        tracker.classify_landed(10, Ok(vec![add_stake_record(10, "confirmed", None)]), t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("500"))));
+    }
+
+    /// An op the Portal still lists as `submitted` although Kontor has
+    /// consumed its nonce has executed already: the listing is a block
+    /// behind. Adopted as in flight, it "landed" on the next read without the
+    /// bond moving, and the next top-up waited an hour for nothing.
+    #[test]
+    fn an_op_whose_nonce_is_already_consumed_is_not_adopted() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut read = entry(Some("990"), Some("990"));
+        read.next_nonce = Some(13);
+        observed(&tracker, &read, t0);
+
+        let mut record = add_stake_record(12, "submitted", None);
+        record.amount = Some("990".into());
+        assert_eq!(tracker.adopt_pending_ops(&[record.clone()], t0), None);
+        assert_eq!(tracker.status()["in_flight"], Value::Null);
+        assert!(tracker.pending_ops_checked());
+
+        // One at the next nonce is still to run, and is adopted.
+        record.nonce = 13;
+        assert_eq!(
+            tracker.adopt_pending_ops(&[record], t0),
+            Some((NodeOp::AddStake(kor("990")), 13))
+        );
+    }
+
+    /// An adopted op has no starting point to measure from. When its nonce
+    /// goes the Portal is asked how it ended, and the next top-up waits for
+    /// the answer rather than being signed on a guess.
+    #[test]
+    fn an_adopted_top_up_is_settled_by_the_portal_s_listing() {
+        let adopted = || {
+            let tracker = StakeTracker::new(StakePolicy::default());
+            let t0 = Instant::now();
+            observed(&tracker, &entry(Some("0"), Some("0")), t0);
+            let mut record = add_stake_record(10, "queued", None);
+            record.amount = Some("990".into());
+            tracker.adopt_pending_ops(&[record], t0);
+            let mut consumed = entry(Some("0"), Some("0"));
+            consumed.next_nonce = Some(11);
+            observed(&tracker, &consumed, t0);
+            assert_eq!(tracker.ops_to_classify(), vec![10]);
+            assert_eq!(tracker.plan(t0, None), None, "not signed on a guess");
+            (tracker, t0)
+        };
+
+        // Retired by the Portal before Kontor ran it: signed again at once.
+        let (tracker, t0) = adopted();
+        tracker.classify_landed(
+            10,
+            Ok(vec![add_stake_record(
+                10,
+                "failed",
+                Some(PORTAL_NO_RECEIPT),
+            )]),
+            t0,
+        );
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
+
+        // Refused by Kontor: the hour a refusal earns.
+        let (tracker, t0) = adopted();
+        tracker.classify_landed(
+            10,
+            Ok(vec![add_stake_record(
+                10,
+                "failed",
+                Some("ContractErr: err(message(\"bond cleanup pending\"))"),
+            )]),
+            t0,
+        );
+        assert_eq!(tracker.plan(t0, None), None);
+        assert_eq!(
+            tracker.plan(t0 + REFUSED_OP_RETRY_INTERVAL, None),
+            Some(NodeOp::AddStake(kor("995")))
+        );
     }
 }
