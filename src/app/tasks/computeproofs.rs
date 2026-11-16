@@ -17,10 +17,18 @@
 //!
 //! It is wrong for a proof that is rejected *deterministically*: that one would
 //! be recomputed and resubmitted every cycle, paying gas and a SNARK each time,
-//! until the deadline. [`ProofRetries`] spaces resubmissions out and stops after
-//! [`MAX_PROOF_SUBMISSIONS`]. Stopping does not save the collateral — the
-//! challenge will expire and be slashed either way — it only stops the node
-//! burning its gas reserve on the way there, and says so in the log.
+//! until the deadline. [`ProofRetries`] spaces resubmissions out: the first
+//! [`FAST_PROOF_SUBMISSIONS`] a few minutes apart, then one every
+//! [`SLOW_RESUBMIT_DELAY`] for as long as the challenge stays `active`.
+//!
+//! It never stops for good. The node cannot tell why a challenge came back:
+//! the Portal reopens one when Kontor rejected the proof, but also when the
+//! op never ran at all — its nonce was passed, the gas hold was not covered,
+//! the key had changed — or when it could not read the verdict. None of those
+//! says the proof was wrong, a challenge window is about 2016 blocks, and a
+//! missed challenge is slashed at 30× the agreement's collateral against a
+//! proof's 0.0001 KOR of gas. So a challenge that keeps coming back is proved
+//! at a slower pace, loudly, until it is resolved or the Portal closes it.
 //!
 //! Challenges are worked through nearest deadline first: one cycle can run out
 //! of time or gas, and the one that expires soonest is the one a delay costs.
@@ -43,8 +51,9 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tracing::{debug, error, info, warn, Instrument};
 
-/// Submissions one challenge gets before the node stops proving it.
-pub const MAX_PROOF_SUBMISSIONS: u32 = 5;
+/// Submissions one challenge gets at the fast pace, before the node falls
+/// back to one every [`SLOW_RESUBMIT_DELAY`].
+pub const FAST_PROOF_SUBMISSIONS: u32 = 5;
 
 /// Wait before the first resubmission; doubles with each one after.
 const RESUBMIT_BASE_DELAY: Duration = Duration::from_secs(60);
@@ -53,11 +62,20 @@ const RESUBMIT_BASE_DELAY: Duration = Duration::from_secs(60);
 /// few times well before its deadline.
 const RESUBMIT_MAX_DELAY: Duration = Duration::from_secs(16 * 60);
 
+/// Wait between resubmissions once the fast ones are spent.
+///
+/// An hour is six blocks or so: a challenge window of about 2016 blocks
+/// leaves room for hundreds of these, each costing at most the gas hold of
+/// one op, while a proof that really is wrong no longer costs a SNARK every
+/// few minutes.
+const SLOW_RESUBMIT_DELAY: Duration = Duration::from_secs(60 * 60);
+
 /// Bookkeeping for challenges that have been proved at least once.
 ///
 /// In memory: a restart starts every count again, which costs at most another
-/// [`MAX_PROOF_SUBMISSIONS`] attempts on a challenge that was already hopeless
-/// and never costs a proof that could have landed.
+/// [`FAST_PROOF_SUBMISSIONS`] quick attempts on a challenge that keeps coming
+/// back and never costs a proof that could have landed. Bounded by the
+/// challenges the node has open: [`ProofRetries::prune`] drops the rest.
 #[derive(Debug, Default)]
 pub struct ProofRetries {
     attempts: Mutex<HashMap<String, Attempts>>,
@@ -67,17 +85,17 @@ pub struct ProofRetries {
 struct Attempts {
     submissions: u32,
     last: Instant,
-    gave_up_logged: bool,
+    slowed_down_logged: bool,
 }
 
 /// What [`ProofRetries::check`] says about one active challenge.
 #[derive(Debug, PartialEq, Eq)]
 enum RetryCheck {
     Prove,
-    /// Proved recently; not again until the backoff has passed.
-    Wait,
-    /// Out of submissions. `announce` is true the first time only.
-    GiveUp {
+    /// Proved recently; not again until the backoff has passed. `announce`
+    /// is true once, the first time the wait is the slow one: the fast
+    /// submissions are spent and the challenge is still open.
+    Wait {
         announce: bool,
     },
 }
@@ -88,13 +106,13 @@ impl ProofRetries {
         let Some(entry) = attempts.get_mut(challenge_id) else {
             return RetryCheck::Prove;
         };
-        if entry.submissions >= MAX_PROOF_SUBMISSIONS {
-            let announce = !entry.gave_up_logged;
-            entry.gave_up_logged = true;
-            return RetryCheck::GiveUp { announce };
+        let slow = entry.submissions >= FAST_PROOF_SUBMISSIONS;
+        let announce = slow && !entry.slowed_down_logged;
+        if announce {
+            entry.slowed_down_logged = true;
         }
         if now.duration_since(entry.last) < resubmit_delay(entry.submissions) {
-            RetryCheck::Wait
+            RetryCheck::Wait { announce }
         } else {
             RetryCheck::Prove
         }
@@ -108,9 +126,9 @@ impl ProofRetries {
             .or_insert(Attempts {
                 submissions: 0,
                 last: now,
-                gave_up_logged: false,
+                slowed_down_logged: false,
             });
-        entry.submissions += 1;
+        entry.submissions = entry.submissions.saturating_add(1);
         entry.last = now;
         entry.submissions
     }
@@ -125,8 +143,13 @@ impl ProofRetries {
     }
 }
 
-/// Backoff after the `submissions`-th proof: 1, 2, 4, 8, 16, 16… minutes.
+/// Backoff after the `submissions`-th proof: 1, 2, 4 and 8 minutes after the
+/// first four, then [`SLOW_RESUBMIT_DELAY`] after every one from the
+/// [`FAST_PROOF_SUBMISSIONS`]-th on.
 fn resubmit_delay(submissions: u32) -> Duration {
+    if submissions >= FAST_PROOF_SUBMISSIONS {
+        return SLOW_RESUBMIT_DELAY;
+    }
     let doublings = submissions.saturating_sub(1).min(16);
     RESUBMIT_BASE_DELAY
         .saturating_mul(1 << doublings)
@@ -286,21 +309,23 @@ async fn prove_active_challenges<G: ProofGenerator>(
     for challenge in active_challenges {
         match retries.check(&challenge.challenge_id, now) {
             RetryCheck::Prove => {}
-            RetryCheck::Wait => {
-                debug!(
-                    "Challenge {} was proved recently; waiting before resubmitting",
-                    challenge.challenge_id
-                );
-                continue;
-            }
-            RetryCheck::GiveUp { announce } => {
+            RetryCheck::Wait { announce } => {
                 if announce {
                     error!(
-                        "Giving up on challenge {} (agreement {}, deadline height {}) after \
-                         {MAX_PROOF_SUBMISSIONS} proofs Kontor did not accept. It will expire, \
-                         and expiry is slashed at 30× the agreement's collateral — check the \
-                         stored file and its ledger slot.",
-                        challenge.challenge_id, challenge.agreement_id, challenge.deadline_height
+                        "Challenge {} (agreement {}, deadline height {}) is still open after \
+                         {FAST_PROOF_SUBMISSIONS} proofs. It is proved again every {} minutes \
+                         for as long as it stays open; if it expires it is slashed at 30× the \
+                         agreement's collateral — check the node's KOR balance (a proof needs \
+                         its gas), the stored file and its ledger slot.",
+                        challenge.challenge_id,
+                        challenge.agreement_id,
+                        challenge.deadline_height,
+                        SLOW_RESUBMIT_DELAY.as_secs() / 60
+                    );
+                } else {
+                    debug!(
+                        "Challenge {} was proved recently; waiting before resubmitting",
+                        challenge.challenge_id
                     );
                 }
                 continue;
@@ -328,8 +353,8 @@ async fn prove_active_challenges<G: ProofGenerator>(
                 let submissions = retries.record_submission(&challenge.challenge_id, now);
                 if submissions > 1 {
                     warn!(
-                        "Resubmitted a proof for challenge {} (submission {submissions} of at \
-                         most {MAX_PROOF_SUBMISSIONS}): the previous one was not accepted",
+                        "Resubmitted a proof for challenge {} (submission {submissions}): the \
+                         Portal handed the challenge back after the previous one",
                         challenge.challenge_id
                     );
                 }
@@ -372,20 +397,32 @@ enum ProcessError {
     Submitted(anyhow::Error),
 }
 
+/// Portal error codes on a proof submission that say nothing about the proof:
+/// the challenge is not `active` on the Portal's side (this node's row is
+/// behind — the proof it sent earlier is still being relayed, or the challenge
+/// has closed), or the nonce could not be used.
+const NOT_ABOUT_THE_PROOF: [&str; 2] = ["INVALID_STATUS", "INVALID_NONCE"];
+
 /// Whether a failed `submit_proof` means the Portal read this proof and turned
-/// it down — the only failure that counts toward [`MAX_PROOF_SUBMISSIONS`].
+/// it down — the only failure that counts toward [`FAST_PROOF_SUBMISSIONS`]
+/// and is waited out before the next attempt.
 ///
 /// That is a 4xx, except the ones that say nothing about the proof: `401` (the
-/// session expired), `408` and `429` (come back later), and `409` (the nonce it
+/// session expired), `408` and `429` (come back later), `409` (the nonce it
 /// was signed at is held by another op of this node; the next attempt is signed
-/// at a fresh one). A `2xx` whose body cannot be read counts too: the Portal
-/// took the proof. A connection error, a timeout or a 5xx does not — whether the
-/// Portal even looked at the proof is unknown — so an outage spends none of a
-/// challenge's submissions, and the next cycle tries again.
+/// at a fresh one), and the codes in [`NOT_ABOUT_THE_PROOF`]. A `2xx` whose
+/// body cannot be read counts too: the Portal took the proof. A connection
+/// error, a timeout or a 5xx does not — whether the Portal even looked at the
+/// proof is unknown — so an outage spends none of a challenge's submissions,
+/// and the next cycle tries again.
 fn refused_by_portal(err: &anyhow::Error) -> bool {
-    if let Some(status) = err.downcast_ref::<HttpStatusError>() {
-        let status = status.status.as_u16();
-        return (400..500).contains(&status) && !matches!(status, 401 | 408 | 409 | 429);
+    if let Some(error) = err.downcast_ref::<HttpStatusError>() {
+        let status = error.status.as_u16();
+        return (400..500).contains(&status)
+            && !matches!(status, 401 | 408 | 409 | 429)
+            && !error
+                .api_code()
+                .is_some_and(|code| NOT_ABOUT_THE_PROOF.contains(&code.as_str()));
     }
     err.downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_decode)
@@ -2291,22 +2328,25 @@ mod tests {
         );
     }
 
+    /// A challenge the Portal keeps handing back is not abandoned once the
+    /// fast submissions are spent — it used to be, for the life of the
+    /// process, with some 2000 blocks of its window left and a 30× slash at
+    /// the end of it. It waits out the slow delay instead, and is proved again.
     #[tokio::test]
-    async fn a_challenge_out_of_submissions_is_not_proved_again() {
+    async fn a_challenge_out_of_fast_submissions_is_still_proved_at_the_slow_pace() {
         let mock_server = MockServer::start().await;
         mount_accepting_proofs(&mock_server).await;
         let db = setup_in_memory_db().await;
-        let storage_dir = unique_storage_dir("give_up");
+        let storage_dir = unique_storage_dir("slow_pace");
         stdfs::create_dir_all(&storage_dir).ok();
-        setup_challenges(&db, &storage_dir, &[("chal_hopeless", 800, "active")]).await;
-
-        let retries = ProofRetries::default();
-        let long_ago = Instant::now();
-        for _ in 0..MAX_PROOF_SUBMISSIONS {
-            retries.record_submission("chal_hopeless", long_ago);
-        }
-
+        setup_challenges(&db, &storage_dir, &[("chal_stubborn", 800, "active")]).await;
         let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        // Just spent: inside the slow delay, nothing goes out.
+        let retries = ProofRetries::default();
+        for _ in 0..FAST_PROOF_SUBMISSIONS {
+            retries.record_submission("chal_stubborn", Instant::now());
+        }
         prove_active_challenges(
             &client,
             &db,
@@ -2318,6 +2358,77 @@ mod tests {
         .await
         .unwrap();
         assert!(proved_paths(&mock_server).await.is_empty());
+
+        // The slow delay later, the challenge still active: proved again.
+        let Some(long_ago) = Instant::now().checked_sub(SLOW_RESUBMIT_DELAY) else {
+            // A machine up for less than the delay cannot represent the past
+            // instant; the unit test below covers the arithmetic.
+            return;
+        };
+        let retries = ProofRetries::default();
+        for _ in 0..FAST_PROOF_SUBMISSIONS + 3 {
+            retries.record_submission("chal_stubborn", long_ago);
+        }
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(proved_paths(&mock_server).await.len(), 1);
+    }
+
+    /// `400 INVALID_STATUS` is the Portal saying the challenge is not `active`
+    /// on its side — this node's row is behind — and `INVALID_NONCE` is about
+    /// the nonce. Neither is a verdict on the proof, so neither spends a
+    /// submission; a `400` about the proof itself still does.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_about_the_proof_spends_no_submission() {
+        for (code, counts) in [
+            ("INVALID_STATUS", false),
+            ("INVALID_NONCE", false),
+            ("INVALID_PROOF", true),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/challenges/chal_behind"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": { "code": code, "message": "refused", "status": 400 }
+                })))
+                .mount(&mock_server)
+                .await;
+            let db = setup_in_memory_db().await;
+            let storage_dir = unique_storage_dir("not_about_the_proof");
+            stdfs::create_dir_all(&storage_dir).ok();
+            setup_challenges(&db, &storage_dir, &[("chal_behind", 800, "active")]).await;
+
+            let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+            let retries = ProofRetries::default();
+            prove_active_challenges(
+                &client,
+                &db,
+                &StorageBackend::local(),
+                &storage_dir,
+                &MockProofGenerator,
+                &retries,
+            )
+            .await
+            .unwrap();
+            let expected = if counts {
+                RetryCheck::Wait { announce: false }
+            } else {
+                RetryCheck::Prove
+            };
+            assert_eq!(
+                retries.check("chal_behind", Instant::now()),
+                expected,
+                "{code}"
+            );
+        }
     }
 
     /// A proof the Portal turned down counts as a submission; a failure before
@@ -2350,7 +2461,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             retries.check("chal_refused", Instant::now()),
-            RetryCheck::Wait
+            RetryCheck::Wait { announce: false }
         );
 
         stdfs::remove_file(storage_dir.join("file_retry")).unwrap();
@@ -2446,12 +2557,13 @@ mod tests {
     }
 
     #[test]
-    fn resubmissions_back_off_and_stop_at_the_cap() {
+    fn resubmissions_back_off_then_slow_down_and_never_stop() {
         assert_eq!(resubmit_delay(1), Duration::from_secs(60));
         assert_eq!(resubmit_delay(2), Duration::from_secs(120));
         assert_eq!(resubmit_delay(4), Duration::from_secs(480));
-        assert_eq!(resubmit_delay(5), Duration::from_secs(960));
-        assert_eq!(resubmit_delay(40), RESUBMIT_MAX_DELAY);
+        assert_eq!(resubmit_delay(5), SLOW_RESUBMIT_DELAY);
+        assert_eq!(resubmit_delay(40), SLOW_RESUBMIT_DELAY);
+        assert_eq!(resubmit_delay(u32::MAX), SLOW_RESUBMIT_DELAY);
 
         let retries = ProofRetries::default();
         let t0 = Instant::now();
@@ -2459,29 +2571,41 @@ mod tests {
         retries.record_submission("c", t0);
         assert_eq!(
             retries.check("c", t0 + Duration::from_secs(59)),
-            RetryCheck::Wait
+            RetryCheck::Wait { announce: false }
         );
         assert_eq!(
             retries.check("c", t0 + Duration::from_secs(60)),
             RetryCheck::Prove
         );
 
-        for _ in 1..MAX_PROOF_SUBMISSIONS {
+        for _ in 1..FAST_PROOF_SUBMISSIONS {
             retries.record_submission("c", t0);
         }
-        let much_later = t0 + Duration::from_secs(3600);
+        let inside = t0 + SLOW_RESUBMIT_DELAY - Duration::from_secs(1);
         assert_eq!(
-            retries.check("c", much_later),
-            RetryCheck::GiveUp { announce: true }
+            retries.check("c", inside),
+            RetryCheck::Wait { announce: true }
         );
         assert_eq!(
-            retries.check("c", much_later),
-            RetryCheck::GiveUp { announce: false },
+            retries.check("c", inside),
+            RetryCheck::Wait { announce: false },
             "said once, not every cycle"
         );
+        // Not given up on: due again once the slow delay has passed, and
+        // again after every later submission, however many there have been.
+        let mut now = t0 + SLOW_RESUBMIT_DELAY;
+        for _ in 0..50 {
+            assert_eq!(retries.check("c", now), RetryCheck::Prove);
+            retries.record_submission("c", now);
+            assert_eq!(
+                retries.check("c", now + SLOW_RESUBMIT_DELAY - Duration::from_secs(1)),
+                RetryCheck::Wait { announce: false }
+            );
+            now += SLOW_RESUBMIT_DELAY;
+        }
 
         // Forgotten a day after it stops being active.
-        retries.prune(&[], t0 + Duration::from_secs(24 * 3600));
-        assert_eq!(retries.check("c", much_later), RetryCheck::Prove);
+        retries.prune(&[], now + Duration::from_secs(24 * 3600));
+        assert_eq!(retries.check("c", now), RetryCheck::Prove);
     }
 }

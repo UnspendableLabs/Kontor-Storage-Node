@@ -568,8 +568,11 @@ can lose its whole bond to a short outage. The node defends what it can:
   that happens to a join or a download can cost a proof, and a proof signed
   before the cycle's joins never has a join's nonce passed over it;
 - a proof Kontor rejects leaves the challenge open, and the node proves it again
-  — up to 5 times, waiting 1, 2, 4 and 8 minutes between attempts — before
-  giving up loudly on a proof that is evidently wrong;
+  — five times a few minutes apart (1, 2, 4 and 8 minutes), then once an hour
+  for as long as the challenge stays open, with an ERROR line when it slows
+  down. It never gives a challenge up: the Portal hands one back for reasons
+  that say nothing about the proof (a nonce that was passed, gas the balance
+  could not cover), and a proof costs 0.0001 KOR against a 30× slash;
 - a refused join (`422` from the Portal) pauses joins for 10 minutes; any other
   failure of one agreement — a download the Portal cannot serve, a join it
   answers with anything else, a file that cannot be stored — costs that
