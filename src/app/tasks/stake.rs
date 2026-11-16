@@ -338,9 +338,20 @@ fn parse_field(name: &str, raw: Option<&str>) -> Option<Kor> {
 /// is at least [`MIN_TOP_UP`] and the target still has room. The amount itself
 /// may be smaller than the minimum when it closes the gap to the target — one
 /// op, then nothing more to do.
+///
+/// Nothing while bond cleanup is pending or a withdrawal is requested: Kontor
+/// refuses `add-stake` in both. And nothing on an empty bond while the Portal
+/// could not say whether cleanup is pending (`null`, Portal
+/// `docs/node-portal-contract.md` §3): an empty bond is exactly what a slash
+/// to zero leaves, and an `add-stake` sent into a cleanup is refused on chain
+/// at the cost of its gas, hour after hour. The next read that answers
+/// decides.
 #[must_use]
 pub fn top_up_amount(policy: &StakePolicy, snapshot: &StakeSnapshot) -> Option<Kor> {
     if snapshot.bond_cleanup_pending == Some(true) || snapshot.withdrawal_height.is_some() {
+        return None;
+    }
+    if snapshot.bond_cleanup_pending.is_none() && snapshot.stake.is_zero() {
         return None;
     }
     let free = snapshot.kor_balance?.saturating_sub(policy.gas_reserve);
@@ -6078,5 +6089,35 @@ mod tests {
         tracker.record_sent(NodeOp::WithdrawStake, 10, t0);
         tracker.verify_in_flight(10, Ok(vec![]), t0 + OP_LANDING_CHECK_INTERVAL);
         assert_eq!(tracker.status()["operator_request"], Value::Null);
+    }
+    /// An empty bond is what a slash to zero leaves. While the Portal cannot
+    /// say whether bond cleanup is pending, an `add-stake` is not sent into
+    /// it: Kontor would refuse it, for the price of its gas, every hour.
+    #[test]
+    fn no_top_up_on_an_empty_bond_while_cleanup_is_unknown() {
+        let policy = StakePolicy::default();
+        let mut unknown = snapshot("1000", "0");
+        unknown.bond_cleanup_pending = None;
+        assert_eq!(top_up_amount(&policy, &unknown), None);
+
+        // Known not to be pending, it goes; and a bond that still holds
+        // something cannot be in cleanup, whatever the field says.
+        unknown.bond_cleanup_pending = Some(false);
+        assert_eq!(top_up_amount(&policy, &unknown), Some(kor("995")));
+        let mut bonded = snapshot("1000", "10");
+        bonded.bond_cleanup_pending = None;
+        assert_eq!(top_up_amount(&policy, &bonded), Some(kor("995")));
+
+        // Through the tracker: a fresh read with the field unread plans
+        // nothing, the next one that reads it does.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        let mut read = entry(Some("0"), Some("0"));
+        read.bond_cleanup_pending = None;
+        observed(&tracker, &read, t0);
+        assert_eq!(tracker.plan(t0, None), None);
+        read.bond_cleanup_pending = Some(false);
+        observed(&tracker, &read, t0);
+        assert_eq!(tracker.plan(t0, None), Some(NodeOp::AddStake(kor("995"))));
     }
 }
