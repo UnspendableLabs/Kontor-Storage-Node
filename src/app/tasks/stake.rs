@@ -84,15 +84,17 @@
 //!
 //! A Portal predating staking sends none of the signer stake fields (Portal
 //! `docs/node-portal-contract.md` §3). That is not "zero stake": the node then
-//! keeps its pre-staking behaviour — joins everything, signs no stake op. Once
-//! a Portal *has* reported a stake, a cycle where the entry cannot be read
-//! joins nothing rather than joining blind.
+//! keeps its pre-staking behaviour — joins everything, signs no stake op. A
+//! Portal that knows about staking always sends them, as `null` when it could
+//! not read them from Kontor: a `stake` key, whatever it holds, is such a
+//! Portal, from the very first read. Against one, a cycle where the stake
+//! cannot be read joins nothing rather than joining blind.
 
 use crate::app::tasks::getnewagreements::ReadyListing;
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kontor_op::DEFAULT_GAS_LIMIT;
 use crate::clients::kor::Kor;
-use crate::clients::portal::{NodeOp, NodeOpRecord, RegistryEntry, UnsettledOp};
+use crate::clients::portal::{NodeOp, NodeOpRecord, RegistryEntry, UnsettledOp, STAKE_UNREAD};
 use crate::clients::PortalClient;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -297,7 +299,13 @@ impl StakeSnapshot {
     /// `/admin` do not wait for a view none of them reads.
     #[must_use]
     pub fn from_entry(entry: &RegistryEntry) -> Option<Self> {
-        let stake = parse_field("stake", entry.stake.as_deref())?;
+        // A `null` stake is the Portal saying it could not read the bond:
+        // nothing to parse, and nothing to warn about field by field.
+        let stake = entry
+            .stake
+            .as_deref()
+            .filter(|raw| *raw != STAKE_UNREAD)
+            .and_then(|raw| parse_field("stake", Some(raw)))?;
         let reserved = parse_field("stake_reserved", entry.stake_reserved.as_deref());
         let available = parse_field("stake_available", entry.stake_available.as_deref())
             .or_else(|| reserved.map(|reserved| stake.saturating_sub(reserved)));
@@ -840,7 +848,10 @@ impl StakeTracker {
 
         // A `stake` field, readable or not, is a Portal that knows about
         // staking: an entry whose stake cannot be read must close this
-        // cycle's joins, not pass for an old Portal.
+        // cycle's joins, not pass for an old Portal. That includes a `null`
+        // — the Portal could not read the bond from Kontor this time — which
+        // deserializes as present (`STAKE_UNREAD`); only a Portal predating
+        // staking omits the key.
         let reports_stake = entry.is_some_and(|entry| entry.stake.is_some());
         if reports_stake {
             state.portal_reports_stake = true;
@@ -848,8 +859,8 @@ impl StakeTracker {
         let Some(snapshot) = snapshot else {
             if reports_stake {
                 warn!(
-                    "the Portal's signer entry carries a stake this node cannot read; joins are \
-                     paused this cycle"
+                    "the Portal could not report this node's stake this time; joins are paused \
+                     and no stake op is signed this cycle"
                 );
             } else if entry.is_some() && state.portal_reports_stake {
                 warn!("the Portal's signer entry no longer reports a stake; joins are paused");
@@ -6190,5 +6201,59 @@ mod tests {
             tracker.plan(t0, Some(&exit)),
             Some(NodeOp::LeaveAgreement("AGR-a".into()))
         );
+    }
+    /// A staking-aware Portal that cannot read the bond from Kontor sends
+    /// `"stake": null`; one predating staking sends no such key. Both used to
+    /// deserialize to the same thing, so a first read that failed at the
+    /// Portal passed for an old Portal: the node joined unmetered, on a bond
+    /// nobody had read.
+    #[test]
+    fn a_null_stake_is_a_portal_that_knows_staking_not_an_old_one() {
+        let signer = |stake: Option<Value>| {
+            let mut entry = json!({
+                "signer_id": 42, "x_only_pubkey": "ab", "bls_pubkey": null,
+                "next_nonce": 3, "kor_balance": "10"
+            });
+            if let Some(stake) = stake {
+                entry["stake"] = stake;
+                entry["stake_reserved"] = Value::Null;
+                entry["stake_available"] = Value::Null;
+                entry["stake_withdrawal_height"] = Value::Null;
+                entry["bond_cleanup_pending"] = Value::Null;
+                entry["reward_balance"] = Value::Null;
+            }
+            serde_json::from_value::<RegistryEntry>(entry).unwrap()
+        };
+        let t0 = Instant::now();
+
+        // Every view failed at the Portal: all six fields null.
+        let unread = signer(Some(Value::Null));
+        assert_eq!(unread.stake.as_deref(), Some(STAKE_UNREAD));
+        assert_eq!(StakeSnapshot::from_entry(&unread), None);
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &unread, t0);
+        assert_eq!(tracker.status()["portal_reports_stake"], true);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Skip(SkipReason::StakeUnknown),
+            "not joined blind on a first read that failed"
+        );
+        assert_eq!(tracker.plan(t0, None), None);
+
+        // No key at all: the pre-staking behaviour.
+        let old = signer(None);
+        assert_eq!(old.stake, None);
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &old, t0);
+        assert_eq!(tracker.status()["portal_reports_stake"], false);
+        assert_eq!(
+            tracker.join_budget(t0).decide(false, Some(Some("1"))),
+            JoinDecision::Join {
+                collateral: Some(kor("1"))
+            }
+        );
+
+        // A value still reads as a value.
+        assert_eq!(signer(Some(json!("995"))).stake.as_deref(), Some("995"));
     }
 }

@@ -1604,7 +1604,13 @@ pub struct RegistryEntry {
     /// never as zero. They stay strings here so that a value the node cannot
     /// parse costs the staking decision of one cycle rather than the nonce
     /// resync that rides on the same request.
-    #[serde(default)]
+    ///
+    /// `stake` alone tells the two apart: `None` when the key is absent (a
+    /// Portal predating staking), [`STAKE_UNREAD`] when the Portal sent it as
+    /// `null` (one that knows about staking and could not read the bond this
+    /// time). A staking-aware Portal must never pass for an old one, or the
+    /// node joins unmetered on the strength of a failed read.
+    #[serde(default, deserialize_with = "null_as_unread")]
     pub stake: Option<String>,
     /// `filestorage::get-node-reservation`: stake held by joined agreements.
     #[serde(default)]
@@ -1624,6 +1630,24 @@ pub struct RegistryEntry {
     /// Storage rewards claimable with `claim-rewards`.
     #[serde(default)]
     pub reward_balance: Option<String>,
+}
+
+/// What [`RegistryEntry::stake`] holds when the Portal sent the key as
+/// `null`: present, and not an amount. Every reader parses the field as an
+/// amount and treats one it cannot parse as unknown, so the marker needs no
+/// handling of its own — it only keeps "the Portal reports stake" true.
+pub const STAKE_UNREAD: &str = "";
+
+/// Deserialize a string field that may be `null`, keeping a `null` apart from
+/// an absent key (which `#[serde(default)]` leaves `None`): `null` becomes
+/// [`STAKE_UNREAD`].
+fn null_as_unread<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<String>::deserialize(deserializer)?.unwrap_or_else(|| STAKE_UNREAD.to_string()),
+    ))
 }
 
 /// Body of `POST /api/nodes/{node_id}/ops`.
