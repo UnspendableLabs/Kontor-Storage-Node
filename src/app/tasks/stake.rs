@@ -26,9 +26,10 @@
 //!   estimate instead (see [`JoinBudget::decide`]).
 //! - **Exit.** Once the operator's `begin-unstake` has executed, the node leaves
 //!   its agreements, several leaves in flight at a time, and, when none is
-//!   left, withdraws the bond (see [`ExitInputs`]). A node that has exited bonds nothing more on its
-//!   own, and that is recorded in its database: a restart does not put the
-//!   returned bond back at stake. The operator resumes staking from `/admin`.
+//!   left, withdraws the bond (see [`ExitInputs`]). A node that has exited
+//!   bonds nothing more on its own, and that is recorded in its database: a
+//!   restart does not put the returned bond back at stake. The operator
+//!   resumes staking from `/admin`.
 //!
 //! # Knowing when an op has landed
 //!
@@ -69,15 +70,20 @@
 //!
 //! All of this lives in memory. A new process therefore starts by asking the
 //! Portal which of the node's ops it still holds (§2,
-//! `?status=queued|submitted`), adopts the newest as the op in flight and
-//! moves its nonce counter past every one of them (see
+//! `?status=queued|submitted`), adopts each as an op in flight and moves its
+//! nonce counter past every one of them (see
 //! [`StakeTracker::adopt_pending_ops`]): the top-up the previous process
-//! queued is waited for, not signed again, and its nonce is not reused.
+//! queued is waited for, not signed again, and its nonce is not reused. The
+//! same is done on every activation, since the tracker outlives the client
+//! (see [`bootstrap_stake`]). What an exit has to carry across a restart —
+//! when its withdrawal delay started, and that it finished — is kept in the
+//! database instead (see [`restore_withdrawal_start`]).
 //!
 //! # Why the op goes out last
 //!
-//! The daemon sends its stake op at the end of the cycle, after joins and
-//! proofs, so it holds the cycle's highest nonce. Should two ops ever collide
+//! The daemon sends its stake op — or, during an exit, its leaves — at the end
+//! of the cycle, after joins and proofs, so it holds the cycle's highest
+//! nonces. Should two ops ever collide
 //! on a nonce, the Portal keeps the one it composes first and drops the other;
 //! a dropped proof is a slash, a dropped `add-stake` is a retry. Losing is cheap
 //! for stake ops, and this ordering keeps it that way.
