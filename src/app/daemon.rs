@@ -1,6 +1,7 @@
 use crate::app::tasks::computeproofs::{compute_and_submit_proofs, ProofRetries};
 use crate::app::tasks::downloadagreements::{
-    download_agreements_gated, download_held_agreements, rebuild_ledger, StorageBackend,
+    download_agreements_gated, download_held_agreements, rebuild_ledger, remove_ended_files,
+    EndedFiles, StorageBackend,
 };
 use crate::app::tasks::getactivechallenges::sync_active_challenges;
 use crate::app::tasks::getnewagreements::{sync_ready_agreements, ReadyListing};
@@ -17,6 +18,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -53,6 +55,9 @@ pub(crate) struct DaemonMemory {
     /// that funds a new node, so a cycle does not repeat its request. `None`
     /// where nothing is ever funded (the tests that are not about it).
     pub faucet: Option<Arc<Faucet>>,
+    /// Stored files whose membership the Portal says is over, waiting out
+    /// the grace before they are removed.
+    pub ended_files: EndedFiles,
 }
 
 /// Wait before a daemon that stopped is started again; doubles up to
@@ -165,6 +170,7 @@ async fn run_portal_daemon(
         staking,
         proofs: ProofRetries::default(),
         faucet,
+        ended_files: EndedFiles::default(),
     };
 
     // Ensure only a single daemon instance runs at a time.
@@ -339,8 +345,12 @@ async fn sync_portal_once(
         registry_entry = entry;
     }
 
+    // The agreements the Portal lists this node as a valid member of, when
+    // that listing could be read this cycle.
+    let mut held: Option<HashSet<String>> = None;
     if let Some(node_id) = portal_client.node_id() {
-        if let Err(err) = reconcile::reconcile_from_portal_with(
+        let mut listed = HashSet::new();
+        match reconcile::reconcile_from_portal_with(
             portal_client,
             database,
             node_id,
@@ -349,23 +359,31 @@ async fn sync_portal_once(
             false,
             |agreements| {
                 note_recent_collateral(&memory.staking, agreements, Utc::now(), Instant::now());
+                listed.extend(agreements.iter().map(|a| a.agreement_id.clone()));
             },
         )
         .await
         {
+            Ok(_) => held = Some(listed),
             // The rows stay as the last cycle left them. The challenges are
             // proved against those: a stale row costs nothing a skipped proof
             // would not cost thirty times over.
-            failures.record("reconciling agreements with Portal", err);
+            Err(err) => failures.record("reconciling agreements with Portal", err),
         }
     }
 
     // Proofs before anything the cycle takes on. The challenges are brought up
     // to date first; if the Portal cannot be asked, the ones already known are
     // proved against the previous read rather than not at all.
-    if let Err(err) = sync_active_challenges(portal_client, database).await {
-        warn!("syncing active challenges failed; proving the challenges already known: {err:#}");
-    }
+    let challenges_synced = match sync_active_challenges(portal_client, database).await {
+        Ok(_) => true,
+        Err(err) => {
+            warn!(
+                "syncing active challenges failed; proving the challenges already known: {err:#}"
+            );
+            false
+        }
+    };
 
     // Refresh the aggregated ledger before proving: reconciliation may have
     // learned the contract-assigned `ledger_index` of files stored earlier, and
@@ -414,6 +432,27 @@ async fn sync_portal_once(
                     &listing,
                     node_id,
                 ));
+            }
+            // Before anything new is taken on: the files of memberships that
+            // are over give their room back. Only on a cycle that read all
+            // three of the Portal's views — the node's memberships, its
+            // challenges, the ready listing — since a file is removed on
+            // their combined word that nothing can still ask for it.
+            if let (Some(held), true) = (&held, challenges_synced) {
+                if let Err(err) = remove_ended_files(
+                    portal_client,
+                    database,
+                    storage_backend,
+                    storage_dir,
+                    held,
+                    &listing,
+                    &memory.ended_files,
+                    Instant::now(),
+                )
+                .await
+                {
+                    warn!("could not look for files of ended memberships this cycle: {err:#}");
+                }
             }
             let mut budget = if portal_client.node_id().is_some() {
                 memory.staking.join_budget(Instant::now())
@@ -2542,10 +2581,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(entry))
             .mount(&mock_server)
             .await;
-        // The membership is re-read from the Portal twice: by reconciliation,
-        // since the filtered listing above does not carry it, and by the
-        // exit's first step in a process — the detail is the only place a
-        // leave made by an earlier process shows (as `left`).
+        // The membership is re-read from the Portal three times: by
+        // reconciliation, since the filtered listing above does not carry it;
+        // by the look for stored files nobody owes any more, for the same
+        // reason (it finds a live membership and leaves the file alone); and
+        // by the exit's first step in a process — the detail is the only
+        // place a leave made by an earlier process shows (as `left`).
         Mock::given(method("GET"))
             .and(path("/api/agreements/AGR-held"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2560,7 +2601,7 @@ mod tests {
                 "status": "confirmed",
                 "created_at": "2024-01-01T00:00:00Z"
             })))
-            .expect(2)
+            .expect(3)
             .mount(&mock_server)
             .await;
         Mock::given(method("POST"))

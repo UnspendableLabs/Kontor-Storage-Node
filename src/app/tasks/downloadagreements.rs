@@ -1,15 +1,18 @@
 use crate::app::config::StorageMethod;
 use crate::app::daemon::StorageLimits;
-use crate::app::tasks::field_from_hex;
 use crate::app::tasks::getnewagreements::ReadyListing;
 use crate::app::tasks::stake::{
     is_membership_status, JoinBudget, JoinDecision, StakeTracker, REJOINABLE_MEMBERSHIP,
 };
+use crate::app::tasks::{field_from_hex, STATUS_ACTIVE, STATUS_PROVED, STATUS_SUBMITTED};
 use crate::clients::http_helpers::status_and_code;
 use crate::clients::kor::Kor;
 use crate::clients::portal::{AgreementNode, JoinAgreementResponse, UnsettledOp};
 use crate::clients::{GcsClient, PortalClient};
-use crate::entities::{agreements, prelude::Agreements};
+use crate::entities::{
+    agreements, challenges,
+    prelude::{Agreements, Challenges},
+};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, FileDescriptor, FileLedger, FileMetadata as CryptoFileMetadata};
@@ -21,11 +24,11 @@ use sea_orm::{
     EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
@@ -982,6 +985,280 @@ async fn discard_download(path: &Path) {
     }
 }
 
+/// How long this process must have seen a membership over before the file
+/// stored for it is removed.
+///
+/// A removed file cannot be proved, so removal waits out anything still on
+/// its way: a challenge issued in the last blocks of the membership reaches
+/// the node within a cycle or two of the Portal reading it, and an hour is
+/// several of the Portal's passes. Counted from when this process first saw
+/// the membership over — a restart starts the hour again, which only delays.
+pub const ENDED_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// How many agreements one cycle re-reads from the Portal to learn whether
+/// the membership a stored file was for is over.
+const ENDED_CHECKS_PER_CYCLE: usize = 20;
+
+/// Challenge statuses under which a proof may still be asked of this node:
+/// to prove, or proved and not yet judged (the Portal hands a rejected one
+/// back as `active`).
+const OPEN_CHALLENGE: [&str; 3] = [STATUS_ACTIVE, STATUS_PROVED, STATUS_SUBMITTED];
+
+/// What a cycle last learned about a stored file the node may no longer owe.
+#[derive(Clone, Copy, Debug)]
+enum Seen {
+    /// The Portal says the membership is over, first seen so at this instant.
+    Over(Instant),
+    /// The Portal did not say so when asked at this instant.
+    NotOver(Instant),
+}
+
+/// The stored files whose membership the Portal no longer lists, and what
+/// each cycle learned about them (see [`remove_ended_files`]).
+///
+/// In memory: after a restart every file is looked at afresh and waits out
+/// [`ENDED_FILE_GRACE`] again.
+#[derive(Debug, Default)]
+pub struct EndedFiles {
+    seen: Mutex<HashMap<String, Seen>>,
+}
+
+/// Whether the Portal's own row for an agreement says this node's membership
+/// in it is over for good.
+///
+/// Only on a row of this node's, and only when none of them is a membership:
+/// `left`, `failed`, or `invalid` once the agreement is no longer open to a
+/// new join in its place (`ready`, or `pending` — a batch that is cancelled
+/// puts it back to `ready`). An agreement with no row for this node says
+/// nothing, and is not taken for an ended one.
+fn membership_is_over(remote: &crate::clients::portal::Agreement, node_id: &str) -> bool {
+    let mine: Vec<&str> = remote
+        .nodes
+        .iter()
+        .filter(|node| node.node_id == node_id)
+        .map(|node| node.status.as_str())
+        .collect();
+    if mine.is_empty() || mine.iter().any(|status| is_membership_status(Some(status))) {
+        return false;
+    }
+    mine.iter().any(|status| *status != REJOINABLE_MEMBERSHIP)
+        || !matches!(remote.status.as_str(), "ready" | "pending")
+}
+
+/// Remove the stored files of memberships that are over, and stop counting
+/// them against the storage limits.
+///
+/// A file is stored when its join is accepted. The membership can then end
+/// without the node ever needing the file again: the Portal invalidates the
+/// join and the agreement goes on without this node, the agreement fails, or
+/// the node leaves. Nothing removed those files, so they filled
+/// `STORAGE_MAX_FILES` and `STORAGE_CAPACITY` until the node took on nothing.
+///
+/// `held` is this cycle's listing of the agreements the node validly belongs
+/// to, and `listing` this cycle's ready listing — both read successfully,
+/// which the caller guarantees along with a successful challenge sync. A
+/// stored file is a candidate when its agreement is in neither. It is removed
+/// only when all of this holds:
+///
+/// - the agreement, re-read from the Portal, carries a row of this node and
+///   none of its rows is a membership (see [`membership_is_over`]) — checked
+///   when the file first becomes a candidate and again right before removal;
+/// - this process has seen it so for [`ENDED_FILE_GRACE`];
+/// - no challenge on the agreement is still open;
+/// - no other stored agreement uses the same file.
+///
+/// The row is then marked not downloaded, with the Portal's `nodes` and
+/// `status`, so the download step sees an ended membership and leaves it
+/// alone. Returns how many files were removed.
+///
+/// # Errors
+/// If the node's own rows cannot be read. A file that cannot be removed, or
+/// an agreement that cannot be re-read, is logged and tried again later.
+#[allow(clippy::too_many_arguments)]
+pub async fn remove_ended_files(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    held: &HashSet<String>,
+    listing: &ReadyListing,
+    ended: &EndedFiles,
+    now: Instant,
+) -> Result<usize> {
+    let Some(node_id) = portal_client.node_id() else {
+        return Ok(0);
+    };
+
+    let mut candidates: Vec<agreements::Model> = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
+        .all(database)
+        .await
+        .context("failed to load the stored agreements")?
+        .into_iter()
+        .filter(|agreement| {
+            !held.contains(&agreement.agreement_id)
+                && !listing.contains_key(&agreement.agreement_id)
+        })
+        .collect();
+
+    // Forget what is no longer a candidate: held again, listed again, removed.
+    let known: HashMap<String, Seen> = {
+        let mut seen = ended.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|agreement_id, _| {
+            candidates
+                .iter()
+                .any(|candidate| &candidate.agreement_id == agreement_id)
+        });
+        seen.clone()
+    };
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Which candidates are worth a read this cycle: one never looked at, one
+    // whose grace has run out (to confirm before removing), or one the Portal
+    // did not report over, once the grace has passed since it was asked.
+    // Never-seen ones first, and at most `ENDED_CHECKS_PER_CYCLE` in all.
+    candidates.retain(|candidate| match known.get(&candidate.agreement_id) {
+        None => true,
+        Some(Seen::Over(since) | Seen::NotOver(since)) => {
+            now.duration_since(*since) >= ENDED_FILE_GRACE
+        }
+    });
+    candidates.sort_by_key(|candidate| known.contains_key(&candidate.agreement_id));
+    candidates.truncate(ENDED_CHECKS_PER_CYCLE);
+
+    let mut removed = 0usize;
+    for agreement in candidates {
+        let remote = match portal_client.get_agreement(&agreement.agreement_id).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                debug!(
+                    "could not re-read agreement {} to see whether its file is still owed: {err:#}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        };
+        let record = |seen: Seen| {
+            ended
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(agreement.agreement_id.clone(), seen);
+        };
+        if !membership_is_over(&remote, node_id) {
+            record(Seen::NotOver(now));
+            continue;
+        }
+        let since = match known.get(&agreement.agreement_id) {
+            Some(Seen::Over(since)) => *since,
+            _ => {
+                record(Seen::Over(now));
+                debug!(
+                    "the membership in {} is over; its file is removed in {} minutes if nothing \
+                     asks for it",
+                    agreement.agreement_id,
+                    ENDED_FILE_GRACE.as_secs() / 60
+                );
+                continue;
+            }
+        };
+        if now.duration_since(since) < ENDED_FILE_GRACE {
+            continue;
+        }
+
+        let open_challenges = Challenges::find()
+            .filter(challenges::Column::AgreementId.eq(&agreement.agreement_id))
+            .filter(challenges::Column::Status.is_in(OPEN_CHALLENGE))
+            .count(database)
+            .await
+            .context("failed to count the open challenges of an ended membership")?;
+        if open_challenges > 0 {
+            debug!(
+                "keeping the file of {}: {open_challenges} challenge(s) on it are still open",
+                agreement.agreement_id
+            );
+            continue;
+        }
+
+        let shared = Agreements::find()
+            .filter(agreements::Column::Downloaded.eq(true))
+            .filter(agreements::Column::FileId.eq(&agreement.file_id))
+            .filter(agreements::Column::AgreementId.ne(&agreement.agreement_id))
+            .count(database)
+            .await
+            .context("failed to check whether a stored file is shared")?;
+        if shared == 0 {
+            if let Err(err) =
+                delete_stored_file(storage_backend, storage_dir, &agreement.file_id).await
+            {
+                warn!(
+                    "could not remove the file of ended membership {}; trying again later: {err:#}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        }
+
+        let nodes = serde_json::to_value(&remote.nodes).context("serializing agreement nodes")?;
+        Agreements::update(agreements::ActiveModel {
+            agreement_id: sea_orm::ActiveValue::Unchanged(agreement.agreement_id.clone()),
+            downloaded: Set(false),
+            nodes: Set(nodes),
+            status: Set(remote.status.clone()),
+            ..Default::default()
+        })
+        .exec(database)
+        .await
+        .context("marking an ended membership's file as removed")?;
+        ended
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&agreement.agreement_id);
+        info!(
+            "Removed the file of {} ({} bytes): this node's membership in it is over",
+            agreement.agreement_id, agreement.original_size
+        );
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
+/// Delete a stored file from the configured backend. A file already gone is
+/// not an error.
+async fn delete_stored_file(
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    file_id: &str,
+) -> Result<()> {
+    match storage_backend.method {
+        StorageMethod::Local => match fs::remove_file(storage_dir.join(file_id)).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow!(err).context(format!("removing {file_id} from local storage"))),
+        },
+        StorageMethod::Gcs => {
+            let deleted = storage_backend
+                .gcs_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("GCS storage backend is not initialized"))?
+                .delete_object(file_id)
+                .await;
+            match deleted {
+                Err(err) if !matches!(status_and_code(&err), Some((404, _))) => {
+                    Err(err.context(format!("removing {file_id} from GCS")))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
 async fn current_used_capacity(database: &DatabaseConnection) -> Result<u64> {
     // Compute the sum at the database level rather than streaming every downloaded row
     // into memory. `SELECT SUM(original_size) ... ` always returns one row, but the
@@ -1313,7 +1590,8 @@ mod tests {
     use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Agreements;
     use crate::testutils::{
-        setup_agreements_db, unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY,
+        setup_agreements_db, setup_in_memory_db, unique_storage_dir, AgreementFixture,
+        TEST_PRIVATE_KEY,
     };
     use halo2curves::pasta::Fq;
     use sea_orm::{EntityTrait, PaginatorTrait};
@@ -4173,5 +4451,314 @@ mod tests {
             assert!(!row.downloaded, "{id}");
         }
         assert_eq!(client.current_nonce(), Some(0), "nothing was signed");
+    }
+
+    /// What the Portal's detail of `agreement_id` says of this node.
+    async fn mount_detail(
+        mock_server: &MockServer,
+        agreement_id: &str,
+        status: &str,
+        mine: Option<&str>,
+    ) {
+        let mut detail = json!({
+            "agreement_id": agreement_id,
+            "user_id": "user_1",
+            "file_id": format!("FILE-{agreement_id}"),
+            "filename": "test.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": [{"node_id": "NODE-other", "status": "valid"}],
+            "transaction_id": null,
+            "status": status,
+            "created_at": "2024-01-01T00:00:00Z",
+        });
+        if let Some(mine) = mine {
+            detail["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"node_id": "NODE-test", "status": mine}));
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// A stored agreement, its file on disk.
+    async fn insert_stored(database: &DatabaseConnection, storage_dir: &Path, agreement_id: &str) {
+        let file_id = format!("FILE-{agreement_id}");
+        stdfs::create_dir_all(storage_dir).unwrap();
+        stdfs::write(storage_dir.join(&file_id), b"stored").unwrap();
+        AgreementFixture {
+            downloaded: true,
+            status: "confirmed".into(),
+            nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+            ..AgreementFixture::new(agreement_id, file_id)
+        }
+        .into_active_model()
+        .insert(database)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_challenge(database: &DatabaseConnection, agreement_id: &str, status: &str) {
+        let now = chrono::Utc::now().fixed_offset();
+        challenges::ActiveModel {
+            challenge_id: Set(format!("chal-{agreement_id}")),
+            agreement_id: Set(agreement_id.into()),
+            block_height: Set(100),
+            challenge_count: Set(1),
+            seed: Set("00".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(2116),
+            status: Set(status.into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(database)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn a_membership_is_over_only_on_this_node_s_own_rows() {
+        let over = |status: &str, mine: &[&str]| {
+            let mut agreement = listed("AGR-x", None, &["NODE-other"]);
+            agreement.status = status.to_string();
+            for mine in mine {
+                agreement.nodes.push(AgreementNode {
+                    node_id: "NODE-test".into(),
+                    status: (*mine).to_string(),
+                });
+            }
+            membership_is_over(&agreement, "NODE-test")
+        };
+        // Final wherever the agreement stands.
+        assert!(over("confirmed", &["left"]));
+        assert!(over("ready", &["left"]));
+        assert!(over("confirmed", &["failed"]), "an old Portal's rendering");
+        // An invalidated join can be made again while the agreement is open.
+        assert!(!over("ready", &["invalid"]));
+        assert!(!over("pending", &["invalid"]));
+        assert!(over("confirmed", &["invalid"]));
+        assert!(over("failed", &["invalid"]));
+        // A live row among dead ones is a membership.
+        assert!(!over("confirmed", &["valid"]));
+        assert!(!over("confirmed", &["invalid", "valid"]));
+        assert!(!over("failed", &["valid"]));
+        // No row of this node's: nothing is known.
+        assert!(!over("confirmed", &[]));
+        assert!(!over("failed", &[]));
+    }
+
+    /// A file stored for a membership that then ended — the join invalidated
+    /// and the agreement confirmed without this node — used to stay for good,
+    /// counted against `STORAGE_MAX_FILES` and the capacity until the node
+    /// took on nothing. It is removed once this process has seen the
+    /// membership over for the grace, and the limits get the room back.
+    #[tokio::test]
+    async fn the_file_of_an_ended_membership_is_removed_after_the_grace() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-over", "confirmed", Some("invalid")).await;
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_removed");
+        insert_stored(&database, &storage_dir, "AGR-over").await;
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        let nothing = HashSet::new();
+        let listing = ReadyListing::new();
+        let file = storage_dir.join("FILE-AGR-over");
+        let backend = StorageBackend::local();
+        let pass = |now: Instant| {
+            remove_ended_files(
+                &client,
+                &database,
+                &backend,
+                &storage_dir,
+                &nothing,
+                &listing,
+                &ended,
+                now,
+            )
+        };
+
+        let t0 = Instant::now();
+        assert_eq!(
+            pass(t0).await.unwrap(),
+            0,
+            "first seen over: the grace starts"
+        );
+        assert!(file.exists());
+        assert_eq!(
+            pass(t0 + ENDED_FILE_GRACE - Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(file.exists(), "still inside the grace");
+        assert_eq!(
+            requests_to(&mock_server.received_requests().await.unwrap(), "AGR-over"),
+            1,
+            "and not re-read from the Portal on every cycle of it"
+        );
+
+        assert_eq!(pass(t0 + ENDED_FILE_GRACE).await.unwrap(), 1);
+        assert!(!file.exists(), "the file is gone");
+        let row = Agreements::find_by_id("AGR-over")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.downloaded);
+        assert_eq!(row.status, "confirmed");
+        assert_eq!(
+            membership(&row, None, Some("NODE-test")),
+            Membership::Ended,
+            "the row now says what the Portal says, so nothing downloads it again"
+        );
+        assert_eq!(current_downloaded_count(&database).await.unwrap(), 0);
+        assert_eq!(current_used_capacity(&database).await.unwrap(), 0);
+        // Nothing left to look at.
+        assert_eq!(pass(t0 + ENDED_FILE_GRACE * 3).await.unwrap(), 0);
+    }
+
+    /// A file is only ever removed on the Portal's word that the membership
+    /// is over, and never while anything could still ask for it.
+    #[tokio::test]
+    async fn a_file_that_may_still_be_owed_is_never_removed() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-valid", "confirmed", Some("valid")).await;
+        mount_detail(&mock_server, "AGR-rejoinable", "ready", Some("invalid")).await;
+        mount_detail(&mock_server, "AGR-no-row", "confirmed", None).await;
+        mount_detail(&mock_server, "AGR-held", "confirmed", Some("left")).await;
+        mount_detail(&mock_server, "AGR-listed", "confirmed", Some("left")).await;
+        mount_detail(&mock_server, "AGR-challenged", "confirmed", Some("left")).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-unreadable"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_kept");
+        let all = [
+            "AGR-valid",
+            "AGR-rejoinable",
+            "AGR-no-row",
+            "AGR-held",
+            "AGR-listed",
+            "AGR-challenged",
+            "AGR-unreadable",
+        ];
+        for agreement_id in all {
+            insert_stored(&database, &storage_dir, agreement_id).await;
+        }
+        insert_challenge(&database, "AGR-challenged", "proved").await;
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        // The Portal's own listings win over anything else: an agreement the
+        // node validly belongs to, or one still ready, is not even looked at.
+        let held: HashSet<String> = ["AGR-held".to_string()].into();
+        let listing = listing(vec![listed("AGR-listed", None, &[])]);
+
+        let t0 = Instant::now();
+        for step in 0..4u32 {
+            let removed = remove_ended_files(
+                &client,
+                &database,
+                &StorageBackend::local(),
+                &storage_dir,
+                &held,
+                &listing,
+                &ended,
+                t0 + ENDED_FILE_GRACE * step,
+            )
+            .await
+            .unwrap();
+            assert_eq!(removed, 0, "pass {step}");
+        }
+        for agreement_id in all {
+            assert!(
+                storage_dir.join(format!("FILE-{agreement_id}")).exists(),
+                "{agreement_id} was removed"
+            );
+        }
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-held"), 0);
+        assert_eq!(requests_to(&requests, "AGR-listed"), 0);
+
+        // The open challenge closes: that file, and only that one, goes.
+        challenges::ActiveModel {
+            challenge_id: sea_orm::ActiveValue::Unchanged("chal-AGR-challenged".into()),
+            status: Set("resolved".into()),
+            ..Default::default()
+        }
+        .update(&database)
+        .await
+        .unwrap();
+        let removed = remove_ended_files(
+            &client,
+            &database,
+            &StorageBackend::local(),
+            &storage_dir,
+            &held,
+            &listing,
+            &ended,
+            t0 + ENDED_FILE_GRACE * 5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!storage_dir.join("FILE-AGR-challenged").exists());
+        assert!(storage_dir.join("FILE-AGR-valid").exists());
+    }
+
+    /// Two agreements on one file: the file stays while either still owes it.
+    #[tokio::test]
+    async fn a_file_another_stored_agreement_uses_is_kept() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-left", "confirmed", Some("left")).await;
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_shared");
+        insert_stored(&database, &storage_dir, "AGR-left").await;
+        AgreementFixture {
+            downloaded: true,
+            status: "confirmed".into(),
+            ..AgreementFixture::new("AGR-live", "FILE-AGR-left")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        let held: HashSet<String> = ["AGR-live".to_string()].into();
+        let listing = ReadyListing::new();
+
+        let t0 = Instant::now();
+        let mut removed = 0;
+        for step in 0..2u32 {
+            removed += remove_ended_files(
+                &client,
+                &database,
+                &StorageBackend::local(),
+                &storage_dir,
+                &held,
+                &listing,
+                &ended,
+                t0 + ENDED_FILE_GRACE * step,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(removed, 1, "the ended row stops counting");
+        assert!(
+            storage_dir.join("FILE-AGR-left").exists(),
+            "but the file the live agreement uses stays"
+        );
+        assert_eq!(current_downloaded_count(&database).await.unwrap(), 1);
     }
 }
