@@ -959,8 +959,7 @@ impl StakeTracker {
         });
 
         if let Some(previous) = &state.last_known {
-            let withdraw_landed = landed.iter().any(|op| op.op == NodeOp::WithdrawStake);
-            let event = describe_transition(previous, &snapshot, withdraw_landed);
+            let event = describe_transition(previous, &snapshot);
             if let Some(event) = event {
                 state.last_event = Some((Utc::now(), event));
             }
@@ -1979,11 +1978,7 @@ fn withdraw_due(state: &TrackerState, now: Instant) -> bool {
 
 /// Log, and return for the status page, what changed between two reads that
 /// the operator has to know about.
-fn describe_transition(
-    previous: &StakeSnapshot,
-    current: &StakeSnapshot,
-    withdraw_landed: bool,
-) -> Option<String> {
+fn describe_transition(previous: &StakeSnapshot, current: &StakeSnapshot) -> Option<String> {
     let mut event = None;
 
     // A bond that went to zero while a withdrawal was pending is the
@@ -1994,8 +1989,13 @@ fn describe_transition(
     // unwind, and Kontor clears the withdrawal height with the stake, so the
     // registry otherwise looks the same. Whether cleanup is pending has to be
     // known for that: unread, the drop is reported as what it may be.
+    //
+    // That a `withdraw-stake` landed on this read says nothing by itself:
+    // Kontor refuses one made too early or with an obligation outstanding,
+    // and the bond is then still there. If it shrank on the same read, that
+    // was a slash, and it is reported as one.
     let exit_over = current.stake.is_zero() && previous.withdrawal_height.is_some();
-    let withdrawn = withdraw_landed || (exit_over && current.bond_cleanup_pending == Some(false));
+    let withdrawn = exit_over && current.bond_cleanup_pending == Some(false);
     let undecided = exit_over && current.bond_cleanup_pending.is_none();
     if current.stake < previous.stake && !withdrawn && !undecided {
         let lost = previous.stake.saturating_sub(current.stake);
@@ -5799,5 +5799,41 @@ mod tests {
             tracker.plan(t0 + REFUSED_OP_RETRY_INTERVAL, None),
             Some(NodeOp::AddStake(kor("995")))
         );
+    }
+    /// A `withdraw-stake` Kontor refused leaves the bond where it was. If the
+    /// bond shrank on the read that showed the withdrawal's nonce consumed,
+    /// that was a slash — and it went unreported, because any drop on a read
+    /// where a withdrawal landed was put down to the withdrawal.
+    #[test]
+    fn a_slash_on_the_read_a_refused_withdrawal_lands_is_reported() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(12, "100"), t0);
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        tracker.record_sent(NodeOp::WithdrawStake, 12, t0);
+
+        // Refused (an obligation was outstanding), and 30 KOR slashed.
+        observed(&tracker, &exiting_entry(13, "70"), t0);
+        let event = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(event.contains("slashed"), "{event}");
+        assert!(event.contains("30"), "{event}");
+        assert_eq!(tracker.status()["exited"], false);
+
+        // One that returned the whole bond is still a withdrawal.
+        let tracker = StakeTracker::new(StakePolicy::default());
+        observed(&tracker, &exiting_entry(12, "100"), t0);
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        tracker.record_sent(NodeOp::WithdrawStake, 12, t0);
+        let mut withdrawn = entry(Some("0"), Some("0"));
+        withdrawn.next_nonce = Some(13);
+        observed(&tracker, &withdrawn, t0);
+        let event = tracker.status()["last_event"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(event, "withdrawal completed");
     }
 }
