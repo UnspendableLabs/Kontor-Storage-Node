@@ -50,10 +50,10 @@ a copy, so nothing here can be true on a push and quietly absent on a publish.
 - `cargo check` on the `rust-version` in Cargo.toml. Every other job resolves
   its toolchain through [rust-toolchain.toml](rust-toolchain.toml), so the
   declared minimum is only ever compiled by this one.
-- `cargo llvm-cov` — coverage is gated at 95%. New code needs tests. This one
-  runs in CI only, not in the release: it depends on a third-party service
-  being up, and a release blocked by a Codecov outage would be the tail wagging
-  the dog.
+- `cargo llvm-cov` — line coverage is gated at 95% (`--fail-under-lines 95`).
+  New code needs tests. This one runs in CI only, not in the release; the
+  table and the uncovered lines are in the job's log, and nothing is uploaded
+  to a third party.
 
 ## Migrations
 

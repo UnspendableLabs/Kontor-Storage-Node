@@ -11,14 +11,15 @@ jobs:
   gates:
     uses: ./.github/workflows/gates.yml
 
-  # Deliberately *not* a gate. Coverage is a property of the repository over
-  # time and depends on a third-party service being up; a release that could
-  # not go out because Codecov was down would be the tail wagging the dog. It
-  # still fails the build on a push, which is where it does its work.
+  # Deliberately *not* a gate of the release: the gates already run the suite.
+  # This job measures coverage and fails under 95% of lines — high enough that
+  # untested code still gets caught, low enough that it does not report on
+  # branches no test can reach (a poisoned mutex, an unreachable `map_err`).
+  # The table and the uncovered lines are in its log; nothing is uploaded to a
+  # third party.
   coverage:
     name: cargo llvm-cov
     runs-on: ubuntu-latest
-    environment: default
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,9 +27,4 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info --show-missing-lines
-      - uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+      - run: cargo llvm-cov --workspace --all-features --locked --show-missing-lines --fail-under-lines 95

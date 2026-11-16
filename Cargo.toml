@@ -22,7 +22,6 @@ exclude = [
     "/.github",
     "/.githooks",
     "/apiary.apib",
-    "/codecov.yml",
     "/scripts",
     "/tests",
     # Kept out deliberately. `cargo install` never reads it — rustup picks a
