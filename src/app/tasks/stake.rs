@@ -25,8 +25,8 @@
 //!   the collateral is almost never known yet: those joins are budgeted at an
 //!   estimate instead (see [`JoinBudget::decide`]).
 //! - **Exit.** Once the operator's `begin-unstake` has executed, the node leaves
-//!   its agreements one op per cycle and, when none is left, withdraws the bond
-//!   (see [`ExitInputs`]). A node that has exited bonds nothing more on its
+//!   its agreements, several leaves in flight at a time, and, when none is
+//!   left, withdraws the bond (see [`ExitInputs`]). A node that has exited bonds nothing more on its
 //!   own, and that is recorded in its database: a restart does not put the
 //!   returned bond back at stake. The operator resumes staking from `/admin`.
 //!
@@ -204,6 +204,23 @@ pub const MAX_UNKNOWN_COLLATERAL_JOINS_PER_CYCLE: usize = 3;
 /// How long a collateral seen on an agreement informs the estimate for
 /// agreements whose collateral is not known yet.
 pub const COLLATERAL_MEMORY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many of the exit's `leave-agreement` ops may be in flight at once.
+///
+/// Every other op goes out one at a time: the next is decided from what the
+/// last one changed. A leave changes nothing the next leave depends on, and
+/// one at a time — one per block at best, since each waits for its nonce to
+/// be consumed — a node with more than a couple of thousand memberships could
+/// not leave them all within Kontor's 2028-block withdrawal delay, and went on
+/// proving and risking slashes for as many blocks as it had memberships. The
+/// Portal takes 64 live relayed ops per node and batches 50 per transaction;
+/// 32 leaves room for both and empties some 60 000 memberships within the
+/// delay.
+pub const MAX_LEAVES_IN_FLIGHT: usize = 32;
+
+/// Leaves signed in one cycle at most, so a long exit does not turn the end
+/// of every cycle into a burst of relay requests.
+pub const MAX_LEAVES_PER_CYCLE: usize = 8;
 
 /// Kontor's `WITHDRAWAL_DELAY`: `2016 + ACTIVATION_DELAY (12)` blocks between
 /// `begin-unstake` and the first height `withdraw-stake` accepts
@@ -566,8 +583,8 @@ struct TrackerState {
     /// Sticky: this Portal has reported a stake at least once.
     portal_reports_stake: bool,
     /// The ops the relay took that Kontor has not executed yet, by ascending
-    /// nonce. One at a time for every op but the exit's leaves (see
-    /// [`StakeTracker::plan`]).
+    /// nonce. One at a time for every op but the exit's leaves, of which up to
+    /// [`MAX_LEAVES_IN_FLIGHT`] go together (see [`StakeTracker::plan`]).
     in_flight: Vec<InFlight>,
     /// The Portal's listing of this node's `queued` and `submitted` ops has
     /// been read once in this process, and the newest adopted as in flight
@@ -1234,9 +1251,9 @@ impl StakeTracker {
             .max()
     }
 
-    /// Take the newest op the Portal still holds for this node — `queued` or
+    /// Take the ops the Portal still holds for this node — `queued` or
     /// `submitted`, from `GET /api/nodes/{node_id}/ops?status=queued|submitted`
-    /// — as the op in flight, when none is tracked.
+    /// — as ops in flight, each one the tracker does not know already.
     ///
     /// In-flight tracking lives in memory. After a restart the node knows
     /// nothing of the `add-stake` it signed before, which may well still be
@@ -1250,13 +1267,12 @@ impl StakeTracker {
     /// sent. The same is done after a `409`: the nonce went to an op the
     /// Portal already holds, which may be exactly this one.
     ///
-    /// Returns the op adopted, if any. Marks the listing read either way.
+    /// Returns the newest op adopted, if any. Marks the listing read either
+    /// way.
     pub fn adopt_pending_ops(&self, ops: &[NodeOpRecord], now: Instant) -> Option<(NodeOp, u64)> {
         let mut state = self.lock();
+        let state = &mut *state;
         state.pending_ops_checked = true;
-        if !state.in_flight.is_empty() {
-            return None;
-        }
         // An op whose nonce Kontor has already consumed by the latest registry
         // read has executed, or never will: the Portal's listing is simply
         // behind (it reconciles a block after Kontor runs it). Adopted, it
@@ -1265,74 +1281,90 @@ impl StakeTracker {
             .last_known
             .as_ref()
             .map_or(0, |snapshot| snapshot.next_nonce);
-        let (op, record) = ops
+        let mut held: Vec<(NodeOp, &NodeOpRecord)> = ops
             .iter()
             .filter(|record| matches!(record.status.as_str(), "queued" | "submitted"))
             .filter(|record| record.nonce >= next_nonce)
+            .filter(|record| !state.in_flight.iter().any(|op| op.nonce == record.nonce))
             .filter_map(|record| NodeOp::from_record(record).map(|op| (op, record)))
-            .max_by_key(|(_, record)| record.nonce)?;
-        let nonce = record.nonce;
-        info!(
-            op = op.name(),
-            nonce,
-            status = %record.status,
-            "the Portal still holds a {} op of this node; waiting for it rather than signing \
-             another",
-            op.name()
-        );
-        match op {
-            NodeOp::ClaimRewards => state.last_claim = Some(now),
-            NodeOp::WithdrawStake => state.last_withdraw = Some(now),
-            _ => {}
+            .collect();
+        held.sort_by_key(|(_, record)| record.nonce);
+        let mut newest = None;
+        for (op, record) in held {
+            let nonce = record.nonce;
+            info!(
+                op = op.name(),
+                nonce,
+                status = %record.status,
+                "the Portal still holds a {} op of this node; waiting for it rather than \
+                 signing another",
+                op.name()
+            );
+            match op {
+                NodeOp::ClaimRewards => state.last_claim = Some(now),
+                NodeOp::WithdrawStake => state.last_withdraw = Some(now),
+                _ => {}
+            }
+            // An unstake is only ever the operator's; an adopted withdrawal
+            // is one only if the request for it is still waiting here.
+            let requested =
+                op == NodeOp::BeginUnstake || state.operator_request.as_ref() == Some(&op);
+            if state.operator_request.as_ref() == Some(&op) {
+                state.operator_request = None;
+            }
+            state.last_event = Some((
+                Utc::now(),
+                format!(
+                    "{} {} at the Portal (nonce {nonce}); adopted as in flight",
+                    op.name(),
+                    record.status
+                ),
+            ));
+            state.in_flight.push(InFlight {
+                op: op.clone(),
+                nonce,
+                sent: now,
+                sent_at: Utc::now(),
+                unsettled: false,
+                requested,
+                stake_before: None,
+                checked: Some(now),
+                vouched: Some(now),
+                orphaned: None,
+            });
+            newest = Some((op, nonce));
         }
-        // An unstake is only ever the operator's; an adopted withdrawal is
-        // one only if the request for it is still waiting here.
-        let requested = op == NodeOp::BeginUnstake || state.operator_request.as_ref() == Some(&op);
-        if state.operator_request.as_ref() == Some(&op) {
-            state.operator_request = None;
-        }
-        state.last_event = Some((
-            Utc::now(),
-            format!(
-                "{} {} at the Portal (nonce {nonce}); adopted as in flight",
-                op.name(),
-                record.status
-            ),
-        ));
-        state.in_flight.push(InFlight {
-            op: op.clone(),
-            nonce,
-            sent: now,
-            sent_at: Utc::now(),
-            unsettled: false,
-            requested,
-            stake_before: None,
-            checked: Some(now),
-            vouched: Some(now),
-            orphaned: None,
-        });
-        Some((op, nonce))
+        state.in_flight.sort_by_key(|op| op.nonce);
+        newest
     }
 
-    /// The nonce of the in-flight op the Portal should be asked about this
-    /// cycle, if there is one that has waited [`OP_LANDING_CHECK_INTERVAL`]
-    /// since it was sent or since the listing was last read for it. A listing
-    /// that could not be read is not a reading: the op is asked about again
-    /// on the next cycle, not half an hour later.
+    /// The nonces of the in-flight ops the Portal should be asked about this
+    /// cycle: those that have waited [`OP_LANDING_CHECK_INTERVAL`] since they
+    /// were sent or since the listing was last read for them. A listing that
+    /// could not be read is not a reading: the op is asked about again on the
+    /// next cycle, not half an hour later.
     #[must_use]
-    pub fn op_to_verify(&self, now: Instant) -> Option<u64> {
+    pub fn ops_to_verify(&self, now: Instant) -> Vec<u64> {
         let state = self.lock();
         state
             .in_flight
             .iter()
-            .find(|op| {
+            .filter(|op| {
                 now.duration_since(op.checked.unwrap_or(op.sent)) >= OP_LANDING_CHECK_INTERVAL
             })
             .map(|op| op.nonce)
+            .collect()
+    }
+
+    /// The first of [`Self::ops_to_verify`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn op_to_verify(&self, now: Instant) -> Option<u64> {
+        self.ops_to_verify(now).first().copied()
     }
 
     /// What the Portal's listing of this node's ops says about the in-flight
-    /// op at `nonce` (see [`Self::op_to_verify`]).
+    /// op at `nonce` (see [`Self::ops_to_verify`]).
     ///
     /// Still `queued` or `submitted`: it is waiting for a batch, or in one that
     /// is not confirmed yet, and stays in flight. `confirmed`: it has executed
@@ -1349,10 +1381,22 @@ impl StakeTracker {
     /// that could not be read says nothing: the op stays in flight and the
     /// next cycle asks again, however long the Portal stays silent — it may
     /// hold the op all that time.
+    #[cfg(test)]
     pub fn verify_in_flight(
         &self,
         nonce: u64,
         listing: anyhow::Result<Vec<NodeOpRecord>>,
+        now: Instant,
+    ) {
+        self.verify_in_flight_from(nonce, listing.as_ref().map(Vec::as_slice), now);
+    }
+
+    /// [`Self::verify_in_flight`] from a listing that is not consumed, so one
+    /// read of it answers for every op in flight.
+    fn verify_in_flight_from(
+        &self,
+        nonce: u64,
+        listing: Result<&[NodeOpRecord], &anyhow::Error>,
         now: Instant,
     ) {
         let mut state = self.lock();
@@ -1362,7 +1406,7 @@ impl StakeTracker {
         };
         let name = op.op.name();
         let listed = match listing {
-            Ok(ops) => ops.into_iter().find(|listed| listed.nonce == nonce),
+            Ok(ops) => ops.iter().find(|listed| listed.nonce == nonce),
             Err(err) => {
                 let silent = op.unvouched_for(now);
                 if silent >= OP_LANDING_HARD_TIMEOUT {
@@ -1910,14 +1954,17 @@ impl StakeTracker {
         });
     }
 
-    /// The op this cycle should send, if any. At most one: the next waits
-    /// until this one has landed.
+    /// The next op to send, if any. One at a time — the next waits until the
+    /// last has landed — except the exit's leaves, which go out while others
+    /// are still in flight, up to [`MAX_LEAVES_IN_FLIGHT`] of them: a leave
+    /// changes nothing another leave depends on (see [`manage_stake`], which
+    /// asks again after each leave it has sent).
     ///
     /// `exit` is the daemon's view of its memberships, passed while the node is
     /// [`exiting`](Self::exiting). The exit was started by the operator and is
     /// carried through whatever auto-stake says: leave every membership whose
-    /// challenges are settled, one per cycle, then withdraw once none is left
-    /// and the delay has (by the node's reckoning) passed.
+    /// challenges are settled, then withdraw once none is left, no leave is
+    /// in flight and the delay has (by the node's reckoning) passed.
     #[must_use]
     pub fn plan(&self, now: Instant, exit: Option<&ExitInputs>) -> Option<NodeOp> {
         let mut state = self.lock();
@@ -1925,7 +1972,22 @@ impl StakeTracker {
         let state = &*state;
         let snapshot = state.snapshot.as_ref()?;
         if !state.in_flight.is_empty() {
-            return None;
+            // Only another leave may join leaves in flight — and not when the
+            // operator has asked for something, which goes next, alone.
+            let leaves_only = state
+                .in_flight
+                .iter()
+                .all(|op| matches!(op.op, NodeOp::LeaveAgreement(_)));
+            if !leaves_only
+                || state.in_flight.len() >= MAX_LEAVES_IN_FLIGHT
+                || state.operator_request.is_some()
+            {
+                return None;
+            }
+            return match (snapshot.withdrawal_height, exit) {
+                (Some(_), Some(exit)) => next_leave(state, exit, now),
+                _ => None,
+            };
         }
 
         // The operator's own request outranks the policy, and is honoured
@@ -2168,12 +2230,13 @@ impl StakeTracker {
                 "stake_target": policy.stake_target,
                 "claim_threshold": policy.claim_threshold,
             },
-            "in_flight": state.in_flight.first().map(|op| json!({
+            "in_flight": state.in_flight.last().map(|op| json!({
                 "op": op.op.name(),
                 "amount": op.op.amount(),
                 "nonce": op.nonce,
                 "sent_at": op.sent_at.to_rfc3339(),
             })),
+                        "in_flight_count": state.in_flight.len(),
             "pending_joins": state.pending_joins.iter().map(|join| json!({
                 "agreement_id": join.agreement_id,
                 "collateral": join.collateral,
@@ -2285,27 +2348,44 @@ fn describe_sent(op: &NodeOp, nonce: u64) -> String {
     }
 }
 
-/// The next step of the exit, if one is due.
-fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
-    // The leaves that have executed but whose outcome the Portal has not
-    // given yet (see `classify_landed`): not left, not left again, and nothing
-    // to withdraw behind them.
-    let undecided: Vec<&str> = state
-        .unexplained
+/// The leaves whose outcome is not known yet: in flight, or executed without
+/// the Portal having said how (see `classify_landed`). Their agreements are
+/// not left, are not left again, and nothing is withdrawn behind them.
+fn undecided_leaves(state: &TrackerState) -> Vec<&str> {
+    state
+        .in_flight
         .iter()
-        .filter_map(|landed| landed.op.agreement_id())
-        .collect();
-    if let Some(agreement_id) = exit.memberships.iter().find(|id| {
-        !state.left.contains(*id)
-            && !undecided.contains(&id.as_str())
-            && !exit.deferred.contains(id)
-            && !refused_recently(state, &NodeOp::LeaveAgreement((*id).clone()), now)
-    }) {
-        return Some(NodeOp::LeaveAgreement(agreement_id.clone()));
+        .map(|op| &op.op)
+        .chain(state.unexplained.iter().map(|landed| &landed.op))
+        .filter_map(NodeOp::agreement_id)
+        .collect()
+}
+
+/// The next membership to leave, if any is due: not left yet, no leave of it
+/// in flight or undecided, no open challenge on it, not refused in the last
+/// hour.
+fn next_leave(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
+    let undecided = undecided_leaves(state);
+    exit.memberships
+        .iter()
+        .find(|id| {
+            !state.left.contains(*id)
+                && !undecided.contains(&id.as_str())
+                && !exit.deferred.contains(id)
+                && !refused_recently(state, &NodeOp::LeaveAgreement((*id).clone()), now)
+        })
+        .map(|agreement_id| NodeOp::LeaveAgreement(agreement_id.clone()))
+}
+
+/// The next step of the exit, if one is due: a leave, or — every membership
+/// left and no leave undecided — the withdrawal.
+fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
+    if let Some(leave) = next_leave(state, exit, now) {
+        return Some(leave);
     }
     let all_left = exit.memberships.iter().all(|id| state.left.contains(id));
     (all_left
-        && undecided.is_empty()
+        && undecided_leaves(state).is_empty()
         && exit.unresolved_challenges == 0
         && withdraw_due(state, now))
     .then_some(NodeOp::WithdrawStake)
@@ -2991,7 +3071,9 @@ fn is_live_member(nodes: &Value, node_id: &str) -> bool {
     })
 }
 
-/// Apply the policy for this cycle: send at most one stake or claim op.
+/// Apply the policy for this cycle: send at most one stake or claim op — or,
+/// during an exit, up to [`MAX_LEAVES_PER_CYCLE`] leaves. Returns the first
+/// op sent.
 ///
 /// Never fails the cycle. A stake op that does not go out this time is
 /// re-planned from fresh state on the next one.
@@ -3014,8 +3096,25 @@ pub async fn manage_stake(
     }
     verify_overdue_op(client, tracker, Instant::now()).await;
     classify_landed_op(client, tracker).await;
-    let op = tracker.plan(Instant::now(), exit)?;
-    send(client, tracker, op).await
+    let mut first = None;
+    for _ in 0..MAX_LEAVES_PER_CYCLE {
+        let Some(op) = tracker.plan(Instant::now(), exit) else {
+            break;
+        };
+        let is_leave = matches!(op, NodeOp::LeaveAgreement(_));
+        // An op that did not go out ends the cycle's sending, whatever the
+        // reason: refused, unanswered, or the Portal's queue for this node
+        // full (`429`).
+        let Some(sent) = send(client, tracker, op).await else {
+            break;
+        };
+        first.get_or_insert(sent);
+        // Only leaves follow one another within a cycle.
+        if !is_leave {
+            break;
+        }
+    }
+    first
 }
 
 /// Read the ops the Portal still holds for this node and adopt the newest as
@@ -3071,9 +3170,13 @@ async fn classify_landed_op(client: &PortalClient, tracker: &StakeTracker) {
 /// Ask the Portal about an in-flight op that has waited long enough to be
 /// asked about (see [`StakeTracker::verify_in_flight`]).
 async fn verify_overdue_op(client: &PortalClient, tracker: &StakeTracker, now: Instant) {
-    if let Some(nonce) = tracker.op_to_verify(now) {
-        let listing = client.list_node_ops(&[]).await;
-        tracker.verify_in_flight(nonce, listing, now);
+    let nonces = tracker.ops_to_verify(now);
+    if nonces.is_empty() {
+        return;
+    }
+    let listing = client.list_node_ops(&[]).await;
+    for nonce in nonces {
+        tracker.verify_in_flight_from(nonce, listing.as_ref().map(Vec::as_slice), now);
     }
 }
 
@@ -6904,5 +7007,152 @@ mod tests {
         later.restore_exited(true);
         assert_eq!(later.status()["exited"], false);
         assert_eq!(later.exited_to_persist(), Some(false));
+    }
+    fn memberships(count: usize) -> ExitInputs {
+        ExitInputs {
+            memberships: (0..count).map(|i| format!("AGR-{i:04}")).collect(),
+            ..ExitInputs::default()
+        }
+    }
+
+    /// The exit used to keep one leave in flight: the next was signed only
+    /// once the last had its nonce consumed, one per block at best. A node
+    /// with a few thousand memberships could not leave them within Kontor's
+    /// 2028-block delay, and kept proving — and risking slashes — for as many
+    /// blocks as it had memberships. Leaves now go out while others are in
+    /// flight, up to a bound, and nothing else does.
+    #[test]
+    fn the_exit_keeps_several_leaves_in_flight_and_nothing_else() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = memberships(MAX_LEAVES_IN_FLIGHT + 2);
+
+        let mut nonce = 10;
+        let mut sent = Vec::new();
+        while let Some(op) = tracker.plan(t0, Some(&exit)) {
+            let NodeOp::LeaveAgreement(id) = &op else {
+                panic!("only leaves while leaves are in flight: {op:?}");
+            };
+            assert!(!sent.contains(id), "{id} is left once");
+            sent.push(id.clone());
+            tracker.record_sent(op, nonce, t0);
+            nonce += 1;
+        }
+        assert_eq!(sent.len(), MAX_LEAVES_IN_FLIGHT, "bounded");
+        assert_eq!(tracker.status()["in_flight_count"], MAX_LEAVES_IN_FLIGHT);
+
+        // Half of them execute: the next ones go out, the same ones do not.
+        let half = (MAX_LEAVES_IN_FLIGHT / 2) as u64;
+        observed(&tracker, &exiting_entry(10 + half, "100"), t0);
+        let listing: Vec<NodeOpRecord> = (10..10 + half)
+            .map(|nonce| leave_record(nonce, "confirmed", None))
+            .collect();
+        for landed in tracker.ops_to_classify() {
+            tracker.classify_landed(landed, Ok(listing.clone()), t0);
+        }
+        assert_eq!(tracker.status()["exit"]["left"], half);
+        let next = tracker.plan(t0, Some(&exit)).unwrap();
+        assert!(
+            matches!(&next, NodeOp::LeaveAgreement(id) if !sent.contains(id)),
+            "{next:?}"
+        );
+
+        // No withdrawal while a leave is still out, however late it is.
+        let due = t0 + ASSUMED_BLOCK_TIME * WITHDRAWAL_DELAY_BLOCKS as u32;
+        let done = ExitInputs::default();
+        assert_eq!(tracker.plan(due, Some(&done)), None);
+    }
+
+    /// The operator's request goes next and alone: with leaves in flight no
+    /// further leave is signed, and the request waits for them to land.
+    #[test]
+    fn an_operator_request_waits_for_the_leaves_in_flight_and_stops_new_ones() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = memberships(3);
+        let first = tracker.plan(t0, Some(&exit)).unwrap();
+        tracker.record_sent(first, 10, t0);
+
+        tracker.request(NodeOp::WithdrawStake).unwrap();
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            None,
+            "no leave behind a request"
+        );
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        assert_eq!(tracker.plan(t0, Some(&exit)), Some(NodeOp::WithdrawStake));
+    }
+
+    /// Through the relay: one cycle signs several leaves, each at its own
+    /// nonce, and stops at the cycle's bound.
+    #[tokio::test]
+    async fn a_cycle_of_the_exit_sends_several_leaves() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ops_page(json!([]))))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/nodes/NODE-test/ops"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "op": "leave_agreement", "status": "queued"
+            })))
+            .expect(MAX_LEAVES_PER_CYCLE as u64)
+            .mount(&mock_server)
+            .await;
+        let client = client_at(&mock_server, 10);
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = memberships(MAX_LEAVES_PER_CYCLE + 3);
+
+        let first = manage_stake(&client, &tracker, Some(&exit)).await;
+        assert_eq!(first, Some(NodeOp::LeaveAgreement("AGR-0000".into())));
+        assert_eq!(tracker.status()["in_flight_count"], MAX_LEAVES_PER_CYCLE);
+        assert_eq!(
+            client.current_nonce(),
+            Some(10 + MAX_LEAVES_PER_CYCLE as u64),
+            "one nonce each"
+        );
+    }
+
+    /// A restart during the exit finds several leaves still held by the
+    /// Portal. Every one is adopted — only the newest used to be — so none is
+    /// signed a second time.
+    #[test]
+    fn every_op_the_portal_holds_is_adopted_not_only_the_newest() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let held: Vec<NodeOpRecord> = [(10, "AGR-0000"), (11, "AGR-0001")]
+            .into_iter()
+            .map(|(nonce, id)| {
+                let mut record = leave_record(nonce, "queued", None);
+                record.agreement_id = Some(id.into());
+                record
+            })
+            .collect();
+        assert_eq!(
+            tracker.adopt_pending_ops(&held, t0),
+            Some((NodeOp::LeaveAgreement("AGR-0001".into()), 11))
+        );
+        assert_eq!(tracker.status()["in_flight_count"], 2);
+        assert_eq!(tracker.highest_tracked_nonce(), Some(11));
+
+        let exit = memberships(3);
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            Some(NodeOp::LeaveAgreement("AGR-0002".into())),
+            "the two the Portal holds are not signed again"
+        );
+        // Adopting the same listing again changes nothing.
+        assert_eq!(tracker.adopt_pending_ops(&held, t0), None);
+        assert_eq!(tracker.status()["in_flight_count"], 2);
     }
 }
