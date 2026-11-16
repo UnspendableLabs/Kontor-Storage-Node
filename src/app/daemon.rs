@@ -11,6 +11,7 @@ use crate::app::tasks::stake::{
 };
 use crate::clients::PortalClient;
 use crate::entities::{agreements, prelude::Agreements};
+use crate::node::faucet::{fund_if_unfunded, Faucet};
 use anyhow::{anyhow, Context, Result};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use std::fs::{self, OpenOptions};
@@ -43,6 +44,10 @@ pub(crate) struct DaemonMemory {
     /// How often each challenge has been proved, so a proof Kontor keeps
     /// rejecting is not recomputed every cycle until its deadline.
     pub proofs: ProofRetries,
+    /// The faucet, and when it was last asked: shared with the startup step
+    /// that funds a new node, so a cycle does not repeat its request. `None`
+    /// where nothing is ever funded (the tests that are not about it).
+    pub faucet: Option<Arc<Faucet>>,
 }
 
 /// Starts the portal synchronization daemon that periodically fetches agreements
@@ -50,7 +55,10 @@ pub(crate) struct DaemonMemory {
 ///
 /// `staking` is the bond tracker the node's runtime owns, shared with `/admin`
 /// and with the onboarding step that may already have an op in flight.
-// Eight plain inputs, each from a different part of the configuration;
+/// `faucet` is shared with the startup step the same way: a node the Portal
+/// could not read at startup is funded by the first cycle that reads it as
+/// new.
+// Nine plain inputs, each from a different part of the configuration;
 // bundling them would only move the list into a struct used exactly here.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_portal_daemon(
@@ -62,6 +70,7 @@ pub fn spawn_portal_daemon(
     storage_backend: StorageBackend,
     storage_dir: PathBuf,
     staking: Arc<StakeTracker>,
+    faucet: Option<Arc<Faucet>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = run_portal_daemon(
@@ -73,6 +82,7 @@ pub fn spawn_portal_daemon(
             storage_backend,
             storage_dir,
             staking,
+            faucet,
         )
         .await
         {
@@ -91,10 +101,12 @@ async fn run_portal_daemon(
     storage_backend: StorageBackend,
     storage_dir: PathBuf,
     staking: Arc<StakeTracker>,
+    faucet: Option<Arc<Faucet>>,
 ) -> Result<()> {
     let memory = DaemonMemory {
         staking,
         proofs: ProofRetries::default(),
+        faucet,
     };
 
     // Ensure only a single daemon instance runs at a time.
@@ -208,6 +220,7 @@ async fn sync_portal_once(
     // `resynced_nonce`): ops signed last cycle are usually still queued at the
     // Portal, and signing at their nonces again is what collided. The same read
     // carries the bond, so the cycle's staking decisions share its snapshot.
+    let mut registry_entry = None;
     if portal_client.node_id().is_some() {
         // The start of a withdrawal delay an earlier process recorded, read
         // once before this process acts on its own reads; and after each read,
@@ -230,6 +243,7 @@ async fn sync_portal_once(
         if let Err(err) = persist_withdrawal_start(database, &memory.staking).await {
             warn!("could not record when the withdrawal delay started: {err:#}");
         }
+        registry_entry = entry;
     }
 
     if let Some(node_id) = portal_client.node_id() {
@@ -353,6 +367,15 @@ async fn sync_portal_once(
         _ => None,
     };
     manage_stake(portal_client, &memory.staking, exit.as_ref()).await;
+
+    // Last of all, and never in the way of a proof: a node this cycle read as
+    // new — a known empty balance, a known empty stake — is funded now if
+    // startup could not do it (the Portal could not read its balance then, or
+    // the request went nowhere). The transfer is staked by the cycle that
+    // sees it land.
+    if let (Some(faucet), Some(entry)) = (&memory.faucet, &registry_entry) {
+        fund_if_unfunded(portal_client, entry, faucet, memory.staking.exiting()).await;
+    }
 
     Ok(())
 }
@@ -792,6 +815,7 @@ mod tests {
             StorageBackend::local(),
             storage_dir,
             Arc::new(StakeTracker::default()),
+            None,
         )
         .await
         .unwrap_err();
@@ -1033,6 +1057,7 @@ mod tests {
             StorageBackend::local(),
             storage_dir,
             Arc::new(StakeTracker::default()),
+            None,
         );
 
         // Wait for the daemon to fail and exit on its own. The spawned task
@@ -1150,6 +1175,7 @@ mod tests {
             StorageBackend::local(),
             storage_dir.clone(),
             Arc::new(StakeTracker::default()),
+            None,
         );
 
         // Wait long enough for the daemon to: 1) initial sync (success),
@@ -1241,6 +1267,7 @@ mod tests {
             StorageBackend::local(),
             storage_dir.clone(),
             Arc::new(StakeTracker::default()),
+            None,
         );
 
         // Wait for the daemon to download the agreement at least once. Give it
@@ -1722,6 +1749,72 @@ mod tests {
             "the cycle's other work came before the top-up"
         );
         assert_eq!(memory.staking.status()["in_flight"]["nonce"], 3);
+    }
+
+    /// A new node whose balance the Portal could not read at startup started
+    /// without funds. The first cycle that reads it as new — a known empty
+    /// balance, a known empty stake — asks the faucet, once: the cycles after
+    /// it see the same entry until the transfer lands, and do not ask again.
+    /// It used to sit unfunded for the life of the process.
+    #[tokio::test]
+    async fn a_cycle_funds_a_new_node_startup_could_not() {
+        let mock_server = MockServer::start().await;
+        mount_no_node_agreements(&mock_server).await;
+        mount_empty_ready_agreements(&mock_server).await;
+        mount_empty_challenges(&mock_server).await;
+        let mut new_node = funded_entry(0);
+        new_node["kor_balance"] = json!("0");
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(new_node))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/faucet"))
+            .and(wiremock::matchers::body_json(json!({
+                "recipient": "abcd",
+                "amount": 1000.0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "commit_txid": "c", "reveal_txid": "r", "recipient": "abcd", "amount": 1000.0
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_test_path("daemon_funds_new_node");
+        fs::create_dir_all(&storage_dir).ok();
+        let client = portal_client_with_nonce(&mock_server.uri(), storage_dir.clone(), 0);
+        let memory = DaemonMemory {
+            faucet: Some(Arc::new(Faucet::new(crate::clients::kor::Kor::whole(1000)))),
+            ..DaemonMemory::default()
+        };
+
+        for _ in 0..3 {
+            sync_portal_once(
+                &client,
+                &database,
+                StorageLimits::default(),
+                &StorageBackend::local(),
+                &storage_dir,
+                &memory,
+            )
+            .await
+            .unwrap();
+        }
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let asked = requests
+            .iter()
+            .position(|r| r.url.path() == "/api/faucet")
+            .expect("the faucet was asked");
+        assert!(
+            requests[..asked]
+                .iter()
+                .any(|r| r.url.path() == "/api/nodes/NODE-test/challenges"),
+            "the cycle's proofs came before the faucet request"
+        );
     }
 
     /// Onboarding queues the first top-up at Kontor's `next_nonce`, N. The

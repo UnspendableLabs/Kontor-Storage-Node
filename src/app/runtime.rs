@@ -33,6 +33,7 @@ use crate::app::tasks::stake;
 use crate::clients::PortalClient;
 use crate::crypto::keystore::{Keystore, SealKey, SealKeySource};
 use crate::database::DBClient;
+use crate::node::faucet::Faucet;
 use crate::node::{self, KeySource, NodeKeys};
 use crate::server;
 use crate::server::admin::credentials::AdminCredential;
@@ -458,6 +459,7 @@ async fn serve(
             keystore: None,
             migrating: None,
             retry_in: None,
+            faucet: Arc::new(Faucet::new(config.faucet_amount)),
         }
         .run(start),
     );
@@ -529,6 +531,10 @@ struct Supervisor {
     /// How long to wait before trying a failed activation again, doubling with
     /// each failure. `None` once one succeeds — see [`Supervisor::fail`].
     retry_in: Option<Duration>,
+    /// The faucet and when it was last asked. One for the life of the
+    /// process: an activation that failed after asking is retried, and the
+    /// retry must not ask again while the first transfer may be on its way.
+    faucet: Arc<Faucet>,
 }
 
 /// What the volume gave the supervisor to start from.
@@ -808,13 +814,7 @@ impl Supervisor {
 
         // Only a node with neither a balance nor a bond is funded and waited
         // for; a staked node restarting goes straight on to its daemon.
-        node::ensure_kor_balance(
-            &authenticated,
-            signer_id,
-            self.config.faucet_amount,
-            &mut self.writer,
-        )
-        .await?;
+        node::ensure_kor_balance(&authenticated, signer_id, &self.faucet, &mut self.writer).await?;
 
         // Bond what the faucet just funded before looking at any agreement:
         // Kontor refuses every join until the stake has landed.
@@ -845,6 +845,7 @@ impl Supervisor {
             self.parts.storage_backend.clone(),
             self.config.storage_dir.clone(),
             staking,
+            Some(self.faucet.clone()),
         ));
 
         writeln!(

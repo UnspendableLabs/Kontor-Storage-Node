@@ -1,4 +1,4 @@
-//! KOR balance check and faucet request at startup.
+//! KOR balance check and faucet request, at startup and from the daemon.
 //!
 //! After onboarding completes, ensures a node that has never been funded gets
 //! some KOR. If the registry shows no liquid balance *and* no bonded stake,
@@ -14,6 +14,19 @@
 //! a node with a bonded stake is not funded again, and one whose stake the
 //! Portal does not report asks the faucet once but never waits for it.
 //!
+//! A balance the Portal could not read (`null`, Portal
+//! `docs/node-portal-contract.md` §3) is not an empty one, and startup does
+//! not ask the faucet on it. Startup is not the only chance, though: the
+//! daemon hands every registry entry it reads to [`fund_if_unfunded`], which
+//! asks as soon as a read shows an empty balance and no stake — a new node
+//! whose first read failed is funded by a later one.
+//!
+//! One [`Faucet`] is shared by startup and the daemon, and it remembers when
+//! it last asked: the faucet is a transfer on chain, a block or more in the
+//! making, so a second request while the first may still be in flight —
+//! after a client-side timeout, on an activation retry — would be a second
+//! transfer. It is asked again only after [`FAUCET_RETRY_INTERVAL`].
+//!
 //! The amount is configurable (`KONTOR_STORAGE_FAUCET_AMOUNT_KOR`, 1000 by
 //! default) because staking changed what "funded" means: the KOR is no longer
 //! only gas, it is the collateral every join reserves. The Portal caps the
@@ -22,17 +35,112 @@
 
 use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::kor::Kor;
-use crate::clients::portal::RegistryEntry;
+use crate::clients::portal::{FaucetResponse, RegistryEntry};
 use crate::clients::PortalClient;
 use anyhow::Result;
 use std::io::Write;
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 const KOR_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Shorter interval in unit tests so polling scenarios finish quickly.
 #[cfg(test)]
 const KOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a faucet request stands before the node asks again.
+///
+/// The faucet answers with a broadcast, not a balance: the transfer still has
+/// to be mined and indexed, and a request whose answer was lost may have been
+/// broadcast all the same. An hour is several blocks — long enough that a
+/// transfer on its way has landed, short enough that a node whose request
+/// went nowhere is not left unfunded for long.
+pub const FAUCET_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How many times startup reads a balance the Portal reports as unknown
+/// before starting without it.
+const UNKNOWN_BALANCE_READS: u32 = 3;
+
+/// What this node asks the faucet for, and when it last did.
+///
+/// One per process, shared by every activation and by the daemon, so that
+/// neither an activation retry nor a daemon cycle repeats a request another
+/// of them has just made.
+#[derive(Debug)]
+pub struct Faucet {
+    amount: Kor,
+    last_asked: Mutex<Option<Instant>>,
+}
+
+impl Faucet {
+    #[must_use]
+    pub fn new(amount: Kor) -> Self {
+        Self {
+            amount,
+            last_asked: Mutex::new(None),
+        }
+    }
+
+    /// Whether a request may go out now: none has yet, or the last one is
+    /// older than [`FAUCET_RETRY_INTERVAL`].
+    fn may_ask(&self, now: Instant) -> bool {
+        self.last_asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none_or(|asked| now.duration_since(asked) >= FAUCET_RETRY_INTERVAL)
+    }
+
+    fn asked(&self, now: Instant) {
+        *self
+            .last_asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(now);
+    }
+
+    /// The last request is known to have sent nothing: the next one need not
+    /// wait.
+    fn forget(&self) {
+        *self
+            .last_asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Ask for the configured amount (or the Portal's cap, if lower), keeping
+    /// track of the request.
+    ///
+    /// The request is on record before it goes out, so that whatever becomes
+    /// of the answer — a timeout included — the next caller knows one may be
+    /// in flight. It is struck off again only when the failure shows nothing
+    /// was sent (see [`nothing_was_sent`]).
+    async fn ask(
+        &self,
+        client: &PortalClient,
+        recipient: &str,
+        writer: &mut impl Write,
+    ) -> Result<FaucetResponse> {
+        self.asked(Instant::now());
+        let result = request_within_cap(client, recipient, self.amount, writer).await;
+        if result.as_ref().is_err_and(nothing_was_sent) {
+            self.forget();
+        }
+        result
+    }
+}
+
+/// Whether a failed faucet request certainly broadcast nothing.
+///
+/// A `4xx` is the Portal refusing the request before composing anything, and
+/// a connection that was never established carried no request at all. Anything
+/// else — a timeout, a `5xx`, an answer that cannot be read — leaves open
+/// whether the Portal broadcast the transfer before the failure.
+fn nothing_was_sent(err: &anyhow::Error) -> bool {
+    if let Some(status) = err.downcast_ref::<HttpStatusError>() {
+        return status.status.is_client_error();
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
+}
 
 /// Returns true when the registry entry's `kor_balance` indicates no KOR
 /// (missing, unparsable, or zero).
@@ -43,17 +151,21 @@ const KOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// the grammar allows is read to 18: the question here is only whether any
 /// KOR is there at all, and dust past the 18th digit does not change it.
 fn kor_balance_is_empty(balance: &Option<String>) -> bool {
-    let Some(raw) = balance.as_deref() else {
-        return true;
-    };
-    let raw = raw.trim();
-    let parsed = Kor::parse(raw).or_else(|err| match raw.split_once('.') {
-        Some((whole, frac)) if frac.len() > crate::clients::kor::KOR_DECIMALS => Kor::parse(
-            &format!("{whole}.{}", &frac[..crate::clients::kor::KOR_DECIMALS]),
-        ),
-        _ => Err(err),
-    });
-    parsed.map_or(true, Kor::is_zero)
+    parse_balance(balance).is_none_or(Kor::is_zero)
+}
+
+/// The balance as the Portal reported it, `None` when it reported none or one
+/// that cannot be read.
+fn parse_balance(balance: &Option<String>) -> Option<Kor> {
+    let raw = balance.as_deref()?.trim();
+    Kor::parse(raw)
+        .or_else(|err| match raw.split_once('.') {
+            Some((whole, frac)) if frac.len() > crate::clients::kor::KOR_DECIMALS => Kor::parse(
+                &format!("{whole}.{}", &frac[..crate::clients::kor::KOR_DECIMALS]),
+            ),
+            _ => Err(err),
+        })
+        .ok()
 }
 
 /// What the registry entry says about whether this node was ever funded,
@@ -87,8 +199,11 @@ fn funding(entry: &RegistryEntry) -> Funding {
 ///
 /// 1. Fetches the registry entry for `signer_id`.
 /// 2. If `kor_balance` is `null` — the Portal could not read it (Portal
-///    `docs/node-portal-contract.md` §3: unknown, not zero) — returns without
-///    asking the faucet: a node that may well be funded is not funded again.
+///    `docs/node-portal-contract.md` §3: unknown, not zero) — reads it again,
+///    [`UNKNOWN_BALANCE_READS`] times in all, then returns without asking the
+///    faucet: a node that may well be funded is not funded again. The daemon
+///    asks later, once a read shows an empty balance and no stake (see
+///    [`fund_if_unfunded`]).
 /// 3. If `kor_balance` is already positive, or the node has a bonded stake,
 ///    returns immediately.
 /// 4. If the stake is unknown (see [`Funding::Unknown`]), asks the faucet once
@@ -100,16 +215,27 @@ fn funding(entry: &RegistryEntry) -> Funding {
 pub async fn ensure_kor_balance(
     client: &PortalClient,
     signer_id: u64,
-    amount: Kor,
+    faucet: &Faucet,
     writer: &mut impl Write,
 ) -> Result<()> {
-    let entry = client.get_registry_entry(signer_id).await?;
+    let mut entry = client.get_registry_entry(signer_id).await?;
+    for _ in 1..UNKNOWN_BALANCE_READS {
+        if entry.kor_balance.is_some() {
+            break;
+        }
+        tokio::time::sleep(KOR_POLL_INTERVAL).await;
+        match client.get_registry_entry(signer_id).await {
+            Ok(again) => entry = again,
+            Err(e) => tracing::warn!("could not read the registry entry again: {e:#}"),
+        }
+    }
 
     if entry.kor_balance.is_none() {
         writeln!(
             writer,
-            "⚠ KOR balance: not reported by the Portal this time; not asking the faucet. The \
-             daemon reads it again each cycle"
+            "⚠ KOR balance: the Portal could not read it ({UNKNOWN_BALANCE_READS} attempts); \
+             starting without asking the faucet. The daemon asks once a read shows an empty \
+             balance and no stake"
         )?;
         return Ok(());
     }
@@ -129,6 +255,7 @@ pub async fn ensure_kor_balance(
         return Ok(());
     };
 
+    let amount = faucet.amount;
     match funding(&entry) {
         Funding::Staked(stake) => {
             writeln!(
@@ -138,12 +265,20 @@ pub async fn ensure_kor_balance(
             return Ok(());
         }
         Funding::Unknown => {
+            if !faucet.may_ask(Instant::now()) {
+                writeln!(
+                    writer,
+                    "KOR balance: 0, stake not known; the faucet was asked a moment ago, not \
+                     asking again"
+                )?;
+                return Ok(());
+            }
             writeln!(
                 writer,
                 "KOR balance: 0, stake not known → requesting {amount} KOR from the faucet, \
                  without waiting for it…"
             )?;
-            match request_within_cap(client, recipient, amount, writer).await {
+            match faucet.ask(client, recipient, writer).await {
                 Ok(resp) => writeln!(
                     writer,
                     "✓ Faucet broadcast: commit={} reveal={}",
@@ -163,7 +298,7 @@ pub async fn ensure_kor_balance(
         writer,
         "KOR balance: 0 → requesting {amount} KOR from the faucet…"
     )?;
-    match request_within_cap(client, recipient, amount, writer).await {
+    match faucet.ask(client, recipient, writer).await {
         Ok(resp) => {
             writeln!(
                 writer,
@@ -190,6 +325,48 @@ pub async fn ensure_kor_balance(
     poll_until_balance(client, signer_id, writer).await
 }
 
+/// Ask the faucet for a node the daemon finds unfunded, without waiting.
+///
+/// Called every cycle with the registry entry the cycle read. It asks when
+/// that entry shows a *known* empty balance and a *known* empty stake — a new
+/// node — with no exit or bond cleanup under way, and the faucet has not been
+/// asked within [`FAUCET_RETRY_INTERVAL`]. That covers the node whose balance
+/// the Portal could not read at startup, and the one whose first request went
+/// nowhere. Returns whether a request went out.
+///
+/// Never an error: a faucet that cannot be reached is tried again later, and
+/// nothing else in the cycle depends on it.
+pub async fn fund_if_unfunded(
+    client: &PortalClient,
+    entry: &RegistryEntry,
+    faucet: &Faucet,
+    exiting: bool,
+) -> bool {
+    if exiting
+        || !parse_balance(&entry.kor_balance).is_some_and(Kor::is_zero)
+        || funding(entry) != Funding::Unfunded
+        || !faucet.may_ask(Instant::now())
+    {
+        return false;
+    }
+    let Some(recipient) = entry.x_only_pubkey.as_deref() else {
+        return false;
+    };
+    tracing::info!(
+        "No KOR and no stake: requesting {} KOR from the faucet",
+        faucet.amount
+    );
+    match faucet.ask(client, recipient, &mut std::io::sink()).await {
+        Ok(resp) => tracing::info!(
+            commit = %resp.commit_txid,
+            reveal = %resp.reveal_txid,
+            "the faucet broadcast the transfer; it is staked once it lands"
+        ),
+        Err(e) => tracing::warn!("the faucet request failed; asking again in a later cycle: {e:#}"),
+    }
+    true
+}
+
 /// Ask the faucet for `amount`, and once more for the Portal's cap if it says
 /// `amount` is above it.
 ///
@@ -202,7 +379,7 @@ async fn request_within_cap(
     recipient: &str,
     amount: Kor,
     writer: &mut impl Write,
-) -> Result<crate::clients::portal::FaucetResponse> {
+) -> Result<FaucetResponse> {
     let err = match client
         .request_faucet(recipient, amount.to_f64_lossy())
         .await
@@ -316,7 +493,7 @@ mod tests {
 
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
         let output = String::from_utf8(buffer).unwrap();
@@ -347,7 +524,7 @@ mod tests {
 
             let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
             let mut buffer = Vec::new();
-            ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+            ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
                 .await
                 .unwrap_or_else(|e| panic!("{stake} {cleanup}: {e:#}"));
             let output = String::from_utf8(buffer).unwrap();
@@ -356,28 +533,188 @@ mod tests {
         }
     }
 
-    /// A `kor_balance` the Portal could not read is not an empty one: the
-    /// faucet is not asked, and startup does not wait.
+    /// A `kor_balance` the Portal could not read is not an empty one: it is
+    /// read again a few times, and if it stays unknown the faucet is not
+    /// asked and startup does not wait.
     #[tokio::test]
     async fn ensure_kor_balance_does_not_fund_a_node_whose_balance_is_unknown() {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/signers/42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
-            .expect(1)
+            .expect(u64::from(UNKNOWN_BALANCE_READS))
             .mount(&mock_server)
             .await;
         mount_faucet(&mock_server, 200, 0).await;
 
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
         let output = String::from_utf8(buffer).unwrap();
-        assert!(output.contains("not reported"), "{output}");
+        assert!(output.contains("could not read it"), "{output}");
+        assert!(
+            output.contains("The daemon asks once a read shows an empty balance"),
+            "{output}"
+        );
         assert!(!output.contains("faucet…"), "{output}");
         assert!(!output.contains("Waiting for KOR balance"), "{output}");
+    }
+
+    /// One unreadable balance at startup does not leave a new node unfunded:
+    /// the next read shows the empty balance, and the faucet is asked.
+    #[tokio::test]
+    async fn ensure_kor_balance_reads_an_unknown_balance_again_before_giving_up() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(None)))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("0"))))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        mount_faucet(&mock_server, 200, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/signers/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(registry_entry_json(Some("1000"))),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let mut buffer = Vec::new();
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
+            .await
+            .unwrap();
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("from the faucet"), "{output}");
+        assert!(output.contains("✓ KOR balance: 1000"), "{output}");
+    }
+
+    fn entry(value: serde_json::Value) -> RegistryEntry {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The daemon's half: a node the Portal reports with a known empty
+    /// balance and a known empty stake — what a new node looks like once the
+    /// Portal can read it — is funded by the cycle that sees it, once.
+    #[tokio::test]
+    async fn the_daemon_funds_a_node_it_reads_as_new_and_only_once() {
+        let mock_server = MockServer::start().await;
+        mount_faucet(&mock_server, 200, 1).await;
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let faucet = Faucet::new(Kor::whole(1000));
+        let new_node = entry(registry_entry_json(Some("0")));
+
+        assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        // The next cycles read the same entry until the transfer lands.
+        assert!(!fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        assert!(!fund_if_unfunded(&client, &new_node, &faucet, false).await);
+    }
+
+    /// Nothing but a known empty balance with a known empty stake is a new
+    /// node: an unknown balance, an unknown stake, a bond, a cleanup, an exit
+    /// — none of them is funded from the daemon.
+    #[tokio::test]
+    async fn the_daemon_funds_only_a_node_known_to_be_empty() {
+        let mock_server = MockServer::start().await;
+        mount_faucet(&mock_server, 200, 0).await;
+        let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
+        let faucet = Faucet::new(Kor::whole(1000));
+
+        let unknown_balance = entry(registry_entry_json(None));
+        let unreadable_balance = entry(registry_entry_json(Some("garbage")));
+        let funded = entry(registry_entry_json(Some("3")));
+        let mut staked = registry_entry_json(Some("0"));
+        staked["stake"] = json!("995");
+        let mut unknown_stake = registry_entry_json(Some("0"));
+        unknown_stake["stake"] = json!(null);
+        let mut cleanup = registry_entry_json(Some("0"));
+        cleanup["bond_cleanup_pending"] = json!(true);
+        let mut withdrawing = registry_entry_json(Some("0"));
+        withdrawing["stake_withdrawal_height"] = json!(900_000);
+        let mut keyless = registry_entry_json(Some("0"));
+        keyless["x_only_pubkey"] = json!(null);
+
+        for (what, value) in [
+            ("unknown balance", unknown_balance),
+            ("unreadable balance", unreadable_balance),
+            ("funded", funded),
+            ("staked", entry(staked)),
+            ("unknown stake", entry(unknown_stake)),
+            ("bond cleanup", entry(cleanup)),
+            ("withdrawing", entry(withdrawing)),
+            ("no x-only key", entry(keyless)),
+        ] {
+            assert!(
+                !fund_if_unfunded(&client, &value, &faucet, false).await,
+                "{what} must not be funded"
+            );
+        }
+        let new_node = entry(registry_entry_json(Some("0")));
+        assert!(
+            !fund_if_unfunded(&client, &new_node, &faucet, true).await,
+            "an exiting node must not be funded"
+        );
+    }
+
+    /// A request the Portal refused sent nothing, so the next cycle may ask
+    /// again; one that failed any other way may have been broadcast, and
+    /// stands for the retry interval.
+    #[tokio::test]
+    async fn the_daemon_asks_again_at_once_only_after_a_refusal() {
+        let new_node = entry(registry_entry_json(Some("0")));
+
+        let refusing = MockServer::start().await;
+        mount_faucet(&refusing, 429, 2).await;
+        let client = PortalClient::try_new(refusing.uri(), std::env::temp_dir()).unwrap();
+        let faucet = Faucet::new(Kor::whole(1000));
+        assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
+
+        let failing = MockServer::start().await;
+        mount_faucet(&failing, 500, 1).await;
+        let client = PortalClient::try_new(failing.uri(), std::env::temp_dir()).unwrap();
+        let faucet = Faucet::new(Kor::whole(1000));
+        assert!(fund_if_unfunded(&client, &new_node, &faucet, false).await);
+        assert!(!fund_if_unfunded(&client, &new_node, &faucet, false).await);
+    }
+
+    #[test]
+    fn the_faucet_may_be_asked_again_after_the_retry_interval() {
+        let faucet = Faucet::new(Kor::whole(1000));
+        let start = Instant::now();
+        assert!(faucet.may_ask(start));
+        faucet.asked(start);
+        assert!(!faucet.may_ask(start + FAUCET_RETRY_INTERVAL - Duration::from_secs(1)));
+        assert!(faucet.may_ask(start + FAUCET_RETRY_INTERVAL));
+        faucet.asked(start);
+        faucet.forget();
+        assert!(faucet.may_ask(start));
+    }
+
+    #[test]
+    fn only_a_refusal_or_a_failed_connection_is_known_to_have_sent_nothing() {
+        let status = |code: u16| {
+            anyhow::Error::new(HttpStatusError {
+                status: reqwest::StatusCode::from_u16(code).unwrap(),
+                body: String::new(),
+                context: "request faucet".to_string(),
+            })
+        };
+        assert!(nothing_was_sent(&status(400)));
+        assert!(nothing_was_sent(&status(429)));
+        assert!(!nothing_was_sent(&status(500)));
+        assert!(!nothing_was_sent(&status(502)));
+        assert!(!nothing_was_sent(&status(503)));
+        assert!(!nothing_was_sent(&anyhow::anyhow!("timed out")));
     }
 
     #[test]
@@ -419,7 +756,7 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
 
@@ -473,7 +810,7 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
 
@@ -517,7 +854,7 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
 
@@ -560,7 +897,7 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
 
@@ -594,7 +931,7 @@ mod tests {
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
 
-        let err = ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        let err = ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap_err();
         assert!(
@@ -649,9 +986,14 @@ mod tests {
 
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
-        ensure_kor_balance(&client, 42, Kor::parse("250.5").unwrap(), &mut buffer)
-            .await
-            .unwrap();
+        ensure_kor_balance(
+            &client,
+            42,
+            &Faucet::new(Kor::parse("250.5").unwrap()),
+            &mut buffer,
+        )
+        .await
+        .unwrap();
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("requesting 250.5 KOR"), "{output}");
     }
@@ -701,7 +1043,7 @@ mod tests {
 
         let client = PortalClient::try_new(mock_server.uri(), std::env::temp_dir()).unwrap();
         let mut buffer = Vec::new();
-        ensure_kor_balance(&client, 42, Kor::whole(1000), &mut buffer)
+        ensure_kor_balance(&client, 42, &Faucet::new(Kor::whole(1000)), &mut buffer)
             .await
             .unwrap();
         let output = String::from_utf8(buffer).unwrap();
