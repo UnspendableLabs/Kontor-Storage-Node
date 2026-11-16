@@ -511,13 +511,15 @@ struct TrackerState {
     /// When the Portal last refused an `add-stake` (`None` key) or a
     /// `leave-agreement` (its agreement).
     refused: HashMap<RefusedOp, Instant>,
-    /// An op whose nonce Kontor consumed and whose outcome the registry read
-    /// does not settle, waiting for the Portal's listing to say what became
-    /// of it (see [`StakeTracker::classify_landed`]): an `add-stake` that did
-    /// not raise the bond — Kontor refused it, or the Portal retired it
-    /// unexecuted — or a `leave-agreement`, which the registry says nothing
-    /// about at all.
-    unexplained: Option<LandedOp>,
+    /// The ops whose nonce Kontor consumed and whose outcome the registry read
+    /// does not settle, each waiting for the Portal's listing to say what
+    /// became of it (see [`StakeTracker::classify_landed`]): an `add-stake`
+    /// that did not raise the bond — Kontor refused it, or the Portal retired
+    /// it unexecuted — or a `leave-agreement`, which the registry says nothing
+    /// about at all. Several at once is routine: the Portal reconciles a
+    /// block some time after Kontor executes it, and the next op lands
+    /// meanwhile.
+    unexplained: Vec<LandedOp>,
     joins_paused: Option<(Instant, String)>,
     /// An unstake or withdrawal the operator asked for from `/admin`, waiting
     /// for the daemon's next cycle — the daemon is the only thing that signs,
@@ -806,7 +808,7 @@ impl StakeTracker {
                         "the leave of agreement {agreement_id} has executed; asking the Portal \
                      whether Kontor accepted it"
                     );
-                    state.unexplained = Some(LandedOp {
+                    state.unexplained.push(LandedOp {
                         op: op.clone(),
                         nonce: *nonce,
                         landed: now,
@@ -832,7 +834,7 @@ impl StakeTracker {
                         REFUSED_OP_RETRY_INTERVAL.as_secs() / 3600
                     );
                     state.refused.insert(refused_key(op), now);
-                    state.unexplained = Some(LandedOp {
+                    state.unexplained.push(LandedOp {
                         op: op.clone(),
                         nonce: *nonce,
                         landed: now,
@@ -858,7 +860,7 @@ impl StakeTracker {
                 );
                     state.left.clear();
                     state.memberships_refreshed = false;
-                    state.unexplained = Some(LandedOp {
+                    state.unexplained.push(LandedOp {
                         op: op.clone(),
                         nonce: *nonce,
                         landed: now,
@@ -1163,16 +1165,30 @@ impl StakeTracker {
         state.last_event = Some((Utc::now(), dropped));
     }
 
-    /// The nonce of a landed op the Portal's listing should be asked about:
-    /// an `add-stake` that executed without raising the bond, or a leave (see
-    /// [`Self::classify_landed`]).
+    /// The nonces of the landed ops the Portal's listing should be asked
+    /// about: an `add-stake` that executed without raising the bond, a leave
+    /// (see [`Self::classify_landed`]). Lowest first.
+    #[must_use]
+    pub fn ops_to_classify(&self) -> Vec<u64> {
+        let mut nonces: Vec<u64> = self
+            .lock()
+            .unexplained
+            .iter()
+            .map(|landed| landed.nonce)
+            .collect();
+        nonces.sort_unstable();
+        nonces
+    }
+
+    /// The first of [`Self::ops_to_classify`].
+    #[cfg(test)]
     #[must_use]
     pub fn op_to_classify(&self) -> Option<u64> {
-        self.lock().unexplained.as_ref().map(|landed| landed.nonce)
+        self.ops_to_classify().first().copied()
     }
 
     /// What the Portal's listing of this node's ops says about the op at
-    /// `nonce` whose nonce Kontor consumed (see [`Self::op_to_classify`]).
+    /// `nonce` whose nonce Kontor consumed (see [`Self::ops_to_classify`]).
     ///
     /// For an `add-stake` whose nonce went while the bond did not move, it
     /// went one of two ways. Kontor executed and refused it: the Portal lists
@@ -1198,21 +1214,38 @@ impl StakeTracker {
     /// nothing: the op is asked about again next cycle, up to
     /// [`OP_LANDING_HARD_TIMEOUT`] after it landed, then forgotten: the next
     /// plan decides again from the rows and the bond as they stand.
+    #[cfg(test)]
     pub fn classify_landed(
         &self,
         nonce: u64,
         listing: anyhow::Result<Vec<NodeOpRecord>>,
         now: Instant,
     ) {
+        self.classify_landed_from(nonce, listing.as_ref().map(Vec::as_slice), now);
+    }
+
+    /// [`Self::classify_landed`] from a listing that is not consumed, so one
+    /// read of it answers for every landed op.
+    fn classify_landed_from(
+        &self,
+        nonce: u64,
+        listing: Result<&[NodeOpRecord], &anyhow::Error>,
+        now: Instant,
+    ) {
         let mut state = self.lock();
-        let Some(landed) = state.unexplained.take_if(|landed| landed.nonce == nonce) else {
+        let Some(index) = state
+            .unexplained
+            .iter()
+            .position(|landed| landed.nonce == nonce)
+        else {
             return;
         };
+        let landed = state.unexplained.remove(index);
         let op = landed.op.clone();
         let name = op.name();
         let keep_asking = |state: &mut TrackerState, landed: LandedOp| {
             if now.duration_since(landed.landed) < OP_LANDING_HARD_TIMEOUT {
-                state.unexplained = Some(landed);
+                state.unexplained.push(landed);
             } else {
                 warn!(
                     "the Portal has not said how the {name} op at nonce {nonce} ended in {} \
@@ -1223,7 +1256,7 @@ impl StakeTracker {
         };
         let listed = match listing {
             Ok(ops) => ops
-                .into_iter()
+                .iter()
                 .find(|listed| listed.nonce == nonce && listed.op == name),
             Err(err) => {
                 warn!(
@@ -1709,27 +1742,28 @@ fn describe_sent(op: &NodeOp, nonce: u64) -> String {
 
 /// The next step of the exit, if one is due.
 fn next_exit_op(state: &TrackerState, exit: &ExitInputs, now: Instant) -> Option<NodeOp> {
-    // A leave that has executed but whose outcome the Portal has not given
-    // yet (see `classify_landed`): not left, not left again, and nothing to
-    // withdraw behind it.
-    let undecided = match &state.unexplained {
-        Some(LandedOp {
-            op: NodeOp::LeaveAgreement(agreement_id),
-            ..
-        }) => Some(agreement_id.as_str()),
-        _ => None,
-    };
+    // The leaves that have executed but whose outcome the Portal has not
+    // given yet (see `classify_landed`): not left, not left again, and nothing
+    // to withdraw behind them.
+    let undecided: Vec<&str> = state
+        .unexplained
+        .iter()
+        .filter_map(|landed| landed.op.agreement_id())
+        .collect();
     if let Some(agreement_id) = exit.memberships.iter().find(|id| {
         !state.left.contains(*id)
-            && undecided != Some(id.as_str())
+            && !undecided.contains(&id.as_str())
             && !exit.deferred.contains(id)
             && !refused_recently(state, &NodeOp::LeaveAgreement((*id).clone()), now)
     }) {
         return Some(NodeOp::LeaveAgreement(agreement_id.clone()));
     }
     let all_left = exit.memberships.iter().all(|id| state.left.contains(id));
-    (all_left && undecided.is_none() && exit.unresolved_challenges == 0 && withdraw_due(state, now))
-        .then_some(NodeOp::WithdrawStake)
+    (all_left
+        && undecided.is_empty()
+        && exit.unresolved_challenges == 0
+        && withdraw_due(state, now))
+    .then_some(NodeOp::WithdrawStake)
 }
 
 /// The delay has passed by the node's reckoning, and the last automatic
@@ -2370,9 +2404,14 @@ async fn adopt_pending_ops(client: &PortalClient, tracker: &StakeTracker) -> boo
 /// not raise the bond, a leave (see [`StakeTracker::classify_landed`]) —
 /// before this cycle's plan.
 async fn classify_landed_op(client: &PortalClient, tracker: &StakeTracker) {
-    if let Some(nonce) = tracker.op_to_classify() {
-        let listing = client.list_node_ops(&[]).await;
-        tracker.classify_landed(nonce, listing, Instant::now());
+    let nonces = tracker.ops_to_classify();
+    if nonces.is_empty() {
+        return;
+    }
+    let listing = client.list_node_ops(&[]).await;
+    let now = Instant::now();
+    for nonce in nonces {
+        tracker.classify_landed_from(nonce, listing.as_ref().map(Vec::as_slice), now);
     }
 }
 
@@ -3476,7 +3515,7 @@ mod tests {
 
     /// The leave at `nonce` has landed, and the Portal confirms it.
     fn leave_confirmed(tracker: &StakeTracker, nonce: u64, now: Instant) {
-        assert_eq!(tracker.op_to_classify(), Some(nonce), "asked about");
+        assert!(tracker.ops_to_classify().contains(&nonce), "asked about");
         tracker.classify_landed(nonce, Ok(vec![leave_record(nonce, "confirmed", None)]), now);
     }
 
@@ -5161,5 +5200,54 @@ mod tests {
             Some(15),
             "past the join the tracker waits for and the op the Portal holds"
         );
+    }
+    /// The Portal reconciles a block some time after Kontor executes it, so
+    /// the next leave routinely lands while the first is still unclassified.
+    /// The tracker kept one landed op only: the second overwrote the first,
+    /// which was then neither left nor waited for, and was signed again.
+    #[test]
+    fn every_landed_op_waits_for_the_portal_s_word_not_only_the_last() {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let t0 = Instant::now();
+        observed(&tracker, &exiting_entry(10, "100"), t0);
+        let exit = ExitInputs {
+            memberships: vec!["AGR-a".into(), "AGR-b".into()],
+            ..ExitInputs::default()
+        };
+        let leave = |id: &str| NodeOp::LeaveAgreement(id.into());
+
+        assert_eq!(tracker.plan(t0, Some(&exit)), Some(leave("AGR-a")));
+        tracker.record_sent(leave("AGR-a"), 10, t0);
+        observed(&tracker, &exiting_entry(11, "100"), t0);
+        // Executed on Kontor; the Portal has not reconciled the block yet.
+        tracker.classify_landed(10, Ok(vec![leave_record(10, "submitted", None)]), t0);
+        assert_eq!(tracker.ops_to_classify(), vec![10]);
+
+        assert_eq!(tracker.plan(t0, Some(&exit)), Some(leave("AGR-b")));
+        tracker.record_sent(leave("AGR-b"), 11, t0);
+        observed(&tracker, &exiting_entry(12, "100"), t0);
+        assert_eq!(tracker.ops_to_classify(), vec![10, 11], "both asked about");
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            None,
+            "AGR-a is neither left nor left again while the Portal has not said"
+        );
+
+        let listing = || {
+            Ok(vec![
+                leave_record(11, "confirmed", None),
+                leave_record(10, "confirmed", None),
+            ])
+        };
+        tracker.classify_landed(10, listing(), t0);
+        tracker.classify_landed(11, listing(), t0);
+        assert_eq!(tracker.ops_to_classify(), Vec::<u64>::new());
+        assert_eq!(
+            tracker.plan(t0, Some(&exit)),
+            None,
+            "both left; the delay has not run yet"
+        );
+        assert_eq!(tracker.status()["exit"]["left"], 2);
+        assert_eq!(tracker.status()["exit"]["memberships_left"], json!([]));
     }
 }
