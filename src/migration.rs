@@ -15,6 +15,7 @@ pub use sea_orm_migration::MigrationStatus;
 pub mod m20250127_000001_create_challenges_table;
 pub mod m20251217_000001_create_agreements_table;
 pub mod m20260727_000001_add_ledger_fields_to_agreements;
+pub mod m20261104_000001_create_node_state_table;
 
 /// Migrator orchestrates the ordered list of migrations.
 pub struct Migrator;
@@ -26,6 +27,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20251217_000001_create_agreements_table::Migration),
             Box::new(m20250127_000001_create_challenges_table::Migration),
             Box::new(m20260727_000001_add_ledger_fields_to_agreements::Migration),
+            Box::new(m20261104_000001_create_node_state_table::Migration),
         ]
     }
 }

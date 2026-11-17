@@ -559,4 +559,65 @@ mod tests {
             "transition from active to failed should be counted once"
         );
     }
+
+    async fn sync_with_remote(remote: Vec<Challenge>, local_status: &str) -> (String, usize) {
+        let mock_server = MockServer::start().await;
+        let total = remote.len();
+        Mock::given(method("GET"))
+            .and(path("/api/nodes/NODE-test/challenges"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offset": 0,
+                "limit": 20,
+                "total": total,
+                "challenges": remote.iter().map(challenge_json).collect::<Vec<_>>()
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let db = setup_challenges_db().await;
+        let mut local = challenge_to_active_model(&sample_challenge("chal_1")).unwrap();
+        local.status = Set(local_status.to_string());
+        local.insert(&db).await.unwrap();
+
+        let client = PortalClient::with_auth(
+            mock_server.uri(),
+            unique_storage_dir("challenge_status"),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+        let failed = sync_active_challenges(&client, &db).await.unwrap();
+        let stored = Challenges::find_by_id("chal_1")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        (stored.status, failed)
+    }
+
+    /// Since the staking upgrade a rejected proof leaves the challenge open,
+    /// and the Portal reports it `active` again. Mirroring that is what puts it
+    /// back in front of the prover.
+    #[tokio::test]
+    async fn a_proved_challenge_the_portal_reopens_becomes_active_again() {
+        let mut remote = sample_challenge("chal_1");
+        remote.status = "active".into();
+        remote.updated_at = "2025-01-15T11:00:00Z".into();
+        let (status, failed) = sync_with_remote(vec![remote], "proved").await;
+        assert_eq!(status, "active");
+        assert_eq!(failed, 0);
+    }
+
+    /// A status the node does not know is stored as it is, without an error and
+    /// without counting as a failure; it is simply not `active`.
+    #[tokio::test]
+    async fn an_unknown_remote_status_is_mirrored_without_error() {
+        let mut remote = sample_challenge("chal_1");
+        remote.status = "settled".into();
+        let (status, failed) = sync_with_remote(vec![remote], "proved").await;
+        assert_eq!(status, "settled");
+        assert_eq!(failed, 0, "only `failed` triggers the nonce resync");
+    }
 }

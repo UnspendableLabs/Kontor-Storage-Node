@@ -5,18 +5,207 @@
 //! 2. Load the associated file data from local storage or GCS
 //! 3. Generate cryptographic proofs using `kontor_crypto`
 //! 4. Submit proofs to the Portal and update challenge status
+//!
+//! # Retrying a rejected proof
+//!
+//! Kontor no longer fails a challenge on a bad proof: `verify-proof` returns an
+//! error, the challenge stays `active` until its deadline, and the Portal hands
+//! it back to the node as `active` again. The node mirrors that status, so the
+//! challenge is simply proved again on a later cycle — which is right for a
+//! rejection caused by something that has since changed (a ledger slot the
+//! Portal had not reconciled, a nonce lost to a collision).
+//!
+//! It is wrong for a proof that is rejected *deterministically*: that one would
+//! be recomputed and resubmitted every cycle, paying gas and a SNARK each time,
+//! until the deadline. [`ProofRetries`] spaces resubmissions out: the first
+//! [`FAST_PROOF_SUBMISSIONS`] a few minutes apart, then one every
+//! [`SLOW_RESUBMIT_DELAY`] for as long as the challenge stays `active`.
+//!
+//! It never stops for good. The node cannot tell why a challenge came back:
+//! the Portal reopens one when Kontor rejected the proof, but also when the
+//! op never ran at all — its nonce was passed, the gas hold was not covered,
+//! the key had changed — or when it could not read the verdict. None of those
+//! says the proof was wrong, a challenge window is about 2016 blocks, and a
+//! missed challenge is slashed at 30× the agreement's collateral against a
+//! proof's 0.0001 KOR of gas. So a challenge that keeps coming back is proved
+//! at a slower pace, loudly, until it is resolved or the Portal closes it.
+//!
+//! Challenges are worked through nearest deadline first: one cycle can run out
+//! of time or gas, and the one that expires soonest is the one a delay costs.
 
 use crate::app::config::StorageMethod;
 use crate::app::tasks::downloadagreements::{StorageBackend, PORTAL_FILE_NONCE};
 use crate::app::tasks::{field_from_hex, STATUS_ACTIVE, STATUS_PROVED};
+use crate::clients::http_helpers::HttpStatusError;
 use crate::clients::PortalClient;
 use crate::entities::{agreements, challenges, prelude::Agreements, prelude::Challenges};
 use anyhow::{anyhow, Context, Result};
 use kontor_crypto::{api, Challenge as CryptoChallenge, FileLedger, FileMetadata, PorSystem};
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::fs;
-use tracing::{info, warn, Instrument};
+use tracing::{debug, error, info, warn, Instrument};
+
+/// Submissions one challenge gets at the fast pace, before the node falls
+/// back to one every [`SLOW_RESUBMIT_DELAY`].
+pub const FAST_PROOF_SUBMISSIONS: u32 = 5;
+
+/// Wait before the first resubmission; doubles with each one after.
+const RESUBMIT_BASE_DELAY: Duration = Duration::from_secs(60);
+
+/// Ceiling on that wait, so a challenge with a long window is still retried a
+/// few times well before its deadline.
+const RESUBMIT_MAX_DELAY: Duration = Duration::from_secs(16 * 60);
+
+/// Wait between resubmissions once the fast ones are spent.
+///
+/// An hour is six blocks or so: a challenge window of about 2016 blocks
+/// leaves room for hundreds of these, each costing at most the gas hold of
+/// one op, while a proof that really is wrong no longer costs a SNARK every
+/// few minutes.
+const SLOW_RESUBMIT_DELAY: Duration = Duration::from_secs(60 * 60);
+
+/// Floor of the slow wait when a challenge's deadline looks close (see
+/// [`slow_resubmit_delay`]).
+const MIN_SLOW_RESUBMIT_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// What the node counts a block as when it estimates how much of a
+/// challenge's window is left. It cannot see the chain tip.
+const ESTIMATED_BLOCK_TIME: Duration = Duration::from_secs(10 * 60);
+
+/// The slow wait for `challenge`: [`SLOW_RESUBMIT_DELAY`], shortened as the
+/// deadline nears.
+///
+/// The node cannot see the chain tip, so it estimates what is left of the
+/// window from the window's length in blocks (`deadline_height -
+/// block_height`, at [`ESTIMATED_BLOCK_TIME`] each) and the time since the
+/// challenge was created, and waits an eighth of that, between
+/// [`MIN_SLOW_RESUBMIT_DELAY`] and [`SLOW_RESUBMIT_DELAY`]. A challenge handed
+/// back in its last hours is then proved again several times before it
+/// expires, instead of once an hour whatever the deadline.
+fn slow_resubmit_delay(
+    challenge: &challenges::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    let window_blocks = challenge
+        .deadline_height
+        .saturating_sub(challenge.block_height)
+        .max(0);
+    let window =
+        ESTIMATED_BLOCK_TIME.saturating_mul(u32::try_from(window_blocks).unwrap_or(u32::MAX));
+    let known_for = now
+        .signed_duration_since(challenge.created_at)
+        .to_std()
+        .unwrap_or_default();
+    (window.saturating_sub(known_for) / 8).clamp(MIN_SLOW_RESUBMIT_DELAY, SLOW_RESUBMIT_DELAY)
+}
+
+/// Bookkeeping for challenges that have been proved at least once.
+///
+/// In memory: a restart starts every count again, which costs at most another
+/// [`FAST_PROOF_SUBMISSIONS`] quick attempts on a challenge that keeps coming
+/// back and never costs a proof that could have landed. Bounded by the
+/// challenges the node has open: [`ProofRetries::prune`] drops the rest.
+#[derive(Debug, Default)]
+pub struct ProofRetries {
+    attempts: Mutex<HashMap<String, Attempts>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Attempts {
+    submissions: u32,
+    last: Instant,
+    slowed_down_logged: bool,
+}
+
+/// What [`ProofRetries::check`] says about one active challenge.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryCheck {
+    Prove,
+    /// Proved recently; not again until the backoff has passed. `announce`
+    /// is true once, the first time the wait is the slow one: the fast
+    /// submissions are spent and the challenge is still open.
+    Wait {
+        announce: bool,
+    },
+}
+
+impl ProofRetries {
+    #[cfg(test)]
+    fn check(&self, challenge_id: &str, now: Instant) -> RetryCheck {
+        self.check_at_pace(challenge_id, now, SLOW_RESUBMIT_DELAY)
+    }
+
+    /// [`RetryCheck`] for one active challenge, `slow_delay` being the wait
+    /// between submissions once the fast ones are spent (see
+    /// [`slow_resubmit_delay`]).
+    fn check_at_pace(&self, challenge_id: &str, now: Instant, slow_delay: Duration) -> RetryCheck {
+        let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = attempts.get_mut(challenge_id) else {
+            return RetryCheck::Prove;
+        };
+        let slow = entry.submissions >= FAST_PROOF_SUBMISSIONS;
+        let delay = if slow {
+            slow_delay
+        } else {
+            resubmit_delay(entry.submissions)
+        };
+        if now.duration_since(entry.last) < delay {
+            // Announced on the first wait at the slow pace, and only marked
+            // then: a challenge that came back when its wait had already
+            // passed is proved at once, and announced on the wait after.
+            let announce = slow && !entry.slowed_down_logged;
+            if announce {
+                entry.slowed_down_logged = true;
+            }
+            RetryCheck::Wait { announce }
+        } else {
+            RetryCheck::Prove
+        }
+    }
+
+    /// A proof for `challenge_id` reached the Portal — accepted or refused.
+    fn record_submission(&self, challenge_id: &str, now: Instant) -> u32 {
+        let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = attempts
+            .entry(challenge_id.to_string())
+            .or_insert(Attempts {
+                submissions: 0,
+                last: now,
+                slowed_down_logged: false,
+            });
+        entry.submissions = entry.submissions.saturating_add(1);
+        entry.last = now;
+        entry.submissions
+    }
+
+    /// Drop the counts of challenges no longer active, once they are old
+    /// enough that a return to `active` is not coming.
+    fn prune(&self, active: &[String], now: Instant) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        attempts.retain(|id, entry| {
+            active.contains(id) || now.duration_since(entry.last) < Duration::from_secs(24 * 3600)
+        });
+    }
+}
+
+/// Backoff after the `submissions`-th proof: 1, 2, 4 and 8 minutes after the
+/// first four, then [`SLOW_RESUBMIT_DELAY`] after every one from the
+/// [`FAST_PROOF_SUBMISSIONS`]-th on.
+fn resubmit_delay(submissions: u32) -> Duration {
+    if submissions >= FAST_PROOF_SUBMISSIONS {
+        return SLOW_RESUBMIT_DELAY;
+    }
+    let doublings = submissions.saturating_sub(1).min(16);
+    RESUBMIT_BASE_DELAY
+        .saturating_mul(1 << doublings)
+        .min(RESUBMIT_MAX_DELAY)
+}
 
 /// Trait for generating cryptographic proofs.
 ///
@@ -73,27 +262,34 @@ impl ProofGenerator for RealProofGenerator {
 /// Compute and submit proofs for all active challenges.
 ///
 /// This function:
-/// 1. Queries challenges with status = "active" from the database
+/// 1. Queries challenges with status = "active" from the database, nearest
+///    deadline first
 /// 2. For each challenge, loads the associated agreement and file data
 /// 3. Generates a cryptographic proof using the POR system
 /// 4. Submits the proof to Portal and updates the challenge status
+///
+/// `retries` carries the per-challenge submission count across cycles.
 pub async fn compute_and_submit_proofs(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_backend: &StorageBackend,
     storage_dir: &Path,
+    retries: &ProofRetries,
 ) -> Result<()> {
-    compute_and_submit_proofs_with_generator(
+    prove_active_challenges(
         portal_client,
         database,
         storage_backend,
         storage_dir,
         &RealProofGenerator,
+        retries,
     )
     .await
 }
 
-/// Internal implementation that accepts a proof generator for testability.
+/// [`prove_active_challenges`] with a fresh retry memory, for tests that run
+/// one pass.
+#[cfg(test)]
 pub async fn compute_and_submit_proofs_with_generator<G: ProofGenerator>(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
@@ -101,12 +297,43 @@ pub async fn compute_and_submit_proofs_with_generator<G: ProofGenerator>(
     storage_dir: &Path,
     proof_generator: &G,
 ) -> Result<()> {
-    // Query all active challenges
+    prove_active_challenges(
+        portal_client,
+        database,
+        storage_backend,
+        storage_dir,
+        proof_generator,
+        &ProofRetries::default(),
+    )
+    .await
+}
+
+/// Internal implementation that accepts a proof generator for testability.
+async fn prove_active_challenges<G: ProofGenerator>(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    proof_generator: &G,
+    retries: &ProofRetries,
+) -> Result<()> {
+    // Only `active` is worked on. Every other status — `proved`, `failed`,
+    // and any the Portal adds later, such as a `settled` leaking through — is
+    // simply not this function's business, and is never an error.
     let active_challenges = Challenges::find()
         .filter(challenges::Column::Status.eq(STATUS_ACTIVE))
+        .order_by_asc(challenges::Column::DeadlineHeight)
+        .order_by_asc(challenges::Column::ChallengeId)
         .all(database)
         .await
         .context("failed to query active challenges")?;
+
+    let now = Instant::now();
+    let active_ids: Vec<String> = active_challenges
+        .iter()
+        .map(|challenge| challenge.challenge_id.clone())
+        .collect();
+    retries.prune(&active_ids, now);
 
     if active_challenges.is_empty() {
         info!("No active challenges to process");
@@ -131,6 +358,33 @@ pub async fn compute_and_submit_proofs_with_generator<G: ProofGenerator>(
     let mut submitted_count = 0usize;
 
     for challenge in active_challenges {
+        let slow_delay = slow_resubmit_delay(&challenge, chrono::Utc::now());
+        match retries.check_at_pace(&challenge.challenge_id, now, slow_delay) {
+            RetryCheck::Prove => {}
+            RetryCheck::Wait { announce } => {
+                if announce {
+                    error!(
+                        "Challenge {} (agreement {}, deadline height {}) is still open after \
+                         {FAST_PROOF_SUBMISSIONS} proofs. It is proved again every {} minutes \
+                         (more often as its deadline nears) for as long as it stays open; if \
+                         it expires it is slashed at 30× the agreement's collateral — check \
+                         the node's KOR balance (a proof needs its gas), the stored file and \
+                         its ledger slot.",
+                        challenge.challenge_id,
+                        challenge.agreement_id,
+                        challenge.deadline_height,
+                        slow_delay.as_secs() / 60
+                    );
+                } else {
+                    debug!(
+                        "Challenge {} was proved recently; waiting before resubmitting",
+                        challenge.challenge_id
+                    );
+                }
+                continue;
+            }
+        }
+
         let span = tracing::info_span!("process_challenge",
             challenge_id = %challenge.challenge_id,
             agreement_id = %challenge.agreement_id
@@ -149,14 +403,32 @@ pub async fn compute_and_submit_proofs_with_generator<G: ProofGenerator>(
         .await
         {
             Ok(()) => {
+                let submissions = retries.record_submission(&challenge.challenge_id, now);
+                if submissions > 1 {
+                    warn!(
+                        "Resubmitted a proof for challenge {} (submission {submissions}): the \
+                         Portal handed the challenge back after the previous one",
+                        challenge.challenge_id
+                    );
+                }
                 submitted_count += 1;
             }
-            Err(err) => {
+            Err(ProcessError::Submitted(err)) => {
+                // The Portal saw this proof and turned it down: that counts.
+                retries.record_submission(&challenge.challenge_id, now);
                 warn!(
                     "Failed to process challenge {}: {err}",
                     challenge.challenge_id
                 );
-                // Continue processing other challenges
+            }
+            Err(ProcessError::NotSubmitted(err)) => {
+                // Nothing the Portal judged (missing file, slot not yet
+                // reconciled, Portal unreachable or failing…): free to try
+                // again next cycle.
+                warn!(
+                    "Failed to process challenge {}: {err}",
+                    challenge.challenge_id
+                );
             }
         }
     }
@@ -168,6 +440,47 @@ pub async fn compute_and_submit_proofs_with_generator<G: ProofGenerator>(
     Ok(())
 }
 
+/// Why a challenge was not proved, split by whether the Portal saw a proof.
+#[derive(Debug)]
+enum ProcessError {
+    /// Failed before anything was submitted, or the submission never got an
+    /// answer about the proof (see [`refused_by_portal`]).
+    NotSubmitted(anyhow::Error),
+    /// A proof was submitted and refused, or accepted and then not recorded.
+    Submitted(anyhow::Error),
+}
+
+/// Portal error codes on a proof submission that say nothing about the proof:
+/// the challenge is not `active` on the Portal's side (this node's row is
+/// behind — the proof it sent earlier is still being relayed, or the challenge
+/// has closed), or the nonce could not be used.
+const NOT_ABOUT_THE_PROOF: [&str; 2] = ["INVALID_STATUS", "INVALID_NONCE"];
+
+/// Whether a failed `submit_proof` means the Portal read this proof and turned
+/// it down — the only failure that counts toward [`FAST_PROOF_SUBMISSIONS`]
+/// and is waited out before the next attempt.
+///
+/// That is a 4xx, except the ones that say nothing about the proof: `401` (the
+/// session expired), `408` and `429` (come back later), `409` (the nonce it
+/// was signed at is held by another op of this node; the next attempt is signed
+/// at a fresh one), and the codes in [`NOT_ABOUT_THE_PROOF`]. A `2xx` whose
+/// body cannot be read counts too: the Portal took the proof. A connection
+/// error, a timeout or a 5xx does not — whether the Portal even looked at the
+/// proof is unknown — so an outage spends none of a challenge's submissions,
+/// and the next cycle tries again.
+fn refused_by_portal(err: &anyhow::Error) -> bool {
+    if let Some(error) = err.downcast_ref::<HttpStatusError>() {
+        let status = error.status.as_u16();
+        return (400..500).contains(&status)
+            && !matches!(status, 401 | 408 | 409 | 429)
+            && !error
+                .api_code()
+                .is_some_and(|code| NOT_ABOUT_THE_PROOF.contains(&code.as_str()));
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_decode)
+}
+
 /// Process a single challenge: load file, generate proof, submit to Portal.
 async fn process_single_challenge<G: ProofGenerator>(
     portal_client: &PortalClient,
@@ -177,7 +490,32 @@ async fn process_single_challenge<G: ProofGenerator>(
     ledger: &FileLedger,
     challenge: &challenges::Model,
     proof_generator: &G,
-) -> Result<()> {
+) -> Result<(), ProcessError> {
+    let proof_hex = build_proof(
+        portal_client,
+        database,
+        storage_backend,
+        storage_dir,
+        ledger,
+        challenge,
+        proof_generator,
+    )
+    .await
+    .map_err(ProcessError::NotSubmitted)?;
+
+    submit_and_record(portal_client, database, challenge, proof_hex).await
+}
+
+/// Load the file and generate the proof for one challenge.
+async fn build_proof<G: ProofGenerator>(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    ledger: &FileLedger,
+    challenge: &challenges::Model,
+    proof_generator: &G,
+) -> Result<String> {
     // Get the associated agreement
     let agreement = Agreements::find()
         .filter(agreements::Column::AgreementId.eq(&challenge.agreement_id))
@@ -263,20 +601,35 @@ async fn process_single_challenge<G: ProofGenerator>(
         file_metadata,
         crypto_challenge,
     )?;
-    let proof_hex = hex::encode(&proof_bytes);
+    Ok(hex::encode(&proof_bytes))
+}
 
+/// Submit one proof and mirror the Portal's answer locally.
+async fn submit_and_record(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    challenge: &challenges::Model,
+    proof_hex: String,
+) -> Result<(), ProcessError> {
     // Submit to Portal (BLS signature is computed internally by submit_proof)
     let response = portal_client
         .submit_proof(&challenge.challenge_id, &proof_hex)
         .await
-        .with_context(|| format!("submitting proof for challenge {}", challenge.challenge_id))?;
+        .with_context(|| format!("submitting proof for challenge {}", challenge.challenge_id))
+        .map_err(|err| {
+            if refused_by_portal(&err) {
+                ProcessError::Submitted(err)
+            } else {
+                ProcessError::NotSubmitted(err)
+            }
+        })?;
 
     // Check response status - Portal may reject proof
     if response.status != STATUS_PROVED {
-        return Err(anyhow!(
+        return Err(ProcessError::Submitted(anyhow!(
             "proof rejected by Portal with status: {}",
             response.status
-        ));
+        )));
     }
 
     // Update challenge status in DB.
@@ -298,7 +651,8 @@ async fn process_single_challenge<G: ProofGenerator>(
     active_model
         .update(database)
         .await
-        .context("updating challenge status")?;
+        .context("updating challenge status")
+        .map_err(ProcessError::Submitted)?;
 
     info!(
         "Submitted proof for challenge {} (agreement {})",
@@ -519,7 +873,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(result.is_ok(), "should succeed with no challenges");
     }
 
@@ -548,7 +909,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "should succeed but skip when ledger missing"
@@ -708,7 +1076,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "should succeed but skip undownloaded agreements"
@@ -753,7 +1128,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(result.is_ok(), "should succeed but skip missing agreements");
 
         // Challenge should still be active
@@ -1231,7 +1613,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let chal = Challenges::find()
@@ -1290,7 +1679,14 @@ mod tests {
         );
         let backend = StorageBackend::local();
 
-        let result = compute_and_submit_proofs(&client, &db, &backend, &storage_dir).await;
+        let result = compute_and_submit_proofs(
+            &client,
+            &db,
+            &backend,
+            &storage_dir,
+            &ProofRetries::default(),
+        )
+        .await;
         assert!(result.is_ok());
 
         let chal = Challenges::find()
@@ -1808,6 +2204,538 @@ mod tests {
         assert!(
             chal.proof.as_ref().unwrap().len() > 10,
             "computed proof should be non-trivial"
+        );
+    }
+
+    // ── Resubmission and ordering ───────────────────────────────────────────
+
+    /// One downloaded agreement with its file and an empty ledger on disk, and
+    /// a challenge on it per `(id, deadline, status)`.
+    async fn setup_challenges(
+        db: &DatabaseConnection,
+        storage_dir: &Path,
+        challenges_to_insert: &[(&str, i64, &str)],
+    ) {
+        mock_agreement("agr_retry", "file_retry")
+            .insert(db)
+            .await
+            .unwrap();
+        stdfs::write(storage_dir.join("file_retry"), b"bytes").unwrap();
+        FileLedger::new()
+            .save(&storage_dir.join("ledger.bin"))
+            .unwrap();
+        for (id, deadline, status) in challenges_to_insert {
+            let mut challenge = sample_challenge(id, "agr_retry");
+            challenge.deadline_height = Set(*deadline);
+            challenge.status = Set((*status).to_string());
+            challenge.insert(db).await.unwrap();
+        }
+    }
+
+    async fn mount_accepting_proofs(mock_server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("^/api/challenges/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "proved",
+                "proof": null,
+                "bls_signature": "sig"
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn proved_paths(mock_server: &MockServer) -> Vec<String> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    /// A cycle can run out of time or gas part way; the challenge that expires
+    /// soonest is the one to have proved first.
+    #[tokio::test]
+    async fn challenges_are_proved_nearest_deadline_first() {
+        let mock_server = MockServer::start().await;
+        mount_accepting_proofs(&mock_server).await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("deadline_order");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(
+            &db,
+            &storage_dir,
+            &[
+                ("chal_late", 900, "active"),
+                ("chal_soon", 800, "active"),
+                ("chal_mid", 850, "active"),
+            ],
+        )
+        .await;
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        compute_and_submit_proofs_with_generator(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            proved_paths(&mock_server).await,
+            vec![
+                "/api/challenges/chal_soon",
+                "/api/challenges/chal_mid",
+                "/api/challenges/chal_late"
+            ]
+        );
+    }
+
+    /// Statuses other than `active` — including ones this node has never
+    /// heard of, such as `settled` — are left alone without an error.
+    #[tokio::test]
+    async fn non_active_and_unknown_statuses_are_not_proved() {
+        let mock_server = MockServer::start().await;
+        mount_accepting_proofs(&mock_server).await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("unknown_status");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(
+            &db,
+            &storage_dir,
+            &[
+                ("chal_settled", 800, "settled"),
+                ("chal_failed", 800, "failed"),
+                ("chal_proved", 800, "proved"),
+                ("chal_brand_new_status", 800, "something-else"),
+            ],
+        )
+        .await;
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        compute_and_submit_proofs_with_generator(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+        )
+        .await
+        .unwrap();
+        assert!(proved_paths(&mock_server).await.is_empty());
+    }
+
+    /// The Portal hands a rejected challenge back as `active`. The node proves
+    /// it again — but not in the same breath: a resubmission waits out the
+    /// backoff, and the memory of the first submission is what makes it wait.
+    #[tokio::test]
+    async fn a_challenge_back_to_active_is_resubmitted_only_after_the_backoff() {
+        let mock_server = MockServer::start().await;
+        mount_accepting_proofs(&mock_server).await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("resubmit");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(&db, &storage_dir, &[("chal_back", 800, "active")]).await;
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let retries = ProofRetries::default();
+        let backend = StorageBackend::local();
+        let run = || {
+            prove_active_challenges(
+                &client,
+                &db,
+                &backend,
+                &storage_dir,
+                &MockProofGenerator,
+                &retries,
+            )
+        };
+        run().await.unwrap();
+        assert_eq!(proved_paths(&mock_server).await.len(), 1);
+
+        // What the challenge sync does when the Portal reports it active again.
+        challenges::ActiveModel {
+            challenge_id: sea_orm::ActiveValue::Unchanged("chal_back".into()),
+            status: Set(STATUS_ACTIVE.into()),
+            ..Default::default()
+        }
+        .update(&db)
+        .await
+        .unwrap();
+
+        run().await.unwrap();
+        assert_eq!(
+            proved_paths(&mock_server).await.len(),
+            1,
+            "still inside the backoff: not resubmitted yet"
+        );
+
+        // Once the backoff has passed, it goes out again.
+        assert_eq!(
+            retries.check("chal_back", Instant::now() + resubmit_delay(1)),
+            RetryCheck::Prove
+        );
+    }
+
+    /// A challenge the Portal keeps handing back is not abandoned once the
+    /// fast submissions are spent — it used to be, for the life of the
+    /// process, with some 2000 blocks of its window left and a 30× slash at
+    /// the end of it. It waits out the slow delay instead, and is proved again.
+    #[tokio::test]
+    async fn a_challenge_out_of_fast_submissions_is_still_proved_at_the_slow_pace() {
+        let mock_server = MockServer::start().await;
+        mount_accepting_proofs(&mock_server).await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("slow_pace");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(&db, &storage_dir, &[("chal_stubborn", 800, "active")]).await;
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        // Just spent: inside the slow delay, nothing goes out.
+        let retries = ProofRetries::default();
+        for _ in 0..FAST_PROOF_SUBMISSIONS {
+            retries.record_submission("chal_stubborn", Instant::now());
+        }
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert!(proved_paths(&mock_server).await.is_empty());
+
+        // The slow delay later, the challenge still active: proved again.
+        let Some(long_ago) = Instant::now().checked_sub(SLOW_RESUBMIT_DELAY) else {
+            // A machine up for less than the delay cannot represent the past
+            // instant; the unit test below covers the arithmetic.
+            return;
+        };
+        let retries = ProofRetries::default();
+        for _ in 0..FAST_PROOF_SUBMISSIONS + 3 {
+            retries.record_submission("chal_stubborn", long_ago);
+        }
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(proved_paths(&mock_server).await.len(), 1);
+    }
+
+    /// `400 INVALID_STATUS` is the Portal saying the challenge is not `active`
+    /// on its side — this node's row is behind — and `INVALID_NONCE` is about
+    /// the nonce. Neither is a verdict on the proof, so neither spends a
+    /// submission; a `400` about the proof itself still does.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_about_the_proof_spends_no_submission() {
+        for (code, counts) in [
+            ("INVALID_STATUS", false),
+            ("INVALID_NONCE", false),
+            ("INVALID_PROOF", true),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/challenges/chal_behind"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": { "code": code, "message": "refused", "status": 400 }
+                })))
+                .mount(&mock_server)
+                .await;
+            let db = setup_in_memory_db().await;
+            let storage_dir = unique_storage_dir("not_about_the_proof");
+            stdfs::create_dir_all(&storage_dir).ok();
+            setup_challenges(&db, &storage_dir, &[("chal_behind", 800, "active")]).await;
+
+            let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+            let retries = ProofRetries::default();
+            prove_active_challenges(
+                &client,
+                &db,
+                &StorageBackend::local(),
+                &storage_dir,
+                &MockProofGenerator,
+                &retries,
+            )
+            .await
+            .unwrap();
+            let expected = if counts {
+                RetryCheck::Wait { announce: false }
+            } else {
+                RetryCheck::Prove
+            };
+            assert_eq!(
+                retries.check("chal_behind", Instant::now()),
+                expected,
+                "{code}"
+            );
+        }
+    }
+
+    /// A proof the Portal turned down counts as a submission; a failure before
+    /// anything was sent (here, no file on disk) does not, so the challenge is
+    /// free to be tried the next cycle once the cause is fixed.
+    #[tokio::test]
+    async fn only_proofs_that_reached_the_portal_count() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/challenges/chal_refused"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad proof"))
+            .mount(&mock_server)
+            .await;
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("counts");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(&db, &storage_dir, &[("chal_refused", 800, "active")]).await;
+
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let retries = ProofRetries::default();
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retries.check("chal_refused", Instant::now()),
+            RetryCheck::Wait { announce: false }
+        );
+
+        stdfs::remove_file(storage_dir.join("file_retry")).unwrap();
+        let fresh = ProofRetries::default();
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &fresh,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fresh.check("chal_refused", Instant::now()),
+            RetryCheck::Prove
+        );
+    }
+
+    /// An outage is not a verdict on the proof. A connection refused or a 5xx
+    /// spends none of the challenge's submissions — five of those used to mean
+    /// giving up on a proof the Portal never looked at — nor does a `409`,
+    /// which is about the nonce, not the proof.
+    #[tokio::test]
+    async fn transient_failures_spend_no_submission() {
+        for status in [500u16, 502, 503, 409, 429, 401] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/challenges/chal_outage"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("try later"))
+                .mount(&mock_server)
+                .await;
+            let db = setup_in_memory_db().await;
+            let storage_dir = unique_storage_dir("outage");
+            stdfs::create_dir_all(&storage_dir).ok();
+            setup_challenges(&db, &storage_dir, &[("chal_outage", 800, "active")]).await;
+
+            let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+            let retries = ProofRetries::default();
+            prove_active_challenges(
+                &client,
+                &db,
+                &StorageBackend::local(),
+                &storage_dir,
+                &MockProofGenerator,
+                &retries,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                retries.check("chal_outage", Instant::now()),
+                RetryCheck::Prove,
+                "{status}"
+            );
+        }
+
+        // Nobody listening at all.
+        // (A dropped `MockServer` goes back to wiremock's pool and keeps
+        // answering, so take a port and let it go instead.)
+        let unreachable = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let db = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("outage_unreachable");
+        stdfs::create_dir_all(&storage_dir).ok();
+        setup_challenges(&db, &storage_dir, &[("chal_outage", 800, "active")]).await;
+        let client = PortalClient::with_auth(
+            unreachable,
+            storage_dir.clone(),
+            Arc::new(BlsKeyPair::generate().unwrap()),
+            "NODE-test",
+            42,
+            "test-jwt-token",
+            0,
+        );
+        let retries = ProofRetries::default();
+        prove_active_challenges(
+            &client,
+            &db,
+            &StorageBackend::local(),
+            &storage_dir,
+            &MockProofGenerator,
+            &retries,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retries.check("chal_outage", Instant::now()),
+            RetryCheck::Prove
+        );
+    }
+
+    #[test]
+    fn resubmissions_back_off_then_slow_down_and_never_stop() {
+        assert_eq!(resubmit_delay(1), Duration::from_secs(60));
+        assert_eq!(resubmit_delay(2), Duration::from_secs(120));
+        assert_eq!(resubmit_delay(4), Duration::from_secs(480));
+        assert_eq!(resubmit_delay(5), SLOW_RESUBMIT_DELAY);
+        assert_eq!(resubmit_delay(40), SLOW_RESUBMIT_DELAY);
+        assert_eq!(resubmit_delay(u32::MAX), SLOW_RESUBMIT_DELAY);
+
+        let retries = ProofRetries::default();
+        let t0 = Instant::now();
+        assert_eq!(retries.check("c", t0), RetryCheck::Prove);
+        retries.record_submission("c", t0);
+        assert_eq!(
+            retries.check("c", t0 + Duration::from_secs(59)),
+            RetryCheck::Wait { announce: false }
+        );
+        assert_eq!(
+            retries.check("c", t0 + Duration::from_secs(60)),
+            RetryCheck::Prove
+        );
+
+        for _ in 1..FAST_PROOF_SUBMISSIONS {
+            retries.record_submission("c", t0);
+        }
+        let inside = t0 + SLOW_RESUBMIT_DELAY - Duration::from_secs(1);
+        assert_eq!(
+            retries.check("c", inside),
+            RetryCheck::Wait { announce: true }
+        );
+        assert_eq!(
+            retries.check("c", inside),
+            RetryCheck::Wait { announce: false },
+            "said once, not every cycle"
+        );
+        // Not given up on: due again once the slow delay has passed, and
+        // again after every later submission, however many there have been.
+        let mut now = t0 + SLOW_RESUBMIT_DELAY;
+        for _ in 0..50 {
+            assert_eq!(retries.check("c", now), RetryCheck::Prove);
+            retries.record_submission("c", now);
+            assert_eq!(
+                retries.check("c", now + SLOW_RESUBMIT_DELAY - Duration::from_secs(1)),
+                RetryCheck::Wait { announce: false }
+            );
+            now += SLOW_RESUBMIT_DELAY;
+        }
+
+        // Forgotten a day after it stops being active.
+        retries.prune(&[], now + Duration::from_secs(24 * 3600));
+        assert_eq!(retries.check("c", now), RetryCheck::Prove);
+    }
+
+    fn challenge_with_window(blocks: i64, known_for: chrono::Duration) -> challenges::Model {
+        let created = chrono::Utc::now() - known_for;
+        challenges::Model {
+            challenge_id: "chal_window".into(),
+            agreement_id: "agr_window".into(),
+            block_height: 1_000,
+            challenge_count: 1,
+            seed: String::new(),
+            prover_id: String::new(),
+            deadline_height: 1_000 + blocks,
+            status: STATUS_ACTIVE.into(),
+            proof: None,
+            bls_signature: None,
+            created_at: created.into(),
+            updated_at: created.into(),
+        }
+    }
+
+    /// The slow pace is an hour while the deadline is far, and shortens as
+    /// the estimated end of the window nears — down to five minutes — so a
+    /// challenge handed back late is still proved several times.
+    #[test]
+    fn the_slow_pace_shortens_as_the_deadline_nears() {
+        let now = chrono::Utc::now();
+        // 2016 blocks, just issued: two weeks left.
+        let fresh = challenge_with_window(2016, chrono::Duration::zero());
+        assert_eq!(slow_resubmit_delay(&fresh, now), SLOW_RESUBMIT_DELAY);
+        // About four hours left by the estimate: an eighth of that.
+        let late = challenge_with_window(2016, chrono::Duration::minutes(2016 * 10 - 240));
+        let delay = slow_resubmit_delay(&late, now);
+        assert!(
+            delay >= Duration::from_secs(29 * 60) && delay <= Duration::from_secs(31 * 60),
+            "{delay:?}"
+        );
+        // Past the estimate, or a window that makes no sense: the floor.
+        let overdue = challenge_with_window(2016, chrono::Duration::days(30));
+        assert_eq!(slow_resubmit_delay(&overdue, now), MIN_SLOW_RESUBMIT_DELAY);
+        let nonsense = challenge_with_window(-5, chrono::Duration::zero());
+        assert_eq!(slow_resubmit_delay(&nonsense, now), MIN_SLOW_RESUBMIT_DELAY);
+    }
+
+    /// The line that tells the operator a challenge is still open after its
+    /// fast proofs was lost when the challenge came back after the slow wait
+    /// had already passed: that check proved at once and marked the line as
+    /// said. It is now said on the first wait at the slow pace, whenever
+    /// that is.
+    #[test]
+    fn the_slow_pace_is_announced_on_its_first_wait_even_after_a_late_return() {
+        let retries = ProofRetries::default();
+        let t0 = Instant::now();
+        for _ in 0..FAST_PROOF_SUBMISSIONS {
+            retries.record_submission("chal_late", t0);
+        }
+        // Back to active only after the slow wait: proved at once, no wait
+        // to announce on yet.
+        let back = t0 + SLOW_RESUBMIT_DELAY;
+        assert_eq!(retries.check("chal_late", back), RetryCheck::Prove);
+        retries.record_submission("chal_late", back);
+        assert_eq!(
+            retries.check("chal_late", back + Duration::from_secs(1)),
+            RetryCheck::Wait { announce: true }
+        );
+        assert_eq!(
+            retries.check("chal_late", back + Duration::from_secs(2)),
+            RetryCheck::Wait { announce: false }
+        );
+        // A shorter slow pace is honoured.
+        assert_eq!(
+            retries.check_at_pace(
+                "chal_late",
+                back + MIN_SLOW_RESUBMIT_DELAY,
+                MIN_SLOW_RESUBMIT_DELAY
+            ),
+            RetryCheck::Prove
         );
     }
 }

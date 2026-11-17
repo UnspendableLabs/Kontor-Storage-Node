@@ -11,7 +11,6 @@ description = "Storage node for the Kontor distributed storage network: stores f
 authors = ["Unspendable Labs"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/UnspendableLabs/Kontor-Storage-Node"
-homepage = "https://github.com/UnspendableLabs/Kontor-Storage-Node"
 documentation = "https://github.com/UnspendableLabs/Kontor-Storage-Node#readme"
 readme = "README.md"
 keywords = ["kontor", "storage", "node", "bitcoin", "proof-of-storage"]
@@ -23,12 +22,11 @@ exclude = [
     "/.github",
     "/.githooks",
     "/apiary.apib",
-    "/codecov.yml",
     "/scripts",
     "/tests",
     # Kept out deliberately. `cargo install` never reads it — rustup picks a
     # toolchain from the working directory, not from the crate it is building —
-    # but anyone who unpacks the tarball and builds it would have 1.95.0 forced
+    # but anyone who unpacks the tarball and builds it would have 1.100.0 forced
     # on them by a file they did not write, which is the opposite of what
     # `rust-version` above promises.
     "/rust-toolchain.toml",

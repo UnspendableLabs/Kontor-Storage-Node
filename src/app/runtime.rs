@@ -29,9 +29,12 @@ use crate::app::lifecycle::{Activation, NodeRuntime, Phase, SealStatus};
 use crate::app::output::SharedWriter;
 use crate::app::restart::{Outcome, RestartHandle};
 use crate::app::tasks::downloadagreements::StorageBackend;
+use crate::app::tasks::stake;
+use crate::clients::portal::{starting_nonce, NonceStore};
 use crate::clients::PortalClient;
 use crate::crypto::keystore::{Keystore, SealKey, SealKeySource};
 use crate::database::DBClient;
+use crate::node::faucet::Faucet;
 use crate::node::{self, KeySource, NodeKeys};
 use crate::server;
 use crate::server::admin::credentials::AdminCredential;
@@ -122,6 +125,25 @@ fn print_config_info(config: &Config, writer: &mut impl Write) -> Result<()> {
         "Filestorage contract: {}",
         config.kontor_contract_address
     )?;
+    writeln!(
+        writer,
+        "Staking contract: {}",
+        config.kontor_staking_contract_address
+    )?;
+    let policy = &config.stake_policy;
+    if policy.auto_stake {
+        let target = policy.stake_target.map_or_else(
+            || "everything".to_string(),
+            |target| format!("up to {target} KOR"),
+        );
+        writeln!(
+            writer,
+            "Auto-stake: on ({target} above a {} KOR gas reserve; rewards claimed from {} KOR)",
+            policy.gas_reserve, policy.claim_threshold
+        )?;
+    } else {
+        writeln!(writer, "Auto-stake: off")?;
+    }
 
     Ok(())
 }
@@ -201,7 +223,8 @@ pub async fn run_with_shutdown(
     setup_storage_directory(&config)?;
 
     let client = PortalClient::try_new(&config.portal_url, &config.storage_dir)?
-        .with_contract_address(&config.kontor_contract_address);
+        .with_contract_address(&config.kontor_contract_address)
+        .with_staking_contract_address(&config.kontor_staking_contract_address);
 
     match cli.command {
         Commands::Ping => {
@@ -375,6 +398,7 @@ async fn serve(
 
     let runtime = NodeRuntime::new(phase, seal);
     runtime.set_notice(notice);
+    runtime.staking().set_policy(config.stake_policy.clone());
 
     // The key this boot opened the keystore with, published before the server
     // is: `/admin` reseals with it, and a request can arrive before the
@@ -424,6 +448,8 @@ async fn serve(
     }
 
     let config = Arc::new(config);
+    let daemon = TaskSlot::default();
+    let watcher = TaskSlot::default();
     let supervisor = tokio::spawn(
         Supervisor {
             config: config.clone(),
@@ -431,11 +457,12 @@ async fn serve(
             parts: parts.clone(),
             runtime: runtime.clone(),
             writer,
-            daemon: None,
-            watcher: None,
+            daemon: daemon.clone(),
+            watcher: watcher.clone(),
             keystore: None,
             migrating: None,
             retry_in: None,
+            faucet: Arc::new(Faucet::new(config.faucet_amount).with_store(parts.conn.clone())),
         }
         .run(start),
     );
@@ -456,8 +483,42 @@ async fn serve(
 
     supervisor.abort();
     let _ = supervisor.await;
+    // The supervisor's tasks do not end with it: a spawned task outlives the
+    // handle that is dropped. The daemon in particular now runs until it is
+    // told to stop, holding its lock, so it is stopped here — and waited for,
+    // like everywhere else it is stopped.
+    stop_task(&daemon).await;
+    stop_task(&watcher).await;
 
     outcome
+}
+
+/// Where a background task's handle is kept, shared between the supervisor
+/// that starts and replaces the task and the shutdown path that ends it.
+type TaskSlot = Arc<std::sync::Mutex<Option<JoinHandle<()>>>>;
+
+/// Stop the task in `slot`, if any, and **wait for it to be gone**.
+///
+/// The await is the whole point. `abort()` only schedules cancellation, and
+/// the daemon holds its lock until its guard drops; re-spawning before that
+/// lands means the new daemon finds the old one's lock genuinely held and
+/// has to wait for it.
+async fn stop_task(slot: &TaskSlot) {
+    let handle = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// Put a freshly spawned task in `slot`.
+fn keep_task(slot: &TaskSlot, handle: JoinHandle<()>) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 }
 
 /// Open the keystore, migrating a legacy node into one if that is what this
@@ -490,8 +551,8 @@ struct Supervisor {
     parts: ServerParts,
     runtime: NodeRuntime,
     writer: SharedWriter,
-    daemon: Option<JoinHandle<()>>,
-    watcher: Option<JoinHandle<()>>,
+    daemon: TaskSlot,
+    watcher: TaskSlot,
     /// Kept so the node can be onboarded again without the operator supplying
     /// anything: unsealing a raw slot is one AEAD open, so re-deriving the keys
     /// is cheaper than keeping a `NodeKeys` alive across every await.
@@ -507,6 +568,10 @@ struct Supervisor {
     /// How long to wait before trying a failed activation again, doubling with
     /// each failure. `None` once one succeeds — see [`Supervisor::fail`].
     retry_in: Option<Duration>,
+    /// The faucet and when it was last asked. One for the life of the
+    /// process: an activation that failed after asking is retried, and the
+    /// retry must not ask again while the first transfer may be on its way.
+    faucet: Arc<Faucet>,
 }
 
 /// What the volume gave the supervisor to start from.
@@ -762,6 +827,17 @@ impl Supervisor {
         } = result;
 
         let keypair = Arc::new(keypair);
+        // Start past every nonce an earlier process — or an earlier
+        // activation of this one — signed with: the ops that hold them may
+        // still be queued at the Portal, where Kontor's `next_nonce` does not
+        // show them. Unreadable, the counter starts at Kontor's value as it
+        // always did; the stake task's own read of the Portal's queue then
+        // moves it past the relayed ops at least.
+        let nonces = NonceStore::new(self.parts.conn.clone(), signer_id);
+        let highest_signed = nonces.load().await.unwrap_or_else(|e| {
+            tracing::warn!("could not read the highest nonce signed so far: {e:#}");
+            None
+        });
         let authenticated = PortalClient::try_with_auth(
             &self.config.portal_url,
             &self.config.storage_dir,
@@ -769,9 +845,11 @@ impl Supervisor {
             &node_id,
             signer_id,
             token,
-            next_nonce,
+            starting_nonce(highest_signed, next_nonce),
         )?
-        .with_contract_address(&self.config.kontor_contract_address);
+        .with_contract_address(&self.config.kontor_contract_address)
+        .with_staking_contract_address(&self.config.kontor_staking_contract_address)
+        .with_nonce_store(nonces);
 
         if let Err(e) = authenticated.announce_node(&self.config.public_url).await {
             tracing::warn!("Failed to announce node URL: {e}");
@@ -783,7 +861,15 @@ impl Supervisor {
             )?;
         }
 
-        node::ensure_kor_balance(&authenticated, signer_id, &mut self.writer).await?;
+        // Only a node with neither a balance nor a bond is funded and waited
+        // for; a staked node restarting goes straight on to its daemon.
+        node::ensure_kor_balance(&authenticated, signer_id, &self.faucet, &mut self.writer).await?;
+
+        // Bond what the faucet just funded before looking at any agreement:
+        // Kontor refuses every join until the stake has landed.
+        let staking = self.runtime.staking();
+        stake::bootstrap_stake(&authenticated, &self.parts.conn, &staking, &mut self.writer)
+            .await?;
 
         // The admin UI can re-register an already-registered node, so it gets
         // the same key and an unauthenticated client here as it would on a node
@@ -795,7 +881,7 @@ impl Supervisor {
             public,
         ));
 
-        self.daemon = Some(spawn_portal_daemon(
+        let daemon = spawn_portal_daemon(
             authenticated,
             self.parts.conn.clone(),
             self.config.portal_polling_interval,
@@ -807,7 +893,10 @@ impl Supervisor {
             },
             self.parts.storage_backend.clone(),
             self.config.storage_dir.clone(),
-        ));
+            staking,
+            Some(self.faucet.clone()),
+        );
+        keep_task(&self.daemon, daemon);
 
         writeln!(
             self.writer,
@@ -850,7 +939,7 @@ impl Supervisor {
 
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        self.watcher = Some(tokio::spawn(async move {
+        let watcher = tokio::spawn(async move {
             // The last outcome reported, so a Portal that keeps giving the same
             // answer is logged once rather than every tick — which would bury
             // the line that says which address has to be whitelisted.
@@ -906,7 +995,8 @@ impl Supervisor {
                     }
                 }
             }
-        }));
+        });
+        keep_task(&self.watcher, watcher);
     }
 
     /// Land in [`Phase::Failed`] with the reason on record, and arrange to try
@@ -963,26 +1053,13 @@ impl Supervisor {
         self.runtime.enter(Phase::Failed);
     }
 
-    /// Stop the daemon and **wait for it to be gone**.
-    ///
-    /// The await is the whole point. `abort()` only schedules cancellation, and
-    /// the daemon holds its lock until its guard drops; re-spawning before that
-    /// lands means the new daemon finds the old one's lock genuinely held,
-    /// reports "another daemon is already running" into a log line, and quietly
-    /// never runs. A node that serves files while proving nothing looks healthy
-    /// from outside, which is the worst way to fail.
+    /// Stop the daemon and wait for it to be gone — see [`stop_task`].
     async fn stop_daemon(&mut self) {
-        if let Some(handle) = self.daemon.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        stop_task(&self.daemon).await;
     }
 
     async fn stop_watcher(&mut self) {
-        if let Some(handle) = self.watcher.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        stop_task(&self.watcher).await;
     }
 }
 
@@ -1139,6 +1216,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1201,6 +1285,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1252,6 +1343,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1303,6 +1401,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1359,6 +1464,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         };
 
@@ -1493,6 +1605,13 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 
@@ -1585,6 +1704,13 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: Some("correct horse battery staple".to_string()),
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         }
     }
@@ -1610,6 +1736,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Migrate { action },
         }
     }
@@ -2420,6 +2553,13 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 
@@ -2558,6 +2698,13 @@ mod tests {
             bls_key_path: Some(bls_key_path),
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Run,
         };
 

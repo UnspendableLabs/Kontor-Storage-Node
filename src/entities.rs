@@ -4,3 +4,4 @@ pub mod prelude;
 
 pub mod agreements;
 pub mod challenges;
+pub mod node_state;

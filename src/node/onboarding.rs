@@ -568,14 +568,16 @@ async fn onboard(
 
     // Step 4: Fetch current nonce
     let registry = client.get_registry_entry(signer_id).await?;
-    writeln!(writer, "✓ Registry nonce: {}", registry.next_nonce)?;
+    // A signer Kontor has processed no op for has no next nonce yet: it is 0.
+    let next_nonce = registry.next_nonce.unwrap_or(0);
+    writeln!(writer, "✓ Registry nonce: {next_nonce}")?;
 
     Ok(OnboardingOutcome::Ready(Box::new(OnboardingResult {
         keypair,
         node_id,
         signer_id,
         token: login.token,
-        next_nonce: registry.next_nonce,
+        next_nonce,
         public,
     })))
 }

@@ -48,6 +48,7 @@ pub mod reset;
 pub mod seal;
 pub mod session;
 pub mod setup;
+pub mod stake;
 pub mod status;
 pub mod ui;
 pub mod whitelist;
@@ -464,6 +465,8 @@ pub mod error_codes {
     pub const INVALID_SETUP: &str = "INVALID_SETUP";
     /// A seal change was asked for that this node is not in a position to make.
     pub const SEAL_UNAVAILABLE: &str = "SEAL_UNAVAILABLE";
+    /// An unstake or withdrawal was asked for that the node cannot queue now.
+    pub const STAKE_UNAVAILABLE: &str = "STAKE_UNAVAILABLE";
 }
 
 /// An error rendered as `{"error": {"code": ..., "message": ...}}`.
@@ -567,6 +570,7 @@ pub fn router() -> Router<DownloadServerState> {
         .route("/api/admin/login", post(login_handler))
         .route("/api/admin/status", get(status_handler))
         .route("/api/admin/reset-database", post(reset_handler))
+        .route("/api/admin/stake", post(stake_handler))
         .route("/api/admin/register-node", post(register_handler))
         .route(
             "/api/admin/whitelist-request",
@@ -718,6 +722,15 @@ async fn reset_handler(
     Json(request): Json<reset::ResetDatabaseRequest>,
 ) -> Result<Json<Value>, ApiError> {
     reset::reset_database(&request, &state).await.map(Json)
+}
+
+/// `POST /api/admin/stake`
+async fn stake_handler(
+    _session: AdminSession,
+    State(state): State<DownloadServerState>,
+    Json(request): Json<stake::StakeActionRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    stake::request_stake_action(&request, &state).map(|value| (StatusCode::ACCEPTED, Json(value)))
 }
 
 /// `POST /api/admin/register-node`
@@ -1324,6 +1337,21 @@ mod tests {
                 Agreements::find().count(&state.db).await.unwrap(),
                 1,
                 "an unauthenticated reset must not delete anything"
+            );
+
+            let (status, _) = call(
+                &state,
+                post(
+                    "/api/admin/stake",
+                    json!({"action": "begin_unstake", "confirm": "UNSTAKE"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                state.runtime.staking().status()["operator_request"],
+                Value::Null,
+                "an unauthenticated caller must not queue an unstake"
             );
         }
 

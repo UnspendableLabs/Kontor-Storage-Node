@@ -34,6 +34,43 @@ impl std::fmt::Display for HttpStatusError {
 
 impl std::error::Error for HttpStatusError {}
 
+impl HttpStatusError {
+    /// The structured `code` of a Portal error envelope,
+    /// `{"error": {"code": "...", "message": "...", "status": 422}}`.
+    ///
+    /// `None` when the body is not that envelope — a proxy's HTML page, an
+    /// older flat `{"code": ...}` body is accepted too since the faucet answers
+    /// in that shape.
+    #[must_use]
+    pub fn api_code(&self) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        body.get("error")
+            .and_then(|error| error.get("code"))
+            .or_else(|| body.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// The human-readable `message` of the same envelope.
+    #[must_use]
+    pub fn api_message(&self) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_str(&self.body).ok()?;
+        body.get("error")
+            .and_then(|error| error.get("message"))
+            .or_else(|| body.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+}
+
+/// The status and Portal error code of a failed request, if `error` is one.
+#[must_use]
+pub fn status_and_code(error: &anyhow::Error) -> Option<(u16, Option<String>)> {
+    error
+        .downcast_ref::<HttpStatusError>()
+        .map(|status| (status.status.as_u16(), status.api_code()))
+}
+
 /// Default timeout for HTTP requests (30 seconds).
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -165,5 +202,40 @@ mod tests {
             err.to_string().contains("lookup failed with status 404"),
             "Display text should be preserved verbatim: {err}"
         );
+    }
+
+    fn status_error(body: &str) -> HttpStatusError {
+        HttpStatusError {
+            status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body: body.to_string(),
+            context: "join".to_string(),
+        }
+    }
+
+    /// The Portal's envelope nests the code; the faucet's older errors do not.
+    /// Both are read, and anything else is simply "no code".
+    #[test]
+    fn api_code_reads_the_portal_envelope_and_the_flat_shape() {
+        let nested = status_error(
+            r#"{"error":{"code":"INSUFFICIENT_COLLATERAL","message":"needs 30","status":422}}"#,
+        );
+        assert_eq!(
+            nested.api_code().as_deref(),
+            Some("INSUFFICIENT_COLLATERAL")
+        );
+        assert_eq!(nested.api_message().as_deref(), Some("needs 30"));
+
+        let flat = status_error(r#"{"code":"FAUCET_UNAVAILABLE","message":"off"}"#);
+        assert_eq!(flat.api_code().as_deref(), Some("FAUCET_UNAVAILABLE"));
+
+        assert_eq!(status_error("<html>bad gateway</html>").api_code(), None);
+        assert_eq!(status_error(r#"{"error":"plain"}"#).api_code(), None);
+
+        let wrapped = anyhow::Error::new(nested);
+        assert_eq!(
+            status_and_code(&wrapped),
+            Some((422, Some("INSUFFICIENT_COLLATERAL".to_string())))
+        );
+        assert_eq!(status_and_code(&anyhow::anyhow!("offline")), None);
     }
 }
