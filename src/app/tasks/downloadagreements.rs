@@ -1,8 +1,18 @@
 use crate::app::config::StorageMethod;
 use crate::app::daemon::StorageLimits;
-use crate::app::tasks::field_from_hex;
+use crate::app::tasks::getnewagreements::ReadyListing;
+use crate::app::tasks::stake::{
+    is_membership_status, JoinBudget, JoinDecision, StakeTracker, REJOINABLE_MEMBERSHIP,
+};
+use crate::app::tasks::{field_from_hex, STATUS_ACTIVE, STATUS_PROVED, STATUS_SUBMITTED};
+use crate::clients::http_helpers::status_and_code;
+use crate::clients::kor::Kor;
+use crate::clients::portal::{AgreementNode, JoinAgreementResponse, UnsettledOp};
 use crate::clients::{GcsClient, PortalClient};
-use crate::entities::{agreements, prelude::Agreements};
+use crate::entities::{
+    agreements, challenges,
+    prelude::{Agreements, Challenges},
+};
 use anyhow::{anyhow, Context, Result};
 use ff::PrimeField;
 use kontor_crypto::{api, FileDescriptor, FileLedger, FileMetadata as CryptoFileMetadata};
@@ -11,13 +21,16 @@ use sea_orm::sea_query::Expr;
 use sea_orm::DbErr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+    EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::fs;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use self::tests::should_fail_commit;
@@ -208,51 +221,182 @@ fn check_storage_limits(
     StorageLimitCheck::Allowed
 }
 
-/// Download an agreement file and join it on the Portal.
+/// Join an agreement whose file has just been downloaded.
 ///
-/// # Arguments
-/// * `portal_client` - The Portal client for API calls
-/// * `agreement` - The agreement to download
+/// Download first, join second, deliberately: a join that succeeded for a file
+/// the node then failed to fetch is a membership it cannot prove, and since the
+/// staking upgrade a missed proof is slashed. The cost of this order is a
+/// download wasted when the join is refused, which the join budget keeps rare.
 ///
-/// # Returns
-/// The downloaded file data on success
-async fn download_and_join_agreement(
+/// Only for an agreement the node has no live row in: the Portal answers
+/// `created: false` for one it has, storing nothing, so signing that join would
+/// only spend a nonce. An `invalid` row is the exception — the Portal replaces
+/// it with the new join. Returns `None` for an unauthenticated client (legacy
+/// tests), which has nothing to sign with.
+async fn join_downloaded_agreement(
     portal_client: &PortalClient,
     agreement: &agreements::Model,
-) -> Result<crate::clients::portal::DownloadedFile> {
-    let downloaded = portal_client
-        .download_file(&agreement.agreement_id, &agreement.file_id)
-        .await
-        .with_context(|| format!("downloading file for agreement {}", agreement.agreement_id))?;
-
-    // Join the agreement on Portal after successful download.
-    // This is idempotent - Portal returns created=false if already joined.
-    // Skip if client is not authenticated (e.g., in legacy tests).
-    if portal_client.node_id().is_some() {
-        let join_response = portal_client
-            .join_agreement(&agreement.agreement_id)
-            .await
-            .with_context(|| format!("joining agreement {}", agreement.agreement_id))?;
-
-        if join_response.created {
-            info!(
-                "Joined agreement {} as node {}",
-                agreement.agreement_id, join_response.node_id
-            );
-        } else {
-            info!(
-                "Already joined agreement {} (idempotent)",
-                agreement.agreement_id
-            );
-        }
-    } else {
+) -> Result<Option<JoinAgreementResponse>> {
+    if portal_client.node_id().is_none() {
         warn!(
             "Skipping join for agreement {} - client not authenticated",
             agreement.agreement_id
         );
+        return Ok(None);
     }
 
-    Ok(downloaded)
+    let join_response = portal_client
+        .join_agreement(&agreement.agreement_id)
+        .await
+        .with_context(|| format!("joining agreement {}", agreement.agreement_id))?;
+
+    if join_response.created {
+        info!(
+            "Joined agreement {} as node {}",
+            agreement.agreement_id, join_response.node_id
+        );
+    } else {
+        info!(
+            "Already joined agreement {} (idempotent)",
+            agreement.agreement_id
+        );
+    }
+    Ok(Some(join_response))
+}
+
+/// What this node's row in an agreement says, by the local row or by this
+/// cycle's listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    /// No row, or only an `invalid` one: the agreement is still to be joined.
+    /// The Portal takes a new join in place of an `invalid` row — that join
+    /// was never applied on chain, so nothing is owed for it — while the
+    /// agreement is `ready`.
+    None,
+    /// A membership the node holds, or whose join is on its way: an obligation
+    /// to store the file, which a challenge will slash it for not having.
+    Held,
+    /// A row that is over for good — the join failed on chain, the node left,
+    /// or the join was invalidated and the agreement is no longer open to a
+    /// new one. Nothing is owed, the Portal answers a second join with
+    /// `created: false` (or `403 INVALID_STATUS`) without storing it, so none
+    /// is signed, and the file is not fetched: the node has no membership to
+    /// store it for.
+    Ended,
+}
+
+/// Whether this node has a row in `agreement`, and whether it is still live.
+///
+/// This cycle's listing is the truth for an agreement it has: it is current,
+/// and it carries this node's row whatever its status. The local `nodes` only
+/// stands in when the listing says nothing — it is refreshed by reconciliation,
+/// which lists the agreements the node *validly* belongs to, so a row the
+/// Portal has since invalidated keeps saying `valid` locally. Old rows store
+/// bare node-id strings rather than `{node_id, status}` objects; those count
+/// as held.
+///
+/// An `invalid` row alone is [`Membership::None`] while a new join can replace
+/// it — the agreement is in this cycle's ready listing, or the local row still
+/// says `ready` or `pending` — and [`Membership::Ended`] once the agreement
+/// has moved on without this node.
+fn membership(
+    agreement: &agreements::Model,
+    listed: Option<&crate::clients::portal::Agreement>,
+    node_id: Option<&str>,
+) -> Membership {
+    let Some(node_id) = node_id else {
+        return Membership::None;
+    };
+    let statuses = membership_statuses(agreement, listed, node_id);
+    if statuses.iter().any(|status| is_membership_status(*status)) {
+        Membership::Held
+    } else if statuses
+        .iter()
+        .any(|status| *status != Some(REJOINABLE_MEMBERSHIP))
+    {
+        Membership::Ended
+    } else if statuses.is_empty()
+        || listed.is_some()
+        || matches!(agreement.status.as_str(), "ready" | "pending")
+    {
+        // No row at all, or only an invalidated join the Portal still takes
+        // a new one in place of.
+        Membership::None
+    } else {
+        Membership::Ended
+    }
+}
+
+/// The statuses of this node's rows in `agreement`, `None` standing for a bare
+/// node-id string: the listing's when it has any, the local row's otherwise.
+fn membership_statuses<'a>(
+    agreement: &'a agreements::Model,
+    listed: Option<&'a crate::clients::portal::Agreement>,
+    node_id: &str,
+) -> Vec<Option<&'a str>> {
+    let from_listing: Vec<Option<&str>> = listed
+        .into_iter()
+        .flat_map(|listed| listed.nodes.iter())
+        .filter(|node: &&AgreementNode| node.node_id == node_id)
+        .map(|node| Some(node.status.as_str()))
+        .collect();
+    if !from_listing.is_empty() {
+        return from_listing;
+    }
+    agreement
+        .nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            if node.as_str() == Some(node_id) {
+                Some(None)
+            } else if node.get("node_id").and_then(|id| id.as_str()) == Some(node_id) {
+                Some(Some(
+                    node.get("status").and_then(|s| s.as_str()).unwrap_or(""),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Agreements this node has already stored whose join the Portal invalidated,
+/// and still lists as ready: joined again in place of the invalid row.
+async fn invalidated_joins(
+    database: &DatabaseConnection,
+    listing: &ReadyListing,
+    node_id: Option<&str>,
+) -> Result<Vec<agreements::Model>> {
+    let Some(node_id) = node_id else {
+        return Ok(Vec::new());
+    };
+    let invalidated: Vec<String> = listing
+        .values()
+        .filter(|listed| {
+            let mine: Vec<&str> = listed
+                .nodes
+                .iter()
+                .filter(|node| node.node_id == node_id)
+                .map(|node| node.status.as_str())
+                .collect();
+            !mine.is_empty() && mine.iter().all(|status| *status == REJOINABLE_MEMBERSHIP)
+        })
+        .map(|listed| listed.agreement_id.clone())
+        .collect();
+    if invalidated.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Oldest first, like every join (see `download_agreements_scoped`).
+    Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .filter(agreements::Column::AgreementId.is_in(invalidated))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
+        .all(database)
+        .await
+        .context("failed to load agreements whose join was invalidated")
 }
 
 /// Store an agreement file to the configured storage backend and update the database.
@@ -361,19 +505,133 @@ async fn store_agreement_file(
     Ok(())
 }
 
-/// Download agreement files that are not yet stored locally.
-///
-/// This function orchestrates the download workflow:
-/// 1. Queries for pending agreements respecting storage limits
-/// 2. For each agreement, checks storage limits
-/// 3. Downloads the file and joins the agreement on Portal
-/// 4. Stores the file to the configured backend (local or GCS)
-/// 5. Updates the database to mark the agreement as downloaded
+/// [`download_agreements_gated`] with no stake gating: what the node did
+/// before staking, and still does against a Portal that reports no stake.
+#[cfg(test)]
 pub async fn download_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
     storage_limits: StorageLimits,
     storage_backend: &StorageBackend,
+) -> Result<()> {
+    download_agreements_gated(
+        portal_client,
+        database,
+        storage_limits,
+        storage_backend,
+        &ReadyListing::new(),
+        &mut JoinBudget::unmetered(),
+        None,
+    )
+    .await
+}
+
+/// Download agreement files that are not yet stored locally.
+///
+/// This function orchestrates the download workflow:
+/// 1. Queries for pending agreements, memberships the node already holds
+///    first, and within each group the oldest agreement first
+/// 2. For each agreement it does not hold yet, checks storage limits, then
+///    whether the stake can cover joining it (`budget`, from this cycle's
+///    `listing`)
+/// 3. Downloads the file and, for an agreement not held yet, joins it on Portal
+/// 4. Stores the file to the configured backend (local or GCS)
+/// 5. Updates the database to mark the agreement as downloaded
+///
+/// A membership the node holds is downloaded whatever the limits say: the
+/// limits decide what the node takes on, and a held agreement whose file is
+/// missing is slashed at its first challenge. Nor is it joined again — the
+/// Portal would answer `created: false` and store nothing, and the nonce the
+/// join was signed at would go unused.
+///
+/// A join the Portal has invalidated (never applied on chain) is made again in
+/// its place while the agreement is still listed as ready: budgeted like any
+/// new join, but with no second download — the file is already stored — and
+/// so no storage-limit check, which that file already passed.
+///
+/// A join the Portal refuses with a `422` (no stake, not enough unreserved
+/// collateral, cleanup pending, withdrawal requested) costs the downloaded
+/// file and pauses joins for a while — `tracker` remembers that across cycles.
+/// Any other failure of one agreement — a download the Portal cannot serve, a
+/// join it refuses otherwise, a file that cannot be stored — costs that
+/// agreement this cycle and nothing more: it is logged, its download
+/// discarded, and the next agreement is tried. A join the Portal gave no
+/// usable answer to is the same, except that its collateral stays set aside:
+/// the Portal may hold it (see [`attempt_join`]). The cycle itself only fails
+/// when the node's own rows cannot be read.
+pub async fn download_agreements_gated(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
+    listing: &ReadyListing,
+    budget: &mut JoinBudget,
+    tracker: Option<&StakeTracker>,
+) -> Result<()> {
+    download_agreements_scoped(
+        portal_client,
+        database,
+        storage_limits,
+        storage_backend,
+        listing,
+        budget,
+        tracker,
+        Scope::Everything,
+    )
+    .await
+}
+
+/// Download the files of the memberships this node holds, and nothing else.
+///
+/// What a cycle falls back to when the ready listing cannot be read. Joining
+/// needs that listing — it says what is still open and at what collateral —
+/// but a membership the node already holds needs nothing from it, and a
+/// challenge on a held agreement whose file is missing is slashed. So the
+/// listing failing must not keep those files from being fetched. No join is
+/// signed and no limit applies, exactly as for a held agreement in
+/// [`download_agreements_gated`].
+///
+/// # Errors
+/// As [`download_agreements_gated`]: only if the node's own rows cannot be
+/// read.
+pub async fn download_held_agreements(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+) -> Result<()> {
+    download_agreements_scoped(
+        portal_client,
+        database,
+        StorageLimits::default(),
+        storage_backend,
+        &ReadyListing::new(),
+        &mut JoinBudget::unmetered(),
+        None,
+        Scope::HeldOnly,
+    )
+    .await
+}
+
+/// Which pending agreements a download pass works on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// Held memberships first, then whatever the limits and the budget allow.
+    Everything,
+    /// Held memberships only: nothing is joined.
+    HeldOnly,
+}
+
+// The gated pass's seven inputs and the scope.
+#[allow(clippy::too_many_arguments)]
+async fn download_agreements_scoped(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_limits: StorageLimits,
+    storage_backend: &StorageBackend,
+    listing: &ReadyListing,
+    budget: &mut JoinBudget,
+    tracker: Option<&StakeTracker>,
+    scope: Scope,
 ) -> Result<()> {
     let gcs_client = match storage_backend.method {
         StorageMethod::Local => None,
@@ -395,51 +653,194 @@ pub async fn download_agreements(
         None => 0,
     };
 
-    let mut query = Agreements::find().filter(agreements::Column::Downloaded.eq(false));
-    if let Some(max_file_size) = storage_limits.max_file_size {
-        let max_file_size: i64 = max_file_size
-            .try_into()
-            .map_err(|_| anyhow!("max file size exceeds trackable range"))?;
-        query = query.filter(agreements::Column::OriginalSize.lte(max_file_size));
-    }
-
-    let pending = query
+    // Oldest first. The order new agreements are taken on in is the order
+    // their joins are signed in, so the order of this node's nonces. An
+    // uploader's `create-agreement`s carry nonces in upload order, and the
+    // Portal composes an agreement's create and its joins together: a node
+    // that joined newest first (the order of the Portal's listing, and so of
+    // the rows) ran its nonces against the uploader's, and the Portal could
+    // then batch neither sequence without passing over an op of the other.
+    let pending = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(false))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
         .all(database)
         .await
         .context("failed to load agreements to download")?;
 
-    let mut downloaded_count = 0usize;
+    // Held memberships first, so the files the node already owes are fetched
+    // before new agreements use up the limits. The sort is stable: within
+    // each group the order stays oldest first.
+    let mut pending: Vec<(agreements::Model, Membership)> = pending
+        .into_iter()
+        .map(|agreement| {
+            let membership = membership(
+                &agreement,
+                listing.get(&agreement.agreement_id),
+                portal_client.node_id(),
+            );
+            (agreement, membership)
+        })
+        .collect();
+    pending.sort_by_key(|(_, membership)| *membership != Membership::Held);
 
-    for agreement in pending {
+    let mut downloaded_count = 0usize;
+    // Agreements whose join was attempted this pass, so the pass over the
+    // invalidated joins below does not sign a second one for them; and those
+    // that failed, for one line at the end.
+    let mut joined: HashSet<String> = HashSet::new();
+    let mut failed: Vec<String> = Vec::new();
+    // Failed attempts on new agreements of unknown collateral this cycle (see
+    // [`MAX_FAILED_NEW_JOINS_PER_CYCLE`]).
+    let mut failed_new = 0usize;
+
+    for (agreement, membership) in pending {
+        // Nothing to store it for: the membership is over, and the agreement
+        // is not open to a new join. Downloading it would spend bandwidth and
+        // capacity on a file no challenge will ever ask this node for.
+        if membership == Membership::Ended {
+            debug!(
+                "Not downloading {}: this node's membership in it is over",
+                agreement.agreement_id
+            );
+            continue;
+        }
+        if scope == Scope::HeldOnly && membership != Membership::Held {
+            continue;
+        }
+
         let original_size: u64 = agreement
             .original_size
             .try_into()
             .context("original_size does not fit into u64")?;
 
-        // Check storage limits before downloading
-        match check_storage_limits(
-            &agreement,
-            &storage_limits,
-            used_bytes,
-            downloaded_files,
-            original_size,
-        ) {
-            StorageLimitCheck::Allowed => {}
-            StorageLimitCheck::MaxFilesReached | StorageLimitCheck::CapacityExceeded => continue,
+        // Storage limits gate what the node takes on, never what it owes.
+        if membership != Membership::Held {
+            if storage_limits
+                .max_file_size
+                .is_some_and(|max_file_size| original_size > max_file_size)
+            {
+                continue;
+            }
+            match check_storage_limits(
+                &agreement,
+                &storage_limits,
+                used_bytes,
+                downloaded_files,
+                original_size,
+            ) {
+                StorageLimitCheck::Allowed => {}
+                StorageLimitCheck::MaxFilesReached | StorageLimitCheck::CapacityExceeded => {
+                    continue
+                }
+            }
         }
 
-        // Download file and join agreement
-        let downloaded = download_and_join_agreement(portal_client, &agreement).await?;
+        // Collateral last among the checks: it is the one that sets something
+        // aside, and an agreement skipped for size must not hold any.
+        let listed = listing.get(&agreement.agreement_id);
+        // A new agreement whose collateral the Portal does not list yet is
+        // joined on an estimate, a limited number of times per cycle.
+        let guessed = membership == Membership::None
+            && listed.is_some_and(|listed| listed.required_collateral.is_none());
+        if guessed && failed_new >= MAX_FAILED_NEW_JOINS_PER_CYCLE {
+            debug!(
+                "Not joining {} this cycle: {failed_new} attempts on new agreements already \
+                 failed",
+                agreement.agreement_id
+            );
+            continue;
+        }
+        let collateral = match budget.decide(
+            membership != Membership::None,
+            listed.map(|listed| listed.required_collateral.as_deref()),
+        ) {
+            JoinDecision::Join { collateral } => collateral,
+            JoinDecision::Skip(reason) => {
+                debug!(
+                    "Not joining {} this cycle: {reason}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        };
+
+        let downloaded = match portal_client
+            .download_file(&agreement.agreement_id, &agreement.file_id)
+            .await
+        {
+            Ok(downloaded) => downloaded,
+            Err(err) => {
+                warn!(
+                    "downloading the file of agreement {} failed; trying again next cycle: {err:#}",
+                    agreement.agreement_id
+                );
+                budget.refund(collateral);
+                // Nothing was joined: the guess goes back too, or a few
+                // agreements whose file cannot be fetched, first in line every
+                // cycle, would use up every cycle's guesses and the node would
+                // join nothing.
+                if guessed {
+                    budget.return_guess();
+                    failed_new += 1;
+                }
+                failed.push(agreement.agreement_id.clone());
+                continue;
+            }
+        };
+
+        if membership == Membership::None {
+            joined.insert(agreement.agreement_id.clone());
+            match attempt_join(portal_client, &agreement, collateral, budget, tracker).await {
+                Ok(JoinAttempt::Joined) => {}
+                Ok(JoinAttempt::Refused) => {
+                    debug!(
+                        "Discarding the file downloaded for {}",
+                        agreement.agreement_id
+                    );
+                    discard_download(&downloaded.path).await;
+                    continue;
+                }
+                Ok(JoinAttempt::Unanswered) => {
+                    // The collateral stays set aside (see `attempt_join`).
+                    // The file goes: if the Portal did store the join, the
+                    // next cycle sees the membership and fetches it as one
+                    // the node holds; if it did not, nothing is owed.
+                    discard_download(&downloaded.path).await;
+                    failed.push(agreement.agreement_id.clone());
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        "joining agreement {} failed; trying again next cycle: {err:#}",
+                        agreement.agreement_id
+                    );
+                    budget.refund(collateral);
+                    discard_download(&downloaded.path).await;
+                    failed.push(agreement.agreement_id.clone());
+                    continue;
+                }
+            }
+        }
 
         // Store file to backend and update database
-        store_agreement_file(
+        if let Err(err) = store_agreement_file(
             &downloaded,
             &agreement,
             database,
             gcs_client.as_ref(),
             storage_backend,
         )
-        .await?;
+        .await
+        {
+            warn!(
+                "storing the file of agreement {} failed; it is downloaded again next cycle: \
+                 {err:#}",
+                agreement.agreement_id
+            );
+            failed.push(agreement.agreement_id.clone());
+            continue;
+        }
 
         used_bytes = used_bytes.saturating_add(original_size);
         downloaded_files = downloaded_files.saturating_add(1);
@@ -450,7 +851,480 @@ pub async fn download_agreements(
         info!("Downloaded {} agreements", downloaded_count);
     }
 
+    // Nothing is joined without this cycle's listing; `invalidated_joins`
+    // reads it and would find nothing in an empty one anyway.
+    let rejoin = match scope {
+        Scope::Everything => invalidated_joins(database, listing, portal_client.node_id()).await?,
+        Scope::HeldOnly => Vec::new(),
+    };
+    for agreement in rejoin {
+        // Just joined above, in place of the same invalid row: its file was
+        // only now stored, which is why it shows up here too.
+        if joined.contains(&agreement.agreement_id) {
+            continue;
+        }
+        let listed = listing.get(&agreement.agreement_id);
+        let collateral = match budget.decide(
+            false,
+            listed.map(|listed| listed.required_collateral.as_deref()),
+        ) {
+            JoinDecision::Join { collateral } => collateral,
+            JoinDecision::Skip(reason) => {
+                debug!(
+                    "Not joining {} again this cycle: {reason}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        };
+        info!(
+            "Joining {} again: the Portal invalidated this node's previous join",
+            agreement.agreement_id
+        );
+        match attempt_join(portal_client, &agreement, collateral, budget, tracker).await {
+            Ok(JoinAttempt::Joined | JoinAttempt::Refused) => {}
+            Ok(JoinAttempt::Unanswered) => failed.push(agreement.agreement_id.clone()),
+            Err(err) => {
+                warn!(
+                    "joining agreement {} again failed; trying again next cycle: {err:#}",
+                    agreement.agreement_id
+                );
+                budget.refund(collateral);
+                failed.push(agreement.agreement_id.clone());
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        warn!(
+            "{} agreement(s) could not be taken on this cycle and are retried next cycle: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+    if let Some(summary) = budget.summary() {
+        info!("Agreements not joined this cycle: {summary}");
+    }
+
     Ok(())
+}
+
+/// How a join attempt ended, as far as the caller has to act on it.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinAttempt {
+    /// Signed and accepted, or nothing to sign (an unauthenticated client).
+    Joined,
+    /// The Portal refused it at its pre-check; joins are paused.
+    Refused,
+    /// Signed and sent, and the answer never came or could not be read: the
+    /// Portal may hold the join. Its collateral stays set aside.
+    Unanswered,
+}
+
+/// Join `agreement` and hold its collateral; on a `422`, pause joins instead.
+///
+/// A join whose answer was lost (a timeout, a 5xx, an unreadable `2xx`) is
+/// held like an accepted one. The Portal may have stored it, and then Kontor
+/// will reserve its collateral: giving that back to the budget would let the
+/// next joins commit the same stake twice, to be refused on chain. The hold
+/// ends like any other pending join's — its nonce is consumed, the Portal's
+/// rows show it will not execute, or the next ready listing shows the Portal
+/// never stored it (see `daemon::joins_the_portal_never_stored`).
+///
+/// Any other failure is the caller's to handle, for this agreement alone.
+async fn attempt_join(
+    portal_client: &PortalClient,
+    agreement: &agreements::Model,
+    collateral: Option<Kor>,
+    budget: &mut JoinBudget,
+    tracker: Option<&StakeTracker>,
+) -> Result<JoinAttempt> {
+    match join_downloaded_agreement(portal_client, agreement).await {
+        Ok(Some(joined)) => {
+            record_reservation(tracker, agreement, collateral, &joined);
+            Ok(JoinAttempt::Joined)
+        }
+        Ok(None) => Ok(JoinAttempt::Joined),
+        Err(err) => {
+            if let Some(unsettled) = err.downcast_ref::<UnsettledOp>() {
+                warn!(
+                    "joining agreement {} got no usable answer; the Portal may hold the join, so \
+                     its collateral stays set aside until the next listing settles it: {err:#}",
+                    agreement.agreement_id
+                );
+                if let (Some(tracker), Some(collateral)) = (tracker, collateral) {
+                    tracker.record_join(
+                        &agreement.agreement_id,
+                        collateral,
+                        unsettled.nonce,
+                        Instant::now(),
+                    );
+                }
+                return Ok(JoinAttempt::Unanswered);
+            }
+            let Some((422, code)) = status_and_code(&err) else {
+                return Err(err);
+            };
+            let code = code.unwrap_or_else(|| "UNPROCESSABLE".to_string());
+            warn!(
+                "The Portal refused to let this node join {} ({code}); joins are paused for a \
+                 while: {err:#}",
+                agreement.agreement_id
+            );
+            budget.refund(collateral);
+            budget.close(&code);
+            if let Some(tracker) = tracker {
+                tracker.pause_joins(&code, Instant::now());
+            }
+            Ok(JoinAttempt::Refused)
+        }
+    }
+}
+
+/// Hold a fresh membership's collateral until its join executes.
+fn record_reservation(
+    tracker: Option<&StakeTracker>,
+    agreement: &agreements::Model,
+    collateral: Option<Kor>,
+    joined: &JoinAgreementResponse,
+) {
+    if !joined.created {
+        return;
+    }
+    if let (Some(tracker), Some(collateral), Some(nonce)) = (tracker, collateral, joined.nonce) {
+        tracker.record_join(&agreement.agreement_id, collateral, nonce, Instant::now());
+    }
+}
+
+/// Remove a file downloaded for a join that was refused.
+async fn discard_download(path: &Path) {
+    if let Err(err) = fs::remove_file(path).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "failed to remove {} after a refused join: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// How many new agreements of unknown collateral one cycle may fail to fetch
+/// before it stops trying new ones. Each failed download gives its guess back
+/// (see `JoinBudget::return_guess`), so without a bound a long run of
+/// unfetchable agreements would cost a cycle one download timeout each.
+const MAX_FAILED_NEW_JOINS_PER_CYCLE: usize = 10;
+
+/// How long this process must have seen a membership over before the file
+/// stored for it is removed.
+///
+/// A removed file cannot be proved, so removal waits out anything still on
+/// its way: a challenge issued in the last blocks of the membership reaches
+/// the node within a cycle or two of the Portal reading it, and an hour is
+/// several of the Portal's passes. Counted from when this process first saw
+/// the membership over — a restart starts the hour again, which only delays.
+pub const ENDED_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// The same wait for a membership the node **left**.
+///
+/// A membership that was never on chain (an invalidated join, a failed
+/// agreement) cannot be challenged. One the node left can: a challenge issued
+/// before the leave executed stays open after it, for up to Kontor's deadline
+/// of 2016 blocks (about two weeks), and is slashed like any other if it
+/// expires. The node only learns of a challenge through the Portal, whose feed
+/// can lag, and a removed file is not fetched again. So the file of a left
+/// membership is kept until no such challenge can still be open.
+pub const LEFT_FILE_GRACE: Duration = Duration::from_secs(15 * 24 * 60 * 60);
+
+/// How many agreements one cycle re-reads from the Portal to learn whether
+/// the membership a stored file was for is over.
+const ENDED_CHECKS_PER_CYCLE: usize = 20;
+
+/// Challenge statuses under which a proof may still be asked of this node:
+/// to prove, or proved and not yet judged (the Portal hands a rejected one
+/// back as `active`).
+const OPEN_CHALLENGE: [&str; 3] = [STATUS_ACTIVE, STATUS_PROVED, STATUS_SUBMITTED];
+
+/// What a cycle last learned about a stored file the node may no longer owe.
+#[derive(Clone, Copy, Debug)]
+enum Seen {
+    /// The Portal says the membership is over: first seen so at `since`,
+    /// last confirmed at `checked`.
+    Over { since: Instant, checked: Instant },
+    /// The Portal did not say so when asked at this instant.
+    NotOver(Instant),
+}
+
+/// The stored files whose membership the Portal no longer lists, and what
+/// each cycle learned about them (see [`remove_ended_files`]).
+///
+/// In memory: after a restart every file is looked at afresh and waits out
+/// [`ENDED_FILE_GRACE`] again.
+#[derive(Debug, Default)]
+pub struct EndedFiles {
+    seen: Mutex<HashMap<String, Seen>>,
+}
+
+/// Whether the Portal's own row for an agreement says this node's membership
+/// in it is over for good.
+///
+/// Only on a row of this node's, and only when none of them is a membership:
+/// `left`, `failed`, or `invalid` once the agreement is no longer open to a
+/// new join in its place (`ready`, or `pending` — a batch that is cancelled
+/// puts it back to `ready`). An agreement with no row for this node says
+/// nothing, and is not taken for an ended one.
+fn membership_is_over(remote: &crate::clients::portal::Agreement, node_id: &str) -> bool {
+    let mine: Vec<&str> = remote
+        .nodes
+        .iter()
+        .filter(|node| node.node_id == node_id)
+        .map(|node| node.status.as_str())
+        .collect();
+    if mine.is_empty() || mine.iter().any(|status| is_membership_status(Some(status))) {
+        return false;
+    }
+    mine.iter().any(|status| *status != REJOINABLE_MEMBERSHIP)
+        || !matches!(remote.status.as_str(), "ready" | "pending")
+}
+
+/// How long the file of an ended membership waits before it is removed:
+/// [`LEFT_FILE_GRACE`] when the node left it, [`ENDED_FILE_GRACE`] otherwise.
+fn ended_file_grace(remote: &crate::clients::portal::Agreement, node_id: &str) -> Duration {
+    let left = remote
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && node.status == "left");
+    if left {
+        LEFT_FILE_GRACE
+    } else {
+        ENDED_FILE_GRACE
+    }
+}
+
+/// Remove the stored files of memberships that are over, and stop counting
+/// them against the storage limits.
+///
+/// A file is stored when its join is accepted. The membership can then end
+/// without the node ever needing the file again: the Portal invalidates the
+/// join and the agreement goes on without this node, the agreement fails, or
+/// the node leaves. Nothing removed those files, so they filled
+/// `STORAGE_MAX_FILES` and `STORAGE_CAPACITY` until the node took on nothing.
+///
+/// `held` is this cycle's listing of the agreements the node validly belongs
+/// to, and `listing` this cycle's ready listing — both read successfully,
+/// which the caller guarantees along with a successful challenge sync. A
+/// stored file is a candidate when its agreement is in neither. It is removed
+/// only when all of this holds:
+///
+/// - the agreement, re-read from the Portal, carries a row of this node and
+///   none of its rows is a membership (see [`membership_is_over`]) — checked
+///   when the file first becomes a candidate and again right before removal;
+/// - this process has seen it so for [`ENDED_FILE_GRACE`], or for
+///   [`LEFT_FILE_GRACE`] when the node left it;
+/// - no challenge on the agreement is still open;
+/// - no other stored agreement uses the same file.
+///
+/// The row is then marked not downloaded, with the Portal's `nodes` and
+/// `status`, so the download step sees an ended membership and leaves it
+/// alone. Returns how many files were removed.
+///
+/// # Errors
+/// If the node's own rows cannot be read. A file that cannot be removed, or
+/// an agreement that cannot be re-read, is logged and tried again later.
+#[allow(clippy::too_many_arguments)]
+pub async fn remove_ended_files(
+    portal_client: &PortalClient,
+    database: &DatabaseConnection,
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    held: &HashSet<String>,
+    listing: &ReadyListing,
+    ended: &EndedFiles,
+    now: Instant,
+) -> Result<usize> {
+    let Some(node_id) = portal_client.node_id() else {
+        return Ok(0);
+    };
+
+    let mut candidates: Vec<agreements::Model> = Agreements::find()
+        .filter(agreements::Column::Downloaded.eq(true))
+        .order_by_asc(agreements::Column::CreatedAt)
+        .order_by_asc(agreements::Column::AgreementId)
+        .all(database)
+        .await
+        .context("failed to load the stored agreements")?
+        .into_iter()
+        .filter(|agreement| {
+            !held.contains(&agreement.agreement_id)
+                && !listing.contains_key(&agreement.agreement_id)
+        })
+        .collect();
+
+    // Forget what is no longer a candidate: held again, listed again, removed.
+    let known: HashMap<String, Seen> = {
+        let mut seen = ended.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|agreement_id, _| {
+            candidates
+                .iter()
+                .any(|candidate| &candidate.agreement_id == agreement_id)
+        });
+        seen.clone()
+    };
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    // Which candidates are worth a read this cycle: one never looked at, one
+    // whose grace has run out (to confirm before removing), or one the Portal
+    // did not report over, once the grace has passed since it was asked.
+    // Never-seen ones first, and at most `ENDED_CHECKS_PER_CYCLE` in all.
+    candidates.retain(|candidate| match known.get(&candidate.agreement_id) {
+        None => true,
+        Some(Seen::Over { checked: asked, .. } | Seen::NotOver(asked)) => {
+            now.duration_since(*asked) >= ENDED_FILE_GRACE
+        }
+    });
+    candidates.sort_by_key(|candidate| known.contains_key(&candidate.agreement_id));
+    candidates.truncate(ENDED_CHECKS_PER_CYCLE);
+
+    let mut removed = 0usize;
+    for agreement in candidates {
+        let record = |seen: Seen| {
+            ended
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(agreement.agreement_id.clone(), seen);
+        };
+        let remote = match portal_client.get_agreement(&agreement.agreement_id).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                debug!(
+                    "could not re-read agreement {} to see whether its file is still owed: {err:#}",
+                    agreement.agreement_id
+                );
+                // Asked, and not told it is over: it waits its turn like the
+                // others, so rows the Portal cannot serve do not take every
+                // cycle's reads from the ones it can.
+                record(Seen::NotOver(now));
+                continue;
+            }
+        };
+        if !membership_is_over(&remote, node_id) {
+            record(Seen::NotOver(now));
+            continue;
+        }
+        let grace = ended_file_grace(&remote, node_id);
+        let since = match known.get(&agreement.agreement_id) {
+            Some(Seen::Over { since, .. }) => *since,
+            _ => {
+                record(Seen::Over {
+                    since: now,
+                    checked: now,
+                });
+                debug!(
+                    "the membership in {} is over; its file is removed in {} minutes if nothing \
+                     asks for it",
+                    agreement.agreement_id,
+                    grace.as_secs() / 60
+                );
+                continue;
+            }
+        };
+        if now.duration_since(since) < grace {
+            record(Seen::Over {
+                since,
+                checked: now,
+            });
+            continue;
+        }
+
+        let open_challenges = Challenges::find()
+            .filter(challenges::Column::AgreementId.eq(&agreement.agreement_id))
+            .filter(challenges::Column::Status.is_in(OPEN_CHALLENGE))
+            .count(database)
+            .await
+            .context("failed to count the open challenges of an ended membership")?;
+        if open_challenges > 0 {
+            debug!(
+                "keeping the file of {}: {open_challenges} challenge(s) on it are still open",
+                agreement.agreement_id
+            );
+            continue;
+        }
+
+        let shared = Agreements::find()
+            .filter(agreements::Column::Downloaded.eq(true))
+            .filter(agreements::Column::FileId.eq(&agreement.file_id))
+            .filter(agreements::Column::AgreementId.ne(&agreement.agreement_id))
+            .count(database)
+            .await
+            .context("failed to check whether a stored file is shared")?;
+        if shared == 0 {
+            if let Err(err) =
+                delete_stored_file(storage_backend, storage_dir, &agreement.file_id).await
+            {
+                warn!(
+                    "could not remove the file of ended membership {}; trying again later: {err:#}",
+                    agreement.agreement_id
+                );
+                continue;
+            }
+        }
+
+        let nodes = serde_json::to_value(&remote.nodes).context("serializing agreement nodes")?;
+        Agreements::update(agreements::ActiveModel {
+            agreement_id: sea_orm::ActiveValue::Unchanged(agreement.agreement_id.clone()),
+            downloaded: Set(false),
+            nodes: Set(nodes),
+            status: Set(remote.status.clone()),
+            ..Default::default()
+        })
+        .exec(database)
+        .await
+        .context("marking an ended membership's file as removed")?;
+        ended
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&agreement.agreement_id);
+        info!(
+            "Removed the file of {} ({} bytes): this node's membership in it is over",
+            agreement.agreement_id, agreement.original_size
+        );
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
+/// Delete a stored file from the configured backend. A file already gone is
+/// not an error.
+async fn delete_stored_file(
+    storage_backend: &StorageBackend,
+    storage_dir: &Path,
+    file_id: &str,
+) -> Result<()> {
+    match storage_backend.method {
+        StorageMethod::Local => match fs::remove_file(storage_dir.join(file_id)).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow!(err).context(format!("removing {file_id} from local storage"))),
+        },
+        StorageMethod::Gcs => {
+            let deleted = storage_backend
+                .gcs_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("GCS storage backend is not initialized"))?
+                .delete_object(file_id)
+                .await;
+            match deleted {
+                Err(err) if !matches!(status_and_code(&err), Some((404, _))) => {
+                    Err(err.context(format!("removing {file_id} from GCS")))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
 }
 
 async fn current_used_capacity(database: &DatabaseConnection) -> Result<u64> {
@@ -679,11 +1553,19 @@ pub(crate) async fn rebuild_ledger(
     database: &DatabaseConnection,
     storage_root: &Path,
 ) -> Result<LedgerStats> {
+    // Every agreement this node has prepared a file for, whether the file is
+    // still stored or was removed once the membership ended (see
+    // [`remove_ended_files`]): a slot only needs the root, the padded length
+    // and the ledger index, not the bytes. Dropping the removed ones would
+    // lower the file count while the highest slot stays, and a node leaving
+    // many agreements would run into kontor-crypto's sparsity limit — and
+    // lose the ledger its remaining proofs are made against.
     let downloaded = Agreements::find()
-        .filter(agreements::Column::Downloaded.eq(true))
+        .filter(agreements::Column::Root.is_not_null())
+        .filter(agreements::Column::PaddedLen.is_not_null())
         .all(database)
         .await
-        .context("loading downloaded agreements for ledger rebuild")?;
+        .context("loading the prepared agreements for ledger rebuild")?;
 
     let mut entries: Vec<IndexedFile> = Vec::with_capacity(downloaded.len());
     let mut stats = LedgerStats::default();
@@ -784,7 +1666,8 @@ mod tests {
     use crate::crypto::BlsKeyPair;
     use crate::entities::prelude::Agreements;
     use crate::testutils::{
-        setup_agreements_db, unique_storage_dir, AgreementFixture, TEST_PRIVATE_KEY,
+        setup_agreements_db, setup_in_memory_db, unique_storage_dir, AgreementFixture,
+        TEST_PRIVATE_KEY,
     };
     use halo2curves::pasta::Fq;
     use sea_orm::{EntityTrait, PaginatorTrait};
@@ -1115,20 +1998,14 @@ mod tests {
             gcs_client: Some(Arc::new(gcs_client)),
         };
 
-        let err = download_agreements(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
         )
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("uploading FILE-gcs-fail to GCS bucket"),
-            "expected upload failure to be surfaced, got {err}"
-        );
+        .expect("one agreement's failure does not fail the pass");
         assert!(
             !storage_dir.join(file_id).exists(),
             "local file should be removed after GCS upload failure"
@@ -1212,20 +2089,14 @@ mod tests {
             gcs_client: Some(Arc::new(gcs_client)),
         };
 
-        let err = download_agreements(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
         )
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("uploading FILE-gcs-cleanup-fail to GCS bucket"),
-            "upload failure should surface"
-        );
+        .expect("one agreement's failure does not fail the pass");
         assert!(
             file_path.is_dir(),
             "cleanup failure should leave directory behind for coverage"
@@ -1743,7 +2614,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "post-processing failure should bubble up");
+        assert!(
+            result.is_ok(),
+            "one agreement's failure does not fail the pass"
+        );
         assert!(
             !storage_dir.join(file_id).exists(),
             "downloaded file should be removed when post-processing fails"
@@ -1956,20 +2830,14 @@ mod tests {
         fx.original_size = 100;
         fx.into_active_model().insert(&database).await.unwrap();
 
-        let err = download_agreements(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir),
             &database,
             StorageLimits::default(),
             &StorageBackend::local(),
         )
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("downloading file for agreement AGREEMENT-download-error"),
-            "error should contain context about the agreement, got: {err}"
-        );
+        .expect("one agreement's failure does not fail the pass");
     }
 
     #[tokio::test]
@@ -2051,7 +2919,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "post-processing failure should bubble up");
+        assert!(
+            result.is_ok(),
+            "one agreement's failure does not fail the pass"
+        );
         assert!(
             !storage_dir.join(file_id).exists(),
             "local file should be cleaned up after post-processing failure"
@@ -2150,8 +3021,8 @@ mod tests {
         .await;
 
         assert!(
-            result.is_err(),
-            "post-processing failure should still bubble up even when GCS delete fails"
+            result.is_ok(),
+            "one agreement's failure does not fail the pass, even when the GCS delete fails"
         );
     }
 
@@ -2294,19 +3165,14 @@ mod tests {
         };
 
         let _guard = simulate_commit_failure_once();
-        let err = download_agreements(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
         )
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("simulated commit failure"),
-            "commit error should be surfaced"
-        );
+        .expect("one agreement's failure does not fail the pass");
         assert!(
             file_path.is_dir(),
             "cleanup removal should fail when file path becomes a directory"
@@ -2397,19 +3263,14 @@ mod tests {
             gcs_client: Some(Arc::new(gcs_client)),
         };
 
-        let err = download_agreements(
+        download_agreements(
             &PortalClient::new(mock_server.uri(), storage_dir.clone()),
             &database,
             StorageLimits::default(),
             &backend,
         )
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("prepare_file failed"),
-            "post-processing failure should bubble up"
-        );
+        .expect("one agreement's failure does not fail the pass");
         assert!(
             file_path.is_dir(),
             "cleanup failure should leave directory behind after delete failure"
@@ -2701,5 +3562,1355 @@ mod tests {
         assert!(depth_from_padded_len(0).is_err());
         assert!(depth_from_padded_len(48).is_err());
         assert!(depth_from_padded_len(-8).is_err());
+    }
+
+    // ── Stake gating ────────────────────────────────────────────────────────
+
+    use crate::app::tasks::stake::StakePolicy;
+    use crate::clients::portal::{Agreement, RegistryEntry};
+
+    /// Serve the download of `agreement_id` from the mock server.
+    async fn mount_download(mock_server: &MockServer, agreement_id: &str) {
+        let file_path = format!("/files/{agreement_id}");
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}/download")))
+            .and(query_param("no_redirect", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "download_url": format!("{}{file_path}", mock_server.uri())
+            })))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(file_path))
+            .respond_with(ResponseTemplate::new(200).set_body_string("file-body"))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// A pending agreement this node has not joined.
+    async fn insert_unjoined(database: &DatabaseConnection, agreement_id: &str, file_id: &str) {
+        let mut fx = AgreementFixture::new(agreement_id, file_id);
+        fx.nodes = json!([]);
+        fx.into_active_model().insert(database).await.unwrap();
+    }
+
+    fn listed(agreement_id: &str, collateral: Option<&str>, nodes: &[&str]) -> Agreement {
+        serde_json::from_value(json!({
+            "agreement_id": agreement_id,
+            "user_id": "user_1",
+            "file_id": format!("FILE-{agreement_id}"),
+            "filename": "test.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": nodes.iter().map(|n| json!({"node_id": n, "status": "valid"})).collect::<Vec<_>>(),
+            "transaction_id": null,
+            "status": "ready",
+            "created_at": "2024-01-01T00:00:00Z",
+            "required_collateral": collateral,
+        }))
+        .unwrap()
+    }
+
+    /// A listed agreement in which `node_id` has a row with `status`.
+    fn listed_with_status(
+        agreement_id: &str,
+        collateral: Option<&str>,
+        node_id: &str,
+        status: &str,
+    ) -> Agreement {
+        let mut agreement = listed(agreement_id, collateral, &[]);
+        agreement.nodes = vec![AgreementNode {
+            node_id: node_id.to_string(),
+            status: status.to_string(),
+        }];
+        agreement
+    }
+
+    fn listing(agreements: Vec<Agreement>) -> ReadyListing {
+        agreements
+            .into_iter()
+            .map(|a| (a.agreement_id.clone(), a))
+            .collect()
+    }
+
+    /// A tracker that has read a bond with `available` unreserved KOR.
+    fn tracker_with_available(available: &str) -> StakeTracker {
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let entry = RegistryEntry {
+            signer_id: 42,
+            x_only_pubkey: Some("ab".into()),
+            bls_pubkey: None,
+            next_nonce: Some(0),
+            kor_balance: Some("5".into()),
+            user_id: None,
+            stake: Some("100".into()),
+            stake_reserved: None,
+            stake_available: Some(available.into()),
+            stake_withdrawal_height: None,
+            bond_cleanup_pending: Some(false),
+            reward_balance: None,
+        };
+        tracker.observe(Some(&entry), Instant::now());
+        tracker
+    }
+
+    fn requests_to(requests: &[Request], needle: &str) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.url.path().contains(needle))
+            .count()
+    }
+
+    /// The point of the gate: nothing is downloaded — let alone joined — that
+    /// the stake cannot cover. A known collateral is checked exactly; an
+    /// unknown one (the usual case: the Portal joins in the batch that creates
+    /// the agreement) is taken at the estimate. What was set aside for each is
+    /// held for the next cycle.
+    #[tokio::test]
+    async fn only_agreements_the_stake_covers_are_downloaded() {
+        let mock_server = MockServer::start().await;
+        for id in ["AGR-fits", "AGR-too-big", "AGR-unknown", "AGR-unlisted"] {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        for id in ["AGR-fits", "AGR-too-big", "AGR-unknown", "AGR-unlisted"] {
+            insert_unjoined(&database, id, &format!("FILE-{id}")).await;
+        }
+        let storage_dir = unique_storage_dir("gate_covers");
+        let client = create_authenticated_client(&mock_server, storage_dir).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-fits", Some("30"), &[]),
+            listed("AGR-too-big", Some("50.000000000000000001"), &[]),
+            listed("AGR-unknown", None, &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-fits/join"), 1);
+        assert_eq!(requests_to(&requests, "AGR-unknown/join"), 1);
+        for skipped in ["AGR-too-big", "AGR-unlisted"] {
+            assert_eq!(
+                requests_to(&requests, skipped),
+                0,
+                "{skipped} must be neither downloaded nor joined"
+            );
+        }
+
+        let fits = Agreements::find_by_id("AGR-fits")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fits.downloaded);
+        let status = tracker.status();
+        let mut held: Vec<(String, String)> = status["pending_joins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|join| {
+                (
+                    join["agreement_id"].as_str().unwrap().to_string(),
+                    join["collateral"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                ("AGR-fits".to_string(), "30".to_string()),
+                ("AGR-unknown".to_string(), "10".to_string()),
+            ],
+            "the exact collateral, and the default estimate for the unknown one"
+        );
+    }
+
+    /// A membership already held is an obligation: its file is downloaded
+    /// whatever the stake says, cleanup included.
+    #[tokio::test]
+    async fn an_existing_membership_is_downloaded_even_with_joins_closed() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-mine").await;
+        // Nor joined again: the Portal would store nothing, and the join's
+        // nonce would be spent for nothing.
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-mine/join"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "node_id": "NODE-test",
+                "created": false
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-mine", "FILE-AGR-mine").await;
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_mine")).await;
+
+        let tracker = tracker_with_available("0");
+        let listing = listing(vec![listed("AGR-mine", Some("30"), &["NODE-test"])]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let mine = Agreements::find_by_id("AGR-mine")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mine.downloaded);
+        assert_eq!(
+            tracker.status()["pending_joins"],
+            json!([]),
+            "a held membership reserves nothing new"
+        );
+        assert_eq!(client.current_nonce(), Some(0), "nothing was signed");
+    }
+
+    /// A held membership with its file missing is what gets slashed, so it is
+    /// downloaded first — before a new agreement takes the last slot — and past
+    /// every storage limit, which only gate what the node takes on.
+    #[tokio::test]
+    async fn held_memberships_are_downloaded_first_and_past_the_limits() {
+        let mock_server = MockServer::start().await;
+        for id in ["AGR-new", "AGR-mine", "AGR-mine-too"] {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        // Inserted first, so the database would hand it out first, and within
+        // every limit on its own.
+        let mut new = AgreementFixture::new("AGR-new", "FILE-AGR-new");
+        new.nodes = json!([]);
+        new.original_size = 10;
+        new.into_active_model().insert(&database).await.unwrap();
+        AgreementFixture::new("AGR-mine", "FILE-AGR-mine")
+            .into_active_model()
+            .insert(&database)
+            .await
+            .unwrap();
+        let mut too = AgreementFixture::new("AGR-mine-too", "FILE-AGR-mine-too");
+        too.nodes = json!([{"node_id": "NODE-test", "status": "valid"}]);
+        too.original_size = 10_000;
+        too.into_active_model().insert(&database).await.unwrap();
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("held_first")).await;
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits {
+                capacity: Some(100),
+                max_file_size: Some(50),
+                max_files: Some(1),
+            },
+            &StorageBackend::local(),
+            &listing(vec![listed("AGR-new", Some("1"), &[])]),
+            &mut JoinBudget::unmetered(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (id, downloaded) in [
+            ("AGR-mine", true),
+            ("AGR-mine-too", true),
+            ("AGR-new", false),
+        ] {
+            let row = Agreements::find_by_id(id)
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.downloaded, downloaded, "{id}");
+        }
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "/join"), 0, "nothing joined");
+    }
+
+    /// A Portal `docs/node-portal-contract.md` §5 refusal is survived: the
+    /// cycle goes on, the file it downloaded is thrown away, nothing else is
+    /// joined this cycle, and joins stay paused rather than being retried every
+    /// 30 seconds.
+    #[tokio::test]
+    async fn a_join_refused_for_collateral_does_not_fail_the_cycle() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-a").await;
+        mount_download(&mock_server, "AGR-b").await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-a/join"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": {
+                    "code": "INSUFFICIENT_COLLATERAL",
+                    "message": "insufficient unreserved collateral",
+                    "status": 422
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+        mount_join_agreement_mock(&mock_server, "AGR-b").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-a", "FILE-AGR-a").await;
+        insert_unjoined(&database, "AGR-b", "FILE-AGR-b").await;
+        let storage_dir = unique_storage_dir("gate_refused");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-a", Some("10"), &[]),
+            listed("AGR-b", Some("10"), &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .expect("a refused join must not fail the cycle");
+
+        for id in ["AGR-a", "AGR-b"] {
+            let row = Agreements::find_by_id(id)
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!row.downloaded, "{id} must not be marked downloaded");
+        }
+        assert!(
+            !storage_dir.join("FILE-AGR-a").exists(),
+            "the file downloaded for the refused join is discarded"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests_to(&requests, "AGR-b"),
+            0,
+            "nothing more this cycle"
+        );
+        assert_eq!(
+            client.current_nonce(),
+            Some(0),
+            "the refused join's nonce was given back"
+        );
+
+        assert_eq!(tracker.status()["joins_paused"], "INSUFFICIENT_COLLATERAL");
+        let mut next_cycle = tracker.join_budget(Instant::now());
+        assert!(matches!(
+            next_cycle.decide(false, Some(Some("1"))),
+            JoinDecision::Skip(_)
+        ));
+    }
+
+    /// Any other refusal — a `403` for an agreement that left `ready` between
+    /// the listing and the join — costs that agreement this cycle, not the
+    /// cycle: its download is discarded, its collateral given back, joins are
+    /// not paused, and the next agreement is still taken on.
+    #[tokio::test]
+    async fn other_join_failures_cost_the_agreement_not_the_cycle() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-x").await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-x/join"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        mount_download(&mock_server, "AGR-y").await;
+        mount_join_agreement_mock(&mock_server, "AGR-y").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-x", "FILE-AGR-x").await;
+        insert_unjoined(&database, "AGR-y", "FILE-AGR-y").await;
+        let storage_dir = unique_storage_dir("gate_403");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-x", Some("10"), &[]),
+            listed("AGR-y", Some("10"), &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .expect("a failed join is that agreement's problem");
+
+        let by_id = |id: &str| {
+            let database = database.clone();
+            let id = id.to_string();
+            async move {
+                Agreements::find_by_id(id)
+                    .one(&database)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert!(
+            !by_id("AGR-x").await.downloaded,
+            "AGR-x is left for next cycle"
+        );
+        assert!(
+            !storage_dir.join("FILE-AGR-x").exists(),
+            "its download is discarded"
+        );
+        assert!(by_id("AGR-y").await.downloaded, "AGR-y was still taken on");
+        assert_eq!(
+            tracker.status()["joins_paused"],
+            serde_json::Value::Null,
+            "only a 422 pauses joins"
+        );
+        assert_eq!(
+            tracker.pending_join_agreements(),
+            vec!["AGR-y".to_string()],
+            "only the join that was accepted holds collateral"
+        );
+        assert!(
+            matches!(
+                budget.decide(false, Some(Some("40"))),
+                JoinDecision::Join { .. }
+            ),
+            "AGR-x's collateral went back to the budget"
+        );
+    }
+
+    /// A join the Portal gave no usable answer to — a timeout, a 5xx — may be
+    /// stored there all the same, and Kontor will then reserve its
+    /// collateral. It used to go straight back to the budget, which let the
+    /// next joins commit the same stake a second time. It stays set aside,
+    /// like an accepted join's, until the Portal's rows settle it.
+    #[tokio::test]
+    async fn a_join_whose_answer_was_lost_keeps_its_collateral_set_aside() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-x").await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-x/join"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        mount_download(&mock_server, "AGR-y").await;
+        mount_join_agreement_mock(&mock_server, "AGR-y").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-x", "FILE-AGR-x").await;
+        insert_unjoined(&database, "AGR-y", "FILE-AGR-y").await;
+        let storage_dir = unique_storage_dir("gate_500");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-x", Some("10"), &[]),
+            listed("AGR-y", Some("10"), &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .expect("an unanswered join is that agreement's problem");
+
+        let stored = |id: &'static str| {
+            let database = database.clone();
+            async move {
+                Agreements::find_by_id(id)
+                    .one(&database)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert!(
+            !stored("AGR-x").await.downloaded,
+            "AGR-x is not stored: the next cycle fetches it if the join turns out held"
+        );
+        assert!(
+            !storage_dir.join("FILE-AGR-x").exists(),
+            "its download is discarded"
+        );
+        assert!(stored("AGR-y").await.downloaded, "AGR-y was still taken on");
+        let mut pending = tracker.pending_join_agreements();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec!["AGR-x".to_string(), "AGR-y".to_string()],
+            "the unanswered join holds its collateral like the accepted one"
+        );
+        // 50 unreserved, 10 set aside for each: 30 left this cycle, and the
+        // next cycle's budget starts from the same 30.
+        assert!(matches!(
+            budget.decide(false, Some(Some("40"))),
+            JoinDecision::Skip(_)
+        ));
+        assert!(matches!(
+            tracker
+                .join_budget(Instant::now())
+                .decide(false, Some(Some("40"))),
+            JoinDecision::Skip(_)
+        ));
+        assert!(matches!(
+            tracker
+                .join_budget(Instant::now())
+                .decide(false, Some(Some("30"))),
+            JoinDecision::Join { .. }
+        ));
+    }
+
+    /// Agreements are joined oldest first, whatever order their rows were
+    /// stored in — the Portal lists newest first, and the node used to join in
+    /// that order. An uploader's creates carry nonces in upload order; joining
+    /// against it left the Portal no batch that respected both sequences.
+    #[tokio::test]
+    async fn new_agreements_are_joined_oldest_first() {
+        let mock_server = MockServer::start().await;
+        let database = setup_agreements_db().await;
+        // Stored newest first, as the listing gives them.
+        for (agreement_id, created_at) in [
+            ("AGR-c", "2024-03-01T00:00:00Z"),
+            ("AGR-b", "2024-02-01T00:00:00Z"),
+            ("AGR-a2", "2024-01-01T00:00:00Z"),
+            ("AGR-a1", "2024-01-01T00:00:00Z"),
+        ] {
+            mount_download(&mock_server, agreement_id).await;
+            mount_join_agreement_mock(&mock_server, agreement_id).await;
+            let mut fx = AgreementFixture::new(agreement_id, format!("FILE-{agreement_id}"));
+            fx.nodes = json!([]);
+            fx.created_at = chrono::DateTime::parse_from_rfc3339(created_at).unwrap();
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let storage_dir = unique_storage_dir("oldest_first");
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+
+        download_agreements(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+        )
+        .await
+        .unwrap();
+
+        let joined: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/join"))
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(
+            joined,
+            [
+                "/api/agreements/AGR-a1/join",
+                "/api/agreements/AGR-a2/join",
+                "/api/agreements/AGR-b/join",
+                "/api/agreements/AGR-c/join",
+            ],
+            "oldest first, ties by id"
+        );
+        // And so are the nonces: ascending with the agreements' age.
+        let nonces: Vec<u64> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/join"))
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["nonce"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            nonces.windows(2).all(|pair| pair[0] < pair[1]),
+            "{nonces:?}"
+        );
+    }
+
+    /// A download the Portal cannot serve is the same: that agreement waits,
+    /// the others go on.
+    #[tokio::test]
+    async fn a_failed_download_costs_the_agreement_not_the_cycle() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-x/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+        mount_download(&mock_server, "AGR-y").await;
+        mount_join_agreement_mock(&mock_server, "AGR-y").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-x", "FILE-AGR-x").await;
+        insert_unjoined(&database, "AGR-y", "FILE-AGR-y").await;
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_dl_503")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-x", Some("10"), &[]),
+            listed("AGR-y", Some("10"), &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let x = Agreements::find_by_id("AGR-x")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        let y = Agreements::find_by_id("AGR-y")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!x.downloaded);
+        assert!(y.downloaded);
+        assert_eq!(
+            client.current_nonce(),
+            Some(1),
+            "one join signed, for AGR-y"
+        );
+    }
+
+    /// An agreement whose invalid row is joined again in the main pass — its
+    /// file was not stored yet — is not joined a second time by the pass over
+    /// the invalidated joins, which sees it stored by then.
+    #[tokio::test]
+    async fn an_invalidated_join_is_made_once_per_cycle() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-inv").await;
+        Mock::given(method("POST"))
+            .and(path("/api/agreements/AGR-inv/join"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "agreement_id": "AGR-inv",
+                "node_id": "NODE-test",
+                "bls_signature": "0xabcdef",
+                "joined_at": "2025-01-01T00:00:00Z",
+                "created": true,
+                "nonce": 0
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_agreements_db().await;
+        let mut fx = AgreementFixture::new("AGR-inv", "FILE-AGR-inv");
+        fx.nodes = json!([{"node_id": "NODE-test", "status": "invalid"}]);
+        fx.into_active_model().insert(&database).await.unwrap();
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_inv_once")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![listed_with_status(
+            "AGR-inv",
+            Some("10"),
+            "NODE-test",
+            "invalid",
+        )]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(client.current_nonce(), Some(1), "exactly one join signed");
+        assert_eq!(
+            tracker.pending_join_agreements(),
+            vec!["AGR-inv".to_string()]
+        );
+    }
+
+    /// An old Portal reports no stake: everything pending is downloaded and
+    /// joined as before, listed or not.
+    #[tokio::test]
+    async fn an_old_portal_downloads_everything_as_before() {
+        let mock_server = MockServer::start().await;
+        mount_download(&mock_server, "AGR-old").await;
+        mount_join_agreement_mock(&mock_server, "AGR-old").await;
+
+        let database = setup_agreements_db().await;
+        insert_unjoined(&database, "AGR-old", "FILE-AGR-old").await;
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_old")).await;
+
+        let tracker = StakeTracker::new(StakePolicy::default());
+        let mut legacy = RegistryEntry {
+            signer_id: 42,
+            x_only_pubkey: Some("ab".into()),
+            bls_pubkey: None,
+            next_nonce: Some(0),
+            kor_balance: Some("10".into()),
+            user_id: None,
+            stake: None,
+            stake_reserved: None,
+            stake_available: None,
+            stake_withdrawal_height: None,
+            bond_cleanup_pending: None,
+            reward_balance: None,
+        };
+        legacy.kor_balance = Some("10".into());
+        tracker.observe(Some(&legacy), Instant::now());
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &ReadyListing::new(),
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let old = Agreements::find_by_id("AGR-old")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old.downloaded);
+    }
+
+    #[test]
+    fn membership_is_read_from_both_row_shapes_and_the_listing() {
+        let model = |nodes: serde_json::Value| {
+            let mut fx = AgreementFixture::new("AGR-1", "F");
+            fx.nodes = nodes;
+            let active = fx.into_active_model();
+            agreements::Model {
+                agreement_id: active.agreement_id.unwrap(),
+                user_id: active.user_id.unwrap(),
+                file_id: active.file_id.unwrap(),
+                filename: active.filename.unwrap(),
+                mime_type: active.mime_type.unwrap(),
+                original_size: active.original_size.unwrap(),
+                nodes: active.nodes.unwrap(),
+                root: None,
+                padded_len: None,
+                object_id: None,
+                ledger_index: None,
+                downloaded: false,
+                transaction_id: None,
+                curation: json!({}),
+                status: "ready".into(),
+                created_at: active.created_at.unwrap(),
+            }
+        };
+        let me = Some("NODE-test");
+
+        let bare = model(json!(["NODE-test"]));
+        assert_eq!(membership(&bare, None, me), Membership::Held);
+        assert_eq!(
+            membership(&bare, None, Some("NODE-other")),
+            Membership::None
+        );
+        assert_eq!(membership(&bare, None, None), Membership::None);
+
+        let valid = model(json!([{"node_id": "NODE-test", "status": "valid"}]));
+        assert_eq!(membership(&valid, None, me), Membership::Held);
+
+        let none = model(json!([]));
+        let pending = listed("AGR-1", Some("1"), &["NODE-test"]);
+        assert_eq!(membership(&none, Some(&pending), me), Membership::Held);
+        assert_eq!(membership(&none, None, me), Membership::None);
+
+        for status in ["failed", "left"] {
+            let ended = model(json!([{"node_id": "NODE-test", "status": status}]));
+            assert_eq!(membership(&ended, None, me), Membership::Ended, "{status}");
+        }
+        // An invalidated join is one the Portal takes again: no membership,
+        // nothing owed, and nothing in the way of a new one — while the
+        // agreement is still open to joins. Once it has moved on, the row is
+        // over like a failed one.
+        let invalid = model(json!([{"node_id": "NODE-test", "status": "invalid"}]));
+        assert_eq!(membership(&invalid, None, me), Membership::None);
+        let mut closed = model(json!([{"node_id": "NODE-test", "status": "invalid"}]));
+        closed.status = "confirmed".into();
+        assert_eq!(membership(&closed, None, me), Membership::Ended);
+        let reopened = listed_with_status("AGR-1", Some("1"), "NODE-test", "invalid");
+        assert_eq!(membership(&closed, Some(&reopened), me), Membership::None);
+
+        // The listing is this cycle's truth where it has this node's row: the
+        // local row is only refreshed for memberships the Portal still counts
+        // as valid, so it is the one that goes stale.
+        let left = model(json!([{"node_id": "NODE-test", "status": "left"}]));
+        assert_eq!(membership(&left, Some(&pending), me), Membership::Held);
+        let invalidated = listed_with_status("AGR-1", Some("1"), "NODE-test", "invalid");
+        assert_eq!(
+            membership(&valid, Some(&invalidated), me),
+            Membership::None,
+            "a valid local row does not outlive the listing's invalid one"
+        );
+        let other = listed("AGR-1", Some("1"), &["NODE-other"]);
+        assert_eq!(
+            membership(&valid, Some(&other), me),
+            Membership::Held,
+            "a listing without this node's row leaves the local row to speak"
+        );
+    }
+
+    /// A join the Portal invalidated — never applied on chain — is made again
+    /// in its place while the agreement is listed as ready. The file is
+    /// already stored, so nothing is downloaded a second time; the collateral
+    /// is budgeted and held like any new join's. A `failed` row is final.
+    #[tokio::test]
+    async fn an_invalidated_join_is_made_again_without_a_second_download() {
+        let mock_server = MockServer::start().await;
+        for id in ["AGR-invalid", "AGR-failed"] {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        for id in ["AGR-invalid", "AGR-failed"] {
+            let mut fx = AgreementFixture::new(id, format!("FILE-{id}"));
+            // What reconciliation last wrote, before the Portal invalidated it.
+            fx.nodes = json!([{"node_id": "NODE-test", "status": "valid"}]);
+            fx.downloaded = true;
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_rejoin")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed_with_status("AGR-invalid", Some("30"), "NODE-test", "invalid"),
+            listed_with_status("AGR-failed", Some("30"), "NODE-test", "failed"),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-invalid/join"), 1);
+        assert_eq!(requests_to(&requests, "AGR-invalid/download"), 0);
+        assert_eq!(
+            requests_to(&requests, "AGR-failed"),
+            0,
+            "a failed join is final"
+        );
+        assert_eq!(
+            tracker.status()["pending_joins"],
+            json!([{"agreement_id": "AGR-invalid", "collateral": "30", "nonce": 0}])
+        );
+    }
+
+    /// A membership that is over — the node left, its join failed on chain, or
+    /// its join was invalidated and the agreement has moved on — is neither
+    /// joined again nor downloaded: there is no membership to store the file
+    /// for, and a challenge will never ask this node for it.
+    #[tokio::test]
+    async fn an_ended_membership_is_neither_downloaded_nor_joined() {
+        let mock_server = MockServer::start().await;
+        let ids = ["AGR-left", "AGR-failed-row", "AGR-invalid-closed"];
+        for id in ids {
+            mount_download(&mock_server, id).await;
+            mount_join_agreement_mock(&mock_server, id).await;
+        }
+
+        let database = setup_agreements_db().await;
+        for (id, status) in [
+            ("AGR-left", "left"),
+            ("AGR-failed-row", "failed"),
+            ("AGR-invalid-closed", "invalid"),
+        ] {
+            let mut fx = AgreementFixture::new(id, format!("FILE-{id}"));
+            fx.nodes = json!([{"node_id": "NODE-test", "status": status}]);
+            fx.status = "confirmed".into();
+            fx.into_active_model().insert(&database).await.unwrap();
+        }
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_ended")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "{requests:?}");
+        for id in ids {
+            let row = Agreements::find_by_id(id)
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!row.downloaded, "{id}");
+        }
+        assert_eq!(client.current_nonce(), Some(0), "nothing was signed");
+    }
+
+    /// What the Portal's detail of `agreement_id` says of this node.
+    async fn mount_detail(
+        mock_server: &MockServer,
+        agreement_id: &str,
+        status: &str,
+        mine: Option<&str>,
+    ) {
+        let mut detail = json!({
+            "agreement_id": agreement_id,
+            "user_id": "user_1",
+            "file_id": format!("FILE-{agreement_id}"),
+            "filename": "test.bin",
+            "mime_type": "application/octet-stream",
+            "original_size": 123,
+            "nodes": [{"node_id": "NODE-other", "status": "valid"}],
+            "transaction_id": null,
+            "status": status,
+            "created_at": "2024-01-01T00:00:00Z",
+        });
+        if let Some(mine) = mine {
+            detail["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"node_id": "NODE-test", "status": mine}));
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/agreements/{agreement_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(detail))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// A stored agreement, its file on disk.
+    async fn insert_stored(database: &DatabaseConnection, storage_dir: &Path, agreement_id: &str) {
+        let file_id = format!("FILE-{agreement_id}");
+        stdfs::create_dir_all(storage_dir).unwrap();
+        stdfs::write(storage_dir.join(&file_id), b"stored").unwrap();
+        AgreementFixture {
+            downloaded: true,
+            status: "confirmed".into(),
+            nodes: json!([{"node_id": "NODE-test", "status": "valid"}]),
+            ..AgreementFixture::new(agreement_id, file_id)
+        }
+        .into_active_model()
+        .insert(database)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_challenge(database: &DatabaseConnection, agreement_id: &str, status: &str) {
+        let now = chrono::Utc::now().fixed_offset();
+        challenges::ActiveModel {
+            challenge_id: Set(format!("chal-{agreement_id}")),
+            agreement_id: Set(agreement_id.into()),
+            block_height: Set(100),
+            challenge_count: Set(1),
+            seed: Set("00".into()),
+            prover_id: Set("NODE-test".into()),
+            deadline_height: Set(2116),
+            status: Set(status.into()),
+            proof: Set(None),
+            bls_signature: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(database)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn a_membership_is_over_only_on_this_node_s_own_rows() {
+        let over = |status: &str, mine: &[&str]| {
+            let mut agreement = listed("AGR-x", None, &["NODE-other"]);
+            agreement.status = status.to_string();
+            for mine in mine {
+                agreement.nodes.push(AgreementNode {
+                    node_id: "NODE-test".into(),
+                    status: (*mine).to_string(),
+                });
+            }
+            membership_is_over(&agreement, "NODE-test")
+        };
+        // Final wherever the agreement stands.
+        assert!(over("confirmed", &["left"]));
+        assert!(over("ready", &["left"]));
+        assert!(over("confirmed", &["failed"]), "an old Portal's rendering");
+        // An invalidated join can be made again while the agreement is open.
+        assert!(!over("ready", &["invalid"]));
+        assert!(!over("pending", &["invalid"]));
+        assert!(over("confirmed", &["invalid"]));
+        assert!(over("failed", &["invalid"]));
+        // A live row among dead ones is a membership.
+        assert!(!over("confirmed", &["valid"]));
+        assert!(!over("confirmed", &["invalid", "valid"]));
+        assert!(!over("failed", &["valid"]));
+        // No row of this node's: nothing is known.
+        assert!(!over("confirmed", &[]));
+        assert!(!over("failed", &[]));
+    }
+
+    /// A file stored for a membership that then ended — the join invalidated
+    /// and the agreement confirmed without this node — used to stay for good,
+    /// counted against `STORAGE_MAX_FILES` and the capacity until the node
+    /// took on nothing. It is removed once this process has seen the
+    /// membership over for the grace, and the limits get the room back.
+    #[tokio::test]
+    async fn the_file_of_an_ended_membership_is_removed_after_the_grace() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-over", "confirmed", Some("invalid")).await;
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_removed");
+        insert_stored(&database, &storage_dir, "AGR-over").await;
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        let nothing = HashSet::new();
+        let listing = ReadyListing::new();
+        let file = storage_dir.join("FILE-AGR-over");
+        let backend = StorageBackend::local();
+        let pass = |now: Instant| {
+            remove_ended_files(
+                &client,
+                &database,
+                &backend,
+                &storage_dir,
+                &nothing,
+                &listing,
+                &ended,
+                now,
+            )
+        };
+
+        let t0 = Instant::now();
+        assert_eq!(
+            pass(t0).await.unwrap(),
+            0,
+            "first seen over: the grace starts"
+        );
+        assert!(file.exists());
+        assert_eq!(
+            pass(t0 + ENDED_FILE_GRACE - Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(file.exists(), "still inside the grace");
+        assert_eq!(
+            requests_to(&mock_server.received_requests().await.unwrap(), "AGR-over"),
+            1,
+            "and not re-read from the Portal on every cycle of it"
+        );
+
+        assert_eq!(pass(t0 + ENDED_FILE_GRACE).await.unwrap(), 1);
+        assert!(!file.exists(), "the file is gone");
+        let row = Agreements::find_by_id("AGR-over")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.downloaded);
+        assert_eq!(row.status, "confirmed");
+        assert_eq!(
+            membership(&row, None, Some("NODE-test")),
+            Membership::Ended,
+            "the row now says what the Portal says, so nothing downloads it again"
+        );
+        assert_eq!(current_downloaded_count(&database).await.unwrap(), 0);
+        assert_eq!(current_used_capacity(&database).await.unwrap(), 0);
+        // Nothing left to look at.
+        assert_eq!(pass(t0 + ENDED_FILE_GRACE * 3).await.unwrap(), 0);
+    }
+
+    /// A file is only ever removed on the Portal's word that the membership
+    /// is over, and never while anything could still ask for it.
+    #[tokio::test]
+    async fn a_file_that_may_still_be_owed_is_never_removed() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-valid", "confirmed", Some("valid")).await;
+        mount_detail(&mock_server, "AGR-rejoinable", "ready", Some("invalid")).await;
+        mount_detail(&mock_server, "AGR-no-row", "confirmed", None).await;
+        mount_detail(&mock_server, "AGR-held", "confirmed", Some("left")).await;
+        mount_detail(&mock_server, "AGR-listed", "confirmed", Some("left")).await;
+        mount_detail(&mock_server, "AGR-challenged", "confirmed", Some("left")).await;
+        Mock::given(method("GET"))
+            .and(path("/api/agreements/AGR-unreadable"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_kept");
+        let all = [
+            "AGR-valid",
+            "AGR-rejoinable",
+            "AGR-no-row",
+            "AGR-held",
+            "AGR-listed",
+            "AGR-challenged",
+            "AGR-unreadable",
+        ];
+        for agreement_id in all {
+            insert_stored(&database, &storage_dir, agreement_id).await;
+        }
+        insert_challenge(&database, "AGR-challenged", "proved").await;
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        // The Portal's own listings win over anything else: an agreement the
+        // node validly belongs to, or one still ready, is not even looked at.
+        let held: HashSet<String> = ["AGR-held".to_string()].into();
+        let listing = listing(vec![listed("AGR-listed", None, &[])]);
+
+        let t0 = Instant::now();
+        for step in 0..4u32 {
+            let removed = remove_ended_files(
+                &client,
+                &database,
+                &StorageBackend::local(),
+                &storage_dir,
+                &held,
+                &listing,
+                &ended,
+                t0 + ENDED_FILE_GRACE * step,
+            )
+            .await
+            .unwrap();
+            assert_eq!(removed, 0, "pass {step}");
+        }
+        for agreement_id in all {
+            assert!(
+                storage_dir.join(format!("FILE-{agreement_id}")).exists(),
+                "{agreement_id} was removed"
+            );
+        }
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-held"), 0);
+        assert_eq!(requests_to(&requests, "AGR-listed"), 0);
+
+        // The open challenge closes: that file, and only that one, goes.
+        challenges::ActiveModel {
+            challenge_id: sea_orm::ActiveValue::Unchanged("chal-AGR-challenged".into()),
+            status: Set("resolved".into()),
+            ..Default::default()
+        }
+        .update(&database)
+        .await
+        .unwrap();
+        // A membership the node left can still be challenged from before the
+        // leave: its file waits out Kontor's deadline, not the short grace.
+        let removed = remove_ended_files(
+            &client,
+            &database,
+            &StorageBackend::local(),
+            &storage_dir,
+            &held,
+            &listing,
+            &ended,
+            t0 + ENDED_FILE_GRACE * 5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(storage_dir.join("FILE-AGR-challenged").exists());
+        let removed = remove_ended_files(
+            &client,
+            &database,
+            &StorageBackend::local(),
+            &storage_dir,
+            &held,
+            &listing,
+            &ended,
+            t0 + LEFT_FILE_GRACE + ENDED_FILE_GRACE * 5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!storage_dir.join("FILE-AGR-challenged").exists());
+        assert!(storage_dir.join("FILE-AGR-valid").exists());
+    }
+
+    /// Two agreements on one file: the file stays while either still owes it.
+    #[tokio::test]
+    async fn a_file_another_stored_agreement_uses_is_kept() {
+        let mock_server = MockServer::start().await;
+        mount_detail(&mock_server, "AGR-left", "confirmed", Some("left")).await;
+        let database = setup_in_memory_db().await;
+        let storage_dir = unique_storage_dir("ended_shared");
+        insert_stored(&database, &storage_dir, "AGR-left").await;
+        AgreementFixture {
+            downloaded: true,
+            status: "confirmed".into(),
+            ..AgreementFixture::new("AGR-live", "FILE-AGR-left")
+        }
+        .into_active_model()
+        .insert(&database)
+        .await
+        .unwrap();
+        let client = create_authenticated_client(&mock_server, storage_dir.clone()).await;
+        let ended = EndedFiles::default();
+        let held: HashSet<String> = ["AGR-live".to_string()].into();
+        let listing = ReadyListing::new();
+
+        let t0 = Instant::now();
+        let mut removed = 0;
+        for step in 0..2u32 {
+            removed += remove_ended_files(
+                &client,
+                &database,
+                &StorageBackend::local(),
+                &storage_dir,
+                &held,
+                &listing,
+                &ended,
+                t0 + LEFT_FILE_GRACE * step,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(removed, 1, "the ended row stops counting");
+        assert!(
+            storage_dir.join("FILE-AGR-left").exists(),
+            "but the file the live agreement uses stays"
+        );
+        assert_eq!(current_downloaded_count(&database).await.unwrap(), 1);
+    }
+
+    /// Three agreements of unknown collateral whose file cannot be fetched,
+    /// first in line every cycle, used to spend the cycle's three guesses:
+    /// nothing behind them was ever joined. A failed download now gives its
+    /// guess back.
+    #[tokio::test]
+    async fn agreements_that_cannot_be_fetched_do_not_use_up_the_cycle_s_guesses() {
+        let mock_server = MockServer::start().await;
+        let broken = ["AGR-a1", "AGR-a2", "AGR-a3"];
+        for id in broken {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/agreements/{id}/download")))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&mock_server)
+                .await;
+        }
+        mount_download(&mock_server, "AGR-z").await;
+        mount_join_agreement_mock(&mock_server, "AGR-z").await;
+
+        let database = setup_agreements_db().await;
+        for id in broken {
+            insert_unjoined(&database, id, &format!("FILE-{id}")).await;
+        }
+        insert_unjoined(&database, "AGR-z", "FILE-AGR-z").await;
+        let client =
+            create_authenticated_client(&mock_server, unique_storage_dir("gate_guess_back")).await;
+
+        let tracker = tracker_with_available("50");
+        let listing = listing(vec![
+            listed("AGR-a1", None, &[]),
+            listed("AGR-a2", None, &[]),
+            listed("AGR-a3", None, &[]),
+            listed("AGR-z", None, &[]),
+        ]);
+        let mut budget = tracker.join_budget(Instant::now());
+
+        download_agreements_gated(
+            &client,
+            &database,
+            StorageLimits::default(),
+            &StorageBackend::local(),
+            &listing,
+            &mut budget,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+
+        let z = Agreements::find_by_id("AGR-z")
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            z.downloaded,
+            "the agreement behind the three that cannot be fetched is joined"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&requests, "AGR-z/join"), 1);
     }
 }

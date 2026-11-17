@@ -1,4 +1,6 @@
 use crate::app::cli::Cli;
+use crate::app::tasks::stake::{StakePolicy, MIN_GAS_RESERVE};
+use crate::clients::kor::Kor;
 use crate::database::{default_app_dir, default_storage_dir};
 use anyhow::{anyhow, Result};
 use byte_unit::Byte;
@@ -108,6 +110,13 @@ pub struct Config {
     /// `KONTOR_CONTRACT_ADDRESS`. Part of every signed `Inst`, so both sides
     /// must agree or signature verification fails.
     pub kontor_contract_address: String,
+    /// Kontor address of the staking contract, mirroring the Portal's
+    /// `KONTOR_STAKING_CONTRACT_ADDRESS`; signed into every stake op.
+    pub kontor_staking_contract_address: String,
+    /// How the node keeps its collateral bonded.
+    pub stake_policy: StakePolicy,
+    /// KOR asked of the faucet when the balance is empty.
+    pub faucet_amount: Kor,
 }
 
 impl Config {
@@ -125,10 +134,33 @@ impl Config {
 
         let storage_method = StorageMethod::from_str(&cli.storage_method)?;
 
-        let kontor_contract_address = cli.kontor_contract_address.trim().to_string();
-        if kontor_contract_address.is_empty() {
-            return Err(anyhow!("KONTOR_CONTRACT_ADDRESS cannot be empty"));
-        }
+        let kontor_contract_address =
+            parse_contract_address(&cli.kontor_contract_address, "KONTOR_CONTRACT_ADDRESS")?;
+        let kontor_staking_contract_address = parse_contract_address(
+            &cli.kontor_staking_contract_address,
+            "KONTOR_STAKING_CONTRACT_ADDRESS",
+        )?;
+
+        let stake_policy = StakePolicy {
+            auto_stake: cli.auto_stake,
+            gas_reserve: parse_gas_reserve(&cli.gas_reserve_kor)?,
+            stake_target: cli
+                .stake_target_kor
+                .as_deref()
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| parse_kor_positive(raw, "KONTOR_STORAGE_STAKE_TARGET_KOR"))
+                .transpose()?,
+            claim_threshold: parse_kor_positive(
+                &cli.claim_threshold_kor,
+                "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR",
+            )?,
+            unknown_collateral_estimate: parse_kor_positive(
+                &cli.unknown_collateral_estimate_kor,
+                "KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR",
+            )?,
+        };
+        let faucet_amount =
+            parse_kor_positive(&cli.faucet_amount_kor, "KONTOR_STORAGE_FAUCET_AMOUNT_KOR")?;
 
         // Every secret this node keeps at rest is written here, so a platform
         // with no data directory and no override has nowhere to be a node from.
@@ -187,8 +219,71 @@ impl Config {
             bls_key_path: cli.bls_key_path.clone(),
             admin_password,
             kontor_contract_address,
+            kontor_staking_contract_address,
+            stake_policy,
+            faucet_amount,
         })
     }
+}
+
+/// Check that `raw` is a Kontor contract address in its canonical spelling,
+/// `name_height_txindex`, and return it trimmed.
+///
+/// The address is signed into every op. The Portal parses it as Kontor's
+/// `ContractAddress` (`core/macros/src/contract_address.rs` at 80913826) and
+/// renders it back as `{name}_{height}_{tx_index}` before rebuilding the
+/// message it verifies the signature against; a spelling that parses but
+/// renders differently — `staking_00_0`, `staking_+1_0`, `staking_0_01` —
+/// signs a different message, and every op fails `BLS_VERIFY_FAILED`. So the
+/// value must be what Kontor would render, and only that: exactly three
+/// `_`-separated parts, a height (`u64`) and a tx index (`u32`) written as
+/// plain decimals, and a name Kontor takes as it is. Kontor normalises
+/// nothing in the name — any text without `_` round-trips — so no charset is
+/// imposed on it beyond what cannot be meant in an address: an empty name,
+/// whitespace or a control character.
+///
+/// # Errors
+/// With a message naming `variable`, if the value is not such an address.
+pub fn parse_contract_address(raw: &str, variable: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{variable} cannot be empty"));
+    }
+    let invalid = |why: &str| {
+        anyhow!(
+            "{variable} must be a Kontor contract address spelt as name_height_txindex, \
+             like staking_0_0 (got {value:?}): {why}"
+        )
+    };
+    let parts: Vec<&str> = value.split('_').collect();
+    let [name, height, tx_index] = parts[..] else {
+        return Err(invalid("expected 3 parts separated by '_'"));
+    };
+    if name.is_empty() {
+        return Err(invalid("the name is empty"));
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid(
+            "the name contains whitespace or a control character",
+        ));
+    }
+    if height.parse::<u64>().ok().map(|h| h.to_string()).as_deref() != Some(height) {
+        return Err(invalid(
+            "the height must be a plain decimal that fits u64, as Kontor renders it",
+        ));
+    }
+    if tx_index
+        .parse::<u32>()
+        .ok()
+        .map(|i| i.to_string())
+        .as_deref()
+        != Some(tx_index)
+    {
+        return Err(invalid(
+            "the tx index must be a plain decimal that fits u32, as Kontor renders it",
+        ));
+    }
+    Ok(value.to_string())
 }
 
 impl TryFrom<&Cli> for Config {
@@ -197,6 +292,34 @@ impl TryFrom<&Cli> for Config {
     fn try_from(cli: &Cli) -> Result<Self> {
         Config::from_cli(cli)
     }
+}
+
+/// A KOR amount from the environment: an exact decimal, so `0.1` is `0.1`.
+fn parse_kor(raw: &str, field_name: &str) -> Result<Kor> {
+    Kor::parse(raw).map_err(|err| anyhow!("invalid {field_name}: {err}"))
+}
+
+/// [`parse_kor`], refusing a reserve below [`MIN_GAS_RESERVE`]: Kontor holds an
+/// op's gas from the balance before running it, so with less kept back every
+/// `add-stake` of "everything above the reserve" fails on chain.
+fn parse_gas_reserve(raw: &str) -> Result<Kor> {
+    let reserve = parse_kor(raw, "KONTOR_STORAGE_GAS_RESERVE_KOR")?;
+    if reserve < MIN_GAS_RESERVE {
+        return Err(anyhow!(
+            "invalid KONTOR_STORAGE_GAS_RESERVE_KOR: {reserve} KOR is below the minimum of \
+             {MIN_GAS_RESERVE} KOR. Kontor holds an op's gas from the balance before running \
+             it, so a smaller reserve makes every add-stake of the rest fail; and the node \
+             pays its own proofs out of it (5 KOR by default)"
+        ));
+    }
+    Ok(reserve)
+}
+
+/// [`parse_kor`] for amounts where zero makes no sense: a zero claim threshold
+/// would claim dust every hour, a zero target would stake nothing while saying
+/// it stakes, and a zero faucet request is refused by the Portal.
+fn parse_kor_positive(raw: &str, field_name: &str) -> Result<Kor> {
+    Kor::parse_positive(raw).map_err(|err| anyhow!("invalid {field_name}: {err}"))
 }
 
 fn parse_storage_capacity(raw: &str, field_name: &str) -> Result<u64> {
@@ -239,6 +362,13 @@ mod tests {
             bls_key_path: None,
             admin_password: None,
             kontor_contract_address: "filestorage_0_0".to_string(),
+            kontor_staking_contract_address: "staking_0_0".to_string(),
+            auto_stake: true,
+            gas_reserve_kor: "5".to_string(),
+            stake_target_kor: None,
+            faucet_amount_kor: "1000".to_string(),
+            claim_threshold_kor: "1".to_string(),
+            unknown_collateral_estimate_kor: "10".to_string(),
             command: Commands::Ping,
         }
     }
@@ -477,6 +607,65 @@ mod tests {
         assert!(err.to_string().contains("KONTOR_CONTRACT_ADDRESS"));
     }
 
+    /// The Portal re-renders the address it parses before verifying the
+    /// signature, so only the canonical spelling signs the right message. A
+    /// non-canonical one fails every op with BLS_VERIFY_FAILED, which is a
+    /// worse place to find out than startup.
+    #[test]
+    fn contract_addresses_must_be_canonical() {
+        for good in [
+            "staking_0_0",
+            "filestorage_1_0",
+            "my-contract2_80913826_3",
+            "a_18446744073709551615_4294967295",
+            // Kontor imposes no charset on the name and renders it as it is,
+            // so these spellings are canonical too.
+            "Foo.bar_1_2",
+            "Staking_0_0",
+            "1staking_1_0",
+        ] {
+            assert_eq!(
+                parse_contract_address(&format!(" {good} "), "X").unwrap(),
+                good
+            );
+        }
+        for (bad, why) in [
+            ("staking_00_0", "height"),
+            ("staking_0_01", "tx index"),
+            ("staking_+1_0", "height"),
+            ("staking_1_x", "tx index"),
+            ("staking_0", "3 parts"),
+            ("staking_0_0_0", "3 parts"),
+            ("_1_0", "name"),
+            ("staking_18446744073709551616_0", "height"),
+            ("staking_1_4294967296", "tx index"),
+            ("staking_1_-1", "tx index"),
+            ("stak ing_1_0", "name"),
+        ] {
+            let err = parse_contract_address(bad, "KONTOR_STAKING_CONTRACT_ADDRESS")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("KONTOR_STAKING_CONTRACT_ADDRESS"),
+                "{bad}: {err}"
+            );
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+
+        let cli = Cli {
+            kontor_staking_contract_address: "staking_00_0".to_string(),
+            ..make_cli()
+        };
+        let err = Config::from_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("KONTOR_STAKING_CONTRACT_ADDRESS"), "{err}");
+        let cli = Cli {
+            kontor_contract_address: "filestorage_0_01".to_string(),
+            ..make_cli()
+        };
+        let err = Config::from_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("KONTOR_CONTRACT_ADDRESS"), "{err}");
+    }
+
     #[test]
     fn config_from_cli_trims_the_contract_address() {
         let cli = Cli {
@@ -553,5 +742,132 @@ mod tests {
         let result = parse_storage_capacity("1 ZB", "STORAGE_CAPACITY");
         let err = result.unwrap_err();
         assert!(err.to_string().contains("exceeds u64"));
+    }
+
+    #[test]
+    fn config_from_cli_defaults_to_the_contract_stake_policy() {
+        let config = Config::from_cli(&make_cli()).unwrap();
+        assert_eq!(config.stake_policy, StakePolicy::default());
+        assert_eq!(config.faucet_amount, Kor::whole(1000));
+        assert_eq!(config.kontor_staking_contract_address, "staking_0_0");
+    }
+
+    #[test]
+    fn config_from_cli_reads_stake_amounts_as_exact_decimals() {
+        let cli = Cli {
+            auto_stake: false,
+            gas_reserve_kor: "2.5".to_string(),
+            stake_target_kor: Some("250.000000000000000001".to_string()),
+            faucet_amount_kor: "0.1".to_string(),
+            claim_threshold_kor: "0.75".to_string(),
+            unknown_collateral_estimate_kor: "2.5".to_string(),
+            kontor_staking_contract_address: " staking_3_1 ".to_string(),
+            ..make_cli()
+        };
+        let config = Config::from_cli(&cli).unwrap();
+        assert!(!config.stake_policy.auto_stake);
+        assert_eq!(config.stake_policy.gas_reserve.to_string(), "2.5");
+        assert_eq!(
+            config.stake_policy.stake_target.unwrap().to_string(),
+            "250.000000000000000001"
+        );
+        assert_eq!(config.stake_policy.claim_threshold.to_string(), "0.75");
+        assert_eq!(
+            config.stake_policy.unknown_collateral_estimate.to_string(),
+            "2.5"
+        );
+        assert_eq!(config.faucet_amount.to_string(), "0.1");
+        assert_eq!(config.kontor_staking_contract_address, "staking_3_1");
+    }
+
+    /// Bad amounts are refused, and say which variable holds them. A reserve
+    /// below one op's gas hold is one: Kontor takes the hold before running an
+    /// `add-stake`, so staking everything above a zero reserve always fails.
+    #[test]
+    fn config_from_cli_rejects_bad_stake_amounts_by_name() {
+        let minimum = Cli {
+            gas_reserve_kor: "0.0001".to_string(),
+            ..make_cli()
+        };
+        assert_eq!(
+            Config::from_cli(&minimum).unwrap().stake_policy.gas_reserve,
+            MIN_GAS_RESERVE
+        );
+
+        for (cli, name) in [
+            (
+                Cli {
+                    gas_reserve_kor: "1e3".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_GAS_RESERVE_KOR",
+            ),
+            (
+                Cli {
+                    gas_reserve_kor: "0".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_GAS_RESERVE_KOR",
+            ),
+            (
+                Cli {
+                    gas_reserve_kor: "0.000099999999999999".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_GAS_RESERVE_KOR",
+            ),
+            (
+                Cli {
+                    stake_target_kor: Some("0".to_string()),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_STAKE_TARGET_KOR",
+            ),
+            (
+                Cli {
+                    faucet_amount_kor: "-5".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_FAUCET_AMOUNT_KOR",
+            ),
+            (
+                Cli {
+                    claim_threshold_kor: "0".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_CLAIM_THRESHOLD_KOR",
+            ),
+            (
+                Cli {
+                    unknown_collateral_estimate_kor: "0".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STORAGE_UNKNOWN_COLLATERAL_ESTIMATE_KOR",
+            ),
+            (
+                Cli {
+                    kontor_staking_contract_address: " ".to_string(),
+                    ..make_cli()
+                },
+                "KONTOR_STAKING_CONTRACT_ADDRESS",
+            ),
+        ] {
+            let err = Config::from_cli(&cli).unwrap_err();
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
+    }
+
+    /// `KONTOR_STORAGE_STAKE_TARGET_KOR=` left blank means "no target", not a
+    /// parse error.
+    #[test]
+    fn config_from_cli_treats_a_blank_stake_target_as_unset() {
+        let cli = Cli {
+            stake_target_kor: Some("  ".to_string()),
+            ..make_cli()
+        };
+        assert_eq!(
+            Config::from_cli(&cli).unwrap().stake_policy.stake_target,
+            None
+        );
     }
 }

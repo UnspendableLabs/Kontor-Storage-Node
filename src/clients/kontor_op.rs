@@ -16,8 +16,14 @@
 //! variants are only shaped closely enough to keep the derive happy — they are
 //! never serialized.
 //!
-//! Checked against Kontor `core/indexer-types/src/lib.rs` at rev `b8e4026`,
-//! the revision Horizon Portal's `Cargo.lock` pins.
+//! Checked against Kontor `core/indexer-types/src/lib.rs` at rev `80913826`
+//! (the staking upgrade) and again at `f3ace89a`: variant order, the
+//! `KONTOR-OP-V1` prefix and the `(SignerRef, nonce, sponsored, &Inst)` tuple
+//! are unchanged from `b8e4026`, and `ContractAddress` still displays as
+//! `name_height_txindex` (the `contract_address!` macro in `core/macros`).
+//! The one change between the two, in `9f5779f2`, is a `SponsorBound` variant
+//! appended to `InstKind` after `Sponsor`: no existing index moved, so every
+//! signature the node produces is the same under both.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -83,6 +89,17 @@ pub enum InstKind {
     },
     #[allow(dead_code)]
     Sponsor, // index 5
+    /// Appended upstream in `9f5779f2`; the fields are fixed-width arrays
+    /// there too.
+    #[allow(dead_code)]
+    SponsorBound {
+        // index 6
+        target_input_index: u32,
+        target_txid: [u8; 32],
+        target_vout_le: [u8; 4],
+        target_leaf_hash: [u8; 32],
+        max_total_gas_le: [u8; 8],
+    },
 }
 
 /// Mirror of Kontor's `Inst` struct.
@@ -147,6 +164,22 @@ mod tests {
             postcard::to_allocvec(&register).unwrap(),
             vec![0, 4, 0, 0, 0]
         );
+
+        // The variant Kontor appended after `Sponsor` took the next index and
+        // moved none of the others.
+        let sponsor_bound = Inst {
+            gas_limit: 0,
+            kind: InstKind::SponsorBound {
+                target_input_index: 0,
+                target_txid: [0; 32],
+                target_vout_le: [0; 4],
+                target_leaf_hash: [0; 32],
+                max_total_gas_le: [0; 8],
+            },
+        };
+        let encoded = postcard::to_allocvec(&sponsor_bound).unwrap();
+        assert_eq!(&encoded[..2], &[0, 6]);
+        assert_eq!(encoded.len(), 2 + 1 + 32 + 4 + 32 + 8);
     }
 
     /// The one encoding difference that cannot be caught by reading the enum:

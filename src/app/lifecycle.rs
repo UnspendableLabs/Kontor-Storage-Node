@@ -37,6 +37,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::Notify;
 
+use crate::app::tasks::stake::StakeTracker;
 use crate::crypto::keystore::{self, Keystore, SealKey, SealKeySource, SlotKind};
 use crate::server::admin::NodeIdentity;
 
@@ -242,6 +243,13 @@ struct State {
 struct Inner {
     state: RwLock<State>,
     wake: Notify,
+    /// The daemon's view of the bond, read by `/admin`.
+    ///
+    /// Outside `state` because it is written every cycle and has a lock of its
+    /// own, and because it outlives activations: a re-activation stops one
+    /// daemon and starts another, and the op the first one left in flight is
+    /// still in flight.
+    staking: Arc<StakeTracker>,
 }
 
 /// The node's live state, shared by every request handler and the supervisor.
@@ -265,8 +273,15 @@ impl NodeRuntime {
                     pending: None,
                 }),
                 wake: Notify::new(),
+                staking: Arc::new(StakeTracker::default()),
             }),
         }
+    }
+
+    /// The bond tracker the daemon writes and `/admin` reads.
+    #[must_use]
+    pub fn staking(&self) -> Arc<StakeTracker> {
+        Arc::clone(&self.inner.staking)
     }
 
     fn read(&self) -> RwLockReadGuard<'_, State> {

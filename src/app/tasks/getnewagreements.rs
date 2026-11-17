@@ -5,15 +5,31 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::{DatabaseConnection, Set};
+use std::collections::HashMap;
 
+/// This cycle's ready listing, by agreement id.
+///
+/// Kept for the rest of the cycle rather than written to the database because
+/// what the download step needs from it — `required_collateral`, and who has
+/// joined — is only meaningful as of now. A row stored last week says nothing
+/// about whether the agreement is still ready, or what it costs to join today.
+pub type ReadyListing = HashMap<String, crate::clients::portal::Agreement>;
+
+/// Store the ready agreements this node has not seen yet, and return the whole
+/// listing for the cycle's join decisions.
 pub async fn sync_ready_agreements(
     portal_client: &PortalClient,
     database: &DatabaseConnection,
-) -> Result<()> {
+) -> Result<ReadyListing> {
     let agreements = portal_client
         .get_new_agreements()
         .await
         .context("fetching new agreements failed")?;
+
+    let listing: ReadyListing = agreements
+        .iter()
+        .map(|agreement| (agreement.agreement_id.clone(), agreement.clone()))
+        .collect();
 
     let requested_ids: Vec<String> = agreements
         .iter()
@@ -36,7 +52,9 @@ pub async fn sync_ready_agreements(
         agreement_to_active_model,
         database,
     )
-    .await
+    .await?;
+
+    Ok(listing)
 }
 
 pub(crate) fn agreement_to_active_model(
@@ -118,6 +136,8 @@ mod tests {
             blob_size: None,
             file_hash: None,
             ledger_index: None,
+            required_collateral: None,
+            storage_weight: None,
             txid: None,
             block_height: None,
             block_time: None,

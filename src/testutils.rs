@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::entities::agreements;
-use crate::entities::prelude::{Agreements, Challenges};
+use crate::entities::prelude::{Agreements, Challenges, NodeState};
 
 /// Global test counter for generating unique identifiers.
 /// Used across all test modules to ensure unique paths.
@@ -50,13 +50,24 @@ async fn create_challenges_table(db: &DatabaseConnection) {
         .expect("failed to create challenges table");
 }
 
-/// Set up an in-memory SQLite database with both agreements and challenges tables.
+/// Create the `node_state` table on an existing connection.
+async fn create_node_state_table(db: &DatabaseConnection) {
+    let schema = Schema::new(DatabaseBackend::Sqlite);
+    let stmt = schema.create_table_from_entity(NodeState);
+    db.execute(&stmt)
+        .await
+        .expect("failed to create node_state table");
+}
+
+/// Set up an in-memory SQLite database with the agreements, challenges and
+/// node_state tables — the daemon's whole schema.
 ///
 /// This creates a fresh database for each test to ensure isolation.
 pub async fn setup_in_memory_db() -> DatabaseConnection {
     let db = connect_in_memory_db().await;
     create_agreements_table(&db).await;
     create_challenges_table(&db).await;
+    create_node_state_table(&db).await;
     db
 }
 
